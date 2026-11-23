@@ -31,7 +31,13 @@ import { setDataPathOverrides } from "../src/core/jsonStore.ts";
 import { createDeviceInfo, createPropInfo, type DeviceInfo, type PropInfo } from "../src/core/models.ts";
 import { MijiaService } from "../src/core/service.ts";
 import { VirtualDemoService } from "../src/core/virtualLightService.ts";
-import { flattenMiotSpec, type FlattenedSpec, type MijiaApiClient } from "../src/mijia/index.ts";
+import {
+  flattenMiotSpec,
+  isMiotUnsupportedCode,
+  miotErrorMessageZh,
+  type FlattenedSpec,
+  type MijiaApiClient,
+} from "../src/mijia/index.ts";
 import { startMijiaDeckServer, type MijiaDeckServer } from "../src/server/server.ts";
 import { DeviceDetailController } from "../src/ui/controllers/deviceDetailController.ts";
 import { setAccent, setTheme } from "../src/ui/theme.ts";
@@ -354,6 +360,120 @@ describe("DeviceDetail Spec & Model", () => {
     });
     expect(formatPropertyValue(feedPlanProp, rawLivePlan)).toContain("2 条计划");
     expect(formatPropertyValue(feedPlanProp, rawLivePlan)).toContain("08:00 7份");
+  });
+
+  test("MijiaService translates MIoT error codes, falls back stop->pause on -704220008, and keeps play-music/play-radio arg-free", async () => {
+    expect(miotErrorMessageZh(-704220008)).toContain("不支持");
+    expect(miotErrorMessageZh(-704220025)).toContain("参数");
+    expect(isMiotUnsupportedCode(-704220008)).toBe(true);
+    expect(isMiotUnsupportedCode(-704220043)).toBe(false);
+
+    const tempDir = mkdtempSync(path.join(tmpdir(), "mijiadeck-l05b-spec-"));
+    try {
+      const l05bSpec: FlattenedSpec = {
+        name: "Speaker",
+        properties: [
+          {
+            name: "mute-2",
+            description: "Mute / 静音",
+            type: "bool",
+            rw: "rw",
+            range: null,
+            "value-list": null,
+            method: { siid: 2, piid: 2 },
+          },
+          {
+            name: "mute-4",
+            description: "Mute / 静音",
+            type: "bool",
+            rw: "rw",
+            range: null,
+            "value-list": null,
+            method: { siid: 4, piid: 1 },
+          },
+          {
+            name: "on",
+            description: "Switch Status / 开关",
+            type: "bool",
+            rw: "rw",
+            range: null,
+            "value-list": null,
+            method: { siid: 6, piid: 1 },
+          },
+        ],
+        actions: [
+          { name: "play", description: "Play / 播放", method: { siid: 3, aiid: 2 } },
+          { name: "pause", description: "Pause / 暂停", method: { siid: 3, aiid: 3 } },
+          { name: "stop", description: "Stop / 结束播放", method: { siid: 3, aiid: 4 } },
+          { name: "play-radio", description: "Play Radio / 播放电台", method: { siid: 5, aiid: 2 } },
+          { name: "play-text", description: "Play Text / 播放文本", method: { siid: 5, aiid: 3 } },
+          { name: "play-music", description: "Play Music / 播放音乐", method: { siid: 5, aiid: 5 } },
+          { name: "stop-alarm", description: "Stop Alarm / 停止闹钟", method: { siid: 6, aiid: 1 } },
+        ],
+      };
+
+      const actionPayloads: Array<Record<string, unknown>> = [];
+      const mockApi = {
+        authDataPath: path.join(tempDir, "auth.json"),
+        apiBaseUrl: "https://api.io.mi.com/app",
+        available: true,
+        authData: {},
+        getHomesList: mock(async () => []),
+        getDevicesList: mock(async () => [
+          {
+            did: "504337266",
+            name: "小爱音箱Play",
+            model: "xiaomi.wifispeaker.l05b",
+            spec_type: "urn:miot-spec-v2:device:speaker:0000A015:xiaomi-l05b:1",
+            isOnline: true,
+          },
+        ]),
+        getSharedDevicesList: mock(async () => []),
+        getDevicesProp: mock(async () => []),
+        setDevicesProp: mock(async () => []),
+        runAction: mock(async (payload: Record<string, unknown>) => {
+          actionPayloads.push(payload);
+          if (payload["siid"] === 3 && payload["aiid"] === 4) {
+            return { code: -704220008 };
+          }
+          if (payload["siid"] === 6 && payload["aiid"] === 1) {
+            return { code: -704220008 };
+          }
+          return { code: 0 };
+        }),
+      };
+
+      const service = new MijiaService({
+        api: mockApi as unknown as MijiaApiClient,
+        specFetcher: async () => l05bSpec,
+      });
+
+      const detail = await service.deviceDetail("504337266");
+      expect(detail.actions.find((a) => a.name === "play-music")?.in).toBeUndefined();
+      expect(detail.actions.find((a) => a.name === "play-radio")?.in).toBeUndefined();
+      expect(detail.actions.find((a) => a.name === "play-text")?.in?.length).toBe(1);
+
+      const mute2 = detail.props.find((p) => p.name === "mute-2")!;
+      const mute4 = detail.props.find((p) => p.name === "mute-4")!;
+      const clockOn = detail.props.find((p) => p.name === "on")!;
+      expect(friendlyPropLabel(mute2)).toBe("扬声器静音");
+      expect(friendlyPropLabel(mute4)).toBe("麦克风静音");
+      expect(friendlyPropLabel(clockOn)).toBe("闹钟开关");
+
+      // Calling stop on l05b hits -704220008 and transparently falls back to pause (s3a3)
+      await service.runAction("504337266", "stop");
+      expect(actionPayloads).toEqual([
+        { did: "504337266", siid: 3, aiid: 4, in: [] },
+        { did: "504337266", siid: 3, aiid: 3, in: [] },
+      ]);
+
+      // An unsupported action with no fallback produces a friendly Chinese MIoT error
+      await expect(service.runAction("504337266", "stop-alarm")).rejects.toThrow(
+        "当前设备固件不支持该功能或动作（错误码 -704220008）",
+      );
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });
 

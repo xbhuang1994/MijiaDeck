@@ -3881,6 +3881,11 @@ button:disabled {
   gap: 10px;
 }
 
+.dd-control-row.is-unreported {
+  opacity: 0.72;
+  border-style: dashed;
+}
+
 .dd-control-info {
   min-width: 0;
   flex: 1;

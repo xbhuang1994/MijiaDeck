@@ -369,6 +369,38 @@ describe("mijia/spec", () => {
       }),
     ).rejects.toThrow(GetDeviceInfoError);
     await expect(getDeviceInfo("   ", { cachePath: cacheDir })).rejects.toThrow(GetDeviceInfoError);
+
+    // 5. Legacy cached flattened spec (without service metadata) upgrades online and falls back offline.
+    const legacyType = "urn:miot-spec-v2:device:switch:0000A003:xiaomi-legacy:1";
+    const legacyFile = path.join(cacheDir, `${legacyType.replaceAll(":", "_")}.json`);
+    writeFileSync(
+      legacyFile,
+      JSON.stringify({
+        name: "Legacy Switch",
+        properties: [
+          { name: "on", description: "Switch", type: "bool", rw: "rw", method: { siid: 2, piid: 1 } },
+        ],
+        actions: [],
+      }),
+      "utf8",
+    );
+    const offlineFallback = await getDeviceInfo(legacyType, {
+      cachePath: cacheDir,
+      fetcher: async () => {
+        throw new Error("network down");
+      },
+    });
+    expect(offlineFallback.name).toBe("Legacy Switch");
+
+    const upgraded = await getDeviceInfo(legacyType, {
+      cachePath: cacheDir,
+      fetcher: async () =>
+        new Response(JSON.stringify(rawMiotSpec), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+    });
+    expect(upgraded.properties[0]!.service).toBe("switch");
   });
 });
 

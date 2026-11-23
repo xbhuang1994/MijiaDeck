@@ -262,15 +262,34 @@ export function friendlyLabel(desc: string, fallbackName: string): string {
   return short.length > 28 ? `${short.slice(0, 28)}…` : short;
 }
 
-/** 结合所属服务与设备品类返回更明确的属性展示名称（如区分指示灯开关与主电源）。 */
+/** 结合所属服务与设备品类返回更明确的属性展示名称（如区分指示灯开关与主电源、扬声器静音与麦克风静音）。 */
 export function friendlyPropLabel(prop: PropInfo, device?: DeviceInfo): string {
   const base = friendlyLabel(prop.desc, prop.name);
   if (prop.name === "on" && base === "开关") {
     if (prop.service === "indicator-light") {
       return "指示灯开关";
     }
+    if (prop.service === "clock") {
+      return "闹钟开关";
+    }
     if (device && isPetFeederDevice(device) && prop.siid !== 2) {
       return "指示灯开关";
+    }
+  }
+  if (base === "静音") {
+    if (prop.service === "speaker") {
+      return "扬声器静音";
+    }
+    if (prop.service === "microphone") {
+      return "麦克风静音";
+    }
+  }
+  if (prop.service === "clock") {
+    if (base === "工作状态") {
+      return "闹钟状态";
+    }
+    if (base === "故障") {
+      return "闹钟故障";
     }
   }
   return base;

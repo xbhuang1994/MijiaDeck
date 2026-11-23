@@ -13,6 +13,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import {
+  DeviceActionError,
   DeviceNotFoundError,
   GetDeviceInfoError,
   MIJIA_API_VERSION,
@@ -20,6 +21,8 @@ import {
   MijiaApiError,
   MijiaDevice,
   getDeviceInfo,
+  isMiotUnsupportedCode,
+  miotErrorMessageZh,
   type DevProp,
   type FlattenedSpec,
   type MijiaApiClientOptions,
@@ -77,8 +80,6 @@ const CAMERA_PER_ATTEMPT_FIELDS = [
 const TEXT_DIRECTIVE_ACTIONS = new Set([
   "execute-text-directive",
   "play-text",
-  "play-music",
-  "play-radio",
 ]);
 
 /** 携带用户可直接阅读的中文信息，界面层直接展示 message 即可。 */
@@ -107,6 +108,12 @@ function isFsError(err: unknown): boolean {
 }
 
 function wrapError(err: unknown, context: string): ServiceError {
+  if (err instanceof MijiaApiError && err.code !== undefined) {
+    const zh = miotErrorMessageZh(err.code);
+    if (zh) {
+      return new ServiceError(`${context}：${zh}（错误码 ${err.code}）`, { cause: err });
+    }
+  }
   const detail = err instanceof Error ? err.message : String(err);
   return new ServiceError(`${context}: ${detail}`, { cause: err });
 }
@@ -664,7 +671,7 @@ export class MijiaService implements IMijiaService {
         },
       ];
     }
-    if (baseName === "play-text" || baseName === "play-music" || baseName === "play-radio") {
+    if (baseName === "play-text") {
       const txt = findByPrefix("text-content");
       if (txt) {
         return [toParam(txt)];
@@ -673,7 +680,7 @@ export class MijiaService implements IMijiaService {
         {
           piid: 1,
           name: "text-content",
-          desc: baseName === "play-text" ? "朗读文本内容" : "播放内容",
+          desc: "朗读文本内容",
           type: "string",
           unit: null,
           range: null,
@@ -784,6 +791,44 @@ export class MijiaService implements IMijiaService {
       }
       if (siid === 2) {
         return "pet-feeder";
+      }
+    }
+    if (
+      model.toLowerCase().includes("wifispeaker") ||
+      model.toLowerCase().includes(".speaker.")
+    ) {
+      if (base === "volume" || (base === "mute" && siid === 2)) {
+        return "speaker";
+      }
+      if (base === "mute" && siid === 4) {
+        return "microphone";
+      }
+      if (
+        base === "playing-state" ||
+        base === "seek-time" ||
+        base === "play-loop-mode" ||
+        base === "seek" ||
+        base === "play" ||
+        base === "pause" ||
+        base === "stop" ||
+        base === "previous" ||
+        base === "next"
+      ) {
+        return "play-control";
+      }
+      if (
+        base === "text-content" ||
+        base === "silent-execution" ||
+        base === "wake-up" ||
+        base === "play-radio" ||
+        base === "play-text" ||
+        base === "execute-text-directive" ||
+        base === "play-music"
+      ) {
+        return "intelligent-speaker";
+      }
+      if (base === "ringtone" || base === "stop-alarm" || siid === 6) {
+        return "clock";
       }
     }
     return undefined;
@@ -939,7 +984,7 @@ export class MijiaService implements IMijiaService {
       throw new ServiceError("面板本体仅展示信息，请操作对应灯路");
     }
     try {
-      if (params !== undefined && params !== null) {
+      if (params !== undefined && params !== null && (!Array.isArray(params) || params.length > 0)) {
         if (TEXT_DIRECTIVE_ACTIONS.has(name)) {
           let inVal: unknown[] = Array.isArray(params) ? [...params] : [params];
           if (name === "execute-text-directive") {
@@ -964,6 +1009,35 @@ export class MijiaService implements IMijiaService {
     } catch (err) {
       if (err instanceof ServiceError) {
         throw err;
+      }
+      // Many XiaoAI speaker firmwares (e.g. xiaomi.wifispeaker.l05b) declare `stop` in
+      // MIoT-Spec `play-control` but return -704220008 (-4003) on invoke while supporting `pause`.
+      const normalized = name.replaceAll("_", "-");
+      const baseName = normalized.replace(/-\d+$/, "");
+      if (
+        baseName === "stop" &&
+        err instanceof DeviceActionError &&
+        isMiotUnsupportedCode(err.code)
+      ) {
+        const stopAction = dev.actionList[name] ?? dev.actionList[normalized];
+        const pauseFallback = stopAction
+          ? Object.values(dev.actionList).find(
+              (a) =>
+                a.method.siid === stopAction.method.siid &&
+                a.name.replace(/-\d+$/, "") === "pause",
+            )
+          : undefined;
+        if (pauseFallback) {
+          try {
+            await dev.runAction(pauseFallback.name);
+            return;
+          } catch (fallbackErr) {
+            if (fallbackErr instanceof ServiceError) {
+              throw fallbackErr;
+            }
+            throw wrapError(fallbackErr, `执行动作 ${pauseFallback.name} 失败`);
+          }
+        }
       }
       throw wrapError(err, `执行动作 ${name} 失败`);
     }

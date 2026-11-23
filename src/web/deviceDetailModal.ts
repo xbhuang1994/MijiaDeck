@@ -639,8 +639,19 @@ export class DeviceDetailModalController {
       }
     }
 
+    const hasAnyReportedValue = Object.values(data.values).some(
+      (v) => v !== null && v !== undefined,
+    );
+
     // 5. Live Telemetry / Read-Only Status Grid
-    const remainingTelemetry = classified.telemetry.filter((p) => !heroConsumedProps.has(p.name));
+    const rawTelemetry = classified.telemetry.filter((p) => !heroConsumedProps.has(p.name));
+    const reportedTelemetry =
+      data.online && !data.readWarning && hasAnyReportedValue
+        ? rawTelemetry.filter(
+            (p) => data.values[p.name] !== null && data.values[p.name] !== undefined,
+          )
+        : rawTelemetry;
+    const remainingTelemetry = reportedTelemetry.length > 0 ? reportedTelemetry : rawTelemetry;
     if (remainingTelemetry.length > 0) {
       container.appendChild(this.buildTelemetrySection(data, remainingTelemetry));
       renderedAnything = true;
@@ -649,7 +660,9 @@ export class DeviceDetailModalController {
     // 6. Writable Controls Grouped by Service
     const remainingControls = classified.controls.filter((p) => !heroConsumedProps.has(p.name));
     if (remainingControls.length > 0) {
-      container.appendChild(this.buildControlsSection(data, remainingControls));
+      container.appendChild(
+        this.buildControlsSection(data, remainingControls, hasAnyReportedValue),
+      );
       renderedAnything = true;
     }
 
@@ -1805,7 +1818,11 @@ export class DeviceDetailModalController {
     return section;
   }
 
-  private buildControlsSection(data: DeviceDetailApiResponse, controls: PropInfo[]): HTMLElement {
+  private buildControlsSection(
+    data: DeviceDetailApiResponse,
+    controls: PropInfo[],
+    hasAnyReportedValue = false,
+  ): HTMLElement {
     const section = this.createSection("参数与控制", `${controls.length} 项可调参数`);
     const groups = groupPropsByService(controls);
     const showGroupHead = groups.length > 1;
@@ -1820,21 +1837,31 @@ export class DeviceDetailModalController {
       const list = document.createElement("div");
       list.className = "dd-control-list";
       for (const prop of group.props) {
-        list.appendChild(this.buildControlRow(data, prop));
+        list.appendChild(this.buildControlRow(data, prop, hasAnyReportedValue));
       }
       section.appendChild(list);
     }
     return section;
   }
 
-  private buildControlRow(data: DeviceDetailApiResponse, prop: PropInfo): HTMLElement {
+  private buildControlRow(
+    data: DeviceDetailApiResponse,
+    prop: PropInfo,
+    hasAnyReportedValue = false,
+  ): HTMLElement {
     const widget = choosePropertyWidget(prop);
     const raw = data.values[prop.name];
     const busy = this.busyProps.has(prop.name);
     const disabled = !data.online || busy || data.isSplitParent;
+    const isUnreported =
+      data.online &&
+      !data.readWarning &&
+      hasAnyReportedValue &&
+      prop.readable &&
+      (raw === null || raw === undefined);
 
     const row = document.createElement("div");
-    row.className = `dd-control-row widget-${widget}`;
+    row.className = `dd-control-row widget-${widget}${isUnreported ? " is-unreported" : ""}`;
     row.title = `${prop.desc} (${prop.name})`;
 
     const info = document.createElement("div");
@@ -1847,7 +1874,9 @@ export class DeviceDetailModalController {
     const metaEl = document.createElement("div");
     metaEl.className = "dd-control-meta";
     const metaParts: string[] = [];
-    if (prop.readable) {
+    if (isUnreported) {
+      metaParts.push("当前：未上报（该型号固件可能不支持）");
+    } else if (prop.readable) {
       metaParts.push(`当前：${formatPropertyValue(prop, raw)}`);
     } else {
       metaParts.push("仅支持设置");

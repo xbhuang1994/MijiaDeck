@@ -201,6 +201,14 @@ function isFlattenedSpec(value: unknown): value is FlattenedSpec {
   return Array.isArray(value["properties"]) && Array.isArray(value["actions"]);
 }
 
+function isLegacyFlattenedSpec(spec: FlattenedSpec): boolean {
+  const hasPropsMissingService =
+    spec.properties.length > 0 && !spec.properties.some((p) => Boolean(p.service));
+  const hasActionsMissingService =
+    spec.actions.length > 0 && !spec.actions.some((a) => Boolean(a.service));
+  return hasPropsMissingService || hasActionsMissingService;
+}
+
 /**
  * Convert an official `miot-spec.org/miot-spec-v2/instance` JSON document into the
  * flattened format used by mijiaAPI 5.x and MijiaDeck.
@@ -432,22 +440,28 @@ export async function getDeviceInfo(
 
   const cacheDir = options?.cachePath ?? join(homedir(), ".config", "mijia-api");
   const cacheFile = join(cacheDir, `${trimmed.replaceAll(":", "_")}.json`);
+  let legacyFallback: FlattenedSpec | null = null;
 
   if (existsSync(cacheFile)) {
     try {
       const text = readFileSync(cacheFile, "utf8");
       const parsed: unknown = JSON.parse(text);
       if (isFlattenedSpec(parsed)) {
-        return parsed;
-      }
-      if (isRecord(parsed) && Array.isArray(parsed["services"])) {
+        if (!isLegacyFlattenedSpec(parsed)) {
+          return parsed;
+        }
+        // Legacy cache written before service/action.in enrichment: try refreshing once,
+        // and fall back safely to the cached copy when offline or unreachable.
+        legacyFallback = parsed;
+      } else if (isRecord(parsed) && Array.isArray(parsed["services"])) {
         return flattenMiotSpec(parsed, trimmed);
-      }
-      // Valid JSON but unrecognized structure: fall through or reject
-      try {
-        unlinkSync(cacheFile);
-      } catch {
-        // ignore
+      } else {
+        // Valid JSON but unrecognized structure: fall through or reject
+        try {
+          unlinkSync(cacheFile);
+        } catch {
+          // ignore
+        }
       }
     } catch {
       // Corrupt or unreadable cache file: remove best-effort and re-fetch
@@ -470,6 +484,9 @@ export async function getDeviceInfo(
   try {
     response = await doFetch(url, { method: "GET" });
   } catch (err) {
+    if (legacyFallback !== null) {
+      return legacyFallback;
+    }
     throw new GetDeviceInfoError(
       `Failed to fetch device spec for ${trimmed}: ${err instanceof Error ? err.message : String(err)}`,
       undefined,
@@ -478,6 +495,9 @@ export async function getDeviceInfo(
   }
 
   if (!response.ok) {
+    if (legacyFallback !== null) {
+      return legacyFallback;
+    }
     throw new GetDeviceInfoError(
       `Failed to fetch device spec for ${trimmed}: HTTP ${response.status}`,
       response.status,
@@ -488,6 +508,9 @@ export async function getDeviceInfo(
   try {
     parsed = await response.json();
   } catch (err) {
+    if (legacyFallback !== null) {
+      return legacyFallback;
+    }
     throw new GetDeviceInfoError(
       `Invalid JSON in device spec for ${trimmed}`,
       undefined,
@@ -501,6 +524,9 @@ export async function getDeviceInfo(
   } else if (isRecord(parsed) && Array.isArray(parsed["services"])) {
     flattened = flattenMiotSpec(parsed, trimmed);
   } else {
+    if (legacyFallback !== null) {
+      return legacyFallback;
+    }
     throw new GetDeviceInfoError(`Invalid device spec structure for ${trimmed}`);
   }
 
