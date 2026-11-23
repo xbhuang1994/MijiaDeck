@@ -110,12 +110,74 @@ export const PROPERTY_ZH: Record<string, string> = {
   "electric-power": "电功率",
   "power-consumption-accumulation-way": "耗电量使用累加形式",
   "on-7": "开关",
+  "pm2.5-density": "PM2.5 浓度",
+  "pm10-density": "PM10 浓度",
+  "co2-density": "二氧化碳浓度",
+  "tvoc-density": "TVOC 浓度",
+  "hcho-density": "甲醛浓度",
+  "air-quality": "空气质量",
+  "filter-life-level": "滤芯剩余寿命",
+  "filter-used-time": "滤芯已使用时间",
+  "filter-left-time": "滤芯剩余时间",
+  "alarm": "提示音",
+  "physical-controls-locked": "童锁",
+  "fan-level": "风速档位",
+  "favorite-level": "最爱风速",
+  "anion": "负离子",
+  "uv": "紫外线杀菌",
+  "target-humidity": "目标湿度",
+  "target-temperature": "目标温度",
+  "water-level": "水位",
+  "dry": "烘干模式",
+  "horizontal-swing": "左右摆风",
+  "vertical-swing": "上下摆风",
+  "horizontal-angle": "左右摆风角度",
+  "vertical-angle": "上下摆风角度",
+  "pet-food-left-level": "宠物粮余量",
+  "feeding-measure": "出粮份数",
+  "feeding-type": "出粮方式",
+  "desiccant-left-level": "干燥剂剩余",
+  "desiccant-left-time": "干燥剂剩余天数",
+  "plan-ctrl": "定时喂食计划",
+  "feed-plan": "喂食计划",
+  "skiped-plan": "今日跳过计划",
+  "ringtone": "铃声",
+  "play-loop-mode": "播放循环模式",
+  "seek-time": "播放进度偏移",
+  "motor-control": "电机控制",
+  "current-position": "当前位置",
+  "target-position": "目标位置",
+  "door-state": "门状态",
+  "lock-state": "门锁状态",
+  "night-shot": "夜视模式",
+  "motion-detection": "移动侦测",
+  "motion-tracking": "移动追踪",
+  "image-rollover": "画面翻转",
+  "wdr-mode": "宽动态范围",
+  "time-watermark": "时间水印",
+  "storage-total-space": "存储卡总容量",
+  "storage-free-space": "存储卡剩余容量",
+  "storage-used-space": "存储卡已用容量",
+  "left-time": "剩余时间",
+  "eco-mode": "节能模式",
+  "heater": "电辅热",
+  "suction-level": "吸力档位",
+  "sweep-type": "清扫模式",
+  "humidity": "湿度",
+  "illumination": "光照度",
+  "occupancy": "有人状态",
+  "contact-state": "开关门状态",
+  "submersion-state": "浸水状态",
+  "smoke-concentration": "烟雾浓度",
+  "gas-concentration": "燃气浓度",
 };
 
 // 动作短名 -> 中文
 export const ACTION_ZH: Record<string, string> = {
   "play": "播放",
   "pause": "暂停",
+  "stop": "停止",
+  "seek": "调整进度",
   "next": "下一首",
   "previous": "上一首",
   "play-text": "朗读文本",
@@ -125,6 +187,7 @@ export const ACTION_ZH: Record<string, string> = {
   "stop-alarm": "停止闹钟",
   "wake-up": "唤醒",
   "toggle": "切换",
+  "toggle-mode": "切换模式",
   "turn-on": "开启",
   "turn-off": "关闭",
   "reboot": "重启",
@@ -143,7 +206,86 @@ export const ACTION_ZH: Record<string, string> = {
   "fan-speed-down": "风速调低",
   "temperature-up": "温度调高",
   "temperature-down": "温度调低",
+  "reset-filter-life": "重置滤芯寿命",
+  "reset-desiccant-life": "重置干燥剂寿命",
+  "pet-food-out": "立即出粮",
+  "weigh-manual-calibrate": "称重校准",
+  "start-sweep": "开始清扫",
+  "stop-sweeping": "停止清扫",
+  "start-charge": "返回充电",
+  "identify": "查找设备",
+  "format": "格式化存储卡",
+  "pop-up": "弹出存储卡",
 };
+
+// MIoT 服务短名 -> 中文分组标题
+export const SERVICE_ZH: Record<string, string> = {
+  "light": "灯光控制",
+  "switch": "开关控制",
+  "outlet": "插座控制",
+  "air-purifier": "空气净化",
+  "air-conditioner": "空调控制",
+  "environment": "环境监测",
+  "filter": "滤芯状态",
+  "indicator-light": "指示灯",
+  "alarm": "提示音",
+  "physical-controls-locked": "物理童锁",
+  "fan": "风扇控制",
+  "humidifier": "加湿控制",
+  "dehumidifier": "除湿控制",
+  "heater": "取暖控制",
+  "pet-feeder": "宠物喂食",
+  "desiccant": "干燥剂",
+  "battery": "电池电源",
+  "speaker": "扬声器",
+  "play-control": "播放控制",
+  "microphone": "麦克风",
+  "intelligent-speaker": "小爱语音",
+  "clock": "闹钟提醒",
+  "router": "路由网络",
+  "wifi": "Wi-Fi 设置",
+  "camera-control": "摄像机控制",
+  "memory-card-management": "存储卡",
+  "curtain": "窗帘控制",
+  "television": "电视控制",
+  "lock": "门锁状态",
+  "washer": "洗衣机",
+  "vacuum": "扫地机",
+  "screen": "屏幕显示",
+  "power-consumption": "电量统计",
+  "temperature-humidity-sensor": "温湿度监测",
+  "motion-sensor": "人体感应",
+  "magnet-sensor": "门窗感应",
+};
+
+export const UNIT_ZH: Record<string, string> = {
+  "percentage": "%",
+  "celsius": "°C",
+  "fahrenheit": "°F",
+  "kelvin": "K",
+  "seconds": "秒",
+  "minutes": "分钟",
+  "hours": "小时",
+  "days": "天",
+  "watt": "W",
+  "kwh": "kWh",
+  "lux": "lx",
+  "μg/m3": "μg/m³",
+  "ug/m3": "μg/m³",
+  "mg/m3": "mg/m³",
+  "ppm": "ppm",
+  "arcdegrees": "°",
+  "rpm": "RPM",
+  "db": "dB",
+  "dbm": "dBm",
+  "pascal": "Pa",
+  "rgb": "",
+};
+
+const SENSITIVE_PROP_RE = /(?:password|passwd|secret|token|private[-_]?key)/i;
+const DEBUG_PROP_RE = /(?:^|[-_])(dbg|debug)(?:$|[-_])|^moto-speed-rpm$/i;
+const DANGEROUS_ACTION_RE =
+  /^(?:reboot|reset[-_].+|set[-_]default|restore|factory[-_]reset|format|del|delete)$/i;
 
 const NUM_SUFFIX_RE = /-\d+$/;
 const CJK_RE = /[\u4e00-\u9fff]/;
@@ -192,6 +334,50 @@ export function propDescZh(name: string, desc: string): string {
 
 export function actionDescZh(name: string, desc: string): string {
   return backfillDescription(name, desc, ACTION_ZH);
+}
+
+export function serviceDescZh(name: string, desc: string): string {
+  const zh = lookupZh(name, SERVICE_ZH);
+  if (zh) {
+    return zh;
+  }
+  const cleaned = (desc || "").trim();
+  if (cleaned) {
+    const slashParts = cleaned.split("/").map((p) => p.trim()).filter(Boolean);
+    const cjkPart = slashParts.find((p) => hasCjk(p));
+    if (cjkPart) {
+      return cjkPart;
+    }
+    return cleaned;
+  }
+  return name;
+}
+
+export function unitLabelZh(unit: string | null | undefined): string {
+  if (!unit) {
+    return "";
+  }
+  const trimmed = unit.trim();
+  if (!trimmed || trimmed.toLowerCase() === "none") {
+    return "";
+  }
+  const mapped = UNIT_ZH[trimmed.toLowerCase()];
+  return mapped !== undefined ? mapped : trimmed;
+}
+
+export function isSensitivePropertyName(name: string): boolean {
+  return SENSITIVE_PROP_RE.test(name);
+}
+
+export function isDebugProperty(name: string, desc = ""): boolean {
+  if (DEBUG_PROP_RE.test(name)) {
+    return true;
+  }
+  return desc.includes("调试使用") || desc.includes("不对用户开放") || desc.includes("调试");
+}
+
+export function isDangerousAction(name: string): boolean {
+  return DANGEROUS_ACTION_RE.test(name.replaceAll("_", "-"));
 }
 
 export interface SpecFallbackItem {

@@ -6,7 +6,7 @@
  * HTTP REST API、静态资源服务、前端 TS 按需打包与 WebSocket 状态广播器。
  */
 
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import type { AppMode } from "../cli/startup.ts";
 import { APP_NAME, APP_VERSION, projectRoot } from "../core/appMeta.ts";
@@ -19,13 +19,25 @@ import type {
   TrayOrderItem,
   TraySceneSnapshot,
 } from "../core/contracts.ts";
-import { lightControls, trayEligible } from "../core/deviceControls.ts";
+import { isCamera, isLight, lightControls, supportsCardPower, trayEligible } from "../core/deviceControls.ts";
 import { JobExecutor } from "../core/jobs.ts";
-import { createSceneInfo, isSpeaker, type DeviceInfo, type PropInfo } from "../core/models.ts";
-import { ServiceError } from "../core/service.ts";
+import {
+  createSceneInfo,
+  isSpeaker,
+  type ActionInfo,
+  type DeviceInfo,
+  type PropInfo,
+} from "../core/models.ts";
+import { formatMetricsText, ServiceError } from "../core/service.ts";
+import { isSensitivePropertyName } from "../core/specZh.ts";
 import * as settingsStoreModule from "../core/settingsStore.ts";
 import * as trayStoreModule from "../core/trayStore.ts";
 import { fetchLatestRelease, isNewer, type ReleaseInfo } from "../core/updateChecker.ts";
+import {
+  coercePropWriteValue,
+  deviceCategoryLabel,
+  type DeviceChannelState,
+} from "../core/deviceDetailModel.ts";
 import {
   ALL_HOMES,
   ALL_ROOMS,
@@ -244,15 +256,34 @@ export function invalidateAppBundleCache(): void {
   cachedAppBundle = null;
 }
 
+function latestWebMtimeMs(appTsPath: string): number {
+  let latest = statSync(appTsPath).mtimeMs;
+  const webDir = path.dirname(appTsPath);
+  try {
+    for (const entry of readdirSync(webDir)) {
+      if (!entry.endsWith(".ts")) {
+        continue;
+      }
+      const mtime = statSync(path.join(webDir, entry)).mtimeMs;
+      if (mtime > latest) {
+        latest = mtime;
+      }
+    }
+  } catch {
+    // fallback to entry mtime
+  }
+  return latest;
+}
+
 async function buildAppBundle(appTsPath: string): Promise<string> {
   if (!existsSync(appTsPath)) {
     throw new HttpError(404, "前端脚本入口不存在");
   }
-  const stat = statSync(appTsPath);
+  const latestMtime = latestWebMtimeMs(appTsPath);
   if (
     cachedAppBundle !== null &&
     cachedAppBundle.sourcePath === appTsPath &&
-    cachedAppBundle.mtimeMs === stat.mtimeMs
+    cachedAppBundle.mtimeMs === latestMtime
   ) {
     return cachedAppBundle.code;
   }
@@ -269,7 +300,7 @@ async function buildAppBundle(appTsPath: string): Promise<string> {
   const code = await built.outputs[0]!.text();
   cachedAppBundle = {
     sourcePath: appTsPath,
-    mtimeMs: stat.mtimeMs,
+    mtimeMs: latestMtime,
     code,
   };
   return code;
@@ -718,6 +749,148 @@ export function createRequestHandler(
         });
       }
 
+      const detailMatch = /^\/api\/devices\/([^/]+)\/detail$/.exec(pathname);
+      if (method === "GET" && detailMatch) {
+        const did = decodeSegment(detailMatch[1]!);
+        const mw = runtime.mainWindow;
+        const device = mw.allDevices.find((d) => d.did === did);
+        if (!device) {
+          throw new HttpError(404, "未找到指定设备");
+        }
+
+        const isSplitParent = device.switch_channels.length > 0;
+        const canCardPower = supportsCardPower(device);
+        let props: PropInfo[] = [];
+        let actions: ActionInfo[] = [];
+        let values: Record<string, unknown> = {};
+        let specError: string | null = null;
+        let readWarning: string | null = null;
+        let powerProp: PropInfo | null = null;
+        let controls: Partial<Record<"brightness" | "temperature" | "color", PropInfo>> = {};
+
+        try {
+          const detail = await runInJobs(runtime.jobs, () => runtime.service.deviceDetail(did), 2);
+          props = detail.props;
+          actions = detail.actions;
+          powerProp = canCardPower || isCamera(device) ? findPowerProp(props) : null;
+          controls = isLight(device) ? lightControls(props) : {};
+
+          if (device.online && mw.accessState() === "ready") {
+            const readableNames = props
+              .filter((p) => p.readable && !isSensitivePropertyName(p.name))
+              .map((p) => p.name);
+            if (readableNames.length > 0) {
+              try {
+                values = await runInJobs(
+                  runtime.jobs,
+                  () => runtime.service.readProps(did, readableNames),
+                  2,
+                );
+              } catch (readErr) {
+                readWarning = sanitizeErrorMessage(readErr);
+              }
+            }
+          }
+        } catch (err) {
+          specError = sanitizeErrorMessage(err);
+        }
+
+        // Sync fresh power & metrics back to main grid / tray
+        let stateMutated = false;
+        if (powerProp && typeof values[powerProp.name] === "boolean") {
+          const freshPower = values[powerProp.name] as boolean;
+          if (canCardPower || isCamera(device)) {
+            if (mw.knownPower[did] !== freshPower) {
+              mw.applyPowerState(did, freshPower);
+              mw.updateTrayDevices();
+              stateMutated = true;
+            }
+          }
+        }
+
+        const freshMetrics = formatMetricsText(
+          values["temperature"],
+          values["relative-humidity"] ?? values["humidity"],
+        );
+        if (freshMetrics && mw.metrics[did] !== freshMetrics) {
+          mw.metrics[did] = freshMetrics;
+          stateMutated = true;
+        }
+
+        // Split switch panel: gather & refresh child channels
+        const channels: DeviceChannelState[] = [];
+        if (isSplitParent) {
+          const onlineChildDids = device.switch_channels.filter((childDid) => {
+            const ch = mw.allDevices.find((d) => d.did === childDid);
+            return Boolean(ch?.online);
+          });
+          if (onlineChildDids.length > 0 && mw.accessState() === "ready") {
+            try {
+              const states = await runInJobs(
+                runtime.jobs,
+                () => runtime.service.powerStates(onlineChildDids),
+                2,
+              );
+              for (const [childDid, st] of Object.entries(states)) {
+                if (typeof st === "boolean" && mw.knownPower[childDid] !== st) {
+                  mw.applyPowerState(childDid, st);
+                  stateMutated = true;
+                }
+              }
+              if (stateMutated) {
+                mw.updateTrayDevices();
+              }
+            } catch {
+              // keep cached channel power states on transient read error
+            }
+          }
+          for (const childDid of device.switch_channels) {
+            const ch = mw.allDevices.find((d) => d.did === childDid);
+            channels.push({
+              did: childDid,
+              name: ch?.name ?? childDid,
+              room_name: ch?.room_name ?? device.room_name,
+              online: ch?.online ?? device.online,
+              power: typeof mw.knownPower[childDid] === "boolean" ? mw.knownPower[childDid]! : null,
+            });
+          }
+        }
+
+        if (stateMutated) {
+          emitBroadcast(runtime);
+        }
+
+        const resolvedPowerState =
+          powerProp && typeof values[powerProp.name] === "boolean"
+            ? (values[powerProp.name] as boolean)
+            : typeof mw.knownPower[did] === "boolean"
+              ? mw.knownPower[did]!
+              : null;
+
+        return jsonResponse({
+          ok: true,
+          did,
+          device: { ...device },
+          category: deviceCategoryLabel(device),
+          online: device.online,
+          supportsPower: canCardPower || (isCamera(device) && powerProp !== null),
+          powerState: resolvedPowerState,
+          powerProp,
+          isSplitParent,
+          channels,
+          lightControls: controls,
+          props,
+          actions,
+          values,
+          specError,
+          readWarning,
+          inTray: runtime.trayStore.load().includes(did),
+          trayEligible: trayEligible(device),
+          metrics: mw.metrics[did] ?? null,
+          fetchedAt: Date.now(),
+        });
+      }
+
       const lightMatch = /^\/api\/devices\/([^/]+)\/light$/.exec(pathname);
       if (method === "GET" && lightMatch) {
         const did = decodeSegment(lightMatch[1]!);
@@ -765,20 +938,34 @@ export function createRequestHandler(
         if (!("value" in body) || body.value === undefined) {
           throw new HttpError(400, "缺少属性值参数 value");
         }
-        await runInJobs(runtime.jobs, () => runtime.service.writeProp(did, propName, body.value), 1);
 
-        // 回读设备最新状态（部分灯具调亮度/色温后会自行点亮，不能假设开关未变）
-        let values: Record<string, unknown> = { [propName]: body.value };
+        let cachedDetail: { props: PropInfo[] } | null = null;
+        try {
+          cachedDetail = await runInJobs(runtime.jobs, () => runtime.service.deviceDetail(did), 2);
+        } catch {
+          cachedDetail = null;
+        }
+        const targetProp = cachedDetail?.props.find(
+          (p) => p.name === propName || p.name === propName.replaceAll("_", "-"),
+        );
+        const coerced = coercePropWriteValue(targetProp, body.value);
+        if (!coerced.ok) {
+          throw new HttpError(400, coerced.error);
+        }
+
+        await runInJobs(runtime.jobs, () => runtime.service.writeProp(did, propName, coerced.value), 1);
+
+        // 回读设备最新状态（调亮度可能自动开灯、调风速档位可能切换模式等）
+        let values: Record<string, unknown> = { [propName]: coerced.value };
         let powerPropName: string | null = null;
         try {
-          const detail = await runInJobs(runtime.jobs, () => runtime.service.deviceDetail(did), 2);
+          const detail = cachedDetail ?? (await runInJobs(runtime.jobs, () => runtime.service.deviceDetail(did), 2));
           const powerProp = findPowerProp(detail.props);
           powerPropName = powerProp?.name ?? null;
           const controls = lightControls(detail.props);
           const toRead = new Set<string>();
-          const targetProp = detail.props.find((p) => p.name === propName);
-          if (!targetProp || targetProp.readable) {
-            toRead.add(propName);
+          if (!targetProp || (targetProp.readable && !isSensitivePropertyName(targetProp.name))) {
+            toRead.add(targetProp?.name ?? propName);
           }
           if (powerProp && powerProp.readable) {
             toRead.add(powerProp.name);
@@ -789,7 +976,18 @@ export function createRequestHandler(
             }
           }
           for (const p of detail.props) {
-            if (p.readable && (p.name === "volume" || p.name.startsWith("mute"))) {
+            if (
+              p.readable &&
+              !isSensitivePropertyName(p.name) &&
+              (p.name === "volume" ||
+                p.name.startsWith("mute") ||
+                p.name === "mode" ||
+                p.name === "status" ||
+                p.name === "fan-level" ||
+                p.name === "playing-state" ||
+                p.name === "temperature" ||
+                p.name === "relative-humidity")
+            ) {
               toRead.add(p.name);
             }
           }
@@ -801,13 +999,21 @@ export function createRequestHandler(
             );
           }
         } catch {
-          values = { [propName]: body.value };
+          values = { [propName]: coerced.value };
         }
 
+        const device = runtime.mainWindow.allDevices.find((d) => d.did === did);
         const powerVal = powerPropName ? values[powerPropName] : values["on"];
-        if (typeof powerVal === "boolean") {
+        if (typeof powerVal === "boolean" && (!device || supportsCardPower(device) || isCamera(device))) {
           runtime.mainWindow.applyPowerState(did, powerVal);
           runtime.mainWindow.updateTrayDevices();
+        }
+        const freshMetrics = formatMetricsText(
+          values["temperature"],
+          values["relative-humidity"] ?? values["humidity"],
+        );
+        if (freshMetrics) {
+          runtime.mainWindow.metrics[did] = freshMetrics;
         }
         if (runtime.mainWindow.tray !== null && runtime.mainWindow.tray.quick.audioBar.did === did) {
           runtime.mainWindow.tray.quick.audioBar.refreshAfterCommand(did);
@@ -817,7 +1023,7 @@ export function createRequestHandler(
           ok: true,
           did,
           name: propName,
-          value: body.value,
+          value: coerced.value,
           values,
         });
       }
@@ -835,6 +1041,41 @@ export function createRequestHandler(
           () => runtime.service.runAction(did, actionName, body.params),
           1,
         );
+
+        let values: Record<string, unknown> = {};
+        let actionLabel = actionName;
+        try {
+          const detail = await runInJobs(runtime.jobs, () => runtime.service.deviceDetail(did), 2);
+          const matchedAct = detail.actions.find(
+            (a) => a.name === actionName || a.name === actionName.replaceAll("_", "-"),
+          );
+          if (matchedAct?.desc) {
+            actionLabel = matchedAct.desc;
+          }
+          const powerProp = findPowerProp(detail.props);
+          const readable = detail.props
+            .filter((p) => p.readable && !isSensitivePropertyName(p.name))
+            .map((p) => p.name);
+          if (readable.length > 0) {
+            values = await runInJobs(
+              runtime.jobs,
+              () => runtime.service.readProps(did, readable.slice(0, 15)),
+              2,
+            );
+          }
+          const device = runtime.mainWindow.allDevices.find((d) => d.did === did);
+          if (
+            powerProp &&
+            typeof values[powerProp.name] === "boolean" &&
+            (!device || supportsCardPower(device) || isCamera(device))
+          ) {
+            runtime.mainWindow.applyPowerState(did, values[powerProp.name] as boolean);
+            runtime.mainWindow.updateTrayDevices();
+          }
+        } catch {
+          // best-effort readback after action
+        }
+
         if (runtime.mainWindow.tray !== null && runtime.mainWindow.tray.quick.audioBar.did === did) {
           runtime.mainWindow.tray.quick.audioBar.refreshAfterCommand(did);
         }
@@ -843,6 +1084,8 @@ export function createRequestHandler(
           ok: true,
           did,
           name: actionName,
+          values,
+          message: `已执行「${actionLabel}」`,
         });
       }
 

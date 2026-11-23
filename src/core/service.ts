@@ -42,6 +42,7 @@ import {
   createPropInfo,
   createSceneInfo,
   type ActionInfo,
+  type ActionParamInfo,
   type DeviceDetail,
   type DeviceInfo,
   type PropInfo,
@@ -607,15 +608,158 @@ export class MijiaService implements IMijiaService {
 
   // ---------- 设备控制 ----------
 
+  private static _inferActionParams(
+    actionName: string,
+    siid: number,
+    inPiids: readonly number[],
+    propBySiidPiid: Map<string, DevProp>,
+    propsBySiid: Map<number, DevProp[]>,
+  ): ActionParamInfo[] {
+    const toParam = (p: DevProp): ActionParamInfo => ({
+      piid: p.method.piid,
+      name: p.name,
+      desc: p.desc || p.name,
+      type: p.type,
+      unit: p.unit,
+      range: p.range ? ([...p.range] as [number, number, number] | [number, number]) : null,
+      value_list: p.valueList ? p.valueList.map((e) => ({ ...e })) : null,
+    });
+
+    if (inPiids.length > 0) {
+      const resolved: ActionParamInfo[] = [];
+      for (const piid of inPiids) {
+        const matched = propBySiidPiid.get(`${siid}:${piid}`);
+        if (matched) {
+          resolved.push(toParam(matched));
+        }
+      }
+      if (resolved.length > 0) {
+        return resolved;
+      }
+    }
+
+    // Legacy flattened caches may omit `action.in`; infer well-known MIoT action inputs
+    // from same-service properties so real devices work immediately without re-fetching.
+    const sameServiceProps = propsBySiid.get(siid) ?? [];
+    const findByPrefix = (prefix: string): DevProp | undefined =>
+      sameServiceProps.find(
+        (p) => p.name === prefix || p.name.startsWith(`${prefix}-`) || p.name.startsWith(`${prefix}_`),
+      );
+
+    const baseName = actionName.replace(/-\d+$/, "");
+    if (baseName === "pet-food-out") {
+      const measure = findByPrefix("feeding-measure");
+      if (measure) {
+        return [toParam(measure)];
+      }
+      return [
+        {
+          piid: 5,
+          name: "feeding-measure",
+          desc: "出粮份数",
+          type: "uint",
+          unit: null,
+          range: [1, 60, 1],
+          value_list: null,
+        },
+      ];
+    }
+    if (baseName === "play-text" || baseName === "play-music" || baseName === "play-radio") {
+      const txt = findByPrefix("text-content");
+      if (txt) {
+        return [toParam(txt)];
+      }
+      return [
+        {
+          piid: 1,
+          name: "text-content",
+          desc: baseName === "play-text" ? "朗读文本内容" : "播放内容",
+          type: "string",
+          unit: null,
+          range: null,
+          value_list: null,
+        },
+      ];
+    }
+    if (baseName === "execute-text-directive") {
+      const params: ActionParamInfo[] = [];
+      const txt = findByPrefix("text-content");
+      params.push(
+        txt
+          ? toParam(txt)
+          : {
+              piid: 1,
+              name: "text-content",
+              desc: "指令文本",
+              type: "string",
+              unit: null,
+              range: null,
+              value_list: null,
+            },
+      );
+      const silent = findByPrefix("silent-execution");
+      params.push(
+        silent
+          ? toParam(silent)
+          : {
+              piid: 2,
+              name: "silent-execution",
+              desc: "指令静默执行",
+              type: "bool",
+              unit: null,
+              range: null,
+              value_list: null,
+            },
+      );
+      return params;
+    }
+    if (baseName === "seek") {
+      const seekTime = findByPrefix("seek-time");
+      if (seekTime) {
+        return [toParam(seekTime)];
+      }
+    }
+    if (baseName === "del") {
+      const delProp = findByPrefix("del-plan");
+      if (delProp) {
+        return [toParam(delProp)];
+      }
+    }
+    if (baseName === "skip" || baseName === "re-open") {
+      const skipProp = findByPrefix("skip-plan");
+      if (skipProp) {
+        return [toParam(skipProp)];
+      }
+    }
+    if (baseName === "update") {
+      const editProp = findByPrefix("edit-plan");
+      if (editProp) {
+        return [toParam(editProp)];
+      }
+    }
+    return [];
+  }
+
   async deviceDetail(did: string): Promise<DeviceDetail> {
     const dev = await this._getDevice(did);
     const seen = new Set<DevProp>();
+    const propBySiidPiid = new Map<string, DevProp>();
+    const propsBySiid = new Map<number, DevProp[]>();
     const props: PropInfo[] = [];
     for (const prop of Object.values(dev.propList)) {
       if (seen.has(prop)) {
         continue;
       }
       seen.add(prop);
+      propBySiidPiid.set(`${prop.method.siid}:${prop.method.piid}`, prop);
+      const list = propsBySiid.get(prop.method.siid) ?? [];
+      list.push(prop);
+      propsBySiid.set(prop.method.siid, list);
+
+      const serviceDesc = prop.service || prop.serviceDesc
+        ? specZh.serviceDescZh(prop.service, prop.serviceDesc)
+        : undefined;
+
       props.push(
         createPropInfo({
           name: prop.name,
@@ -627,13 +771,35 @@ export class MijiaService implements IMijiaService {
             ? ([...prop.range] as [number, number, number] | [number, number])
             : null,
           value_list: prop.valueList ? prop.valueList.map((entry) => ({ ...entry })) : null,
+          unit: prop.unit,
+          siid: prop.method.siid,
+          piid: prop.method.piid,
+          ...(prop.service ? { service: prop.service } : {}),
+          ...(serviceDesc ? { service_desc: serviceDesc } : {}),
         }),
       );
     }
-    const actions: ActionInfo[] = Object.values(dev.actionList).map((a) => ({
-      name: a.name,
-      desc: a.desc || a.name,
-    }));
+    const actions: ActionInfo[] = Object.values(dev.actionList).map((a) => {
+      const inParams = MijiaService._inferActionParams(
+        a.name,
+        a.method.siid,
+        a.inPiids,
+        propBySiidPiid,
+        propsBySiid,
+      );
+      const serviceDesc = a.service || a.serviceDesc
+        ? specZh.serviceDescZh(a.service, a.serviceDesc)
+        : undefined;
+      return {
+        name: a.name,
+        desc: a.desc || a.name,
+        siid: a.method.siid,
+        aiid: a.method.aiid,
+        ...(a.service ? { service: a.service } : {}),
+        ...(serviceDesc ? { service_desc: serviceDesc } : {}),
+        ...(inParams.length > 0 ? { in: inParams } : {}),
+      };
+    });
     return {
       did,
       name: dev.name,
@@ -723,8 +889,12 @@ export class MijiaService implements IMijiaService {
       if (params !== undefined && params !== null) {
         if (TEXT_DIRECTIVE_ACTIONS.has(name)) {
           let inVal: unknown[] = Array.isArray(params) ? [...params] : [params];
-          if (name === "execute-text-directive" && inVal.length === 1) {
-            inVal = [inVal[0], 0];
+          if (name === "execute-text-directive") {
+            if (inVal.length === 1) {
+              inVal = [inVal[0], 0];
+            } else if (inVal.length >= 2 && typeof inVal[1] === "boolean") {
+              inVal[1] = inVal[1] ? 1 : 0;
+            }
           }
           await dev.runAction(name, { _in: inVal });
         } else if (Array.isArray(params)) {

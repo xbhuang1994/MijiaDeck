@@ -3,6 +3,7 @@
 // Zero-dependency browser client wired to MijiaDeck REST + WebSocket API.
 
 import { renderQrSvg } from "../ui/qrSvg.ts";
+import { DeviceDetailModalController } from "./deviceDetailModal.ts";
 
 // ---------------------------------------------------------------------------
 // Types & Data Models
@@ -140,6 +141,7 @@ export interface AppState {
 
 type ModalName =
   | "settings"
+  | "device-detail"
   | "light"
   | "camera"
   | "tray-manager"
@@ -1096,9 +1098,10 @@ export class MijiaDeckWebApp {
   private trayMgrOrder: TrayOrderItem[] = [];
   private trayMgrDragKey: string | null = null;
 
-  // Light controllers
+  // Light & full device detail controllers
   private modalLightSession: LightControlSession;
   private trayLightSession: LightControlSession;
+  private deviceDetailModal: DeviceDetailModalController;
 
   // Camera preview state
   private cameraDevice: DeviceInfo | null = null;
@@ -1185,6 +1188,28 @@ export class MijiaDeckWebApp {
       (did, state) => this.updateDevicePowerLocally(did, state),
       () => this.closeTrayLightPage(),
     );
+
+    this.deviceDetailModal = new DeviceDetailModalController({
+      apiGet,
+      apiPost,
+      deviceIconSvg,
+      getIconUrl: (dev) => this.state.icons[dev.model] ?? this.state.icons[dev.did] ?? null,
+      getDeviceByDid: (did) => this.state.devices.find((d) => d.did === did),
+      isCamera,
+      isSpeaker,
+      deviceTitle,
+      showToast: (msg, ms) => this.showToast(msg, ms),
+      onPowerSynced: (did, st) => this.updateDevicePowerLocally(did, st),
+      onTrayMembershipToggle: async (did, selected) => {
+        await this.setTrayMembership("device", did, selected);
+      },
+      openDiagnostics: (did) => this.openDiagnosticsModal(did),
+      openCameraPreview: (dev) => this.openCameraModal(dev),
+      openOtherDevice: (dev) => this.openDeviceDetailModal(dev),
+      closeSelf: () => {
+        if (this.activeModal === "device-detail") this.closeModal();
+      },
+    });
   }
 
   private createDefaultState(): AppState {
@@ -2079,11 +2104,10 @@ export class MijiaDeckWebApp {
 
   private createDeviceCard(device: DeviceInfo): HTMLElement {
     const card = document.createElement("article");
-    const clickable = hasDeviceDetails(device) && device.online;
-    card.className = "device-card";
+    card.className = "device-card clickable";
     if (!device.online) card.classList.add("offline");
-    if (clickable) card.classList.add("clickable");
     card.dataset.did = device.did;
+    card.title = device.online ? "点击查看设备详情与完整操作" : "设备离线，点击查看设备信息与规格";
 
     // Corner tags
     if (isCamera(device)) {
@@ -2155,30 +2179,43 @@ export class MijiaDeckWebApp {
       }
     }
 
-    // Card click opens light or camera popup
-    if (clickable) {
-      card.addEventListener("click", () => {
-        if (isCamera(device)) {
-          this.openCameraModal(device);
-        } else if (isLight(device)) {
-          this.openLightModal(device);
-        }
-      });
-    }
+    // Card click opens camera preview (for online cameras) or full device detail modal
+    card.addEventListener("click", () => {
+      if (isCamera(device) && device.online) {
+        this.openCameraModal(device);
+      } else {
+        this.openDeviceDetailModal(device);
+      }
+    });
 
-    // Right-click context menu for tray membership
-    if (trayEligible(device)) {
-      card.addEventListener("contextmenu", (e) => {
-        e.preventDefault();
+    // Right-click context menu: view details, tray membership (when eligible), diagnostics
+    card.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      const menuItems: Array<{ label: string; onClick: () => void }> = [
+        {
+          label: "查看详情与操作",
+          onClick: () => this.openDeviceDetailModal(device),
+        },
+      ];
+      if (isCamera(device) && device.online) {
+        menuItems.push({
+          label: "打开摄像头画面",
+          onClick: () => this.openCameraModal(device),
+        });
+      }
+      if (trayEligible(device)) {
         const inTray = this.state.trayDevices.includes(device.did);
-        this.showContextMenu(e.clientX, e.clientY, [
-          {
-            label: inTray ? "从托盘窗口移除" : "添加到托盘窗口",
-            onClick: () => void this.setTrayMembership("device", device.did, !inTray),
-          },
-        ]);
+        menuItems.push({
+          label: inTray ? "从托盘窗口移除" : "添加到托盘窗口",
+          onClick: () => void this.setTrayMembership("device", device.did, !inTray),
+        });
+      }
+      menuItems.push({
+        label: "设备诊断报告",
+        onClick: () => this.openDiagnosticsModal(device.did),
       });
-    }
+      this.showContextMenu(e.clientX, e.clientY, menuItems);
+    });
 
     return card;
   }
@@ -2532,19 +2569,24 @@ export class MijiaDeckWebApp {
       }
     }
 
-    if (clickable) {
-      row.addEventListener("click", () => {
-        if (cam) {
-          this.openCameraModal(device);
-        } else if (adjLight) {
-          this.openTrayLightPage(device);
-        }
-      });
-    }
+    row.classList.add("clickable");
+    row.addEventListener("click", () => {
+      if (cam && device.online) {
+        this.openCameraModal(device);
+      } else if (adjLight && device.online) {
+        this.openTrayLightPage(device);
+      } else {
+        this.openDeviceDetailModal(device);
+      }
+    });
 
     row.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       this.showContextMenu(e.clientX, e.clientY, [
+        {
+          label: "查看详情与操作",
+          onClick: () => this.openDeviceDetailModal(device),
+        },
         {
           label: "从托盘窗口移除",
           onClick: () => void this.setTrayMembership("device", device.did, false),
@@ -3028,6 +3070,7 @@ export class MijiaDeckWebApp {
     }
     const allModals: ModalName[] = [
       "settings",
+      "device-detail",
       "light",
       "camera",
       "tray-manager",
@@ -3055,6 +3098,8 @@ export class MijiaDeckWebApp {
   private cleanupModal(name: ModalName): void {
     if (name === "settings" && this.settingsOriginal) {
       void this.revertSettingsPreview();
+    } else if (name === "device-detail") {
+      this.deviceDetailModal.close();
     } else if (name === "light") {
       this.modalLightSession.close();
     } else if (name === "camera") {
@@ -3286,8 +3331,13 @@ export class MijiaDeckWebApp {
   }
 
   // -------------------------------------------------------------------------
-  // Light Control Popup Modal
+  // Full Device Detail Modal & Light Control Popup Modal
   // -------------------------------------------------------------------------
+
+  private openDeviceDetailModal(device: DeviceInfo): void {
+    this.openModal("device-detail");
+    this.deviceDetailModal.open(device);
+  }
 
   private openLightModal(device: DeviceInfo): void {
     this.openModal("light");
@@ -4664,6 +4714,11 @@ export class MijiaDeckWebApp {
 
   private bindCameraEvents(): void {
     el("camera-power-btn").addEventListener("click", () => void this.toggleCameraPower());
+    el("camera-detail-btn").addEventListener("click", () => {
+      if (this.cameraDevice) {
+        this.openDeviceDetailModal(this.cameraDevice);
+      }
+    });
     el("camera-diag-btn").addEventListener("click", () => {
       this.openDiagnosticsModal(this.cameraDevice?.did);
     });

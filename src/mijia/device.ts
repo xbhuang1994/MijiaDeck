@@ -46,6 +46,8 @@ export class DevProp {
   readonly range: [number, number, number] | [number, number] | null;
   readonly valueList: PropEnumOption[] | null;
   readonly method: { siid: number; piid: number };
+  readonly service: string;
+  readonly serviceDesc: string;
 
   constructor(raw: RawSpecProp) {
     this.name = String(raw.name ?? "");
@@ -61,6 +63,8 @@ export class DevProp {
       siid: raw.method.siid,
       piid: raw.method.piid,
     };
+    this.service = typeof raw.service === "string" ? raw.service : "";
+    this.serviceDesc = typeof raw.serviceDesc === "string" ? raw.serviceDesc : "";
   }
 
   get description(): string {
@@ -80,6 +84,9 @@ export class DevAction {
   readonly name: string;
   desc: string;
   readonly method: { siid: number; aiid: number };
+  readonly service: string;
+  readonly serviceDesc: string;
+  readonly inPiids: number[];
 
   constructor(raw: RawSpecAction) {
     this.name = String(raw.name ?? "");
@@ -88,6 +95,11 @@ export class DevAction {
       siid: raw.method.siid,
       aiid: raw.method.aiid,
     };
+    this.service = typeof raw.service === "string" ? raw.service : "";
+    this.serviceDesc = typeof raw.serviceDesc === "string" ? raw.serviceDesc : "";
+    this.inPiids = Array.isArray(raw.in)
+      ? raw.in.filter((n): n is number => typeof n === "number" && Number.isInteger(n))
+      : [];
   }
 
   get description(): string {

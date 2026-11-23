@@ -37,12 +37,18 @@ export interface RawSpecProp {
   range?: [number, number, number] | [number, number] | null;
   "value-list"?: Array<{ value: number | string; description?: string; desc_zh_cn?: string }> | null;
   method: { siid: number; piid: number };
+  service?: string;
+  serviceDesc?: string;
 }
 
 export interface RawSpecAction {
   name: string;
   description: string;
   method: { siid: number; aiid: number };
+  service?: string;
+  serviceDesc?: string;
+  in?: number[];
+  out?: number[];
 }
 
 export interface FlattenedSpec {
@@ -213,6 +219,8 @@ export function flattenMiotSpec(
     baseName: string;
     siid: number;
     piid: number;
+    serviceName: string;
+    serviceDesc: string;
     entry: Record<string, unknown>;
   }
 
@@ -220,6 +228,8 @@ export function flattenMiotSpec(
     baseName: string;
     siid: number;
     aiid: number;
+    serviceName: string;
+    serviceDesc: string;
     entry: Record<string, unknown>;
   }
 
@@ -238,6 +248,7 @@ export function flattenMiotSpec(
     if (serviceShortName === "device-information") {
       continue;
     }
+    const serviceDesc = formatDescription(service, serviceShortName);
 
     if (Array.isArray(service["properties"])) {
       for (const prop of service["properties"]) {
@@ -252,7 +263,14 @@ export function flattenMiotSpec(
           extractUrnShortName(prop["type"]) ||
           (typeof prop["name"] === "string" && prop["name"].trim()) ||
           `prop-${siid}-${piid}`;
-        pendingProps.push({ baseName, siid, piid, entry: prop });
+        pendingProps.push({
+          baseName,
+          siid,
+          piid,
+          serviceName: serviceShortName,
+          serviceDesc,
+          entry: prop,
+        });
       }
     }
 
@@ -269,7 +287,14 @@ export function flattenMiotSpec(
           extractUrnShortName(act["type"]) ||
           (typeof act["name"] === "string" && act["name"].trim()) ||
           `action-${siid}-${aiid}`;
-        pendingActions.push({ baseName, siid, aiid, entry: act });
+        pendingActions.push({
+          baseName,
+          siid,
+          aiid,
+          serviceName: serviceShortName,
+          serviceDesc,
+          entry: act,
+        });
       }
     }
   }
@@ -294,7 +319,7 @@ export function flattenMiotSpec(
         ? rawUnit.trim()
         : null;
 
-    properties.push({
+    const rawProp: RawSpecProp = {
       name: finalName,
       description: formatDescription(item.entry, finalName),
       type: normalizeFormat(item.entry["format"] ?? item.entry["type"]),
@@ -306,7 +331,14 @@ export function flattenMiotSpec(
       range: normalizeRange(item.entry["value-range"] ?? item.entry["range"]),
       "value-list": normalizeValueList(item.entry["value-list"]),
       method: { siid: item.siid, piid: item.piid },
-    });
+    };
+    if (item.serviceName) {
+      rawProp.service = item.serviceName;
+    }
+    if (item.serviceDesc) {
+      rawProp.serviceDesc = item.serviceDesc;
+    }
+    properties.push(rawProp);
   }
 
   const actionCounts = new Map<string, number>();
@@ -323,11 +355,31 @@ export function flattenMiotSpec(
     }
     usedActionNames.add(finalName);
 
-    actions.push({
+    const rawIn = Array.isArray(item.entry["in"])
+      ? item.entry["in"].filter((n): n is number => typeof n === "number" && Number.isInteger(n))
+      : [];
+    const rawOut = Array.isArray(item.entry["out"])
+      ? item.entry["out"].filter((n): n is number => typeof n === "number" && Number.isInteger(n))
+      : [];
+
+    const rawAct: RawSpecAction = {
       name: finalName,
       description: formatDescription(item.entry, finalName),
       method: { siid: item.siid, aiid: item.aiid },
-    });
+    };
+    if (item.serviceName) {
+      rawAct.service = item.serviceName;
+    }
+    if (item.serviceDesc) {
+      rawAct.serviceDesc = item.serviceDesc;
+    }
+    if (rawIn.length > 0) {
+      rawAct.in = rawIn;
+    }
+    if (rawOut.length > 0) {
+      rawAct.out = rawOut;
+    }
+    actions.push(rawAct);
   }
 
   const topName =

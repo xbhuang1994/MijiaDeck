@@ -55,13 +55,20 @@ export interface PropInfo {
   writable: boolean;
   range: [number, number, number] | [number, number] | null;
   value_list: PropEnumOption[] | null;
+  unit?: string | null;
+  siid?: number;
+  piid?: number;
+  service?: string;
+  service_desc?: string;
 }
 
 export function createPropInfo(
   partial: Pick<PropInfo, "name" | "desc" | "type" | "readable" | "writable"> &
-    Partial<Pick<PropInfo, "range" | "value_list">>,
+    Partial<
+      Pick<PropInfo, "range" | "value_list" | "unit" | "siid" | "piid" | "service" | "service_desc">
+    >,
 ): PropInfo {
-  return {
+  const result: PropInfo = {
     name: partial.name,
     desc: partial.desc,
     type: partial.type,
@@ -70,11 +77,42 @@ export function createPropInfo(
     range: partial.range ?? null,
     value_list: partial.value_list ?? null,
   };
+  if (partial.unit !== undefined) {
+    result.unit = partial.unit;
+  }
+  if (partial.siid !== undefined) {
+    result.siid = partial.siid;
+  }
+  if (partial.piid !== undefined) {
+    result.piid = partial.piid;
+  }
+  if (partial.service !== undefined) {
+    result.service = partial.service;
+  }
+  if (partial.service_desc !== undefined) {
+    result.service_desc = partial.service_desc;
+  }
+  return result;
+}
+
+export interface ActionParamInfo {
+  piid: number;
+  name: string;
+  desc: string;
+  type: string;
+  unit?: string | null;
+  range?: [number, number, number] | [number, number] | null;
+  value_list?: PropEnumOption[] | null;
 }
 
 export interface ActionInfo {
   name: string;
   desc: string;
+  siid?: number;
+  aiid?: number;
+  service?: string;
+  service_desc?: string;
+  in?: ActionParamInfo[];
 }
 
 export interface DeviceDetail {
