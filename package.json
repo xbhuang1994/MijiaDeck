@@ -1,0 +1,21 @@
+{
+  "name": "mijiadeck",
+  "version": "1.1.2",
+  "description": "MijiaDeck — 米家设备的桌面控制端 (Bun + TypeScript 重构版)",
+  "license": "GPL-3.0-or-later",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "demo": "bun run src/index.ts --demo",
+    "dev": "bun --watch src/index.ts --demo",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build src/index.ts --outdir dist --target bun && bun build src/web/app.ts --outdir dist/web --target browser",
+    "check:startup": "bun run src/index.ts --demo --check-startup"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.8.0"
+  }
+}

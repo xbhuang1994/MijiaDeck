@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MijiaDeck · 米家桌面控制台</title>
+  <link rel="icon" type="image/png" href="/assets/icon.png">
+  <link rel="stylesheet" href="/theme.css" id="theme-stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <div id="app-shell" class="app-shell">
+    <!-- Frameless-style Desktop Title Bar -->
+    <header id="title-bar" class="title-bar" role="banner">
+      <div class="title-bar-left">
+        <img src="/assets/icon.png" alt="MijiaDeck" class="brand-logo" width="20" height="20">
+        <span class="brand-title">MijiaDeck</span>
+        <span id="demo-badge" class="demo-badge" hidden>示例模式</span>
+      </div>
+      <div class="title-bar-right">
+        <span id="window-status" class="window-status" title="实时连接状态" aria-live="polite">
+          <span class="ws-dot" id="ws-dot"></span>
+          <span class="ws-label" id="ws-label">连接中…</span>
+        </span>
+        <button type="button" id="tray-toggle-btn" class="title-action-btn" title="打开 / 收起托盘快捷控制" aria-label="打开或收起托盘快捷控制" aria-expanded="false">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="4" width="18" height="16" rx="3"></rect>
+            <path d="M14 4v16"></path>
+            <path d="M17 9h1.5"></path>
+            <path d="M17 13h1.5"></path>
+          </svg>
+          <span class="title-action-label">快捷托盘</span>
+        </button>
+        <button type="button" id="theme-quick-btn" class="title-icon-btn" title="快速切换深浅色模式" aria-label="快速切换深浅色模式">
+          <svg id="theme-icon-sun" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4"></circle>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path>
+          </svg>
+          <svg id="theme-icon-moon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden>
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Central Loading Page -->
+    <section id="loading-page" class="loading-page" aria-label="正在加载设备" hidden>
+      <div class="loading-inner">
+        <img src="/assets/icon.png" alt="MijiaDeck" class="loading-logo" width="60" height="60">
+        <h1 class="loading-title">MijiaDeck</h1>
+        <p class="loading-subtitle">米家设备桌面控制</p>
+        <div class="loading-progress-track" role="progressbar" aria-label="设备加载进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="loading-progress-bar">
+          <div class="loading-progress-fill" id="loading-progress-fill"></div>
+        </div>
+        <p class="loading-status" id="loading-status">正在准备设备…</p>
+      </div>
+    </section>
+
+    <!-- Main Workspace -->
+    <main id="main-workspace" class="main-workspace">
+      <div class="workspace-content">
+        <!-- Main Header: Home Switcher, Device Summary Pill, Refresh & More -->
+        <div class="main-header" id="main-header">
+          <div class="header-left">
+            <div class="menu-anchor">
+              <button type="button" id="home-switcher-btn" class="home-switcher" aria-label="切换家庭" aria-haspopup="menu" aria-expanded="false">
+                <span id="home-switcher-text">我的家庭</span>
+                <svg class="chevron-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </button>
+              <div id="home-menu" class="popup-menu" role="menu" hidden></div>
+            </div>
+
+            <div id="device-summary" class="device-summary" aria-live="polite">
+              <span class="summary-total">共 <span id="device-total-count">0</span> 台设备</span>
+              <span class="summary-divider" aria-hidden="true"></span>
+              <span class="online-dot" aria-hidden="true"></span>
+              <span class="summary-online"><strong id="device-online-count">0</strong> 台设备在线</span>
+            </div>
+          </div>
+
+          <div class="header-right">
+            <button type="button" id="refresh-btn" class="header-icon-btn" title="刷新设备" aria-label="刷新设备">
+              <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 12a9 9 0 1 1-2.64-6.36"></path>
+                <polyline points="21 3 21 9 15 9"></polyline>
+              </svg>
+            </button>
+
+            <div class="menu-anchor">
+              <button type="button" id="more-menu-btn" class="header-icon-btn" title="设置与管理" aria-label="设置与管理" aria-haspopup="menu" aria-expanded="false">
+                <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="3"></circle>
+                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                </svg>
+              </button>
+              <div id="more-menu" class="popup-menu popup-menu-right" role="menu" hidden>
+                <button type="button" class="popup-menu-item" role="menuitem" data-action="tray-manager">编辑卡片</button>
+                <button type="button" class="popup-menu-item" role="menuitem" data-action="settings">设置</button>
+                <button type="button" class="popup-menu-item" role="menuitem" data-action="diagnostics">设备诊断报告</button>
+                <div class="popup-menu-sep" role="separator"></div>
+                <button type="button" class="popup-menu-item" role="menuitem" data-action="about">关于</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Room Tab Strip + Room List Dropdown -->
+        <div class="room-bar" id="room-bar">
+          <div id="room-strip" class="room-strip" role="tablist" aria-label="房间分类"></div>
+          <div class="menu-anchor">
+            <button type="button" id="room-menu-btn" class="room-menu-btn" title="房间列表与设备数量" aria-label="房间列表与设备数量" aria-haspopup="menu" aria-expanded="false">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <line x1="4" y1="7" x2="20" y2="7"></line>
+                <line x1="4" y1="12" x2="20" y2="12"></line>
+                <line x1="4" y1="17" x2="20" y2="17"></line>
+              </svg>
+            </button>
+            <div id="room-menu" class="popup-menu popup-menu-right room-popup-menu" role="menu" hidden></div>
+          </div>
+        </div>
+
+        <!-- Access Hint / Offline / Signed-out / Speaker Hint Banner -->
+        <div id="access-banner" class="access-banner" hidden>
+          <p id="access-banner-text" class="access-banner-text"></p>
+          <button type="button" id="access-banner-action" class="primary-button access-banner-btn" hidden></button>
+        </div>
+
+        <!-- Responsive Device & Scene Card Grid -->
+        <div id="card-grid-scroll" class="card-grid-scroll">
+          <div id="card-grid" class="card-grid" role="region" aria-label="设备与场景列表"></div>
+          <div id="grid-empty" class="grid-empty" hidden>
+            <p id="grid-empty-title" class="grid-empty-title"></p>
+            <p id="grid-empty-detail" class="grid-empty-detail"></p>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- Toast Notification (anchored to the left of Voice FAB) -->
+    <div id="toast-card" class="toast-card" role="status" aria-live="polite" hidden>
+      <span id="toast-text"></span>
+    </div>
+
+    <!-- Floating Voice FAB (bottom-right, expands smoothly left) -->
+    <div id="voice-fab" class="voice-fab" hidden>
+      <div id="voice-fab-panel" class="voice-panel" aria-hidden="true">
+        <input type="text" id="voice-fab-input" class="voice-fab-input" autocomplete="off" spellcheck="false" aria-label="输入小爱同学文字指令">
+      </div>
+      <button type="button" id="voice-fab-ball" class="voice-ball" title="输入小爱指令" aria-label="输入小爱指令" aria-expanded="false">
+        <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="2" y="5" width="20" height="14" rx="2.5"></rect>
+          <path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 12h.01M10 12h.01M14 12h.01M18 12h.01M8 15h8"></path>
+        </svg>
+      </button>
+    </div>
+
+    <!-- Reserved 40px FooterBar -->
+    <footer id="footer-bar" class="reserved-footer" role="contentinfo">
+      <div class="footer-left">
+        <button type="button" id="footer-version-btn" class="footer-link-btn" aria-label="检查新版本">当前版本号:v1.1.2</button>
+        <button type="button" id="footer-update-btn" class="footer-link-btn update-button" hidden></button>
+        <div id="footer-progress-wrap" class="footer-progress-wrap" hidden>
+          <div class="progress-track" role="progressbar" aria-label="设备加载进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="footer-progress-bar">
+            <div class="progress-chunk" id="footer-progress-chunk"></div>
+          </div>
+        </div>
+        <span id="footer-status" class="footer-status" hidden></span>
+      </div>
+      <div class="footer-right">
+        <button type="button" id="footer-account-btn" class="footer-link-btn">退出登录</button>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Floating Tray Quick Window Popup -->
+  <aside id="tray-quick-window" class="tray-quick-window" aria-label="托盘快捷控制" hidden>
+    <div id="tray-quick-panel" class="tray-quick-panel">
+      <!-- Overview Page (hidden completely while embedded Light Control sub-page is open) -->
+      <div id="tray-overview-page" class="tray-overview-page">
+        <!-- Audio Bar -->
+        <div id="tray-audio-bar" class="tray-audio-bar" hidden>
+          <div class="tray-audio-header" id="tray-audio-drag-header">
+            <div class="menu-anchor">
+              <button type="button" id="tray-speaker-btn" class="tray-speaker-btn" aria-haspopup="menu" aria-expanded="false">
+                <span id="tray-speaker-name">小爱音箱</span>
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </button>
+              <div id="tray-speaker-menu" class="popup-menu tray-speaker-menu" role="menu" hidden></div>
+            </div>
+            <span class="tray-drag-handle" id="tray-audio-drag-handle" title="拖动调整浮窗位置" aria-label="拖动调整浮窗位置">
+              <svg viewBox="0 0 1024 1024" width="15" height="15" fill="currentColor" aria-hidden="true">
+                <path d="M510.7 896.2c-15.3 0-28.7-11.3-31.4-26.6-0.7-4-0.6-7.9 0.1-11.7 1.7-43.3 0.6-444.5-0.6-710.7-0.1-17.5 14-31.7 31.5-31.8h0.1c17.4 0 31.6 14.1 31.7 31.5 0 0 0.8 179.3 1.3 358.7 0.2 89.7 0.3 179.4 0.2 246.8-0.3 141-0.3 141-30.2 143.7-0.9 0.1-1.8 0.1-2.7 0.1z"/>
+                <path d="M330.2 538.2h-65.5c-141-0.3-141-0.3-143.7-30.2-1.5-16.4 10.3-31.3 26.5-34.1 4-0.7 8-0.6 11.7 0.1 43.3 1.8 444.4 0.6 710.7-0.6h0.1c17.4 0 31.6 14.1 31.7 31.5 0.1 17.5-14 31.7-31.5 31.8 0 0-179.3 0.8-358.7 1.3-63 0.1-126 0.2-181.3 0.2zM614.8 250c-8.1 0-16.2-3.1-22.4-9.3L512 160.4l-80.4 80.4c-12.4 12.4-32.4 12.4-44.8 0-12.4-12.4-12.4-32.4 0-44.8L489.6 93.2c12.4-12.4 32.4-12.4 44.8 0L637.2 196c12.4 12.4 12.4 32.4 0 44.8-6.2 6.1-14.3 9.2-22.4 9.2zM512 920.5c-8.1 0-16.2-3.1-22.4-9.3L386.8 808.4c-12.4-12.4-12.4-32.4 0-44.8 12.4-12.4 32.4-12.4 44.8 0L512 844l80.4-80.4c12.4-12.4 32.4-12.4 44.8 0 12.4 12.4 12.4 32.4 0 44.8L534.4 911.2c-6.2 6.2-14.3 9.3-22.4 9.3z"/>
+                <path d="M795.8 636.6c-8.1 0-16.2-3.1-22.4-9.3-12.4-12.4-12.4-32.4 0-44.8l80.4-80.4-80.4-80.4c-12.4-12.4-12.4-32.4 0-44.8 12.4-12.4 32.4-12.4 44.8 0L921 479.8c12.4 12.4 12.4 32.4 0 44.8L818.2 627.4c-6.2 6.1-14.3 9.2-22.4 9.2zM228.2 636.6c-8.1 0-16.2-3.1-22.4-9.3L103 524.6c-12.4-12.4-12.4-32.4 0-44.8L205.8 377c12.4-12.4 32.4-12.4 44.8 0 12.4 12.4 12.4 32.4 0 44.8l-80.4 80.4 80.4 80.4c12.4 12.4 12.4 32.4 0 44.8-6.2 6.1-14.3 9.2-22.4 9.2z"/>
+              </svg>
+            </span>
+          </div>
+          <div class="tray-audio-controls">
+            <button type="button" id="tray-audio-prev" class="audio-ctrl-btn" title="上一首" aria-label="上一首">
+              <svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor" aria-hidden="true">
+                <path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"></path>
+              </svg>
+            </button>
+            <button type="button" id="tray-audio-play" class="audio-ctrl-btn audio-ctrl-play" title="暂停" aria-label="暂停">
+              <svg id="tray-icon-pause" viewBox="0 0 24 24" width="42" height="42" fill="currentColor" aria-hidden="true">
+                <path d="M6 5h4v14H6zm8 0h4v14h-4z"></path>
+              </svg>
+              <svg id="tray-icon-play" viewBox="0 0 24 24" width="42" height="42" fill="currentColor" aria-hidden="true" hidden>
+                <path d="M8 5v14l11-7z"></path>
+              </svg>
+            </button>
+            <button type="button" id="tray-audio-next" class="audio-ctrl-btn" title="下一首" aria-label="下一首">
+              <svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor" aria-hidden="true">
+                <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"></path>
+              </svg>
+            </button>
+          </div>
+          <div class="tray-volume-wrap">
+            <div class="volume-slider-track" id="tray-volume-track">
+              <div class="volume-slider-fill" id="tray-volume-fill"></div>
+              <div class="volume-slider-thumb" id="tray-volume-thumb">
+                <span id="tray-volume-readout">—</span>
+              </div>
+              <input type="range" id="tray-volume-slider" class="volume-slider-native" min="0" max="100" value="50" aria-label="音箱音量">
+            </div>
+          </div>
+        </div>
+
+        <div id="tray-audio-divider" class="tray-divider" hidden></div>
+
+        <!-- Quick Controls Body -->
+        <div class="tray-body">
+          <div class="tray-header" id="tray-drag-header">
+            <span class="tray-title">快捷控制</span>
+            <div class="tray-header-actions">
+              <span class="tray-drag-handle" id="tray-quick-drag-handle" title="拖动调整浮窗位置" aria-label="拖动调整浮窗位置" hidden>
+                <svg viewBox="0 0 1024 1024" width="14" height="14" fill="currentColor" aria-hidden="true">
+                  <path d="M510.7 896.2c-15.3 0-28.7-11.3-31.4-26.6-0.7-4-0.6-7.9 0.1-11.7 1.7-43.3 0.6-444.5-0.6-710.7-0.1-17.5 14-31.7 31.5-31.8h0.1c17.4 0 31.6 14.1 31.7 31.5 0 0 0.8 179.3 1.3 358.7 0.2 89.7 0.3 179.4 0.2 246.8-0.3 141-0.3 141-30.2 143.7-0.9 0.1-1.8 0.1-2.7 0.1z"/>
+                  <path d="M330.2 538.2h-65.5c-141-0.3-141-0.3-143.7-30.2-1.5-16.4 10.3-31.3 26.5-34.1 4-0.7 8-0.6 11.7 0.1 43.3 1.8 444.4 0.6 710.7-0.6h0.1c17.4 0 31.6 14.1 31.7 31.5 0.1 17.5-14 31.7-31.5 31.8 0 0-179.3 0.8-358.7 1.3-63 0.1-126 0.2-181.3 0.2zM614.8 250c-8.1 0-16.2-3.1-22.4-9.3L512 160.4l-80.4 80.4c-12.4 12.4-32.4 12.4-44.8 0-12.4-12.4-12.4-32.4 0-44.8L489.6 93.2c12.4-12.4 32.4-12.4 44.8 0L637.2 196c12.4 12.4 12.4 32.4 0 44.8-6.2 6.1-14.3 9.2-22.4 9.2zM512 920.5c-8.1 0-16.2-3.1-22.4-9.3L386.8 808.4c-12.4-12.4-12.4-32.4 0-44.8 12.4-12.4 32.4-12.4 44.8 0L512 844l80.4-80.4c12.4-12.4 32.4-12.4 44.8 0 12.4 12.4 12.4 32.4 0 44.8L534.4 911.2c-6.2 6.2-14.3 9.3-22.4 9.3z"/>
+                  <path d="M795.8 636.6c-8.1 0-16.2-3.1-22.4-9.3-12.4-12.4-12.4-32.4 0-44.8l80.4-80.4-80.4-80.4c-12.4-12.4-12.4-32.4 0-44.8 12.4-12.4 32.4-12.4 44.8 0L921 479.8c12.4 12.4 12.4 32.4 0 44.8L818.2 627.4c-6.2 6.1-14.3 9.2-22.4 9.2zM228.2 636.6c-8.1 0-16.2-3.1-22.4-9.3L103 524.6c-12.4-12.4-12.4-32.4 0-44.8L205.8 377c12.4-12.4 32.4-12.4 44.8 0 12.4 12.4 12.4 32.4 0 44.8l-80.4 80.4 80.4 80.4c12.4 12.4 12.4 32.4 0 44.8-6.2 6.1-14.3 9.2-22.4 9.2z"/>
+                </svg>
+              </span>
+              <button type="button" id="tray-cols-btn" class="tray-icon-btn" title="双列显示，点击切换单列" aria-label="双列显示，点击切换单列">
+                <svg id="tray-cols-icon-2" viewBox="0 0 1024 1024" width="14" height="14" fill="currentColor" aria-hidden="true">
+                  <path d="M400.4 588.4H98.5c-19.1 0-34.4 15.9-34.4 34.4v302.4c0 18.6 15.4 33.7 34.4 33.7h301.9c19.1 0 34.7-15.2 34.7-33.7V622.9c0-18.6-15.7-34.5-34.7-34.5z m-34.2 302.2H132.9V657.3h233.3v233.3z m168.5-709.9h390.1c19.1 0 34.7-15.6 34.7-34.7s-15.6-34.2-34.7-34.2H534.7c-19 0-34.2 15.2-34.2 34.2 0 19.1 15.2 34.7 34.2 34.7zM400.4 63.9H98.5C79.4 63.9 64 79.3 64 98.6v301.7c0 19 15.4 34.2 34.4 34.2h301.9c19.1 0 34.7-15.2 34.7-34.2V98.6c0.1-19.3-15.6-34.7-34.6-34.7z m-34.2 301.7H132.9V132.4h233.3v233.2z m558.7-47.3H534.7c-19 0-34.2 15.4-34.2 34.2 0 19.1 15.2 34.9 34.2 34.9h390.1c19.1 0 34.7-15.9 34.7-34.9 0.1-18.9-15.6-34.2-34.6-34.2z m0 318H534.7c-19 0-34.2 15.2-34.2 34.2 0 18.8 15.2 34.7 34.2 34.7h390.1c19.1 0 34.7-15.9 34.7-34.7 0.1-19-15.6-34.2-34.6-34.2z m0 206.4H534.7c-19 0-34.2 15.4-34.2 34.2 0 19.6 15.2 34.7 34.2 34.7h390.1c19.1 0 34.7-15.1 34.7-34.7 0.1-18.8-15.6-34.2-34.6-34.2z"/>
+                </svg>
+                <svg id="tray-cols-icon-1" viewBox="0 0 1024 1024" width="14" height="14" fill="currentColor" aria-hidden="true" hidden>
+                  <path d="M977.2 191.6V90.4c0-26.4-21.2-47.6-47.6-47.6H84c-26.4 0-47.6 21.2-47.6 47.6v101.2c0 26.4 21.2 47.6 47.6 47.6h846c26-0.4 47.2-21.6 47.2-47.6zM977.2 562.8v-101.2c0-26.4-21.2-47.6-47.6-47.6H84c-26.4 0-47.6 21.2-47.6 47.6v101.2c0 26.4 21.2 47.6 47.6 47.6h846c26-0.4 47.2-21.6 47.2-47.6zM977.2 933.6v-101.2c0-26.4-21.2-47.6-47.6-47.6H84c-26.4 0-47.6 21.2-47.6 47.6v101.2c0 26.4 21.2 47.6 47.6 47.6h846c26 0 47.2-21.2 47.2-47.6z"/>
+                </svg>
+              </button>
+              <button type="button" id="tray-edit-btn" class="tray-icon-btn" title="编辑卡片" aria-label="编辑卡片">
+                <svg viewBox="0 0 1024 1024" width="15" height="15" fill="currentColor" aria-hidden="true">
+                  <path d="M674.92049 167.601633l3.343673 3.176489 147.748572 147.748572a83.591837 83.591837 0 0 1 3.176489 114.896979l-3.155591 3.343674-431.083102 431.062204a83.591837 83.591837 0 0 1-54.355592 24.346122l-4.743837 0.125388H167.183673a62.693878 62.693878 0 0 1-62.589387-58.994939L104.489796 829.607184v-168.646531a83.591837 83.591837 0 0 1 21.232326-55.672163l3.260082-3.448163L560.044408 170.778122a83.591837 83.591837 0 0 1 114.876082-3.155591z m243.231347 639.414857a20.897959 20.897959 0 0 1 20.897959 20.897959v41.795918a20.897959 20.897959 0 0 1-20.897959 20.89796h-334.367347a20.897959 20.897959 0 0 1-20.897959-20.89796v-41.795918a20.897959 20.897959 0 0 1 20.897959-20.897959h334.367347zM500.924082 348.097306L188.081633 660.918857v147.748572l147.769469 0.020898 312.842449-312.842449-147.769469-147.790368z m417.227755 291.73551a20.897959 20.897959 0 0 1 20.897959 20.89796v41.795918a20.897959 20.897959 0 0 1-20.897959 20.897959h-167.183674a20.897959 20.897959 0 0 1-20.897959-20.897959v-41.795918a20.897959 20.897959 0 0 1 20.897959-20.89796h167.183674zM619.143837 229.877551L560.065306 288.97698l147.748572 147.748571 59.099428-59.078531L619.164735 229.877551z"/>
+                </svg>
+              </button>
+              <button type="button" id="tray-close-btn" class="tray-icon-btn" title="收起托盘窗口" aria-label="收起托盘窗口">✕</button>
+            </div>
+          </div>
+
+          <div id="tray-list-scroll" class="tray-list-scroll">
+            <div id="tray-card-list" class="tray-card-list cols-2"></div>
+          </div>
+
+          <p id="tray-empty" class="tray-empty" hidden>暂无卡片<br>点击右上角编辑图标添加</p>
+          <p id="tray-speaker-hint" class="tray-speaker-hint" hidden></p>
+
+          <!-- Bottom XiaoAI Voice Input Bar -->
+          <div id="tray-voice-bar" class="tray-voice-bar" hidden>
+            <input type="text" id="tray-voice-input" class="tray-voice-input" autocomplete="off" spellcheck="false" aria-label="发送小爱指令">
+            <button type="button" id="tray-voice-send-btn" class="tray-voice-send-btn" title="发送小爱指令" aria-label="发送小爱指令">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="2" y="5" width="20" height="14" rx="2.5"></rect>
+                <path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 12h.01M10 12h.01M14 12h.01M18 12h.01M8 15h8"></path>
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Embedded Light Control Sub-Page (completely replaces overview while open) -->
+      <div id="tray-light-page" class="tray-light-page" hidden>
+        <div class="light-panel light-panel-embedded">
+          <div class="light-header">
+            <button type="button" id="tray-light-power-btn" class="power-btn power-btn-sm is-unknown" aria-label="灯光电源开关" hidden>
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path>
+                <line x1="12" y1="2" x2="12" y2="12"></line>
+              </svg>
+            </button>
+            <div class="light-title-col">
+              <h3 id="tray-light-title" class="light-title">灯光</h3>
+              <span id="tray-light-power-text" class="light-power-text">状态待确认</span>
+            </div>
+            <button type="button" id="tray-light-close-btn" class="icon-close-btn" title="返回设备列表" aria-label="返回设备列表">✕</button>
+          </div>
+          <div id="tray-light-body" class="light-body" hidden>
+            <div id="tray-light-brightness-row" class="light-control-group" hidden>
+              <div class="light-control-head">
+                <label for="tray-light-brightness-slider">亮度</label>
+                <span id="tray-light-brightness-val" class="light-control-val">—</span>
+              </div>
+              <input type="range" id="tray-light-brightness-slider" class="md-slider" min="0" max="100" value="0" aria-label="灯光亮度" disabled>
+            </div>
+            <div id="tray-light-temp-row" class="light-control-group" hidden>
+              <div class="light-control-head">
+                <label for="tray-light-temp-slider">色温</label>
+                <span id="tray-light-temp-val" class="light-control-val">—</span>
+              </div>
+              <input type="range" id="tray-light-temp-slider" class="md-slider md-slider-temp" min="0" max="1000" value="0" aria-label="灯光色温" disabled>
+            </div>
+            <div id="tray-light-color-row" class="light-color-row" hidden>
+              <button type="button" id="tray-light-color-btn" class="light-color-btn" disabled>
+                <span class="light-color-dot" id="tray-light-color-dot"></span>
+                <span>选择灯光颜色</span>
+              </button>
+              <input type="color" id="tray-light-color-picker" class="sr-color-input" value="#ffffff" aria-label="选择灯光颜色">
+            </div>
+          </div>
+          <p id="tray-light-status" class="light-status">正在读取灯光状态…</p>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Context Menu -->
+  <div id="context-menu" class="popup-menu context-menu" role="menu" hidden></div>
+
+  <!-- Modal Backdrop -->
+  <div id="modal-backdrop" class="modal-backdrop" hidden>
+    <!-- Settings Dialog -->
+    <div id="modal-settings" class="modal-dialog modal-settings" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title" hidden>
+      <div class="modal-header">
+        <h2 id="settings-modal-title" class="modal-title">设置</h2>
+        <button type="button" class="icon-close-btn" data-close-modal="settings" aria-label="关闭设置">✕</button>
+      </div>
+      <div class="settings-tabs" role="tablist">
+        <button type="button" class="settings-tab active" role="tab" aria-selected="true" data-settings-tab="appearance">主题界面</button>
+        <button type="button" class="settings-tab" role="tab" aria-selected="false" data-settings-tab="features">应用功能</button>
+      </div>
+      <div class="settings-pages">
+        <!-- Appearance Tab -->
+        <div id="settings-page-appearance" class="settings-page">
+          <div class="setting-card">
+            <div class="setting-info">
+              <div class="setting-label">外观模式</div>
+              <div class="setting-desc">切换界面明暗配色；「跟随系统」随 Windows 深浅色模式自动变化</div>
+            </div>
+            <select id="set-theme-mode" class="md-select" aria-label="外观模式">
+              <option value="system">跟随系统</option>
+              <option value="light">浅色模式</option>
+              <option value="dark">深色模式</option>
+            </select>
+          </div>
+
+          <div class="setting-card setting-card-wrap">
+            <div class="setting-info">
+              <div class="setting-label">主题色</div>
+              <div class="setting-desc">为按钮、选中项和浮窗搭配统一色系，支持深浅模式</div>
+            </div>
+            <div class="theme-color-controls">
+              <button type="button" class="color-preset-btn" data-color="green"><span class="swatch-dot" style="background:#00cc92"></span>绿色</button>
+              <button type="button" class="color-preset-btn" data-color="pink"><span class="swatch-dot" style="background:#db2777"></span>粉色</button>
+              <button type="button" class="color-preset-btn" data-color="yellow"><span class="swatch-dot" style="background:#eab308"></span>黄色</button>
+              <button type="button" class="color-preset-btn" data-color="blue"><span class="swatch-dot" style="background:#2563eb"></span>蓝色</button>
+              <span class="custom-color-label">自定义</span>
+              <button type="button" id="set-custom-swatch" class="custom-swatch-btn" title="点击打开取色色盘" aria-label="打开自定义主题色取色器"></button>
+              <input type="color" id="set-custom-picker" class="sr-color-input" value="#333333" aria-label="自定义主题色取色器">
+              <input type="text" id="set-custom-hex" class="custom-hex-input" maxlength="7" placeholder="#333333" aria-label="自定义主题色 HEX 色值">
+            </div>
+          </div>
+
+          <div class="setting-card">
+            <div class="setting-info">
+              <div class="setting-label">界面缩放比例</div>
+              <div class="setting-desc">100% 跟随 Windows 系统缩放，不额外放大。可调整界面整体元素大小，适用于高 DPI 屏幕使用较高系统缩放时觉得界面偏大的情况；可从下拉选档位或直接键入任意百分比，更改后需重启应用生效</div>
+            </div>
+            <div class="scale-control">
+              <input type="text" id="set-ui-scale" class="scale-input" list="ui-scale-presets" value="100%" aria-label="界面缩放比例">
+              <datalist id="ui-scale-presets">
+                <option value="50%"></option>
+                <option value="75%"></option>
+                <option value="100%"></option>
+                <option value="125%"></option>
+                <option value="150%"></option>
+                <option value="175%"></option>
+                <option value="200%"></option>
+              </datalist>
+            </div>
+          </div>
+
+          <div class="setting-card" id="setting-row-voice-fab">
+            <div class="setting-info">
+              <div class="setting-label">小爱同学悬浮对话按钮</div>
+              <div class="setting-desc">启用位于主界面右下角的小爱同学对话悬浮按钮（需设备里有小爱音箱）</div>
+            </div>
+            <label class="md-switch">
+              <input type="checkbox" id="set-voice-fab">
+              <span class="md-switch-track"></span>
+            </label>
+          </div>
+
+          <div class="setting-card">
+            <div class="setting-info">
+              <div class="setting-label">显示场景选项卡</div>
+              <div class="setting-desc">在主页房间选项卡左侧显示「场景」入口，可一键执行米家 APP 中创建的手动场景</div>
+            </div>
+            <label class="md-switch">
+              <input type="checkbox" id="set-show-scene-tab">
+              <span class="md-switch-track"></span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Features Tab -->
+        <div id="settings-page-features" class="settings-page" hidden>
+          <div class="setting-card" id="setting-row-autostart">
+            <div class="setting-info">
+              <div class="setting-label">开机自启动</div>
+              <div class="setting-desc" id="set-autostart-desc">开启后，Windows 登录时自动启动米家（可与「以系统托盘方式启动」搭配静默运行）</div>
+            </div>
+            <label class="md-switch">
+              <input type="checkbox" id="set-autostart">
+              <span class="md-switch-track"></span>
+            </label>
+          </div>
+
+          <div class="setting-card" id="setting-row-speaker">
+            <div class="setting-info">
+              <div class="setting-label">默认指挥的音箱</div>
+              <div class="setting-desc">小爱语音指令默认发往的音箱；选择「自动」时使用设备列表中第一个在线音箱</div>
+            </div>
+            <select id="set-default-speaker" class="md-select speaker-select" aria-label="默认指挥的音箱">
+              <option value="">自动（第一个在线音箱）</option>
+            </select>
+          </div>
+
+          <div class="setting-card">
+            <div class="setting-info">
+              <div class="setting-label">带快捷操作面板的系统托盘</div>
+              <div class="setting-desc">开启后，关闭主窗口时将最小化到系统托盘并启用托盘快捷操作面板</div>
+            </div>
+            <label class="md-switch">
+              <input type="checkbox" id="set-minimize-to-tray">
+              <span class="md-switch-track"></span>
+            </label>
+          </div>
+
+          <div class="setting-card" id="setting-row-start-min">
+            <div class="setting-info">
+              <div class="setting-label">以系统托盘方式启动</div>
+              <div class="setting-desc">开启后，启动软件时将以系统托盘的方式静默启动，不唤出主界面（该功能需开启系统托盘功能可选）</div>
+            </div>
+            <label class="md-switch">
+              <input type="checkbox" id="set-start-minimized">
+              <span class="md-switch-track"></span>
+            </label>
+          </div>
+
+          <div class="setting-card">
+            <div class="setting-info">
+              <div class="setting-label">隐藏无可控制功能的设备</div>
+              <div class="setting-desc">无公开功能规格或规格无属性的设备（如部分蓝牙类产品）将不在主页显示</div>
+            </div>
+            <label class="md-switch">
+              <input type="checkbox" id="set-hide-no-func">
+              <span class="md-switch-track"></span>
+            </label>
+          </div>
+
+          <div class="setting-card">
+            <div class="setting-info">
+              <div class="setting-label">自动检测新版本</div>
+              <div class="setting-desc">开启时，会在每次启动应用时自动从 Github 仓库获取新版本信息，有则提示更新</div>
+            </div>
+            <label class="md-switch">
+              <input type="checkbox" id="set-check-update">
+              <span class="md-switch-track"></span>
+            </label>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" id="settings-cancel-btn" class="secondary-button">取消</button>
+        <button type="button" id="settings-save-btn" class="primary-button">保存设置</button>
+      </div>
+    </div>
+
+    <!-- Light Control Popup Modal -->
+    <div id="modal-light" class="modal-dialog modal-light" role="dialog" aria-modal="true" aria-labelledby="light-modal-title" hidden>
+      <div class="light-panel">
+        <div class="light-header">
+          <button type="button" id="light-power-btn" class="power-btn is-unknown" aria-label="灯光电源开关" hidden>
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path>
+              <line x1="12" y1="2" x2="12" y2="12"></line>
+            </svg>
+          </button>
+          <div class="light-title-col">
+            <h2 id="light-modal-title" class="light-title">灯光</h2>
+            <span id="light-power-text" class="light-power-text">状态待确认</span>
+          </div>
+          <button type="button" id="light-diag-btn" class="secondary-button btn-compact">诊断报告</button>
+          <button type="button" class="icon-close-btn" data-close-modal="light" aria-label="关闭灯光控制">✕</button>
+        </div>
+        <div id="light-body" class="light-body" hidden>
+          <div id="light-brightness-row" class="light-control-group" hidden>
+            <div class="light-control-head">
+              <label for="light-brightness-slider">亮度</label>
+              <span id="light-brightness-val" class="light-control-val">—</span>
+            </div>
+            <input type="range" id="light-brightness-slider" class="md-slider" min="0" max="100" value="0" aria-label="灯光亮度" disabled>
+          </div>
+          <div id="light-temp-row" class="light-control-group" hidden>
+            <div class="light-control-head">
+              <label for="light-temp-slider">色温</label>
+              <span id="light-temp-val" class="light-control-val">—</span>
+            </div>
+            <input type="range" id="light-temp-slider" class="md-slider md-slider-temp" min="0" max="1000" value="0" aria-label="灯光色温" disabled>
+          </div>
+          <div id="light-color-row" class="light-color-row" hidden>
+            <button type="button" id="light-color-btn" class="light-color-btn" disabled>
+              <span class="light-color-dot" id="light-color-dot"></span>
+              <span>选择灯光颜色</span>
+            </button>
+            <input type="color" id="light-color-picker" class="sr-color-input" value="#ffffff" aria-label="选择灯光颜色">
+          </div>
+        </div>
+        <p id="light-status" class="light-status">正在读取灯光状态…</p>
+      </div>
+    </div>
+
+    <!-- Camera Preview Window Modal -->
+    <div id="modal-camera" class="modal-dialog modal-camera" role="dialog" aria-modal="true" aria-labelledby="camera-modal-title" hidden>
+      <div class="camera-header">
+        <button type="button" id="camera-power-btn" class="power-btn power-btn-lg is-unknown" title="摄像头开关" aria-label="摄像头开关">
+          <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path>
+            <line x1="12" y1="2" x2="12" y2="12"></line>
+          </svg>
+        </button>
+        <div class="camera-title-col">
+          <h2 id="camera-modal-title" class="camera-title">摄像头</h2>
+          <span id="camera-modal-room" class="camera-room"></span>
+        </div>
+        <button type="button" id="camera-diag-btn" class="secondary-button btn-compact">诊断报告</button>
+        <button type="button" class="icon-close-btn" data-close-modal="camera" aria-label="关闭摄像头预览">✕</button>
+      </div>
+
+      <div id="camera-stage" class="camera-stage">
+        <canvas id="camera-canvas" class="camera-canvas" width="960" height="540"></canvas>
+        <div id="camera-notice" class="camera-notice" hidden>
+          <span id="camera-notice-text">正在读取摄像头状态…</span>
+        </div>
+        <div id="camera-ptz-feedback" class="camera-ptz-feedback" hidden>
+          <span id="camera-ptz-arrow" class="camera-ptz-arrow"></span>
+          <span id="camera-ptz-label"></span>
+        </div>
+        <div class="camera-overlay-bar">
+          <button type="button" id="camera-mute-btn" class="camera-overlay-btn" title="开启声音" aria-label="开启声音">
+            <svg id="camera-icon-muted" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+              <line x1="23" y1="9" x2="17" y2="15"></line>
+              <line x1="17" y1="9" x2="23" y2="15"></line>
+            </svg>
+            <svg id="camera-icon-sound" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden>
+              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+              <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+              <path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
+            </svg>
+          </button>
+
+          <div class="menu-anchor camera-quality-anchor">
+            <button type="button" id="camera-quality-btn" class="camera-quality-btn" title="切换画质" aria-haspopup="menu" aria-expanded="false">流畅</button>
+            <div id="camera-quality-menu" class="popup-menu camera-quality-menu" role="menu" hidden>
+              <button type="button" class="popup-menu-item" role="menuitem" data-quality="0">自动</button>
+              <button type="button" class="popup-menu-item checked" role="menuitem" data-quality="1">360P 流畅</button>
+              <button type="button" class="popup-menu-item" role="menuitem" data-quality="2">2K 高清</button>
+            </div>
+          </div>
+
+          <button type="button" id="camera-fullscreen-btn" class="camera-overlay-btn" title="全屏观看" aria-label="全屏观看">
+            <svg id="camera-icon-fs-enter" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="15 3 21 3 21 9"></polyline>
+              <polyline points="9 21 3 21 3 15"></polyline>
+              <line x1="21" y1="3" x2="14" y2="10"></line>
+              <line x1="3" y1="21" x2="10" y2="14"></line>
+            </svg>
+            <svg id="camera-icon-fs-exit" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden>
+              <polyline points="4 14 10 14 10 20"></polyline>
+              <polyline points="20 10 14 10 14 4"></polyline>
+              <line x1="14" y1="10" x2="21" y2="3"></line>
+              <line x1="3" y1="21" x2="10" y2="14"></line>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <p id="camera-drag-hint" class="camera-drag-hint">拖拽画面可调整摄像头角度</p>
+    </div>
+
+    <!-- Tray Manager Dialog -->
+    <div id="modal-tray-manager" class="modal-dialog modal-tray-manager" role="dialog" aria-modal="true" aria-labelledby="tray-mgr-title" hidden>
+      <div class="modal-header">
+        <h2 id="tray-mgr-title" class="modal-title">编辑卡片</h2>
+        <button type="button" class="icon-close-btn" data-close-modal="tray-manager" aria-label="关闭编辑卡片">✕</button>
+      </div>
+      <div class="tray-mgr-toolbar">
+        <div id="tray-mgr-tabs" class="tray-mgr-tabs" role="tablist">
+          <button type="button" class="settings-tab active" role="tab" aria-selected="true" data-tm-tab="devices">设备</button>
+          <button type="button" class="settings-tab" role="tab" aria-selected="false" data-tm-tab="scenes">场景</button>
+        </div>
+        <button type="button" id="tray-mgr-sort-btn" class="secondary-button btn-compact">排序</button>
+      </div>
+      <div class="tray-mgr-filter-row">
+        <span id="tray-mgr-subtitle" class="tray-mgr-subtitle">勾选加入托盘快捷窗口</span>
+        <select id="tray-mgr-room-filter" class="md-select md-select-sm" aria-label="按房间筛选设备">
+          <option value="">全部房间</option>
+        </select>
+      </div>
+      <div id="tray-mgr-list" class="tray-mgr-list"></div>
+      <div class="modal-footer">
+        <button type="button" id="tray-mgr-cancel-btn" class="secondary-button">取消</button>
+        <button type="button" id="tray-mgr-save-btn" class="primary-button">保存</button>
+      </div>
+    </div>
+
+    <!-- QR Login Dialog -->
+    <div id="modal-login" class="modal-dialog modal-login" role="dialog" aria-modal="true" aria-labelledby="login-modal-title" hidden>
+      <div class="modal-header">
+        <h2 id="login-modal-title" class="modal-title">登录米家账号</h2>
+        <button type="button" class="icon-close-btn" data-close-modal="login" aria-label="关闭登录窗口">✕</button>
+      </div>
+      <div class="login-body">
+        <div id="login-qr-box" class="login-qr-box" aria-label="登录二维码">
+          <span class="login-qr-placeholder">正在获取…</span>
+        </div>
+        <p id="login-status" class="login-status">正在获取登录二维码…</p>
+        <button type="button" id="login-retry-btn" class="primary-button" hidden>重新获取二维码</button>
+      </div>
+    </div>
+
+    <!-- Diagnostic Report Dialog -->
+    <div id="modal-diagnostics" class="modal-dialog modal-diagnostics" role="dialog" aria-modal="true" aria-labelledby="diag-modal-title" hidden>
+      <div class="modal-header">
+        <h2 id="diag-modal-title" class="modal-title">设备诊断报告 - MijiaDeck</h2>
+        <button type="button" class="icon-close-btn" data-close-modal="diagnostics" aria-label="关闭诊断报告">✕</button>
+      </div>
+      <div class="diag-body">
+        <select id="diag-device-select" class="md-select diag-select" aria-label="选择要诊断的设备"></select>
+        <p class="diag-privacy-note">
+          先复现问题，再生成报告。复制后粘贴到 GitHub Issue，并补充操作步骤和实际现象。<br>
+          仅采集所选设备的能力定义及连接诊断；不包含账号凭证、设备名称、房间、画面或当前传感器读数。
+        </p>
+        <textarea id="diag-preview" class="diag-preview" readonly spellcheck="false" aria-label="诊断报告 JSON 预览"></textarea>
+        <p id="diag-status" class="diag-status"></p>
+      </div>
+      <div class="modal-footer modal-footer-between">
+        <div class="modal-footer-group">
+          <button type="button" id="diag-regen-btn" class="secondary-button">重新生成</button>
+          <button type="button" id="diag-copy-btn" class="primary-button" disabled>复制诊断报告</button>
+        </div>
+        <div class="modal-footer-group">
+          <a href="https://github.com/Songmanual/MijiaDeck/issues/new" target="_blank" rel="noopener noreferrer" class="secondary-button link-button">打开反馈页面</a>
+          <button type="button" class="secondary-button" data-close-modal="diagnostics">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tray Intro Onboarding Modal -->
+    <div id="modal-tray-intro" class="modal-dialog modal-tray-intro" role="dialog" aria-modal="true" aria-labelledby="tray-intro-heading" hidden>
+      <div class="tray-intro-body">
+        <div class="tray-intro-badge">
+          <img src="/assets/icon.png" alt="MijiaDeck" width="36" height="36">
+        </div>
+        <h2 id="tray-intro-heading" class="tray-intro-heading">从托盘快速操作 MijiaDeck</h2>
+        <ul class="tray-intro-list">
+          <li>单击或双击托盘图标：打开 / 收起快捷浮窗</li>
+          <li>右键托盘图标：打开菜单，选择「显示主窗口」</li>
+          <li>鼠标经过图标不会再弹窗。开启托盘常驻时，关闭主窗口仍可从托盘操作。</li>
+          <li>找不到图标？请点击任务栏右侧的「显示隐藏图标」按钮。</li>
+        </ul>
+        <button type="button" id="tray-intro-dismiss-btn" class="primary-button tray-intro-btn">知道了</button>
+      </div>
+    </div>
+
+    <!-- About Dialog -->
+    <div id="modal-about" class="modal-dialog modal-about" role="dialog" aria-modal="true" aria-labelledby="about-modal-title" hidden>
+      <div class="modal-header modal-header-minimal">
+        <span class="sr-only" id="about-modal-title">关于 MijiaDeck</span>
+        <button type="button" class="icon-close-btn" data-close-modal="about" aria-label="关闭关于对话框">✕</button>
+      </div>
+      <div class="about-body">
+        <img src="/assets/icon.png" alt="MijiaDeck" class="about-logo" width="52" height="52">
+        <h2 class="about-name">MijiaDeck</h2>
+        <p id="about-version" class="about-version">版本 v1.1.2</p>
+        <p class="about-intro">
+          米家设备的桌面控制端：扫码登录米家账号后，在本地窗口中查看与控制家里全部米家设备——设备卡片快速开关、灯光控制、摄像头远程预览、系统托盘快捷控制、小爱语音指令与深浅色主题。
+        </p>
+        <h3 class="about-credits-title">开源致谢</h3>
+        <p class="about-credits">
+          本项目基于 <a href="https://github.com/huanyuejue/MiHome-Windows" target="_blank" rel="noopener noreferrer">MiHome-Windows</a> 改进，参考 <a href="https://github.com/Do1e/mijia-api" target="_blank" rel="noopener noreferrer">mijiaAPI</a> 连接米家设备，使用 Bun + TypeScript 构建，遵循 GPL-3.0-or-later 开源协议。
+        </p>
+        <div class="about-actions">
+          <button type="button" id="about-check-update-btn" class="secondary-button about-btn">检测更新</button>
+          <a href="https://github.com/Songmanual/MijiaDeck" target="_blank" rel="noopener noreferrer" class="secondary-button link-button about-btn">GitHub 仓库</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,27 @@
+name: Bun TypeScript CI
+
+on:
+  push:
+    branches: [main, refactor/bun-ts]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Typecheck (strict TypeScript)
+        run: bun run typecheck
+      - name: Run full Bun test suite
+        run: bun test
+      - name: Build server and web bundles
+        run: bun run build
+      - name: Verify demo startup health check
+        run: bun run check:startup
