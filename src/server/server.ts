@@ -286,6 +286,9 @@ export async function startMijiaDeckServer(
   const server = Bun.serve<WsData>({
     port: requestedPort,
     hostname,
+    // QR login long-poll (/api/auth/qr/wait) holds the request open up to 120s;
+    // Bun's default idleTimeout is 10s which would abort waiting scans prematurely.
+    idleTimeout: 255,
     fetch(req, srv) {
       const url = new URL(req.url);
       if (url.pathname === "/ws") {

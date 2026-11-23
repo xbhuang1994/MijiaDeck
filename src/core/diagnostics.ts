@@ -359,11 +359,11 @@ export function regionFromUrl(url: unknown): string {
   } catch {
     return "unknown";
   }
-  if (host === "api.io.mi.com") {
+  if (host === "api.io.mi.com" || host === "api.mijia.tech") {
     return "cn";
   }
   for (const region of REGIONS) {
-    if (host === `${region}.api.io.mi.com`) {
+    if (host === `${region}.api.io.mi.com` || host === `${region}.api.mijia.tech`) {
       return region;
     }
   }

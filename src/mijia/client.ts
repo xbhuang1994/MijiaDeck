@@ -4,7 +4,7 @@
 
 /**
  * Pure Bun + TypeScript Xiaomi MIoT Cloud API v2 client
- * (compatible with mijiaAPI 5.x semantics and auth.json format).
+ * (protocol-compatible with Do1e/mijia-api 5.x and ~/.config/mijia-api/auth.json).
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -34,25 +34,28 @@ import type { MijiaDeviceApi } from "./device.ts";
 import { LoginError, MijiaApiError } from "./errors.ts";
 
 export const MIJIA_API_VERSION = "5.0.0-ts";
-export const DEFAULT_API_BASE_URL = "https://api.io.mi.com/app";
+export const DEFAULT_API_BASE_URL = "https://api.mijia.tech/app";
 
 const XIAOMI_SERVICE_LOGIN_URL = "https://account.xiaomi.com/pass/serviceLogin";
 const XIAOMI_QR_LOGIN_URL = "https://account.xiaomi.com/longPolling/loginUrl";
-const XIAOMI_STS_CALLBACK = "https://sts.api.io.mi.com/sts";
 const XIAOMI_JSON_PREFIX = "&&&START&&&";
 const QR_LONG_POLL_TIMEOUT_MS = 120_000;
 const ICON_REDIRECT_TIMEOUT_MS = 6_000;
 const DEFAULT_LOCALE = "zh_CN";
+const AUTH_EXPIRE_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_PAGINATION_PAGES = 50;
-const MAX_STS_REDIRECTS = 5;
+const MAX_STS_REDIRECTS = 10;
 
 export interface AuthData {
   userId?: string | number;
   cUserId?: string;
   ssecurity?: string;
+  psecurity?: string;
+  nonce?: string | number;
   serviceToken?: string;
   passToken?: string;
   deviceId?: string;
+  pass_o?: string;
   ua?: string;
   saveTime?: number;
   expireTime?: number;
@@ -74,18 +77,47 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function generateDeviceId(): string {
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  const bytes = randomBytes(16);
+function randomFromAlphabet(alphabet: string, length: number): string {
+  const bytes = randomBytes(length);
   let out = "";
-  for (let i = 0; i < bytes.length; i++) {
+  for (let i = 0; i < length; i++) {
     out += alphabet[bytes[i]! % alphabet.length];
   }
   return out;
 }
 
-function defaultUserAgent(deviceId: string): string {
-  return `Android-7.1.1-1.0.0-ONEPLUS A3010-136-${deviceId} APP/xiaomi.smarthome APPV/62830`;
+function generateDeviceId(): string {
+  return randomFromAlphabet(
+    "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-",
+    16,
+  );
+}
+
+function generatePassO(): string {
+  return randomFromAlphabet("0123456789abcdef", 16);
+}
+
+function defaultUserAgent(passO: string, locale = DEFAULT_LOCALE): string {
+  const hexUpper = "0123456789ABCDEF";
+  const uaId1 = randomFromAlphabet(hexUpper, 40);
+  const uaId2 = randomFromAlphabet(hexUpper, 32);
+  const uaId3 = randomFromAlphabet(hexUpper, 32);
+  const uaId4 = randomFromAlphabet(hexUpper, 40);
+  const country = locale.split("_")[1] || "CN";
+  return (
+    `Android-15-11.0.701-Xiaomi-23046RP50C-OS2.0.212.0.VMYCNXM-` +
+    `${uaId1}-${country}-${uaId3}-${uaId2}-SmartHome-MI_APP_STORE-` +
+    `${uaId1}|${uaId4}|${passO}-64`
+  );
+}
+
+function formatTimezoneOffset(): string {
+  const offsetMin = -new Date().getTimezoneOffset();
+  const sign = offsetMin >= 0 ? "+" : "-";
+  const abs = Math.abs(offsetMin);
+  const hh = String(Math.floor(abs / 60)).padStart(2, "0");
+  const mm = String(abs % 60).padStart(2, "0");
+  return `GMT${sign}${hh}:${mm}`;
 }
 
 function parseXiaomiJson(rawText: string): Record<string, unknown> {
@@ -112,11 +144,83 @@ function getSetCookieHeaders(headers: Headers): string[] {
   if (!combined) {
     return [];
   }
-  // Split combined Set-Cookie header without splitting on comma inside Expires dates.
+  // Split combined Set-Cookie header without splitting on commas inside Expires dates.
   return combined.split(/,(?=\s*[A-Za-z0-9_.-]+=)/);
 }
 
-function collectCookiesFromHeaders(headers: Headers, target: Record<string, string>): void {
+interface CookieJarEntry {
+  name: string;
+  value: string;
+  domain: string;
+  hostOnly: boolean;
+}
+
+function isClearingCookie(rawCookie: string, value: string): boolean {
+  const lowerVal = value.toLowerCase();
+  if (!value || lowerVal === "existed" || lowerVal === "deleted" || lowerVal === "expired") {
+    return true;
+  }
+  const attrs = rawCookie.split(";").slice(1);
+  for (const attr of attrs) {
+    const eqIdx = attr.indexOf("=");
+    if (eqIdx <= 0) {
+      continue;
+    }
+    const k = attr.slice(0, eqIdx).trim().toLowerCase();
+    const v = attr.slice(eqIdx + 1).trim();
+    if (k === "max-age" && v !== "" && Number(v) <= 0) {
+      return true;
+    }
+    if (k === "expires" && v !== "") {
+      const ts = Date.parse(v);
+      if (Number.isFinite(ts) && ts <= Date.now()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function extractCookieDomain(rawCookie: string, requestUrl: string): { domain: string; hostOnly: boolean } {
+  let defaultHost = "";
+  try {
+    defaultHost = new URL(requestUrl).hostname.toLowerCase();
+  } catch {
+    defaultHost = "";
+  }
+  const attrs = rawCookie.split(";").slice(1);
+  for (const attr of attrs) {
+    const eqIdx = attr.indexOf("=");
+    if (eqIdx <= 0) {
+      continue;
+    }
+    const k = attr.slice(0, eqIdx).trim().toLowerCase();
+    if (k === "domain") {
+      const rawDomain = attr.slice(eqIdx + 1).trim().toLowerCase().replace(/^\.+/, "");
+      if (rawDomain) {
+        return { domain: rawDomain, hostOnly: false };
+      }
+    }
+  }
+  return { domain: defaultHost, hostOnly: true };
+}
+
+function cookieMatchesHost(entry: CookieJarEntry, hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  if (!entry.domain || !host) {
+    return true;
+  }
+  if (entry.hostOnly) {
+    return host === entry.domain;
+  }
+  return host === entry.domain || host.endsWith(`.${entry.domain}`);
+}
+
+function collectCookiesIntoJar(
+  headers: Headers,
+  requestUrl: string,
+  jar: CookieJarEntry[],
+): void {
   for (const rawCookie of getSetCookieHeaders(headers)) {
     const firstPart = rawCookie.split(";")[0]?.trim() ?? "";
     const eqIdx = firstPart.indexOf("=");
@@ -124,11 +228,71 @@ function collectCookiesFromHeaders(headers: Headers, target: Record<string, stri
       continue;
     }
     const name = firstPart.slice(0, eqIdx).trim();
-    const value = firstPart.slice(eqIdx + 1).trim();
-    if (name && value && value.toLowerCase() !== "existed") {
-      target[name] = value;
+    let value = firstPart.slice(eqIdx + 1).trim();
+    if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+      value = value.slice(1, -1);
+    }
+    if (!name || isClearingCookie(rawCookie, value)) {
+      continue;
+    }
+    const { domain, hostOnly } = extractCookieDomain(rawCookie, requestUrl);
+    const existingIdx = jar.findIndex(
+      (c) => c.name === name && c.domain === domain && c.hostOnly === hostOnly,
+    );
+    const entry: CookieJarEntry = { name, value, domain, hostOnly };
+    if (existingIdx >= 0) {
+      jar.splice(existingIdx, 1);
+    }
+    jar.push(entry);
+  }
+}
+
+function formatCookieHeaderForUrl(jar: readonly CookieJarEntry[], targetUrl: string): string {
+  let host = "";
+  try {
+    host = new URL(targetUrl).hostname.toLowerCase();
+  } catch {
+    host = "";
+  }
+  const byName = new Map<string, string>();
+  for (const entry of jar) {
+    if (entry.value !== "" && cookieMatchesHost(entry, host)) {
+      byName.set(entry.name, entry.value);
     }
   }
+  return Array.from(byName.entries())
+    .map(([k, v]) => `${k}=${v}`)
+    .join("; ");
+}
+
+function flattenCookieJar(jar: readonly CookieJarEntry[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const entry of jar) {
+    if (entry.value !== "") {
+      out[entry.name] = entry.value;
+    }
+  }
+  return out;
+}
+
+function extractServiceToken(cookies: Record<string, string>): string {
+  if (cookies["serviceToken"]) {
+    return cookies["serviceToken"];
+  }
+  if (cookies["yetAnotherServiceToken"]) {
+    return cookies["yetAnotherServiceToken"];
+  }
+  for (const [k, v] of Object.entries(cookies)) {
+    if (v && k.toLowerCase() === "servicetoken") {
+      return v;
+    }
+  }
+  for (const [k, v] of Object.entries(cookies)) {
+    if (v && k.toLowerCase().endsWith("servicetoken")) {
+      return v;
+    }
+  }
+  return "";
 }
 
 function computeClientSign(nonce: unknown, ssecurity: string): string {
@@ -180,6 +344,7 @@ export class MijiaApiClient implements MijiaDeviceApi {
 
   private readonly fetcher: BoundedFetch;
   private closed = false;
+  private homeOwnersCache = new Map<string, number | string>();
 
   constructor(options?: MijiaApiClientOptions) {
     this.authDataPath =
@@ -235,56 +400,78 @@ export class MijiaApiClient implements MijiaDeviceApi {
 
   close(): void {
     this.closed = true;
+    this.homeOwnersCache.clear();
   }
 
-  private ensureDeviceMeta(): { deviceId: string; ua: string } {
+  private ensureDeviceMeta(): { deviceId: string; passO: string; ua: string } {
     let deviceId =
       typeof this.authData["deviceId"] === "string" && this.authData["deviceId"].trim()
         ? this.authData["deviceId"].trim()
         : "";
     if (!deviceId) {
       deviceId = generateDeviceId();
+      this.authData["deviceId"] = deviceId;
     }
+
+    let passO =
+      typeof this.authData["pass_o"] === "string" && this.authData["pass_o"].trim()
+        ? this.authData["pass_o"].trim()
+        : "";
+    if (!passO) {
+      passO = generatePassO();
+      this.authData["pass_o"] = passO;
+    }
+
     let ua =
       typeof this.authData["ua"] === "string" && this.authData["ua"].trim()
         ? this.authData["ua"].trim()
         : "";
     if (!ua) {
-      ua = defaultUserAgent(deviceId);
+      ua = defaultUserAgent(passO);
+      this.authData["ua"] = ua;
     }
-    return { deviceId, ua };
+    return { deviceId, passO, ua };
   }
 
   private buildMiotHeaders(ssecurity?: string): Record<string, string> {
-    const { ua } = this.ensureDeviceMeta();
+    const { deviceId, ua } = this.ensureDeviceMeta();
     const userId = String(this.authData["userId"] ?? "");
     const cUserId = String(this.authData["cUserId"] ?? "");
     const serviceToken = String(this.authData["serviceToken"] ?? "");
+    const country = DEFAULT_LOCALE.split("_")[1] || "CN";
 
-    const cookies: string[] = [
-      `userId=${userId}`,
-      `yetAnotherServiceToken=${serviceToken}`,
-      `serviceToken=${serviceToken}`,
-      `locale=${DEFAULT_LOCALE}`,
-      "timezone=GMT+08:00",
-      "is_daylight=0",
-      "dst_offset=0",
-      "channel=MI_APP_STORE",
-    ];
+    const cookies: string[] = [];
     if (cUserId) {
       cookies.push(`cUserId=${cUserId}`);
     }
+    if (userId) {
+      cookies.push(`userId=${userId}`);
+    }
+    const timezoneId = Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai";
+    cookies.push(
+      `yetAnotherServiceToken=${serviceToken}`,
+      `serviceToken=${serviceToken}`,
+      `timezone_id=${timezoneId}`,
+      `timezone=${formatTimezoneOffset()}`,
+      "is_daylight=0",
+      "dst_offset=0",
+      "channel=MI_APP_STORE",
+      `countryCode=${country}`,
+      `PassportDeviceId=${deviceId}`,
+      `locale=${DEFAULT_LOCALE}`,
+    );
 
     const headers: Record<string, string> = {
       "User-Agent": ua,
       "Content-Type": "application/x-www-form-urlencoded",
       "Accept-Encoding": "identity",
+      "miot-accept-encoding": "GZIP",
+      "miot-encrypt-algorithm": "ENCRYPT-RC4",
       "x-xiaomi-protocal-flag-cli": "PROTOCAL-HTTP2",
-      "MIOT-ENCRYPT-ALGORITHM": "ENCRYPT-RC4",
       Cookie: cookies.join("; "),
     };
     if (ssecurity !== undefined) {
-      // Keep ssecurity out of headers; passed inside signed form params.
+      // ssecurity stays in signed form params, never in HTTP headers.
     }
     return headers;
   }
@@ -296,53 +483,227 @@ export class MijiaApiClient implements MijiaDeviceApi {
     return this.fetcher(url, init);
   }
 
-  private async exchangeLocationForTokens(
-    location: string,
-    ssecurity: string,
-    nonce: unknown,
+  /**
+   * Follow a Xiaomi STS callback URL with a session cookie jar across all redirect hops.
+   *
+   * Matches `Do1e/mijia-api`: requests `location` as-is first (since `sid=mijia` QR login
+   * already returns a fully signed STS callback URL) and forwards accumulated cookies across
+   * hops. Only falls back to appending `clientSign` if the untouched URL fails to yield a
+   * `serviceToken` (backward compatibility with legacy `xiaomiio` STS flows).
+   */
+  private async followStsUrl(
+    startUrl: string,
     ua: string,
-    initialCookies?: Record<string, string>,
-  ): Promise<Record<string, string>> {
-    let targetUrl = location;
-    if (nonce !== undefined && nonce !== null && !location.includes("clientSign=")) {
-      const clientSign = computeClientSign(nonce, ssecurity);
-      const sep = location.includes("?") ? "&" : "?";
-      targetUrl = `${location}${sep}clientSign=${encodeURIComponent(clientSign)}`;
-    }
-
-    const cookies: Record<string, string> = { ...(initialCookies ?? {}) };
-    let currentUrl = targetUrl;
+    seedJar: readonly CookieJarEntry[],
+  ): Promise<{
+    cookies: Record<string, string>;
+    stsCookies: Record<string, string>;
+    ok: boolean;
+    lastStatus: number;
+  }> {
+    const jar: CookieJarEntry[] = seedJar.map((entry) => ({ ...entry }));
+    const stsJar: CookieJarEntry[] = [];
+    let currentUrl = startUrl;
+    let lastStatus = 0;
 
     for (let hop = 0; hop < MAX_STS_REDIRECTS; hop++) {
+      const headers: Record<string, string> = {
+        "User-Agent": ua,
+        "Content-Type": "application/x-www-form-urlencoded",
+        Connection: "keep-alive",
+      };
+      const cookieHeader = formatCookieHeaderForUrl(jar, currentUrl);
+      if (cookieHeader) {
+        headers["Cookie"] = cookieHeader;
+      }
+
       const res = await this.request(currentUrl, {
         method: "GET",
-        headers: { "User-Agent": ua },
+        headers,
         redirect: "manual",
       });
-      collectCookiesFromHeaders(res.headers, cookies);
+      lastStatus = res.status;
+      collectCookiesIntoJar(res.headers, currentUrl, jar);
+      collectCookiesIntoJar(res.headers, currentUrl, stsJar);
 
       if (res.status >= 300 && res.status < 400) {
         const nextLocation = res.headers.get("location");
-        if (nextLocation && !cookies["serviceToken"]) {
+        if (nextLocation) {
           currentUrl = new URL(nextLocation, currentUrl).toString();
           continue;
         }
         break;
       }
 
-      if (!res.ok) {
-        throw new LoginError(
-          `Failed to exchange Xiaomi STS location: HTTP ${res.status}`,
-          res.status,
-        );
-      }
-      break;
+      return {
+        cookies: flattenCookieJar(jar),
+        stsCookies: flattenCookieJar(stsJar),
+        ok: res.ok,
+        lastStatus,
+      };
     }
 
-    if (!cookies["serviceToken"]) {
-      throw new LoginError("Failed to obtain serviceToken from Xiaomi STS response");
+    return {
+      cookies: flattenCookieJar(jar),
+      stsCookies: flattenCookieJar(stsJar),
+      ok: lastStatus >= 200 && lastStatus < 400,
+      lastStatus,
+    };
+  }
+
+  private async exchangeLocationForTokens(
+    location: string,
+    ssecurity: string,
+    nonce: unknown,
+    ua: string,
+    initialJar?: readonly CookieJarEntry[],
+  ): Promise<Record<string, string>> {
+    const seed = initialJar ?? [];
+
+    // Primary path (mijia-api 5.x `sid=mijia`): request `location` as returned by Xiaomi.
+    const primary = await this.followStsUrl(location, ua, seed);
+    const primaryToken = extractServiceToken(primary.stsCookies);
+    if (primaryToken) {
+      primary.cookies["serviceToken"] = primaryToken;
+      return primary.cookies;
     }
-    return cookies;
+
+    // Fallback path (legacy `xiaomiio` STS endpoints that require an explicit clientSign param).
+    if (nonce !== undefined && nonce !== null && !location.includes("clientSign=")) {
+      const clientSign = computeClientSign(nonce, ssecurity);
+      const sep = location.includes("?") ? "&" : "?";
+      const signedUrl = `${location}${sep}clientSign=${encodeURIComponent(clientSign)}`;
+      const fallback = await this.followStsUrl(signedUrl, ua, seed);
+      const fallbackToken = extractServiceToken(fallback.stsCookies);
+      if (fallbackToken) {
+        fallback.cookies["serviceToken"] = fallbackToken;
+        return fallback.cookies;
+      }
+      if (!fallback.ok && fallback.lastStatus > 0) {
+        throw new LoginError(
+          `Failed to exchange Xiaomi STS location: HTTP ${fallback.lastStatus}`,
+          fallback.lastStatus,
+        );
+      }
+    }
+
+    const seedToken = extractServiceToken(primary.cookies);
+    if (seedToken && primary.ok) {
+      primary.cookies["serviceToken"] = seedToken;
+      return primary.cookies;
+    }
+
+    if (!primary.ok && primary.lastStatus > 0) {
+      throw new LoginError(
+        `Failed to exchange Xiaomi STS location: HTTP ${primary.lastStatus}`,
+        primary.lastStatus,
+      );
+    }
+
+    throw new LoginError("Failed to obtain serviceToken from Xiaomi STS response");
+  }
+
+  /**
+   * Call Xiaomi Account `pass/serviceLogin?_json=true&sid=mijia&_locale=zh_CN`.
+   *
+   * - If existing `passToken`/`userId` cookies are still valid (`code === 0`), refreshes
+   *   `serviceToken` via the returned STS `location` and returns `{ refreshed: true }`.
+   * - Otherwise (`code === 70016` etc.), extracts the signed login query parameters
+   *   (`_sign`, `qs`, `callback`, `sid`, `serviceParam`, ...) from `serviceData.location`
+   *   for the subsequent `longPolling/loginUrl` QR code request.
+   */
+  private async getLocation(): Promise<
+    { refreshed: true } | { refreshed: false; locationData: Record<string, string> }
+  > {
+    const { deviceId, passO, ua } = this.ensureDeviceMeta();
+    const passToken =
+      typeof this.authData["passToken"] === "string" ? this.authData["passToken"].trim() : "";
+    const userId = String(this.authData["userId"] ?? "").trim();
+    const cUserId =
+      typeof this.authData["cUserId"] === "string" ? this.authData["cUserId"].trim() : "";
+
+    const reqCookie =
+      `deviceId=${deviceId};` +
+      `pass_o=${passO};` +
+      `passToken=${passToken};` +
+      `userId=${userId};` +
+      `cUserId=${cUserId};` +
+      `uLocale=${DEFAULT_LOCALE};`;
+
+    const serviceUrl = `${XIAOMI_SERVICE_LOGIN_URL}?_json=true&sid=mijia&_locale=${DEFAULT_LOCALE}`;
+    const res = await this.request(serviceUrl, {
+      method: "GET",
+      headers: {
+        "User-Agent": ua,
+        Connection: "keep-alive",
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: reqCookie,
+      },
+    });
+    if (!res.ok) {
+      throw new LoginError(
+        `Failed to query Xiaomi serviceLogin: HTTP ${res.status}`,
+        res.status,
+      );
+    }
+
+    const initialCookies: CookieJarEntry[] = [];
+    collectCookiesIntoJar(res.headers, serviceUrl, initialCookies);
+
+    const serviceData = parseXiaomiJson(await res.text());
+    const location = typeof serviceData["location"] === "string" ? serviceData["location"].trim() : "";
+    if (!location) {
+      throw new LoginError("Xiaomi serviceLogin response missing location");
+    }
+
+    const code = serviceData["code"];
+    const ssecurity =
+      typeof serviceData["ssecurity"] === "string" ? serviceData["ssecurity"].trim() : "";
+
+    if (code === 0 && ssecurity) {
+      try {
+        const stsCookies = await this.exchangeLocationForTokens(
+          location,
+          ssecurity,
+          serviceData["nonce"],
+          ua,
+          initialCookies,
+        );
+        this.authData = {
+          ...this.authData,
+          ...stsCookies,
+          userId: serviceData["userId"] ?? stsCookies["userId"] ?? userId,
+          cUserId:
+            (typeof serviceData["cUserId"] === "string" && serviceData["cUserId"]) ||
+            stsCookies["cUserId"] ||
+            cUserId,
+          ssecurity,
+          serviceToken: stsCookies["serviceToken"],
+          passToken:
+            (typeof serviceData["passToken"] === "string" && serviceData["passToken"]) ||
+            stsCookies["passToken"] ||
+            passToken,
+          deviceId,
+          pass_o: passO,
+          ua,
+          expireTime: Date.now() + AUTH_EXPIRE_DAYS_MS,
+          saveTime: Date.now(),
+        };
+        this.saveAuthData();
+        return { refreshed: true };
+      } catch {
+        // Fall through to fresh QR login if silent STS exchange fails.
+      }
+    }
+
+    const parsedLocation = new URL(location);
+    const locationData: Record<string, string> = {};
+    for (const [key, value] of parsedLocation.searchParams.entries()) {
+      if (!(key in locationData)) {
+        locationData[key] = value;
+      }
+    }
+    return { refreshed: false, locationData };
   }
 
   private saveAuthData(): void {
@@ -359,101 +720,33 @@ export class MijiaApiClient implements MijiaDeviceApi {
     if (!passToken || !userId) {
       return false;
     }
-
-    const { deviceId, ua } = this.ensureDeviceMeta();
-    const cUserId =
-      typeof this.authData["cUserId"] === "string" ? this.authData["cUserId"].trim() : "";
-
-    const reqCookies = [`passToken=${passToken}`, `userId=${userId}`, `deviceId=${deviceId}`];
-    if (cUserId) {
-      reqCookies.push(`cUserId=${cUserId}`);
-    }
-
     try {
-      const res = await this.request(`${XIAOMI_SERVICE_LOGIN_URL}?sid=xiaomiio&_json=true`, {
-        method: "GET",
-        headers: {
-          "User-Agent": ua,
-          Cookie: reqCookies.join("; "),
-        },
-      });
-      if (!res.ok) {
-        return false;
-      }
-
-      const initialCookies: Record<string, string> = {};
-      collectCookiesFromHeaders(res.headers, initialCookies);
-
-      const data = parseXiaomiJson(await res.text());
-      const code = data["code"];
-      const ssecurity = typeof data["ssecurity"] === "string" ? data["ssecurity"].trim() : "";
-      const location = typeof data["location"] === "string" ? data["location"].trim() : "";
-      if (code !== 0 || !ssecurity || !location) {
-        return false;
-      }
-
-      const stsCookies = await this.exchangeLocationForTokens(
-        location,
-        ssecurity,
-        data["nonce"],
-        ua,
-        initialCookies,
-      );
-
-      this.authData = {
-        ...this.authData,
-        userId: data["userId"] ?? stsCookies["userId"] ?? userId,
-        cUserId:
-          (typeof data["cUserId"] === "string" && data["cUserId"]) ||
-          stsCookies["cUserId"] ||
-          cUserId,
-        ssecurity,
-        serviceToken: stsCookies["serviceToken"],
-        passToken:
-          (typeof data["passToken"] === "string" && data["passToken"]) ||
-          stsCookies["passToken"] ||
-          passToken,
-        deviceId,
-        ua,
-        saveTime: Date.now(),
-      };
-      delete this.authData["expireTime"];
-      this.saveAuthData();
-      return true;
+      const result = await this.getLocation();
+      return result.refreshed;
     } catch {
       return false;
     }
   }
 
   /**
-   * Step 1 of two-step QR login.
-   * Attempts silent token refresh first; returns `{ refreshed: true, ... }` when refreshed,
-   * otherwise requests a Xiaomi Account `longPolling/loginUrl` QR session.
+   * Step 1 of two-step QR login (matching `Do1e/mijia-api._get_qr_login_data`).
+   * Calls `serviceLogin?sid=mijia` first: returns `{ refreshed: true }` when existing
+   * credentials silently refreshed, otherwise uses the server-signed location params
+   * (`_sign`, `qs`, `callback`, `sid=mijia`, `serviceParam`) to fetch QR login data.
    */
   async getQrLoginData(): Promise<QrLoginData> {
-    if (await this.refreshToken()) {
+    const locResult = await this.getLocation();
+    if (locResult.refreshed) {
       return { loginUrl: "", lp: "", refreshed: true };
     }
 
-    const { deviceId, ua } = this.ensureDeviceMeta();
+    const { ua } = this.ensureDeviceMeta();
     const params = new URLSearchParams({
-      _group: "DEFAULT",
-      _qrsize: "240",
-      qs: "%3Fsid%3Dxiaomiio%26_json%3Dtrue",
-      bizDeviceType: "",
-      callback: XIAOMI_STS_CALLBACK,
-      _hasLogo: "false",
+      ...locResult.locationData,
       theme: "",
-      sid: "xiaomiio",
-      needTheme: "false",
-      showActiveX: "false",
-      serviceParam: JSON.stringify({
-        checkSafePhone: false,
-        checkSafeAddress: false,
-        lsrp_score: 0.0,
-      }),
-      _locale: DEFAULT_LOCALE,
-      _sign: "",
+      bizDeviceType: "",
+      _hasLogo: "false",
+      _qrsize: "240",
       _dc: String(Date.now()),
     });
 
@@ -461,7 +754,8 @@ export class MijiaApiClient implements MijiaDeviceApi {
       method: "GET",
       headers: {
         "User-Agent": ua,
-        Cookie: `deviceId=${deviceId}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+        Connection: "keep-alive",
       },
     });
 
@@ -496,9 +790,9 @@ export class MijiaApiClient implements MijiaDeviceApi {
   }
 
   /**
-   * Step 2 of two-step QR login.
+   * Step 2 of two-step QR login (matching `Do1e/mijia-api._complete_qr_login`).
    * Long-polls `loginData.lp` with an explicit 120-second timeout, exchanges the
-   * returned STS location for `serviceToken` + `ssecurity`, and persists `auth.json`.
+   * returned STS `location` using the session cookie jar, and persists `auth.json`.
    */
   async completeQrLogin(loginData: QrLoginData): Promise<void> {
     const lp = typeof loginData?.lp === "string" ? loginData.lp.trim() : "";
@@ -506,12 +800,13 @@ export class MijiaApiClient implements MijiaDeviceApi {
       throw new LoginError("Missing long-poll URL (lp) in QR login data");
     }
 
-    const { deviceId, ua } = this.ensureDeviceMeta();
+    const { deviceId, passO, ua } = this.ensureDeviceMeta();
     const lpRes = await this.request(lp, {
       method: "GET",
       headers: {
         "User-Agent": ua,
-        Cookie: `deviceId=${deviceId}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+        Connection: "keep-alive",
       },
       timeoutMs: QR_LONG_POLL_TIMEOUT_MS,
     });
@@ -523,8 +818,8 @@ export class MijiaApiClient implements MijiaDeviceApi {
       );
     }
 
-    const initialCookies: Record<string, string> = {};
-    collectCookiesFromHeaders(lpRes.headers, initialCookies);
+    const sessionCookies: CookieJarEntry[] = [];
+    collectCookiesIntoJar(lpRes.headers, lp, sessionCookies);
 
     const lpData = parseXiaomiJson(await lpRes.text());
     const code = lpData["code"];
@@ -548,7 +843,7 @@ export class MijiaApiClient implements MijiaDeviceApi {
       ssecurity,
       lpData["nonce"],
       ua,
-      initialCookies,
+      sessionCookies,
     );
 
     const userId = lpData["userId"] ?? stsCookies["userId"] ?? "";
@@ -560,19 +855,25 @@ export class MijiaApiClient implements MijiaDeviceApi {
       (typeof lpData["passToken"] === "string" && lpData["passToken"]) ||
       stsCookies["passToken"] ||
       "";
+    const psecurity =
+      typeof lpData["psecurity"] === "string" ? lpData["psecurity"] : undefined;
 
     this.authData = {
       ...this.authData,
+      ...stsCookies,
+      ...(psecurity !== undefined ? { psecurity } : {}),
+      ...(lpData["nonce"] !== undefined ? { nonce: lpData["nonce"] } : {}),
       userId,
       cUserId,
       ssecurity,
       serviceToken: stsCookies["serviceToken"],
       ...(passToken ? { passToken } : {}),
       deviceId,
+      pass_o: passO,
       ua,
+      expireTime: Date.now() + AUTH_EXPIRE_DAYS_MS,
       saveTime: Date.now(),
     };
-    delete this.authData["expireTime"];
     this.saveAuthData();
   }
 
@@ -664,7 +965,7 @@ export class MijiaApiClient implements MijiaDeviceApi {
 
     if (isRecord(parsed) && typeof parsed["code"] === "number" && parsed["code"] !== 0) {
       throw new MijiaApiError(
-        `MIoT API error on ${uri}: ${String(parsed["message"] ?? "unknown error")} (code ${parsed["code"]})`,
+        `MIoT API error on ${uri}: ${String(parsed["message"] ?? parsed["desc"] ?? "unknown error")} (code ${parsed["code"]})`,
         parsed["code"],
       );
     }
@@ -672,13 +973,33 @@ export class MijiaApiClient implements MijiaDeviceApi {
     return parsed;
   }
 
+  private async getHomeOwner(homeId: string): Promise<number | string> {
+    const key = String(homeId);
+    const cached = this.homeOwnersCache.get(key);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const homes = await this.getHomesList();
+    for (const home of homes) {
+      const id = String(home["id"] ?? "");
+      if (id === key && home["uid"] !== undefined && home["uid"] !== null) {
+        const owner = toNumericId(home["uid"]);
+        this.homeOwnersCache.set(key, owner);
+        return owner;
+      }
+    }
+    return toNumericId(this.authData["userId"] ?? "");
+  }
+
   async getHomesList(): Promise<Array<Record<string, unknown>>> {
-    const res = await this.postEncrypted("/v2/homeroom/gethome", {
+    const res = await this.postEncrypted("/v2/homeroom/gethome_merged", {
       fg: true,
       fetch_share: true,
       fetch_share_dev: true,
+      fetch_cariot: true,
       limit: 300,
       app_ver: 7,
+      plat_form: 0,
     });
 
     if (!isRecord(res) || !isRecord(res["result"])) {
@@ -703,6 +1024,9 @@ export class MijiaApiClient implements MijiaDeviceApi {
         }
         if (idKey) {
           seen.add(idKey);
+          if (item["uid"] !== undefined && item["uid"] !== null) {
+            this.homeOwnersCache.set(idKey, toNumericId(item["uid"]));
+          }
         }
         homes.push(item);
       }
@@ -724,7 +1048,7 @@ export class MijiaApiClient implements MijiaDeviceApi {
 
       let startDid = "";
       for (let page = 0; page < MAX_PAGINATION_PAGES; page++) {
-        const res = await this.postEncrypted("/v2/home/home_device_list", {
+        const res = await this.postEncrypted("/home/home_device_list", {
           home_owner: toNumericId(homeOwner),
           home_id: toNumericId(homeId),
           limit: 200,
@@ -754,12 +1078,16 @@ export class MijiaApiClient implements MijiaDeviceApi {
             continue;
           }
           seen.add(did);
-          devices.push(item);
+          devices.push(item["home_id"] ? item : { ...item, home_id: String(homeId) });
         }
 
         const hasMore = Boolean(result["has_more"]);
         const nextStart =
-          typeof result["next_start_did"] === "string" ? result["next_start_did"] : "";
+          typeof result["max_did"] === "string" && result["max_did"]
+            ? result["max_did"]
+            : typeof result["next_start_did"] === "string"
+              ? result["next_start_did"]
+              : "";
         if (!hasMore || !nextStart || nextStart === startDid) {
           break;
         }
@@ -771,27 +1099,35 @@ export class MijiaApiClient implements MijiaDeviceApi {
   }
 
   async getSharedDevicesList(): Promise<Array<Record<string, unknown>>> {
-    const res = await this.postEncrypted("/v2/share/receive_share_dev_list", {
-      share_type: 1,
-      limit: 200,
+    const res = await this.postEncrypted("/v2/home/device_list_page", {
+      ssid: "<unknown ssid>",
+      bssid: "02:00:00:00:00:00",
+      getVirtualModel: true,
+      getHuamiDevices: 1,
+      get_split_device: true,
+      support_smart_home: true,
+      get_cariot_device: true,
+      get_third_device: true,
+      get_phone_device: true,
+      get_miwear_device: true,
     });
 
     if (!isRecord(res) || !isRecord(res["result"])) {
       return [];
     }
     const result = res["result"];
-    const rawList = Array.isArray(result["share_dev_list"])
-      ? result["share_dev_list"]
-      : Array.isArray(result["device_info"])
-        ? result["device_info"]
-        : Array.isArray(result["list"])
-          ? result["list"]
+    const rawList = Array.isArray(result["list"])
+      ? result["list"]
+      : Array.isArray(result["share_dev_list"])
+        ? result["share_dev_list"]
+        : Array.isArray(result["device_info"])
+          ? result["device_info"]
           : [];
 
     const devices: Array<Record<string, unknown>> = [];
     for (const item of rawList) {
-      if (isRecord(item)) {
-        devices.push(item);
+      if (isRecord(item) && Boolean(item["owner"])) {
+        devices.push({ ...item, home_id: "shared" });
       }
     }
     return devices;
@@ -806,7 +1142,10 @@ export class MijiaApiClient implements MijiaDeviceApi {
       return [];
     }
 
-    const res = await this.postEncrypted("/miotspec/prop/get", { params: items });
+    const res = await this.postEncrypted("/miotspec/prop/get", {
+      params: items,
+      datasource: 1,
+    });
     const result = isRecord(res) ? res["result"] : undefined;
     if (isSingle) {
       return Array.isArray(result) ? result[0] : result;
@@ -840,20 +1179,31 @@ export class MijiaApiClient implements MijiaDeviceApi {
   }
 
   async getScenesList(homeId?: string | null): Promise<Array<Record<string, unknown>>> {
-    const fetchForHome = async (hid: string): Promise<Array<Record<string, unknown>>> => {
+    const fetchForHome = async (
+      hid: string,
+      ownerUid?: number | string,
+    ): Promise<Array<Record<string, unknown>>> => {
+      const owner = ownerUid ?? (await this.getHomeOwner(hid));
       const res = await this.postEncrypted(
-        "/appgateway/miot/appsceneservice/AppSceneService/GetSceneList",
-        { home_id: hid },
+        "/appgateway/miot/appsceneservice/AppSceneService/GetSimpleSceneList",
+        {
+          app_version: 12,
+          get_type: 2,
+          home_id: String(hid),
+          owner_uid: toNumericId(owner),
+        },
       );
       if (!isRecord(res) || !isRecord(res["result"])) {
         return [];
       }
       const result = res["result"];
-      const list = Array.isArray(result["scene_info_list"])
-        ? result["scene_info_list"]
-        : Array.isArray(result["list"])
-          ? result["list"]
-          : [];
+      const list = Array.isArray(result["manual_scene_info_list"])
+        ? result["manual_scene_info_list"]
+        : Array.isArray(result["scene_info_list"])
+          ? result["scene_info_list"]
+          : Array.isArray(result["list"])
+            ? result["list"]
+            : [];
       const scenes: Array<Record<string, unknown>> = [];
       for (const item of list) {
         if (!isRecord(item)) {
@@ -875,23 +1225,25 @@ export class MijiaApiClient implements MijiaDeviceApi {
       if (!hid) {
         continue;
       }
-      const scenes = await fetchForHome(hid);
+      const owner =
+        home["uid"] !== undefined && home["uid"] !== null ? toNumericId(home["uid"]) : undefined;
+      const scenes = await fetchForHome(hid, owner);
       allScenes.push(...scenes);
     }
     return allScenes;
   }
 
   async runScene(sceneId: string, homeId: string): Promise<boolean> {
-    const payload: Record<string, unknown> = {
-      scene_id: String(sceneId),
-      trigger_key: "user.click",
-    };
-    if (homeId) {
-      payload["home_id"] = String(homeId);
-    }
+    const owner = homeId ? await this.getHomeOwner(homeId) : toNumericId(this.authData["userId"] ?? "");
     const res = await this.postEncrypted(
-      "/appgateway/miot/appsceneservice/AppSceneService/RunScene",
-      payload,
+      "/appgateway/miot/appsceneservice/AppSceneService/NewRunScene",
+      {
+        scene_id: String(sceneId),
+        scene_type: 2,
+        phone_id: "null",
+        home_id: String(homeId),
+        owner_uid: toNumericId(owner),
+      },
     );
     if (!isRecord(res)) {
       return false;

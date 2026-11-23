@@ -9,7 +9,7 @@ import path from "node:path";
 import { buildCameraSource } from "../src/core/cameraAccess.ts";
 import { CameraPreviewError } from "../src/core/cameraPreview.ts";
 import type { IJobExecutor, JobSubmitOptions } from "../src/core/contracts.ts";
-import { buildReport, fetchPublicSpec, safeObservation } from "../src/core/diagnostics.ts";
+import { buildReport, fetchPublicSpec, regionFromUrl, safeObservation } from "../src/core/diagnostics.ts";
 import { setDataPathOverrides } from "../src/core/jsonStore.ts";
 import { createDeviceInfo } from "../src/core/models.ts";
 import { MijiaService } from "../src/core/service.ts";
@@ -342,6 +342,14 @@ describe("DiagnosticCoreTest", () => {
     expect(data.capabilities.source).toBe("sdk_cache");
     const defs = data.capabilities.definitions as { events: string };
     expect(defs.events).toBe("unavailable_in_sdk_cache");
+  });
+
+  test("regionFromUrl recognizes both api.mijia.tech and api.io.mi.com hosts", () => {
+    expect(regionFromUrl("https://api.mijia.tech/app")).toBe("cn");
+    expect(regionFromUrl("https://de.api.mijia.tech/app")).toBe("de");
+    expect(regionFromUrl("https://api.io.mi.com/app")).toBe("cn");
+    expect(regionFromUrl("https://us.api.io.mi.com/app")).toBe("us");
+    expect(regionFromUrl("")).toBe("unknown");
   });
 });
 

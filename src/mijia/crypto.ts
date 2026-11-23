@@ -8,6 +8,7 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
+import { gunzipSync } from "node:zlib";
 
 const RC4_DEFAULT_DROP = 1024;
 
@@ -159,11 +160,20 @@ export function generateEncParams(
 
 /**
  * Decrypt a Base64 RC4-drop1024 MIoT API response payload and decode as UTF-8.
+ * Supports GZIP-compressed decrypted payloads (when `miot-accept-encoding: GZIP` is used).
  */
 export function decrypt(ssecurity: string, nonce: string, payload: string): string {
   const signedNonce = getSignedNonce(ssecurity, nonce);
   const key = Buffer.from(signedNonce, "base64");
   const cipherBytes = Buffer.from(payload, "base64");
   const plainBytes = rc4Crypt(key, cipherBytes, RC4_DEFAULT_DROP);
-  return Buffer.from(plainBytes).toString("utf8");
+  // GZIP magic header 0x1f 0x8b
+  if (plainBytes.length >= 2 && plainBytes[0] === 0x1f && plainBytes[1] === 0x8b) {
+    return gunzipSync(plainBytes).toString("utf8");
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(plainBytes);
+  } catch {
+    return gunzipSync(plainBytes).toString("utf8");
+  }
 }

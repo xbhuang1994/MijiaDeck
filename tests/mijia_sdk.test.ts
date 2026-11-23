@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
+import { gzipSync } from "node:zlib";
 
 import { setPackagedOverride } from "../src/core/appMeta.ts";
 import * as deviceCache from "../src/core/cache.ts";
@@ -27,6 +28,7 @@ import {
   DeviceNotFoundError,
   DeviceSetError,
   GetDeviceInfoError,
+  LoginError,
   MijiaApiClient,
   MijiaDevice,
   decrypt,
@@ -180,6 +182,18 @@ describe("mijia/crypto", () => {
     expect(generateSignature("/app/v2/test", signedNonce, nonce, { data: "{}" })).toBe(
       generateSignature("/v2/test", signedNonce, nonce, { data: "{}" }),
     );
+  });
+
+  test("decrypt transparently decompresses GZIP-compressed MIoT payloads", () => {
+    const ssecurity = Buffer.from("mijia-gzip-test-key", "utf8").toString("base64");
+    const nonce = genNonce();
+    const signedNonce = getSignedNonce(ssecurity, nonce);
+    const key = Buffer.from(signedNonce, "base64");
+    const expectedJson = JSON.stringify({ code: 0, result: { homelist: [{ id: "1", name: "客厅" }] } });
+    const gz = gzipSync(Buffer.from(expectedJson, "utf8"));
+    const encryptedB64 = Buffer.from(rc4Crypt(key, gz)).toString("base64");
+
+    expect(decrypt(ssecurity, nonce, encryptedB64)).toBe(expectedJson);
   });
 });
 
@@ -524,7 +538,7 @@ describe("MijiaApiClient, quarantine, icon redirect, specZh, cache v4 & iconStor
     const loc = await client.fetchIconRedirect("yeelink.light.lamp4");
     expect(loc).toBe(redirectUrl);
     expect(captured.length).toBe(1);
-    expect(captured[0]!.url).toBe("https://api.io.mi.com/app/v2/productconfig/get_icon");
+    expect(captured[0]!.url).toBe("https://api.mijia.tech/app/v2/productconfig/get_icon");
     expect(captured[0]!.init?.redirect).toBe("manual");
 
     // Verify request body decrypts to the expected model payload.
@@ -630,5 +644,257 @@ describe("MijiaApiClient, quarantine, icon redirect, specZh, cache v4 & iconStor
     expect(iconStore.loadUrls()).toEqual({
       "xiaomi.light.1": "https://cdn.example/light1.png",
     });
+  });
+});
+
+describe("mijia/client QR login & STS token exchange", () => {
+  test("two-step sid=mijia QR login fetches signed serviceLogin params, preserves STS callback URL, carries domain cookies, and persists auth.json", async () => {
+    const authDir = makeTempDir("mijiadeck-qr-login-");
+    const authPath = path.join(authDir, "auth.json");
+
+    const requests: Array<{ url: string; headers: Headers; redirect?: RequestRedirect }> = [];
+    const stsCallbackUrl =
+      "https://sts.api.mijia.tech/mijia/sts?d=dev&ticket=t123&nonce=987654321&p_ts=1700000000";
+
+    const mockFetcher: FetchLike = async (input, init) => {
+      const url = String(input);
+      const headers = new Headers(init?.headers);
+      requests.push({ url, headers, redirect: init?.redirect });
+
+      if (url.startsWith("https://account.xiaomi.com/pass/serviceLogin")) {
+        const location =
+          "https://account.xiaomi.com/fe/service/login/password?" +
+          new URLSearchParams({
+            _sign: "SERVER_SIGNED_VALUE==",
+            qs: "%3F_json%3Dtrue%26sid%3Dmijia",
+            callback: "https://sts.api.mijia.tech/mijia/sts",
+            sid: "mijia",
+            serviceParam: '{"checkSafePhone":false}',
+          }).toString();
+        return new Response(`&&&START&&&${JSON.stringify({ code: 70016, location })}`, {
+          status: 200,
+        });
+      }
+
+      if (url.startsWith("https://account.xiaomi.com/longPolling/loginUrl")) {
+        return new Response(
+          `&&&START&&&${JSON.stringify({
+            code: 0,
+            loginUrl: "https://account.xiaomi.com/fe/service/login/qrcode?token=qr-abc",
+            lp: "https://lp.open.account.xiaomi.com/lp?id=poll-123",
+            qr: "https://account.xiaomi.com/qr/poll-123.png",
+          })}`,
+          { status: 200 },
+        );
+      }
+
+      if (url === "https://lp.open.account.xiaomi.com/lp?id=poll-123") {
+        const resHeaders = new Headers();
+        resHeaders.append("Set-Cookie", "passToken=lp-pass-token; Domain=.account.xiaomi.com; Path=/");
+        return new Response(
+          `&&&START&&&${JSON.stringify({
+            code: 0,
+            userId: 123456789,
+            cUserId: "encrypted-uid-1",
+            ssecurity: "c3NlY3VyaXR5S2V5MTIzNA==",
+            psecurity: "cHNlY3VyaXR5S2V5",
+            nonce: 987654321,
+            passToken: "body-pass-token",
+            location: stsCallbackUrl,
+          })}`,
+          { status: 200, headers: resHeaders },
+        );
+      }
+
+      if (url === stsCallbackUrl) {
+        // Must NOT leak account.xiaomi.com cookies to sts.api.mijia.tech,
+        // and must NOT mangle the sid=mijia STS URL with a forged clientSign.
+        expect(headers.get("cookie") ?? "").not.toContain("passToken");
+        const resHeaders = new Headers();
+        resHeaders.set("Location", "/mijia/sts/finish?ok=1");
+        resHeaders.append("Set-Cookie", "stsSession=hop1-sess; Domain=.api.mijia.tech; Path=/");
+        resHeaders.append(
+          "Set-Cookie",
+          'serviceToken="valid-mijia-sts-token=="; Domain=.api.mijia.tech; Path=/',
+        );
+        return new Response(null, { status: 302, headers: resHeaders });
+      }
+
+      if (url === "https://sts.api.mijia.tech/mijia/sts/finish?ok=1") {
+        // Redirect hop on the same domain MUST carry cookies set on hop 1.
+        const cookieHdr = headers.get("cookie") ?? "";
+        expect(cookieHdr).toContain("stsSession=hop1-sess");
+        expect(cookieHdr).toContain("serviceToken=valid-mijia-sts-token==");
+
+        // Clearing cookies (Max-Age=0, expired date, EXPIRED/deleted) must NOT overwrite valid serviceToken.
+        const resHeaders = new Headers();
+        resHeaders.append("Set-Cookie", "serviceToken=EXPIRED; Max-Age=0; Domain=.api.mijia.tech; Path=/");
+        resHeaders.append(
+          "Set-Cookie",
+          "serviceToken=stale; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Domain=.api.mijia.tech; Path=/",
+        );
+        resHeaders.append("Set-Cookie", "userId=123456789; Domain=.api.mijia.tech; Path=/");
+        return new Response("ok", { status: 200, headers: resHeaders });
+      }
+
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+
+    const client = new MijiaApiClient({ authDataPath: authPath, fetcher: mockFetcher });
+    const qrData = await client.getQrLoginData();
+    expect(qrData.refreshed).toBeUndefined();
+    expect(qrData.loginUrl).toBe("https://account.xiaomi.com/fe/service/login/qrcode?token=qr-abc");
+    expect(qrData.lp).toBe("https://lp.open.account.xiaomi.com/lp?id=poll-123");
+
+    // Verify Step 1 queried serviceLogin with sid=mijia and forwarded server-signed params.
+    expect(requests[0]!.url).toBe(
+      "https://account.xiaomi.com/pass/serviceLogin?_json=true&sid=mijia&_locale=zh_CN",
+    );
+    const qrUrl = new URL(requests[1]!.url);
+    expect(qrUrl.origin + qrUrl.pathname).toBe("https://account.xiaomi.com/longPolling/loginUrl");
+    expect(qrUrl.searchParams.get("_sign")).toBe("SERVER_SIGNED_VALUE==");
+    expect(qrUrl.searchParams.get("sid")).toBe("mijia");
+    expect(qrUrl.searchParams.get("callback")).toBe("https://sts.api.mijia.tech/mijia/sts");
+
+    await client.completeQrLogin(qrData);
+    expect(client.available).toBe(true);
+    expect(client.authData["serviceToken"]).toBe("valid-mijia-sts-token==");
+    expect(client.authData["ssecurity"]).toBe("c3NlY3VyaXR5S2V5MTIzNA==");
+    expect(client.authData["psecurity"]).toBe("cHNlY3VyaXR5S2V5");
+    expect(client.authData["passToken"]).toBe("body-pass-token");
+    expect(client.authData["cUserId"]).toBe("encrypted-uid-1");
+    expect(typeof client.authData["deviceId"]).toBe("string");
+    expect(typeof client.authData["pass_o"]).toBe("string");
+    expect(typeof client.authData["ua"]).toBe("string");
+    expect(typeof client.authData["expireTime"]).toBe("number");
+
+    // Auth file persisted cleanly on disk.
+    const saved = JSON.parse(readFileSync(authPath, "utf8")) as Record<string, unknown>;
+    expect(saved["serviceToken"]).toBe("valid-mijia-sts-token==");
+    expect(saved["userId"]).toBe(123456789);
+
+    // Confirm STS URL was requested verbatim without forged clientSign.
+    const stsUrls = requests.filter((r) => r.url.startsWith("https://sts.api.mijia.tech")).map((r) => r.url);
+    expect(stsUrls).toEqual([stsCallbackUrl, "https://sts.api.mijia.tech/mijia/sts/finish?ok=1"]);
+  });
+
+  test("completeQrLogin falls back to clientSign only when untouched STS URL yields no serviceToken and throws LoginError if both fail", async () => {
+    const authDir = makeTempDir("mijiadeck-qr-fallback-");
+    const authPath = path.join(authDir, "auth.json");
+    const legacyLocation = "https://sts.api.io.mi.com/sts?d=dev&ticket=legacy";
+    const visited: string[] = [];
+
+    const fallbackFetcher: FetchLike = async (input) => {
+      const url = String(input);
+      visited.push(url);
+      if (url === "https://lp.open.account.xiaomi.com/lp?id=legacy") {
+        return new Response(
+          `&&&START&&&${JSON.stringify({
+            code: 0,
+            userId: "998877",
+            cUserId: "c-998877",
+            ssecurity: "bGVnYWN5U3NlY3VyaXR5",
+            nonce: 424242,
+            location: legacyLocation,
+          })}`,
+          { status: 200 },
+        );
+      }
+      if (url === legacyLocation) {
+        return new Response("missing sign", { status: 401 });
+      }
+      if (url.startsWith(`${legacyLocation}&clientSign=`)) {
+        const resHeaders = new Headers();
+        resHeaders.append("Set-Cookie", "yetAnotherServiceToken=legacy-token-ok; Path=/");
+        return new Response("ok", { status: 200, headers: resHeaders });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+
+    const client = new MijiaApiClient({ authDataPath: authPath, fetcher: fallbackFetcher });
+    await client.completeQrLogin({
+      loginUrl: "https://example.invalid/qr",
+      lp: "https://lp.open.account.xiaomi.com/lp?id=legacy",
+    });
+    expect(client.authData["serviceToken"]).toBe("legacy-token-ok");
+    expect(visited.length).toBe(3);
+    expect(visited[1]).toBe(legacyLocation);
+    expect(visited[2]).toContain("clientSign=");
+
+    // When neither primary nor fallback returns a serviceToken, throw LoginError.
+    const failingClient = new MijiaApiClient({
+      authDataPath: path.join(authDir, "fail-auth.json"),
+      fetcher: async (input) => {
+        const url = String(input);
+        if (url.includes("/lp?")) {
+          return new Response(
+            `&&&START&&&${JSON.stringify({
+              code: 0,
+              userId: "1",
+              ssecurity: "YWJj",
+              nonce: 1,
+              location: "https://sts.api.mijia.tech/mijia/sts?ticket=bad",
+            })}`,
+            { status: 200 },
+          );
+        }
+        return new Response("ok", { status: 200 });
+      },
+    });
+    await expect(
+      failingClient.completeQrLogin({
+        loginUrl: "https://example.invalid/qr",
+        lp: "https://lp.open.account.xiaomi.com/lp?id=fail",
+      }),
+    ).rejects.toThrow(LoginError);
+  });
+
+  test("getQrLoginData silently refreshes credentials when serviceLogin returns code 0", async () => {
+    const authDir = makeTempDir("mijiadeck-qr-refresh-");
+    const authPath = path.join(authDir, "auth.json");
+    writeFileSync(
+      authPath,
+      JSON.stringify({
+        userId: "556677",
+        cUserId: "c-556677",
+        passToken: "valid-pass-token",
+        ssecurity: "b2xkU3NlYw==",
+        serviceToken: "expired-token",
+        expireTime: Date.now() - 10_000,
+      }),
+      "utf8",
+    );
+
+    const refreshFetcher: FetchLike = async (input) => {
+      const url = String(input);
+      if (url.startsWith("https://account.xiaomi.com/pass/serviceLogin")) {
+        return new Response(
+          `&&&START&&&${JSON.stringify({
+            code: 0,
+            userId: "556677",
+            cUserId: "c-556677",
+            ssecurity: "bmV3U3NlYw==",
+            nonce: 777,
+            location: "https://sts.api.mijia.tech/mijia/sts?ticket=silent",
+          })}`,
+          { status: 200 },
+        );
+      }
+      if (url === "https://sts.api.mijia.tech/mijia/sts?ticket=silent") {
+        const headers = new Headers();
+        headers.append("Set-Cookie", "serviceToken=fresh-silent-token; Domain=.api.mijia.tech; Path=/");
+        return new Response("ok", { status: 200, headers });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+
+    const client = new MijiaApiClient({ authDataPath: authPath, fetcher: refreshFetcher });
+    expect(client.available).toBe(false);
+
+    const result = await client.getQrLoginData();
+    expect(result.refreshed).toBe(true);
+    expect(client.available).toBe(true);
+    expect(client.authData["serviceToken"]).toBe("fresh-silent-token");
+    expect(client.authData["ssecurity"]).toBe("bmV3U3NlYw==");
   });
 });
