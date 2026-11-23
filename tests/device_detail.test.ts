@@ -13,10 +13,19 @@ import {
   classifyDeviceProps,
   coercePropWriteValue,
   deviceCategoryLabel,
+  encodeFeedPlan,
+  encodeSkippedPlans,
+  formatFeedDaysLabel,
   formatPropertyValue,
   friendlyLabel,
+  friendlyPropLabel,
   groupPropsByService,
+  isPetFeederDevice,
+  nextAvailableFeedPlanId,
+  parseFeedPlans,
+  parseSkippedPlans,
   percentageProgressFor,
+  skippedPlanIdsForDate,
 } from "../src/core/deviceDetailModel.ts";
 import { setDataPathOverrides } from "../src/core/jsonStore.ts";
 import { createDeviceInfo, createPropInfo, type DeviceInfo, type PropInfo } from "../src/core/models.ts";
@@ -281,6 +290,71 @@ describe("DeviceDetail Spec & Model", () => {
     expect(coercePropWriteValue(props[5]!, true)).toEqual({ ok: true, value: true });
     expect(coercePropWriteValue(props[5]!, "yes").ok).toBe(false);
   });
+
+  test("pet feeder plan codec decodes/encodes madv.feeder.fjpet2 schedules, skipped dates, and indicator-light labels", () => {
+    const rawLivePlan = "03017F08000701017F120507";
+    const parsed = parseFeedPlans(rawLivePlan);
+    expect(parsed).toEqual([
+      { id: 3, enabled: true, daysMask: 0x7f, hour: 8, minute: 0, portions: 7 },
+      { id: 1, enabled: true, daysMask: 0x7f, hour: 18, minute: 5, portions: 7 },
+    ]);
+    expect(encodeFeedPlan(parsed[0]!)).toBe("03017F080007");
+    expect(encodeFeedPlan(parsed[1]!)).toBe("01017F120507");
+    expect(nextAvailableFeedPlanId(parsed)).toBe(2);
+
+    expect(formatFeedDaysLabel(0x7f)).toBe("每天");
+    expect(formatFeedDaysLabel(0x1f)).toBe("工作日");
+    expect(formatFeedDaysLabel(0x60)).toBe("周末");
+    expect(formatFeedDaysLabel(0x05)).toBe("周一、周三");
+
+    const liveSkipped = parseSkippedPlans("1A0B0D");
+    expect(liveSkipped).toEqual({
+      year: 2026,
+      month: 11,
+      day: 13,
+      dateText: "2026-11-13",
+      skippedIds: [],
+    });
+    const withSkipped = parseSkippedPlans("1A0B0D0103");
+    expect(withSkipped?.skippedIds).toEqual([1, 3]);
+    expect(skippedPlanIdsForDate("1A0B0D0103", new Date(2026, 10, 13))).toEqual(new Set([1, 3]));
+    expect(skippedPlanIdsForDate("1A0B0D0103", new Date(2026, 10, 24))).toEqual(new Set());
+    expect(encodeSkippedPlans(new Date(2026, 10, 24), [3, 1, 3])).toBe("1A0B180103");
+
+    const feederDevice = createDeviceInfo({
+      did: "feeder-1",
+      name: "智能宠物喂食器",
+      model: "madv.feeder.fjpet2",
+      home_name: "家",
+      room_name: "客厅",
+      online: true,
+      spec_type: "urn:miot-spec-v2:device:pet-feeder:0000A06C:madv-fjpet2:1",
+    });
+    expect(isPetFeederDevice(feederDevice)).toBe(true);
+
+    const indicatorProp = createPropInfo({
+      name: "on",
+      desc: "Switch Status / 开关",
+      type: "bool",
+      readable: true,
+      writable: true,
+      siid: 3,
+      piid: 1,
+    });
+    expect(friendlyPropLabel(indicatorProp, feederDevice)).toBe("指示灯开关");
+
+    const feedPlanProp = createPropInfo({
+      name: "feed-plan",
+      desc: "全量喂食计划",
+      type: "string",
+      readable: true,
+      writable: false,
+      siid: 8,
+      piid: 8,
+    });
+    expect(formatPropertyValue(feedPlanProp, rawLivePlan)).toContain("2 条计划");
+    expect(formatPropertyValue(feedPlanProp, rawLivePlan)).toContain("08:00 7份");
+  });
 });
 
 describe("DeviceDetailController", () => {
@@ -466,6 +540,101 @@ describe("Device Detail HTTP API", () => {
     // 5. Unknown device returns 404
     const missingRes = await fetch(`${base}/api/devices/non-existent-did/detail`);
     expect(missingRes.status).toBe(404);
+  });
+
+  test("pet feeder detail API supports portion dispensing and visual schedule CRUD/skip/re-open", async () => {
+    const base = server!.url;
+
+    const detailRes = await fetch(`${base}/api/devices/demo-pet-feeder/detail`);
+    expect(detailRes.status).toBe(200);
+    const detail = (await detailRes.json()) as {
+      ok: boolean;
+      category: string;
+      supportsPower: boolean;
+      values: Record<string, unknown>;
+      actions: Array<{ name: string; in?: Array<{ name: string; range?: number[] | null }> }>;
+    };
+    expect(detail.ok).toBe(true);
+    expect(detail.category).toBe("宠物喂食器");
+    expect(detail.supportsPower).toBe(false);
+    expect(detail.values["feed-plan"]).toBe("03017F08000701017F120507");
+    const outAct = detail.actions.find((a) => a.name === "pet-food-out");
+    expect(outAct?.in?.[0]?.range).toEqual([1, 60, 1]);
+
+    // Immediate portion dispensing
+    const feedRes = await fetch(`${base}/api/devices/demo-pet-feeder/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "pet-food-out", params: [4] }),
+    });
+    expect(feedRes.status).toBe(200);
+    expect((server!.runtime.service as VirtualDemoService).lastDispensedPortions).toBe(4);
+
+    // Add a new feeding schedule via `update`
+    const newHex = encodeFeedPlan({
+      id: 2,
+      enabled: true,
+      daysMask: 0x1f,
+      hour: 12,
+      minute: 30,
+      portions: 3,
+    });
+    const addRes = await fetch(`${base}/api/devices/demo-pet-feeder/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "update", params: [newHex] }),
+    });
+    expect(addRes.status).toBe(200);
+    const addBody = (await addRes.json()) as { ok: boolean; values: Record<string, unknown> };
+    const afterAdd = parseFeedPlans(addBody.values["feed-plan"]);
+    expect(afterAdd.map((p) => p.id)).toEqual([3, 2, 1]);
+    expect(afterAdd[1]).toEqual({
+      id: 2,
+      enabled: true,
+      daysMask: 0x1f,
+      hour: 12,
+      minute: 30,
+      portions: 3,
+    });
+
+    // Skip and re-open plan #3 for today
+    const skipRes = await fetch(`${base}/api/devices/demo-pet-feeder/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "skip", params: [3] }),
+    });
+    expect(skipRes.status).toBe(200);
+    const skipBody = (await skipRes.json()) as { values: Record<string, unknown> };
+    expect(skippedPlanIdsForDate(skipBody.values["skiped-plan"])).toEqual(new Set([3]));
+
+    const reopenRes = await fetch(`${base}/api/devices/demo-pet-feeder/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "re-open", params: [3] }),
+    });
+    expect(reopenRes.status).toBe(200);
+    const reopenBody = (await reopenRes.json()) as { values: Record<string, unknown> };
+    expect(skippedPlanIdsForDate(reopenBody.values["skiped-plan"])).toEqual(new Set());
+
+    // Delete plan #2
+    const delRes = await fetch(`${base}/api/devices/demo-pet-feeder/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "del", params: [2] }),
+    });
+    expect(delRes.status).toBe(200);
+    const delBody = (await delRes.json()) as { values: Record<string, unknown> };
+    expect(parseFeedPlans(delBody.values["feed-plan"]).map((p) => p.id)).toEqual([3, 1]);
+
+    // Toggle plan-ctrl master switch
+    const toggleRes = await fetch(`${base}/api/devices/demo-pet-feeder/prop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "plan-ctrl", value: false }),
+    });
+    expect(toggleRes.status).toBe(200);
+    const toggleBody = (await toggleRes.json()) as { values: Record<string, unknown> };
+    expect(toggleBody.values["plan-ctrl"]).toBe(false);
   });
 
   test("GET /api/devices/:did/detail degrades cleanly for offline and spec-less devices", async () => {

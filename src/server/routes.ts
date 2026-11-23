@@ -986,7 +986,10 @@ export function createRequestHandler(
                 p.name === "fan-level" ||
                 p.name === "playing-state" ||
                 p.name === "temperature" ||
-                p.name === "relative-humidity")
+                p.name === "relative-humidity" ||
+                p.name === "feed-plan" ||
+                p.name === "skiped-plan" ||
+                p.name === "plan-ctrl")
             ) {
               toRead.add(p.name);
             }
@@ -1053,13 +1056,18 @@ export function createRequestHandler(
             actionLabel = matchedAct.desc;
           }
           const powerProp = findPowerProp(detail.props);
-          const readable = detail.props
-            .filter((p) => p.readable && !isSensitivePropertyName(p.name))
-            .map((p) => p.name);
-          if (readable.length > 0) {
+          const targetSiid = matchedAct?.siid;
+          const readableProps = detail.props.filter(
+            (p) => p.readable && !isSensitivePropertyName(p.name),
+          );
+          const prioritized = [
+            ...readableProps.filter((p) => targetSiid !== undefined && p.siid === targetSiid),
+            ...readableProps.filter((p) => targetSiid === undefined || p.siid !== targetSiid),
+          ].map((p) => p.name);
+          if (prioritized.length > 0) {
             values = await runInJobs(
               runtime.jobs,
-              () => runtime.service.readProps(did, readable.slice(0, 15)),
+              () => runtime.service.readProps(did, prioritized.slice(0, 30)),
               2,
             );
           }

@@ -432,6 +432,9 @@ function deviceIconSvg(model: string): string {
   if (m.includes("curtain")) {
     return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18M5 5v14M19 5v14M9 5c0 4-1.5 7-4 9M15 5c0 4 1.5 7 4 9"></path></svg>`;
   }
+  if (m.includes("feeder")) {
+    return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h12l-1 10H7L6 3z"></path><path d="M4 17a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3v2a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-2z"></path><path d="M9.5 17.5h5"></path></svg>`;
+  }
   if (m.includes("camera")) {
     return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"></path><rect x="1" y="5" width="15" height="14" rx="2.5"></rect></svg>`;
   }

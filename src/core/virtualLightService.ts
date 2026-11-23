@@ -14,6 +14,12 @@ import { CameraSource, generateX25519KeyPair } from "./cameraAccess.ts";
 import { CameraPreviewError } from "./cameraPreview.ts";
 import type { IMijiaService, ProgressCallback, QrLoginData } from "./contracts.ts";
 import { prepareDeviceCards, supportsCardPower } from "./deviceControls.ts";
+import {
+  encodeFeedPlan,
+  encodeSkippedPlans,
+  parseFeedPlans,
+  skippedPlanIdsForDate,
+} from "./deviceDetailModel.ts";
 import { buildReport, safeObservation } from "./diagnostics.ts";
 import {
   createDeviceInfo,
@@ -341,6 +347,7 @@ export class VirtualDemoService implements IMijiaService {
   private readonly _observations = new Map<string, Record<string, unknown>>();
   private _controlBlockReason = "";
   lastDirective = "";
+  lastDispensedPortions: number | null = null;
 
   constructor() {
     const livingLight = createDeviceInfo({
@@ -452,6 +459,18 @@ export class VirtualDemoService implements IMijiaService {
       firmware: "1.0.72",
     });
 
+    const petFeeder = createDeviceInfo({
+      did: "demo-pet-feeder",
+      name: "智能宠物喂食器",
+      model: "madv.feeder.fjpet2",
+      home_name: DEMO_HOME_NAME,
+      room_name: "客厅",
+      online: true,
+      spec_type: "urn:miot-spec-v2:device:pet-feeder:0000A06C:madv-fjpet2:1",
+      metric_features: [],
+      firmware: "1.0.8_0021",
+    });
+
     const allDevices = [
       livingLight,
       switchParent,
@@ -462,6 +481,7 @@ export class VirtualDemoService implements IMijiaService {
       speaker,
       camera,
       router,
+      petFeeder,
     ];
     prepareDeviceCards(allDevices);
 
@@ -968,6 +988,276 @@ export class VirtualDemoService implements IMijiaService {
       },
     });
 
+    this._entries.set(petFeeder.did, {
+      device: petFeeder,
+      props: [
+        createPropInfo({
+          name: "fault",
+          desc: "Device Fault / 故障",
+          type: "uint",
+          readable: true,
+          writable: false,
+          value_list: [
+            { value: 0, description: "No Faults", desc_zh_cn: "无故障" },
+            { value: 1, description: "Stock", desc_zh_cn: "卡粮" },
+          ],
+          siid: 2,
+          piid: 1,
+          service: "pet-feeder",
+          service_desc: "宠物喂食",
+        }),
+        createPropInfo({
+          name: "status",
+          desc: "Status / 工作状态",
+          type: "uint",
+          readable: true,
+          writable: false,
+          value_list: [
+            { value: 0, description: "Power", desc_zh_cn: "电源供电" },
+            { value: 1, description: "Battery", desc_zh_cn: "电池供电" },
+          ],
+          siid: 2,
+          piid: 3,
+          service: "pet-feeder",
+          service_desc: "宠物喂食",
+        }),
+        createPropInfo({
+          name: "mode",
+          desc: "Mode / 模式",
+          type: "uint",
+          readable: true,
+          writable: true,
+          value_list: [
+            { value: 0, description: "Normal", desc_zh_cn: "正常出粮" },
+            { value: 1, description: "Slow", desc_zh_cn: "慢速" },
+          ],
+          siid: 2,
+          piid: 4,
+          service: "pet-feeder",
+          service_desc: "宠物喂食",
+        }),
+        createPropInfo({
+          name: "feeding-measure",
+          desc: "Feeding Measure / 出粮量",
+          type: "uint",
+          readable: false,
+          writable: false,
+          range: [1, 60, 1],
+          siid: 2,
+          piid: 5,
+          service: "pet-feeder",
+          service_desc: "宠物喂食",
+        }),
+        createPropInfo({
+          name: "pet-food-left-level",
+          desc: "Pet Food Left Level / 宠物粮剩余量",
+          type: "uint",
+          readable: true,
+          writable: false,
+          value_list: [
+            { value: 1, description: "Normal", desc_zh_cn: "正常" },
+            { value: 2, description: "Empty", desc_zh_cn: "缺粮" },
+          ],
+          siid: 2,
+          piid: 6,
+          service: "pet-feeder",
+          service_desc: "宠物喂食",
+        }),
+        createPropInfo({
+          name: "on",
+          desc: "Switch Status / 开关",
+          type: "bool",
+          readable: true,
+          writable: true,
+          siid: 3,
+          piid: 1,
+          service: "indicator-light",
+          service_desc: "指示灯",
+        }),
+        createPropInfo({
+          name: "physical-controls-locked",
+          desc: "Physical Control Locked / 童锁",
+          type: "bool",
+          readable: true,
+          writable: true,
+          siid: 5,
+          piid: 1,
+          service: "physical-controls-locked",
+          service_desc: "物理童锁",
+        }),
+        createPropInfo({
+          name: "battery-level",
+          desc: "Battery Level / 电池电量",
+          type: "uint",
+          readable: true,
+          writable: false,
+          unit: "percentage",
+          range: [0, 100, 1],
+          siid: 7,
+          piid: 1,
+          service: "battery",
+          service_desc: "电池电源",
+        }),
+        createPropInfo({
+          name: "desiccant-left-level",
+          desc: "Desiccant Left Level / 干燥剂剩余量",
+          type: "uint",
+          readable: true,
+          writable: false,
+          unit: "percentage",
+          range: [0, 100, 1],
+          siid: 9,
+          piid: 1,
+          service: "desiccant",
+          service_desc: "干燥剂",
+        }),
+        createPropInfo({
+          name: "plan-ctrl",
+          desc: "plan-ctrl / 开启关闭整个喂食计划",
+          type: "bool",
+          readable: true,
+          writable: true,
+          siid: 8,
+          piid: 2,
+          service: "feed-plan",
+          service_desc: "喂食计划",
+        }),
+        createPropInfo({
+          name: "edit-plan",
+          desc: "edit-plan / 添加/编辑喂食计划",
+          type: "string",
+          readable: false,
+          writable: false,
+          siid: 8,
+          piid: 6,
+          service: "feed-plan",
+          service_desc: "喂食计划",
+        }),
+        createPropInfo({
+          name: "del-plan",
+          desc: "del-plan / 删除喂食计划",
+          type: "uint",
+          readable: false,
+          writable: false,
+          range: [1, 255, 1],
+          siid: 8,
+          piid: 7,
+          service: "feed-plan",
+          service_desc: "喂食计划",
+        }),
+        createPropInfo({
+          name: "feed-plan",
+          desc: "全量喂食计划",
+          type: "string",
+          readable: true,
+          writable: false,
+          siid: 8,
+          piid: 8,
+          service: "feed-plan",
+          service_desc: "喂食计划",
+        }),
+        createPropInfo({
+          name: "skiped-plan",
+          desc: "跳过的计划id列表",
+          type: "string",
+          readable: true,
+          writable: false,
+          siid: 8,
+          piid: 9,
+          service: "feed-plan",
+          service_desc: "喂食计划",
+        }),
+        createPropInfo({
+          name: "skip-plan",
+          desc: "skip-plan / 要跳过或重新启用的计划id",
+          type: "uint",
+          readable: false,
+          writable: false,
+          range: [1, 255, 1],
+          siid: 8,
+          piid: 10,
+          service: "feed-plan",
+          service_desc: "喂食计划",
+        }),
+      ],
+      actions: [
+        {
+          name: "pet-food-out",
+          desc: "Pet Food Out / 喂食机出粮，远程加餐",
+          siid: 2,
+          aiid: 1,
+          service: "pet-feeder",
+          service_desc: "宠物喂食",
+          in: [{ piid: 5, name: "feeding-measure", desc: "出粮份数", type: "uint", range: [1, 60, 1] }],
+        },
+        {
+          name: "weigh-manual-calibrate",
+          desc: "Weigh Manual Calibrate / 称重手动校准",
+          siid: 2,
+          aiid: 2,
+          service: "pet-feeder",
+          service_desc: "宠物喂食",
+        },
+        {
+          name: "reset-desiccant-life",
+          desc: "Reset Desiccant Life / 重置干燥剂",
+          siid: 9,
+          aiid: 1,
+          service: "desiccant",
+          service_desc: "干燥剂",
+        },
+        {
+          name: "update",
+          desc: "update / 更新计划",
+          siid: 8,
+          aiid: 2,
+          service: "feed-plan",
+          service_desc: "喂食计划",
+          in: [{ piid: 6, name: "edit-plan", desc: "添加/编辑喂食计划", type: "string" }],
+        },
+        {
+          name: "del",
+          desc: "del / 删除喂食计划",
+          siid: 8,
+          aiid: 3,
+          service: "feed-plan",
+          service_desc: "喂食计划",
+          in: [{ piid: 7, name: "del-plan", desc: "删除喂食计划", type: "uint", range: [1, 255, 1] }],
+        },
+        {
+          name: "skip",
+          desc: "skip / 跳过今日计划",
+          siid: 8,
+          aiid: 4,
+          service: "feed-plan",
+          service_desc: "喂食计划",
+          in: [{ piid: 10, name: "skip-plan", desc: "计划编号", type: "uint", range: [1, 255, 1] }],
+        },
+        {
+          name: "re-open",
+          desc: "re-open / 恢复今日计划",
+          siid: 8,
+          aiid: 5,
+          service: "feed-plan",
+          service_desc: "喂食计划",
+          in: [{ piid: 10, name: "skip-plan", desc: "计划编号", type: "uint", range: [1, 255, 1] }],
+        },
+      ],
+      values: {
+        fault: 0,
+        status: 0,
+        mode: 0,
+        "pet-food-left-level": 1,
+        on: true,
+        "physical-controls-locked": false,
+        "battery-level": 88,
+        "desiccant-left-level": 76,
+        "plan-ctrl": true,
+        "feed-plan": "03017F08000701017F120507",
+        "skiped-plan": "1A0B0D",
+      },
+    });
+
     this._scenes = [
       createSceneInfo({
         scene_id: "demo-scene-home",
@@ -1137,6 +1427,61 @@ export class VirtualDemoService implements IMijiaService {
     }
     if (action.name === "delay-off" && "delay-off-countdown" in entry.values) {
       entry.values["delay-off-countdown"] = 15;
+      return;
+    }
+    if (action.name === "pet-food-out") {
+      const rawPortion = Array.isArray(params) ? params[0] : params;
+      const portion = Number(rawPortion);
+      if (!Number.isFinite(portion) || portion < 1 || portion > 60) {
+        throw new ServiceError("出粮份数需在 1–60 份之间");
+      }
+      this.lastDispensedPortions = Math.round(portion);
+      return;
+    }
+    if (action.name === "reset-desiccant-life" && "desiccant-left-level" in entry.values) {
+      entry.values["desiccant-left-level"] = 100;
+      return;
+    }
+    if (action.name === "update" && "feed-plan" in entry.values) {
+      const rawHex = Array.isArray(params) ? params[0] : params;
+      const parsed = parseFeedPlans(rawHex);
+      if (parsed.length !== 1) {
+        throw new ServiceError("喂食计划参数格式无效");
+      }
+      const nextItem = parsed[0]!;
+      const existing = parseFeedPlans(entry.values["feed-plan"]).filter((p) => p.id !== nextItem.id);
+      existing.push(nextItem);
+      entry.values["feed-plan"] = existing.map((p) => encodeFeedPlan(p)).join("");
+      return;
+    }
+    if (action.name === "del" && "feed-plan" in entry.values) {
+      const rawId = Array.isArray(params) ? params[0] : params;
+      const id = Math.round(Number(rawId));
+      if (!Number.isFinite(id) || id < 1 || id > 255) {
+        throw new ServiceError("无效的计划编号");
+      }
+      const remaining = parseFeedPlans(entry.values["feed-plan"]).filter((p) => p.id !== id);
+      entry.values["feed-plan"] = remaining.map((p) => encodeFeedPlan(p)).join("");
+      const skipped = skippedPlanIdsForDate(entry.values["skiped-plan"]);
+      if (skipped.delete(id)) {
+        entry.values["skiped-plan"] = encodeSkippedPlans(new Date(), [...skipped]);
+      }
+      return;
+    }
+    if ((action.name === "skip" || action.name === "re-open") && "skiped-plan" in entry.values) {
+      const rawId = Array.isArray(params) ? params[0] : params;
+      const id = Math.round(Number(rawId));
+      if (!Number.isFinite(id) || id < 1 || id > 255) {
+        throw new ServiceError("无效的计划编号");
+      }
+      const now = new Date();
+      const skipped = skippedPlanIdsForDate(entry.values["skiped-plan"], now);
+      if (action.name === "skip") {
+        skipped.add(id);
+      } else {
+        skipped.delete(id);
+      }
+      entry.values["skiped-plan"] = encodeSkippedPlans(now, [...skipped]);
       return;
     }
     if ((action.name === "toggle" || action.name.startsWith("toggle-")) && entry.powerProp) {

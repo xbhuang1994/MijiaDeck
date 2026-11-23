@@ -740,6 +740,55 @@ export class MijiaService implements IMijiaService {
     return [];
   }
 
+  private static _inferLegacyService(
+    name: string,
+    siid: number,
+    model: string,
+  ): string | undefined {
+    const base = name.replace(/-\d+$/, "");
+    if (
+      base === "plan-ctrl" ||
+      base === "feed-plan" ||
+      base === "skiped-plan" ||
+      base === "edit-plan" ||
+      base === "del-plan" ||
+      base === "skip-plan" ||
+      base === "update" ||
+      base === "del" ||
+      base === "skip" ||
+      base === "re-open"
+    ) {
+      return "feed-plan";
+    }
+    if (base === "physical-controls-locked") {
+      return "physical-controls-locked";
+    }
+    if (base === "battery-level") {
+      return "battery";
+    }
+    if (base === "desiccant-left-level" || base === "desiccant-left-time" || base === "reset-desiccant-life") {
+      return "desiccant";
+    }
+    if (
+      base === "pet-food-left-level" ||
+      base === "feeding-measure" ||
+      base === "feeding-type" ||
+      base === "pet-food-out" ||
+      base === "weigh-manual-calibrate"
+    ) {
+      return "pet-feeder";
+    }
+    if (model.toLowerCase().includes(".feeder.")) {
+      if (base === "on" && siid === 3) {
+        return "indicator-light";
+      }
+      if (siid === 2) {
+        return "pet-feeder";
+      }
+    }
+    return undefined;
+  }
+
   async deviceDetail(did: string): Promise<DeviceDetail> {
     const dev = await this._getDevice(did);
     const seen = new Set<DevProp>();
@@ -756,8 +805,10 @@ export class MijiaService implements IMijiaService {
       list.push(prop);
       propsBySiid.set(prop.method.siid, list);
 
-      const serviceDesc = prop.service || prop.serviceDesc
-        ? specZh.serviceDescZh(prop.service, prop.serviceDesc)
+      const resolvedService =
+        prop.service || MijiaService._inferLegacyService(prop.name, prop.method.siid, dev.model);
+      const serviceDesc = resolvedService || prop.serviceDesc
+        ? specZh.serviceDescZh(resolvedService ?? "", prop.serviceDesc)
         : undefined;
 
       props.push(
@@ -774,7 +825,7 @@ export class MijiaService implements IMijiaService {
           unit: prop.unit,
           siid: prop.method.siid,
           piid: prop.method.piid,
-          ...(prop.service ? { service: prop.service } : {}),
+          ...(resolvedService ? { service: resolvedService } : {}),
           ...(serviceDesc ? { service_desc: serviceDesc } : {}),
         }),
       );
@@ -787,15 +838,17 @@ export class MijiaService implements IMijiaService {
         propBySiidPiid,
         propsBySiid,
       );
-      const serviceDesc = a.service || a.serviceDesc
-        ? specZh.serviceDescZh(a.service, a.serviceDesc)
+      const resolvedService =
+        a.service || MijiaService._inferLegacyService(a.name, a.method.siid, dev.model);
+      const serviceDesc = resolvedService || a.serviceDesc
+        ? specZh.serviceDescZh(resolvedService ?? "", a.serviceDesc)
         : undefined;
       return {
         name: a.name,
         desc: a.desc || a.name,
         siid: a.method.siid,
         aiid: a.method.aiid,
-        ...(a.service ? { service: a.service } : {}),
+        ...(resolvedService ? { service: resolvedService } : {}),
         ...(serviceDesc ? { service_desc: serviceDesc } : {}),
         ...(inParams.length > 0 ? { in: inParams } : {}),
       };

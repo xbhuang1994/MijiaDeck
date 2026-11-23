@@ -7,17 +7,27 @@
  */
 
 import {
+  FEED_WEEKDAYS,
   actionRequiresConfirmation,
   choosePropertyWidget,
   classifyDeviceProps,
   deviceCategoryLabel,
+  encodeFeedPlan,
+  formatFeedDaysLabel,
+  formatFeedTime,
   formatPropertyValue,
   friendlyLabel,
+  friendlyPropLabel,
   groupPropsByService,
+  isPetFeederDevice,
+  nextAvailableFeedPlanId,
+  parseFeedPlans,
   percentageProgressFor,
   resolveEnumLabel,
+  skippedPlanIdsForDate,
   type ClassifiedDeviceProps,
   type DeviceChannelState,
+  type FeedPlanItem,
   type LightPropKind,
 } from "../core/deviceDetailModel.ts";
 import type { ActionInfo, ActionParamInfo, DeviceInfo, PropInfo } from "../core/models.ts";
@@ -123,7 +133,12 @@ function defaultActionParamValue(param: ActionParamInfo): unknown {
   return "";
 }
 
-function semanticToneForTelemetry(prop: PropInfo, rawValue: unknown, formatted: string): "normal" | "good" | "warn" | "danger" {
+function semanticToneForTelemetry(
+  prop: PropInfo,
+  rawValue: unknown,
+  formatted: string,
+  allValues?: Record<string, unknown>,
+): "normal" | "good" | "warn" | "danger" {
   const name = prop.name.toLowerCase();
   if (name === "fault" || name.endsWith("-fault")) {
     if (typeof rawValue === "number" && rawValue !== 0) {
@@ -144,10 +159,23 @@ function semanticToneForTelemetry(prop: PropInfo, rawValue: unknown, formatted: 
     if (formatted.includes("正常") || rawValue === 1) return "good";
   }
   if (name.includes("battery") || name.includes("life-level") || name.includes("left-level")) {
+    if (name.includes("battery") && rawValue === 0 && allValues?.["status"] === 0) {
+      return "normal";
+    }
     if (typeof rawValue === "number" && rawValue <= 15) return "danger";
     if (typeof rawValue === "number" && rawValue <= 30) return "warn";
   }
   return "normal";
+}
+
+interface FeederPlanEditorState {
+  mode: "add" | "edit";
+  id: number;
+  enabled: boolean;
+  hour: number;
+  minute: number;
+  daysMask: number;
+  portions: number;
 }
 
 export class DeviceDetailModalController {
@@ -170,6 +198,9 @@ export class DeviceDetailModalController {
   private actionDrafts = new Map<string, Record<string, unknown>>();
   private speakerVoiceText = "";
   private speakerVoiceMode: "directive" | "tts" = "directive";
+  private feederPortions = 2;
+  private feederEditor: FeederPlanEditorState | null = null;
+  private pendingDeletePlan: { id: number; timer: number } | null = null;
   private propsSearchQuery = "";
   private showAdvancedProps = false;
   private parentBackDevice: DeviceInfo | null = null;
@@ -191,6 +222,9 @@ export class DeviceDetailModalController {
     this.showAdvancedProps = false;
     this.actionDrafts.clear();
     this.speakerVoiceText = "";
+    this.feederPortions = 2;
+    this.feederEditor = null;
+    this.clearPendingDeletePlan();
     this.generation += 1;
     const gen = this.generation;
 
@@ -224,7 +258,9 @@ export class DeviceDetailModalController {
     this.busyActions.clear();
     this.busyChannels.clear();
     this.draggingProps.clear();
+    this.feederEditor = null;
     this.clearPendingConfirm();
+    this.clearPendingDeletePlan();
     this.stopPolling();
   }
 
@@ -298,6 +334,13 @@ export class DeviceDetailModalController {
     }
   }
 
+  private clearPendingDeletePlan(): void {
+    if (this.pendingDeletePlan) {
+      window.clearTimeout(this.pendingDeletePlan.timer);
+      this.pendingDeletePlan = null;
+    }
+  }
+
   private startPolling(): void {
     this.stopPolling();
     if (!this.device?.online) return;
@@ -305,6 +348,7 @@ export class DeviceDetailModalController {
       if (!this.device || !this.device.online) return;
       if (this.loading || this.refreshing || this.busyPower) return;
       if (this.busyProps.size > 0 || this.busyActions.size > 0 || this.draggingProps.size > 0) return;
+      if (this.feederEditor !== null) return;
       if (this.isUserTypingInModal()) return;
       void this.fetchDetail(this.device.did, this.generation, false, false);
     }, 3500);
@@ -558,6 +602,9 @@ export class DeviceDetailModalController {
       container.appendChild(bar);
     }
 
+    const heroConsumedActions = new Set<string>();
+    const heroConsumedProps = new Set<string>();
+
     // 1. Split Switch Panel Hero
     if (data.isSplitParent && data.channels.length > 0) {
       container.appendChild(this.buildSwitchPanelHero(data));
@@ -570,30 +617,44 @@ export class DeviceDetailModalController {
       renderedAnything = true;
     }
 
-    // 3. Speaker Media & Voice Hero
-    const speakerHeroActionNames = new Set<string>();
+    // 3. Pet Feeder Dispensing & Schedule Workbench Hero
+    if (isPetFeederDevice(data.device, data.props, data.actions)) {
+      const feederSections = this.buildPetFeederSections(
+        data,
+        heroConsumedProps,
+        heroConsumedActions,
+      );
+      for (const sec of feederSections) {
+        container.appendChild(sec);
+        renderedAnything = true;
+      }
+    }
+
+    // 4. Speaker Media & Voice Hero
     if (this.host.isSpeaker(data.device)) {
-      const hero = this.buildSpeakerHero(data, speakerHeroActionNames);
+      const hero = this.buildSpeakerHero(data, heroConsumedActions);
       if (hero) {
         container.appendChild(hero);
         renderedAnything = true;
       }
     }
 
-    // 4. Live Telemetry / Read-Only Status Grid
-    if (classified.telemetry.length > 0) {
-      container.appendChild(this.buildTelemetrySection(data, classified.telemetry));
+    // 5. Live Telemetry / Read-Only Status Grid
+    const remainingTelemetry = classified.telemetry.filter((p) => !heroConsumedProps.has(p.name));
+    if (remainingTelemetry.length > 0) {
+      container.appendChild(this.buildTelemetrySection(data, remainingTelemetry));
       renderedAnything = true;
     }
 
-    // 5. Writable Controls Grouped by Service
-    if (classified.controls.length > 0) {
-      container.appendChild(this.buildControlsSection(data, classified.controls));
+    // 6. Writable Controls Grouped by Service
+    const remainingControls = classified.controls.filter((p) => !heroConsumedProps.has(p.name));
+    if (remainingControls.length > 0) {
+      container.appendChild(this.buildControlsSection(data, remainingControls));
       renderedAnything = true;
     }
 
-    // 6. Executable Actions (excluding transport buttons already shown in Speaker Hero)
-    const remainingActions = data.actions.filter((a) => !speakerHeroActionNames.has(a.name));
+    // 7. Executable Actions (excluding actions already rendered inside Hero workbenches)
+    const remainingActions = data.actions.filter((a) => !heroConsumedActions.has(a.name));
     if (remainingActions.length > 0) {
       container.appendChild(this.buildActionsSection(data, remainingActions));
       renderedAnything = true;
@@ -1001,6 +1062,707 @@ export class DeviceDetailModalController {
     return section;
   }
 
+  private buildPetFeederSections(
+    data: DeviceDetailApiResponse,
+    consumedProps: Set<string>,
+    consumedActions: Set<string>,
+  ): HTMLElement[] {
+    const sections: HTMLElement[] = [];
+    const dispenseAction = data.actions.find(
+      (a) => a.name === "pet-food-out" || a.name.startsWith("pet-food-out-"),
+    );
+    const measureProp = data.props.find(
+      (p) => p.name === "feeding-measure" || p.name.startsWith("feeding-measure-"),
+    );
+    const range = dispenseAction?.in?.[0]?.range ?? measureProp?.range ?? [1, 60, 1];
+    const minPortions = Math.max(1, Math.round(range[0] ?? 1));
+    const maxPortions = Math.max(minPortions, Math.round(range[1] ?? 60));
+    const step = range.length >= 3 && range[2] && range[2] > 0 ? Math.round(range[2]) : 1;
+
+    this.feederPortions = Math.max(minPortions, Math.min(maxPortions, Math.round(this.feederPortions)));
+
+    // Section A: Immediate remote dispensing with portion stepper & quick chips
+    if (dispenseAction) {
+      consumedActions.add(dispenseAction.name);
+      if (measureProp?.writable) {
+        consumedProps.add(measureProp.name);
+      }
+
+      const foodLevelProp = data.props.find((p) => p.name === "pet-food-left-level");
+      const modeProp = data.props.find((p) => p.name === "mode");
+      const hintParts: string[] = [];
+      if (!data.online) {
+        hintParts.push("设备离线");
+      } else {
+        if (foodLevelProp && data.values[foodLevelProp.name] !== undefined) {
+          hintParts.push(`余粮${formatPropertyValue(foodLevelProp, data.values[foodLevelProp.name])}`);
+        }
+        if (modeProp && data.values[modeProp.name] !== undefined) {
+          hintParts.push(formatPropertyValue(modeProp, data.values[modeProp.name]));
+        }
+        if (hintParts.length === 0) {
+          hintParts.push(`可调 ${minPortions}–${maxPortions} 份`);
+        }
+      }
+
+      const sec = this.createSection("远程出粮", hintParts.join(" · "));
+      const card = document.createElement("div");
+      card.className = "dd-feeder-card";
+
+      const mainRow = document.createElement("div");
+      mainRow.className = "dd-feeder-dispense-row";
+
+      const left = document.createElement("div");
+      left.className = "dd-feeder-portion-block";
+      const lbl = document.createElement("div");
+      lbl.className = "dd-feeder-portion-label";
+      lbl.textContent = `出粮份数（${minPortions}–${maxPortions} 份）`;
+
+      const busy = this.busyActions.has(dispenseAction.name);
+      const disabled = !data.online || busy || data.isSplitParent;
+
+      const stepper = document.createElement("div");
+      stepper.className = "dd-stepper";
+
+      const decBtn = document.createElement("button");
+      decBtn.type = "button";
+      decBtn.className = "dd-stepper-btn";
+      decBtn.textContent = "−";
+      decBtn.setAttribute("aria-label", "减少出粮份数");
+      decBtn.disabled = disabled || this.feederPortions <= minPortions;
+
+      const numInput = document.createElement("input");
+      numInput.type = "number";
+      numInput.className = "dd-stepper-input";
+      numInput.min = String(minPortions);
+      numInput.max = String(maxPortions);
+      numInput.step = String(step);
+      numInput.value = String(this.feederPortions);
+      numInput.disabled = disabled;
+      numInput.setAttribute("aria-label", "出粮份数");
+
+      const unitSpan = document.createElement("span");
+      unitSpan.className = "dd-stepper-unit";
+      unitSpan.textContent = "份";
+
+      const incBtn = document.createElement("button");
+      incBtn.type = "button";
+      incBtn.className = "dd-stepper-btn";
+      incBtn.textContent = "+";
+      incBtn.setAttribute("aria-label", "增加出粮份数");
+      incBtn.disabled = disabled || this.feederPortions >= maxPortions;
+
+      const syncStepper = (next: number) => {
+        const clamped = Math.max(minPortions, Math.min(maxPortions, Math.round(next)));
+        this.feederPortions = clamped;
+        numInput.value = String(clamped);
+        decBtn.disabled = disabled || clamped <= minPortions;
+        incBtn.disabled = disabled || clamped >= maxPortions;
+        card.querySelectorAll<HTMLButtonElement>("[data-portion-chip]").forEach((chip) => {
+          chip.classList.toggle("active", Number(chip.dataset.portionChip) === clamped);
+        });
+      };
+
+      decBtn.addEventListener("click", () => syncStepper(this.feederPortions - step));
+      incBtn.addEventListener("click", () => syncStepper(this.feederPortions + step));
+      numInput.addEventListener("input", () => {
+        const parsed = Number(numInput.value);
+        if (Number.isFinite(parsed) && parsed >= minPortions && parsed <= maxPortions) {
+          this.feederPortions = Math.round(parsed);
+          decBtn.disabled = disabled || this.feederPortions <= minPortions;
+          incBtn.disabled = disabled || this.feederPortions >= maxPortions;
+          card.querySelectorAll<HTMLButtonElement>("[data-portion-chip]").forEach((chip) => {
+            chip.classList.toggle("active", Number(chip.dataset.portionChip) === this.feederPortions);
+          });
+        }
+      });
+      numInput.addEventListener("blur", () => {
+        const parsed = Number(numInput.value);
+        syncStepper(Number.isFinite(parsed) ? parsed : this.feederPortions);
+      });
+
+      stepper.append(decBtn, numInput, unitSpan, incBtn);
+      left.append(lbl, stepper);
+
+      const feedBtn = document.createElement("button");
+      feedBtn.type = "button";
+      feedBtn.className = "primary-button dd-feeder-dispense-btn";
+      feedBtn.disabled = disabled;
+      feedBtn.textContent = busy ? "出粮中…" : "立即出粮";
+      feedBtn.addEventListener("click", () => {
+        const parsed = Number(numInput.value);
+        const portions = Number.isFinite(parsed)
+          ? Math.max(minPortions, Math.min(maxPortions, Math.round(parsed)))
+          : this.feederPortions;
+        this.feederPortions = portions;
+        void this.dispensePetFood(dispenseAction, measureProp, portions);
+      });
+
+      mainRow.append(left, feedBtn);
+      card.appendChild(mainRow);
+
+      // Quick portion preset chips
+      const chipCandidates = [1, 2, 3, 5, 7, 10, 15, 20].filter(
+        (n) => n >= minPortions && n <= maxPortions,
+      );
+      const chips = chipCandidates.slice(0, 6);
+      if (chips.length > 0) {
+        const chipRow = document.createElement("div");
+        chipRow.className = "dd-preset-row";
+        for (const count of chips) {
+          const chip = document.createElement("button");
+          chip.type = "button";
+          chip.className = `dd-preset-chip${this.feederPortions === count ? " active" : ""}`;
+          chip.dataset.portionChip = String(count);
+          chip.textContent = `${count} 份`;
+          chip.disabled = disabled;
+          chip.addEventListener("click", () => syncStepper(count));
+          chipRow.appendChild(chip);
+        }
+        card.appendChild(chipRow);
+      }
+
+      sec.appendChild(card);
+      sections.push(sec);
+    }
+
+    // Section B: Visual Feeding Schedule Manager (madv-spec:service:feed-plan)
+    const feedPlanProp = data.props.find((p) => p.name === "feed-plan");
+    const skippedPlanProp = data.props.find((p) => p.name === "skiped-plan");
+    const planCtrlProp = data.props.find((p) => p.name === "plan-ctrl");
+    const updateAction = data.actions.find((a) => a.name === "update");
+    const delAction = data.actions.find((a) => a.name === "del");
+    const skipAction = data.actions.find((a) => a.name === "skip");
+    const reopenAction = data.actions.find((a) => a.name === "re-open");
+
+    if (feedPlanProp || planCtrlProp || updateAction) {
+      if (feedPlanProp) consumedProps.add(feedPlanProp.name);
+      if (skippedPlanProp) consumedProps.add(skippedPlanProp.name);
+      if (planCtrlProp) consumedProps.add(planCtrlProp.name);
+      if (updateAction) consumedActions.add(updateAction.name);
+      if (delAction) consumedActions.add(delAction.name);
+      if (skipAction) consumedActions.add(skipAction.name);
+      if (reopenAction) consumedActions.add(reopenAction.name);
+
+      const plans = parseFeedPlans(feedPlanProp ? data.values[feedPlanProp.name] : "");
+      const skippedToday = skippedPlanIdsForDate(
+        skippedPlanProp ? data.values[skippedPlanProp.name] : "",
+      );
+      const planMasterOn = planCtrlProp ? Boolean(data.values[planCtrlProp.name]) : true;
+      const enabledDailyPortions = plans
+        .filter((p) => p.enabled && !skippedToday.has(p.id))
+        .reduce((sum, p) => sum + p.portions, 0);
+
+      const sec = document.createElement("section");
+      sec.className = "dd-section";
+
+      const head = document.createElement("div");
+      head.className = "dd-section-head dd-feeder-plan-head";
+      const titleGroup = document.createElement("div");
+      titleGroup.className = "dd-feeder-plan-title-group";
+      const h3 = document.createElement("h3");
+      h3.className = "dd-section-title";
+      h3.textContent = "定时喂食计划";
+      const sub = document.createElement("span");
+      sub.className = "dd-section-hint";
+      sub.textContent =
+        plans.length > 0
+          ? `${plans.length} 条计划 · 今日预计 ${planMasterOn ? enabledDailyPortions : 0} 份`
+          : "暂无定时计划";
+      titleGroup.append(h3, sub);
+
+      const headActions = document.createElement("div");
+      headActions.className = "dd-feeder-plan-head-actions";
+
+      if (planCtrlProp) {
+        const masterWrap = document.createElement("label");
+        masterWrap.className = "dd-feeder-master-toggle";
+        const masterTxt = document.createElement("span");
+        masterTxt.textContent = "总开关";
+        const sw = document.createElement("label");
+        sw.className = "md-switch";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = planMasterOn;
+        cb.disabled = !data.online || this.busyProps.has(planCtrlProp.name) || data.isSplitParent;
+        cb.setAttribute("aria-label", "定时喂食计划总开关");
+        cb.addEventListener("change", () => {
+          void this.writeProp(planCtrlProp.name, cb.checked);
+        });
+        const tr = document.createElement("span");
+        tr.className = "md-switch-track";
+        sw.append(cb, tr);
+        masterWrap.append(masterTxt, sw);
+        headActions.appendChild(masterWrap);
+      }
+
+      if (updateAction) {
+        const addBtn = document.createElement("button");
+        addBtn.type = "button";
+        addBtn.className = "secondary-button btn-compact dd-feeder-add-btn";
+        addBtn.textContent = "+ 添加计划";
+        addBtn.disabled = !data.online || this.busyActions.has(updateAction.name) || data.isSplitParent;
+        addBtn.addEventListener("click", () => {
+          this.clearPendingDeletePlan();
+          this.feederEditor = {
+            mode: "add",
+            id: nextAvailableFeedPlanId(plans),
+            enabled: true,
+            hour: 12,
+            minute: 0,
+            daysMask: 0x7f,
+            portions: Math.max(minPortions, Math.min(maxPortions, this.feederPortions)),
+          };
+          this.renderOverviewTab();
+        });
+        headActions.appendChild(addBtn);
+      }
+
+      head.append(titleGroup, headActions);
+      sec.appendChild(head);
+
+      // Inline add/edit form
+      if (this.feederEditor && updateAction) {
+        sec.appendChild(
+          this.buildFeederPlanEditor(
+            data,
+            this.feederEditor,
+            updateAction.name,
+            minPortions,
+            maxPortions,
+          ),
+        );
+      }
+
+      if (!planMasterOn && plans.length > 0) {
+        const pausedHint = document.createElement("div");
+        pausedHint.className = "dd-feeder-paused-note";
+        pausedHint.textContent = "计划总开关当前已关闭，开启后将按以下定时计划自动投喂。";
+        sec.appendChild(pausedHint);
+      }
+
+      // Decoded plan items list
+      const planList = document.createElement("div");
+      planList.className = `dd-feeder-plan-list${planMasterOn ? "" : " is-master-off"}`;
+
+      if (plans.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "dd-feeder-empty";
+        empty.textContent = updateAction
+          ? "尚未配置定时喂食计划，点击右上角「+ 添加计划」即可添加每日或自定义周期投喂。"
+          : "当前设备暂无已启用的定时喂食计划。";
+        planList.appendChild(empty);
+      } else {
+        for (const plan of plans) {
+          planList.appendChild(
+            this.buildFeederPlanRow(
+              data,
+              plan,
+              skippedToday.has(plan.id),
+              {
+                updateName: updateAction?.name ?? null,
+                delName: delAction?.name ?? null,
+                skipName: skipAction?.name ?? null,
+                reopenName: reopenAction?.name ?? null,
+              },
+              maxPortions,
+            ),
+          );
+        }
+      }
+
+      sec.appendChild(planList);
+      sections.push(sec);
+    }
+
+    return sections;
+  }
+
+  private buildFeederPlanEditor(
+    data: DeviceDetailApiResponse,
+    draft: FeederPlanEditorState,
+    updateActionName: string,
+    minPortions: number,
+    maxPortions: number,
+  ): HTMLElement {
+    const busy = this.busyActions.has(updateActionName);
+    const disabled = !data.online || busy;
+
+    const card = document.createElement("div");
+    card.className = "dd-feeder-editor";
+
+    const head = document.createElement("div");
+    head.className = "dd-feeder-editor-head";
+    const title = document.createElement("span");
+    title.className = "dd-feeder-editor-title";
+    title.textContent =
+      draft.mode === "add" ? "添加定时喂食计划" : `编辑定时喂食计划 #${draft.id}`;
+    head.appendChild(title);
+    card.appendChild(head);
+
+    const grid = document.createElement("div");
+    grid.className = "dd-feeder-editor-grid";
+
+    // Time picker
+    const timeField = document.createElement("div");
+    timeField.className = "dd-feeder-editor-field";
+    const timeLbl = document.createElement("label");
+    timeLbl.className = "dd-action-param-label";
+    timeLbl.textContent = "出粮时间";
+    const timeInput = document.createElement("input");
+    timeInput.type = "time";
+    timeInput.className = "dd-time-input";
+    timeInput.value = formatFeedTime(draft.hour, draft.minute);
+    timeInput.disabled = disabled;
+    timeInput.addEventListener("input", () => {
+      const [hStr, mStr] = timeInput.value.split(":");
+      const h = Number(hStr);
+      const m = Number(mStr);
+      if (Number.isInteger(h) && h >= 0 && h <= 23 && Number.isInteger(m) && m >= 0 && m <= 59) {
+        draft.hour = h;
+        draft.minute = m;
+      }
+    });
+    timeField.append(timeLbl, timeInput);
+
+    // Portions stepper
+    const portionField = document.createElement("div");
+    portionField.className = "dd-feeder-editor-field";
+    const portionLbl = document.createElement("label");
+    portionLbl.className = "dd-action-param-label";
+    portionLbl.textContent = `出粮份数（${minPortions}–${maxPortions} 份）`;
+
+    const stepper = document.createElement("div");
+    stepper.className = "dd-stepper dd-stepper-sm";
+    const dec = document.createElement("button");
+    dec.type = "button";
+    dec.className = "dd-stepper-btn";
+    dec.textContent = "−";
+    dec.disabled = disabled || draft.portions <= minPortions;
+    const pInp = document.createElement("input");
+    pInp.type = "number";
+    pInp.className = "dd-stepper-input";
+    pInp.min = String(minPortions);
+    pInp.max = String(maxPortions);
+    pInp.value = String(draft.portions);
+    pInp.disabled = disabled;
+    const pUnit = document.createElement("span");
+    pUnit.className = "dd-stepper-unit";
+    pUnit.textContent = "份";
+    const inc = document.createElement("button");
+    inc.type = "button";
+    inc.className = "dd-stepper-btn";
+    inc.textContent = "+";
+    inc.disabled = disabled || draft.portions >= maxPortions;
+
+    const setDraftPortions = (v: number) => {
+      const clamped = Math.max(minPortions, Math.min(maxPortions, Math.round(v)));
+      draft.portions = clamped;
+      pInp.value = String(clamped);
+      dec.disabled = disabled || clamped <= minPortions;
+      inc.disabled = disabled || clamped >= maxPortions;
+    };
+    dec.addEventListener("click", () => setDraftPortions(draft.portions - 1));
+    inc.addEventListener("click", () => setDraftPortions(draft.portions + 1));
+    pInp.addEventListener("input", () => {
+      const n = Number(pInp.value);
+      if (Number.isFinite(n) && n >= minPortions && n <= maxPortions) {
+        draft.portions = Math.round(n);
+        dec.disabled = disabled || draft.portions <= minPortions;
+        inc.disabled = disabled || draft.portions >= maxPortions;
+      }
+    });
+    pInp.addEventListener("blur", () => {
+      const n = Number(pInp.value);
+      setDraftPortions(Number.isFinite(n) ? n : draft.portions);
+    });
+
+    stepper.append(dec, pInp, pUnit, inc);
+    portionField.append(portionLbl, stepper);
+    grid.append(timeField, portionField);
+    card.appendChild(grid);
+
+    // Repeat cycle selector
+    const repeatBlock = document.createElement("div");
+    repeatBlock.className = "dd-feeder-repeat-block";
+    const repeatLbl = document.createElement("div");
+    repeatLbl.className = "dd-action-param-label";
+    repeatLbl.textContent = `重复周期 · ${formatFeedDaysLabel(draft.daysMask)}`;
+
+    const presetRow = document.createElement("div");
+    presetRow.className = "dd-preset-row";
+    const cyclePresets: ReadonlyArray<{ label: string; mask: number }> = [
+      { label: "每天", mask: 0x7f },
+      { label: "工作日", mask: 0x1f },
+      { label: "周末", mask: 0x60 },
+    ];
+    for (const preset of cyclePresets) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `dd-preset-chip${draft.daysMask === preset.mask ? " active" : ""}`;
+      btn.textContent = preset.label;
+      btn.disabled = disabled;
+      btn.addEventListener("click", () => {
+        draft.daysMask = preset.mask;
+        this.renderOverviewTab();
+      });
+      presetRow.appendChild(btn);
+    }
+
+    const daysRow = document.createElement("div");
+    daysRow.className = "dd-weekday-row";
+    for (const day of FEED_WEEKDAYS) {
+      const active = (draft.daysMask & day.bit) !== 0;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `dd-weekday-pill${active ? " active" : ""}`;
+      btn.textContent = day.short;
+      btn.title = day.label;
+      btn.setAttribute("aria-label", day.label);
+      btn.setAttribute("aria-pressed", String(active));
+      btn.disabled = disabled;
+      btn.addEventListener("click", () => {
+        const nextMask = active ? draft.daysMask & ~day.bit : draft.daysMask | day.bit;
+        if (nextMask === 0) {
+          this.host.showToast("至少选择一天重复周期", 1800);
+          return;
+        }
+        draft.daysMask = nextMask;
+        this.renderOverviewTab();
+      });
+      daysRow.appendChild(btn);
+    }
+
+    repeatBlock.append(repeatLbl, presetRow, daysRow);
+    card.appendChild(repeatBlock);
+
+    // Footer buttons
+    const footer = document.createElement("div");
+    footer.className = "dd-feeder-editor-actions";
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.className = "secondary-button btn-compact dd-feeder-cancel-btn";
+    cancelBtn.textContent = "取消";
+    cancelBtn.disabled = busy;
+    cancelBtn.addEventListener("click", () => {
+      this.feederEditor = null;
+      this.renderOverviewTab();
+    });
+
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.className = "primary-button btn-compact";
+    saveBtn.textContent = busy ? "保存中…" : "保存计划";
+    saveBtn.disabled = disabled;
+    saveBtn.addEventListener("click", async () => {
+      const [hStr, mStr] = timeInput.value.split(":");
+      const h = Number(hStr);
+      const m = Number(mStr);
+      if (Number.isInteger(h) && h >= 0 && h <= 23 && Number.isInteger(m) && m >= 0 && m <= 59) {
+        draft.hour = h;
+        draft.minute = m;
+      }
+      const pNum = Number(pInp.value);
+      if (Number.isFinite(pNum)) {
+        draft.portions = Math.max(minPortions, Math.min(maxPortions, Math.round(pNum)));
+      }
+      const hex = encodeFeedPlan(draft, maxPortions);
+      const ok = await this.runAction(
+        updateActionName,
+        [hex],
+        `已保存定时计划：${formatFeedTime(draft.hour, draft.minute)} · ${draft.portions} 份`,
+      );
+      if (ok) {
+        this.feederEditor = null;
+        this.renderOverviewTab();
+      }
+    });
+
+    footer.append(cancelBtn, saveBtn);
+    card.appendChild(footer);
+    return card;
+  }
+
+  private buildFeederPlanRow(
+    data: DeviceDetailApiResponse,
+    plan: FeedPlanItem,
+    isSkippedToday: boolean,
+    actions: {
+      updateName: string | null;
+      delName: string | null;
+      skipName: string | null;
+      reopenName: string | null;
+    },
+    maxPortions: number,
+  ): HTMLElement {
+    const busyAny =
+      (actions.updateName !== null && this.busyActions.has(actions.updateName)) ||
+      (actions.delName !== null && this.busyActions.has(actions.delName)) ||
+      (actions.skipName !== null && this.busyActions.has(actions.skipName)) ||
+      (actions.reopenName !== null && this.busyActions.has(actions.reopenName));
+    const disabled = !data.online || busyAny || data.isSplitParent;
+    const confirmingDel = this.pendingDeletePlan?.id === plan.id;
+
+    const row = document.createElement("div");
+    row.className = `dd-feeder-plan-item${!plan.enabled ? " is-disabled" : ""}${
+      isSkippedToday ? " is-skipped" : ""
+    }`;
+
+    const left = document.createElement("div");
+    left.className = "dd-feeder-plan-info";
+
+    const topLine = document.createElement("div");
+    topLine.className = "dd-feeder-plan-top";
+    const timeEl = document.createElement("span");
+    timeEl.className = "dd-feeder-plan-time";
+    timeEl.textContent = formatFeedTime(plan.hour, plan.minute);
+
+    const portionBadge = document.createElement("span");
+    portionBadge.className = "dd-feeder-portion-badge";
+    portionBadge.textContent = `${plan.portions} 份`;
+    topLine.append(timeEl, portionBadge);
+
+    if (isSkippedToday) {
+      const badge = document.createElement("span");
+      badge.className = "dd-feeder-state-pill is-warn";
+      badge.textContent = "今日已跳过";
+      topLine.appendChild(badge);
+    } else if (!plan.enabled) {
+      const badge = document.createElement("span");
+      badge.className = "dd-feeder-state-pill";
+      badge.textContent = "已停用";
+      topLine.appendChild(badge);
+    }
+
+    const subLine = document.createElement("div");
+    subLine.className = "dd-feeder-plan-sub";
+    subLine.textContent = `${formatFeedDaysLabel(plan.daysMask)} · 计划 #${plan.id}`;
+    left.append(topLine, subLine);
+
+    const right = document.createElement("div");
+    right.className = "dd-feeder-plan-controls";
+
+    if (plan.enabled && ((isSkippedToday && actions.reopenName) || (!isSkippedToday && actions.skipName))) {
+      const skipBtn = document.createElement("button");
+      skipBtn.type = "button";
+      skipBtn.className = "dd-plan-mini-btn";
+      skipBtn.textContent = isSkippedToday ? "恢复今日" : "跳过今日";
+      skipBtn.disabled = disabled;
+      skipBtn.addEventListener("click", () => {
+        if (isSkippedToday && actions.reopenName) {
+          void this.runAction(
+            actions.reopenName,
+            [plan.id],
+            `已恢复今日 ${formatFeedTime(plan.hour, plan.minute)} 投喂计划`,
+          );
+        } else if (!isSkippedToday && actions.skipName) {
+          void this.runAction(
+            actions.skipName,
+            [plan.id],
+            `已跳过今日 ${formatFeedTime(plan.hour, plan.minute)} 投喂计划`,
+          );
+        }
+      });
+      right.appendChild(skipBtn);
+    }
+
+    if (actions.updateName) {
+      const editBtn = document.createElement("button");
+      editBtn.type = "button";
+      editBtn.className = "dd-plan-mini-btn";
+      editBtn.textContent = "编辑";
+      editBtn.disabled = disabled;
+      editBtn.addEventListener("click", () => {
+        this.clearPendingDeletePlan();
+        this.feederEditor = {
+          mode: "edit",
+          id: plan.id,
+          enabled: plan.enabled,
+          hour: plan.hour,
+          minute: plan.minute,
+          daysMask: plan.daysMask,
+          portions: plan.portions,
+        };
+        this.renderOverviewTab();
+      });
+      right.appendChild(editBtn);
+    }
+
+    if (actions.delName) {
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = `dd-plan-mini-btn is-danger${confirmingDel ? " is-confirming" : ""}`;
+      delBtn.textContent = confirmingDel ? "确认删除" : "删除";
+      delBtn.disabled = disabled;
+      delBtn.addEventListener("click", () => {
+        if (!confirmingDel) {
+          this.clearPendingDeletePlan();
+          const timer = window.setTimeout(() => {
+            this.pendingDeletePlan = null;
+            this.renderOverviewTab();
+          }, 4000);
+          this.pendingDeletePlan = { id: plan.id, timer };
+          this.renderOverviewTab();
+          return;
+        }
+        this.clearPendingDeletePlan();
+        if (this.feederEditor?.id === plan.id) {
+          this.feederEditor = null;
+        }
+        void this.runAction(
+          actions.delName!,
+          [plan.id],
+          `已删除定时计划 ${formatFeedTime(plan.hour, plan.minute)}`,
+        );
+      });
+      right.appendChild(delBtn);
+    }
+
+    if (actions.updateName) {
+      const sw = document.createElement("label");
+      sw.className = "md-switch";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = plan.enabled;
+      cb.disabled = disabled;
+      cb.setAttribute("aria-label", `切换定时计划 ${formatFeedTime(plan.hour, plan.minute)}`);
+      cb.addEventListener("change", () => {
+        const hex = encodeFeedPlan({ ...plan, enabled: cb.checked }, maxPortions);
+        void this.runAction(
+          actions.updateName!,
+          [hex],
+          cb.checked
+            ? `已开启 ${formatFeedTime(plan.hour, plan.minute)} 定时计划`
+            : `已停用 ${formatFeedTime(plan.hour, plan.minute)} 定时计划`,
+        );
+      });
+      const tr = document.createElement("span");
+      tr.className = "md-switch-track";
+      sw.append(cb, tr);
+      right.appendChild(sw);
+    }
+
+    row.append(left, right);
+    return row;
+  }
+
+  private async dispensePetFood(
+    dispenseAction: ActionInfo,
+    measureProp: PropInfo | undefined,
+    portions: number,
+  ): Promise<void> {
+    const hasParam = Boolean(dispenseAction.in && dispenseAction.in.length > 0);
+    if (hasParam) {
+      await this.runAction(dispenseAction.name, [portions], `已下发出粮指令（${portions} 份）`);
+      return;
+    }
+    if (measureProp?.writable) {
+      await this.writeProp(measureProp.name, portions);
+    }
+    await this.runAction(dispenseAction.name, undefined, `已下发出粮指令（${portions} 份）`);
+  }
+
   private buildTelemetrySection(data: DeviceDetailApiResponse, telemetry: PropInfo[]): HTMLElement {
     const section = this.createSection("实时状态", `${telemetry.length} 项只读指标`);
     const grid = document.createElement("div");
@@ -1009,7 +1771,7 @@ export class DeviceDetailModalController {
     for (const prop of telemetry) {
       const raw = data.values[prop.name];
       const formatted = formatPropertyValue(prop, raw);
-      const tone = semanticToneForTelemetry(prop, raw, formatted);
+      const tone = semanticToneForTelemetry(prop, raw, formatted, data.values);
       const progress = percentageProgressFor(prop, raw);
 
       const tile = document.createElement("div");
@@ -1018,7 +1780,7 @@ export class DeviceDetailModalController {
 
       const labelEl = document.createElement("div");
       labelEl.className = "dd-metric-label";
-      labelEl.textContent = friendlyLabel(prop.desc, prop.name);
+      labelEl.textContent = friendlyPropLabel(prop, data.device);
 
       const valEl = document.createElement("div");
       valEl.className = "dd-metric-value";
@@ -1077,9 +1839,10 @@ export class DeviceDetailModalController {
 
     const info = document.createElement("div");
     info.className = "dd-control-info";
+    const propLabel = friendlyPropLabel(prop, data.device);
     const nameEl = document.createElement("div");
     nameEl.className = "dd-control-name";
-    nameEl.textContent = friendlyLabel(prop.desc, prop.name);
+    nameEl.textContent = propLabel;
 
     const metaEl = document.createElement("div");
     metaEl.className = "dd-control-meta";
@@ -1553,7 +2316,7 @@ export class DeviceDetailModalController {
       tdName.className = "dd-td-name";
       const mainLbl = document.createElement("div");
       mainLbl.className = "dd-td-title";
-      mainLbl.textContent = friendlyLabel(prop.desc, prop.name);
+      mainLbl.textContent = friendlyPropLabel(prop, data.device);
       const codeLbl = document.createElement("div");
       codeLbl.className = "dd-td-code";
       const addr =
@@ -1783,7 +2546,7 @@ export class DeviceDetailModalController {
       }
       this.data.fetchedAt = Date.now();
       const prop = this.data.props.find((p) => p.name === propName);
-      const label = prop ? friendlyLabel(prop.desc, prop.name) : propName;
+      const label = prop ? friendlyPropLabel(prop, this.data.device) : propName;
       const formatted = prop ? formatPropertyValue(prop, this.data.values[propName]) : String(value);
       this.host.showToast(`已更新「${label}」：${formatted}`, 2000);
     } catch (err) {
@@ -1798,9 +2561,13 @@ export class DeviceDetailModalController {
     }
   }
 
-  private async runAction(actionName: string, params?: unknown[]): Promise<void> {
+  private async runAction(
+    actionName: string,
+    params?: unknown[],
+    customSuccessToast?: string,
+  ): Promise<boolean> {
     const data = this.data;
-    if (!data || !data.online || this.busyActions.has(actionName)) return;
+    if (!data || !data.online || this.busyActions.has(actionName)) return false;
     const gen = this.generation;
     this.busyActions.add(actionName);
     this.revision += 1;
@@ -1817,7 +2584,7 @@ export class DeviceDetailModalController {
         values?: Record<string, unknown>;
         message?: string;
       }>(`/api/devices/${encodeURIComponent(data.did)}/action`, body);
-      if (gen !== this.generation || !this.data) return;
+      if (gen !== this.generation || !this.data) return false;
       if (res?.values && typeof res.values === "object") {
         Object.assign(this.data.values, res.values);
       }
@@ -1829,11 +2596,13 @@ export class DeviceDetailModalController {
       this.data.fetchedAt = Date.now();
       const act = this.data.actions.find((a) => a.name === actionName);
       const label = act ? friendlyLabel(act.desc, act.name) : actionName;
-      this.host.showToast(res?.message || `已执行「${label}」`, 2200);
+      this.host.showToast(customSuccessToast || res?.message || `已执行「${label}」`, 2200);
+      return true;
     } catch (err) {
-      if (gen !== this.generation) return;
+      if (gen !== this.generation) return false;
       const msg = err instanceof Error ? err.message : String(err);
       this.host.showToast(`执行失败：${msg}`, 3500);
+      return false;
     } finally {
       if (gen === this.generation) {
         this.busyActions.delete(actionName);

@@ -3460,6 +3460,402 @@ button:disabled {
   font-weight: 600;
 }
 
+/* Pet Feeder Workbench Hero */
+
+.dd-feeder-card {
+  background: var(--c-card);
+  border: 1px solid var(--c-accent-border);
+  border-radius: 12px;
+  padding: 15px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dd-feeder-dispense-row {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.dd-feeder-portion-block {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.dd-feeder-portion-label {
+  font-size: 12px;
+  color: var(--c-text-secondary);
+}
+
+.dd-stepper {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--c-surface);
+  border: 1px solid var(--c-line);
+  border-radius: 10px;
+  padding: 3px;
+}
+
+.dd-stepper-sm {
+  border-radius: 8px;
+  padding: 2px;
+}
+
+.dd-stepper-btn {
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 7px;
+  background: var(--c-card);
+  color: var(--c-text-primary);
+  font-size: 16px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.dd-stepper-sm .dd-stepper-btn {
+  width: 28px;
+  height: 28px;
+  font-size: 15px;
+}
+
+.dd-stepper-btn:hover:not(:disabled) {
+  background: var(--c-btn-hover);
+  color: var(--c-theme);
+}
+
+.dd-stepper-btn:disabled {
+  opacity: 0.35;
+}
+
+.dd-stepper-input {
+  width: 54px;
+  height: 32px;
+  border: none;
+  background: transparent;
+  color: var(--c-text-primary);
+  text-align: center;
+  font-size: 16px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  -moz-appearance: textfield;
+}
+
+.dd-stepper-sm .dd-stepper-input {
+  width: 48px;
+  height: 28px;
+  font-size: 14px;
+}
+
+.dd-stepper-input::-webkit-inner-spin-button,
+.dd-stepper-input::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.dd-stepper-input:focus {
+  outline: none;
+}
+
+.dd-stepper-unit {
+  font-size: 12.5px;
+  color: var(--c-text-secondary);
+  padding-right: 6px;
+}
+
+.dd-feeder-dispense-btn {
+  min-width: 118px;
+  height: 40px;
+  padding: 0 20px;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.dd-feeder-plan-head {
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.dd-feeder-plan-title-group {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.dd-feeder-plan-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.dd-feeder-master-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--c-text-secondary);
+}
+
+.dd-feeder-paused-note {
+  font-size: 12px;
+  color: var(--c-warn-text);
+  background: var(--c-warn-bg);
+  border: 1px solid var(--c-warn-border);
+  border-radius: 8px;
+  padding: 7px 11px;
+}
+
+.dd-feeder-plan-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: opacity 0.16s ease;
+}
+
+.dd-feeder-plan-list.is-master-off {
+  opacity: 0.62;
+}
+
+.dd-feeder-empty {
+  background: var(--c-card);
+  border: 1px dashed var(--c-line);
+  border-radius: 10px;
+  padding: 18px 14px;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--c-text-secondary);
+}
+
+.dd-feeder-plan-item {
+  background: var(--c-card);
+  border: 1px solid var(--c-line);
+  border-radius: 10px;
+  padding: 11px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.dd-feeder-plan-item.is-disabled {
+  opacity: 0.65;
+}
+
+.dd-feeder-plan-item.is-skipped {
+  border-color: var(--c-warn-border);
+  background: color-mix(in srgb, var(--c-warn-bg) 45%, var(--c-card));
+}
+
+.dd-feeder-plan-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 140px;
+}
+
+.dd-feeder-plan-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.dd-feeder-plan-time {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--c-text-primary);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+
+.dd-feeder-portion-badge {
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--c-accent-surface);
+  color: var(--c-theme-dim);
+  border: 1px solid var(--c-accent-border);
+}
+
+.dd-feeder-state-pill {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--c-surface);
+  color: var(--c-text-secondary);
+}
+
+.dd-feeder-state-pill.is-warn {
+  background: var(--c-warn-bg);
+  color: var(--c-warn-text);
+  border: 1px solid var(--c-warn-border);
+}
+
+.dd-feeder-plan-sub {
+  font-size: 12px;
+  color: var(--c-text-secondary);
+}
+
+.dd-feeder-plan-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.dd-plan-mini-btn {
+  height: 28px;
+  padding: 0 9px;
+  border-radius: 7px;
+  border: 1px solid var(--c-line);
+  background: var(--c-surface);
+  color: var(--c-text-secondary);
+  font-size: 11.5px;
+  font-weight: 500;
+  transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+}
+
+.dd-plan-mini-btn:hover:not(:disabled) {
+  background: var(--c-btn-hover);
+  color: var(--c-text-primary);
+}
+
+.dd-plan-mini-btn.is-danger {
+  color: var(--c-error-text);
+  border-color: color-mix(in srgb, var(--c-error-text) 35%, var(--c-line));
+}
+
+.dd-plan-mini-btn.is-danger:hover:not(:disabled),
+.dd-plan-mini-btn.is-danger.is-confirming {
+  background: var(--c-danger);
+  border-color: var(--c-danger);
+  color: #ffffff;
+}
+
+.dd-plan-mini-btn:disabled {
+  opacity: 0.4;
+}
+
+/* Inline Schedule Editor */
+
+.dd-feeder-editor {
+  background: var(--c-card);
+  border: 1px solid var(--c-theme);
+  border-radius: 11px;
+  padding: 14px 15px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dd-feeder-editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.dd-feeder-editor-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--c-text-primary);
+}
+
+.dd-feeder-editor-grid {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.dd-feeder-editor-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dd-time-input {
+  height: 34px;
+  min-width: 124px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--c-line);
+  background: var(--c-surface);
+  color: var(--c-text-primary);
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.dd-time-input:focus {
+  outline: none;
+  border-color: var(--c-theme);
+}
+
+.dd-feeder-repeat-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dd-weekday-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.dd-weekday-pill {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 1px solid var(--c-line);
+  background: var(--c-surface);
+  color: var(--c-text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.dd-weekday-pill:hover:not(:disabled) {
+  border-color: var(--c-accent-border);
+  color: var(--c-text-primary);
+}
+
+.dd-weekday-pill.active {
+  background: var(--c-theme);
+  border-color: var(--c-theme);
+  color: var(--c-on-theme-text);
+  font-weight: 600;
+}
+
+.dd-weekday-pill:disabled {
+  opacity: 0.45;
+}
+
+.dd-feeder-editor-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--c-line);
+}
+
 /* Writable Control Rows */
 
 .dd-control-list {
