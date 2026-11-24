@@ -49,3 +49,8 @@ tools/camera_relay/UPSTREAM-README.md
 
 # ---- Coverage ----
 coverage/
+
+# ---- Benchmark ephemeral caches & raw third-party audio downloads ----
+benchmarks/raw_sources/
+benchmarks/voice_sep_100/_tts_cache/
+

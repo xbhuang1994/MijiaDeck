@@ -36,8 +36,14 @@ import {
 } from "./openWakeWordEngine.ts";
 import type { SystemOneClient } from "./systemOneClient.ts";
 import {
+  AudioSourceSeparator,
+  resolveSourceSeparatorModelPaths,
+} from "./audioSourceSeparator.ts";
+import {
   extractCommandAfterAcousticWake,
   findWakeWordSpan,
+  hasSmartHomeDomainIntent,
+  isThirdPersonNeoMention,
   isWakeQueryText,
   looksLikeDirectDeviceCommand,
   matchEnglishHeadWakeWord,
@@ -61,6 +67,11 @@ export interface LocalVoiceModelPaths {
   openWakeWordDir: string;
   openWakeWordMel: string;
   openWakeWordEmbedding: string;
+  cedModel: string;
+  cedLabels: string;
+  pyannoteSegmentation: string;
+  spleeterVocals: string;
+  spleeterAccompaniment: string;
 }
 
 export interface LocalVoiceEngineStatus {
@@ -75,6 +86,9 @@ export interface LocalVoiceEngineStatus {
     speakerCampp: boolean;
     senseVoice: boolean;
     openWakeWord: boolean;
+    cedAudioTagging?: boolean;
+    pyannoteDiarization?: boolean;
+    spleeterSeparation?: boolean;
   };
   readyForDenoise: boolean;
   readyForDpdfnet: boolean;
@@ -83,6 +97,7 @@ export interface LocalVoiceEngineStatus {
   readyForVoiceprint: boolean;
   readyForLocalAsr: boolean;
   readyForWakeWord: boolean;
+  readyForSourceSeparation?: boolean;
   downloading: boolean;
   lastError: string | null;
 }
@@ -194,6 +209,12 @@ const MODEL_URLS = {
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
   senseVoiceTar:
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2",
+  cedTinyTar:
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/audio-tagging-models/sherpa-onnx-ced-tiny-audio-tagging-2024-04-19.tar.bz2",
+  pyannoteSegTar:
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2",
+  spleeterFp16Tar:
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/source-separation-models/sherpa-onnx-spleeter-2stems-fp16.tar.bz2",
 } as const;
 
 const SENSE_VOICE_DIR_NAME = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17";
@@ -227,6 +248,7 @@ export function resolveVoiceModelPaths(modelsDirOverride?: string): LocalVoiceMo
   const senseVoiceDir = path.join(modelsDir, SENSE_VOICE_DIR_NAME);
   const voxlockDir = path.join(modelsDir, VOXLOCK_DIR_NAME);
   const openWakeWordDir = path.join(modelsDir, "openwakeword");
+  const sepPaths = resolveSourceSeparatorModelPaths(modelsDir);
   return {
     modelsDir,
     gtcrn: path.join(modelsDir, "gtcrn_simple.onnx"),
@@ -242,6 +264,11 @@ export function resolveVoiceModelPaths(modelsDirOverride?: string): LocalVoiceMo
     openWakeWordDir,
     openWakeWordMel: path.join(openWakeWordDir, "melspectrogram.onnx"),
     openWakeWordEmbedding: path.join(openWakeWordDir, "embedding_model.onnx"),
+    cedModel: sepPaths.cedModel,
+    cedLabels: sepPaths.cedLabels,
+    pyannoteSegmentation: sepPaths.pyannoteSegmentation,
+    spleeterVocals: sepPaths.spleeterVocals,
+    spleeterAccompaniment: sepPaths.spleeterAccompaniment,
   };
 }
 
@@ -350,6 +377,7 @@ export function chooseBestAsrCandidate(
 export class LocalVoiceEngine {
   private readonly _modelsDirOverride?: string;
   private readonly _oww: OpenWakeWordEngine;
+  private _sourceSeparator: AudioSourceSeparator | null = null;
   private _gtcrnDenoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
   private _dpdfnetDenoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
   private _voxlockDenoiser: {
@@ -377,6 +405,13 @@ export class LocalVoiceEngine {
 
   get openWakeWord(): OpenWakeWordEngine {
     return this._oww;
+  }
+
+  get sourceSeparator(): AudioSourceSeparator {
+    if (!this._sourceSeparator) {
+      this._sourceSeparator = new AudioSourceSeparator(this);
+    }
+    return this._sourceSeparator;
   }
 
   createWakeWordStream(
@@ -410,12 +445,26 @@ export class LocalVoiceEngine {
     const speakerCampp = existsSync(p.speakerCampp);
     const senseVoice = existsSync(p.senseVoiceModel) && existsSync(p.senseVoiceTokens);
     const openWakeWord = existsSync(p.openWakeWordMel) && existsSync(p.openWakeWordEmbedding);
+    const cedAudioTagging = existsSync(p.cedModel) && existsSync(p.cedLabels);
+    const pyannoteDiarization = existsSync(p.pyannoteSegmentation) && speakerCampp;
+    const spleeterSeparation = existsSync(p.spleeterVocals) && existsSync(p.spleeterAccompaniment);
     const addonAvailable = sherpa !== null;
     return {
       addonAvailable,
       addonVersion: sherpa?.version ?? null,
       modelsDir: p.modelsDir,
-      models: { gtcrn, dpdfnet4, voxlock, sileroVad, speakerCampp, senseVoice, openWakeWord },
+      models: {
+        gtcrn,
+        dpdfnet4,
+        voxlock,
+        sileroVad,
+        speakerCampp,
+        senseVoice,
+        openWakeWord,
+        cedAudioTagging,
+        pyannoteDiarization,
+        spleeterSeparation,
+      },
       readyForDenoise: addonAvailable && gtcrn,
       readyForDpdfnet: addonAvailable && dpdfnet4,
       readyForVoxlock: addonAvailable && voxlock,
@@ -423,6 +472,8 @@ export class LocalVoiceEngine {
       readyForVoiceprint: addonAvailable && speakerCampp,
       readyForLocalAsr: addonAvailable && senseVoice,
       readyForWakeWord: this._oww.getStatus().ready,
+      readyForSourceSeparation:
+        addonAvailable && senseVoice && (cedAudioTagging || pyannoteDiarization || spleeterSeparation),
       downloading: this._downloading,
       lastError: this._lastError,
     };
@@ -1037,10 +1088,16 @@ export class LocalVoiceEngine {
       /^(?:你有|你又|你好|你给)/.test(trimmedBest) &&
       /[吗嘛么呢][。？！!?\s]*$/.test(trimmedBest) &&
       !isWakeQueryText(extractCommandAfterAcousticWake(trimmedBest, acousticWake?.wakeWord ?? ""));
+    const isThirdPerson = isThirdPersonNeoMention(trimmedBest);
+    const isHelloNonDeviceChat =
+      /^(?:你好|您好)/.test(trimmedBest) &&
+      !hasSmartHomeDomainIntent(extractCommandAfterAcousticWake(trimmedBest, acousticWake?.wakeWord ?? ""));
     if (
       acousticWake?.matched &&
       wakeWords.length > 0 &&
       !isAmbiguousInterrogative &&
+      !isThirdPerson &&
+      !isHelloNonDeviceChat &&
       (!currentWakeSpan || currentWakeSpan.fuzzy)
     ) {
       const extracted = extractCommandAfterAcousticWake(best.text, acousticWake.wakeWord);
@@ -1235,6 +1292,31 @@ export class LocalVoiceEngine {
           throw new Error(`解压 SenseVoice 模型失败: ${errText.trim() || exitCode}`);
         }
       }
+
+      const fetchAndExtractOptionalTar = async (url: string, checkFile: string, archiveName: string) => {
+        if (existsSync(checkFile)) return;
+        const tarPath = path.join(p.modelsDir, archiveName);
+        try {
+          await fetchFile(url, tarPath);
+          const proc = Bun.spawn(["tar", "-xjf", tarPath, "-C", p.modelsDir], {
+            stdout: "ignore",
+            stderr: "pipe",
+          });
+          await proc.exited;
+        } catch {
+          // 可选声源分离增强模型下载失败时不影响核心离线 ASR
+        } finally {
+          try {
+            if (existsSync(tarPath)) unlinkSync(tarPath);
+          } catch {
+            // ignore
+          }
+        }
+      };
+
+      await fetchAndExtractOptionalTar(MODEL_URLS.cedTinyTar, p.cedModel, "ced-tiny.tar.bz2");
+      await fetchAndExtractOptionalTar(MODEL_URLS.pyannoteSegTar, p.pyannoteSegmentation, "pyannote-seg.tar.bz2");
+      await fetchAndExtractOptionalTar(MODEL_URLS.spleeterFp16Tar, p.spleeterVocals, "spleeter-fp16.tar.bz2");
     } catch (err) {
       this._lastError = err instanceof Error ? err.message : String(err);
       throw err;
@@ -1246,6 +1328,8 @@ export class LocalVoiceEngine {
   }
 
   dispose(): void {
+    this._sourceSeparator?.dispose();
+    this._sourceSeparator = null;
     this._oww.dispose();
     this._gtcrnDenoiser = null;
     this._dpdfnetDenoiser = null;

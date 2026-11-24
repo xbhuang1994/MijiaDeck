@@ -25,6 +25,7 @@ export type AgentProviderMode =
 
 export type VoiceEngineMode = "auto" | "local" | "browser" | "whisper";
 export type NoiseSuppressionMode = "auto" | "neural" | "dpdfnet" | "voxlock" | "dsp" | "off";
+export type SourceSeparationMode = "auto" | "fast" | "full" | "off";
 export type VadEngineMode = "silero" | "adaptive";
 export type VoiceprintPolicyMode = "off" | "tag" | "strict";
 export type AttentionMode = "smart" | "strict" | "off";
@@ -141,6 +142,7 @@ export const PROVIDER_PRESETS: ReadonlyArray<ProviderPreset> = [
 const VALID_PROVIDERS = new Set<string>(PROVIDER_PRESETS.map((p) => p.id));
 const VALID_VOICE_ENGINES = new Set<string>(["auto", "local", "browser", "whisper"]);
 const VALID_NOISE_MODES = new Set<string>(["auto", "neural", "dpdfnet", "voxlock", "dsp", "off"]);
+const VALID_SOURCE_SEP_MODES = new Set<string>(["auto", "fast", "full", "off"]);
 const VALID_VAD_MODES = new Set<string>(["silero", "adaptive"]);
 const VALID_VOICEPRINT_MODES = new Set<string>(["off", "tag", "strict"]);
 const VALID_ATTENTION_MODES = new Set<string>(["smart", "strict", "off"]);
@@ -189,6 +191,7 @@ export interface AgentVoiceConfig {
   vadThreshold: number;
   vadSilenceMs: number;
   noiseSuppressionMode: NoiseSuppressionMode;
+  sourceSeparationMode: SourceSeparationMode;
   vadMode: VadEngineMode;
   voiceprintMode: VoiceprintPolicyMode;
   voiceprintThreshold: number;
@@ -248,6 +251,7 @@ export interface AgentConfigPatch {
   vadThreshold?: unknown;
   vadSilenceMs?: unknown;
   noiseSuppressionMode?: unknown;
+  sourceSeparationMode?: unknown;
   vadMode?: unknown;
   voiceprintMode?: unknown;
   voiceprintThreshold?: unknown;
@@ -293,6 +297,7 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     vadThreshold: 0.018,
     vadSilenceMs: 750,
     noiseSuppressionMode: "auto",
+    sourceSeparationMode: "auto",
     vadMode: "silero",
     voiceprintMode: "tag",
     voiceprintThreshold: 0.42,
@@ -435,6 +440,14 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     ? (noiseRaw as NoiseSuppressionMode)
     : defaults.noiseSuppressionMode;
 
+  const sepRaw =
+    typeof raw.sourceSeparationMode === "string"
+      ? raw.sourceSeparationMode.trim().toLowerCase()
+      : defaults.sourceSeparationMode;
+  const sourceSeparationMode: SourceSeparationMode = VALID_SOURCE_SEP_MODES.has(sepRaw)
+    ? (sepRaw as SourceSeparationMode)
+    : defaults.sourceSeparationMode;
+
   const vadModeRaw =
     typeof raw.vadMode === "string" ? raw.vadMode.trim() : defaults.vadMode;
   const vadMode: VadEngineMode = VALID_VAD_MODES.has(vadModeRaw)
@@ -495,6 +508,7 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     vadThreshold: Number(clampNumber(raw.vadThreshold, 0.004, 0.3, defaults.vadThreshold).toFixed(4)),
     vadSilenceMs: Math.round(clampNumber(raw.vadSilenceMs, 350, 5000, defaults.vadSilenceMs)),
     noiseSuppressionMode,
+    sourceSeparationMode,
     vadMode,
     voiceprintMode,
     voiceprintThreshold: Number(
@@ -787,6 +801,13 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
       throw new Error(`不支持的环境降噪模式: ${nm}`);
     }
     nextRaw.noiseSuppressionMode = nm;
+  }
+  if (patch.sourceSeparationMode !== undefined) {
+    const sm = String(patch.sourceSeparationMode).trim().toLowerCase();
+    if (!VALID_SOURCE_SEP_MODES.has(sm)) {
+      throw new Error(`不支持的声源分离模式: ${sm}`);
+    }
+    nextRaw.sourceSeparationMode = sm;
   }
   if (patch.vadMode !== undefined) {
     const vm = String(patch.vadMode).trim();

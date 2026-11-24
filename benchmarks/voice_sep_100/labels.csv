@@ -1,0 +1,101 @@
+﻿id,filename,is_neo_command,category,sound_types,has_bgm,has_song,noise_type,speaker_count,overlapping_speakers,snr_db,dialog_state,duration_sec,target_transcript,expected_command,expected_woke_only,distractor_transcript,notes
+clip_001,audio/clip_001.wav,true,clean_no_bgm,speech,false,false,none,1,false,,standby,2.859,Neo，打开客厅吸顶灯,打开客厅吸顶灯,false,,干净环境标准句首唤醒+完整控制指令（男声）
+clip_002,audio/clip_002.wav,true,clean_no_bgm,speech,false,false,none,1,false,,standby,2.6,Neo关灯,关灯,false,,快速连读短指令 'Neo关灯' 回归测试
+clip_003,audio/clip_003.wav,true,clean_no_bgm,speech,false,false,none,1,false,,standby,3.11,嘿Neo，把卧室灯关掉,把卧室灯关掉,false,,女声呼唤前缀 + 设备关闭指令
+clip_004,audio/clip_004.wav,true,clean_no_bgm,speech,false,false,none,1,false,,standby,4.042,Neo，把小米音响音量调到35,把小米音响音量调到35,false,,干净环境数字调节指令（女声2）
+clip_005,audio/clip_005.wav,true,clean_no_bgm,speech,false,false,none,1,false,,standby,2.6,Neo在吗,,true,,干净环境纯唤醒询问
+clip_006,audio/clip_006.wav,true,clean_no_bgm,speech,false,false,none,1,false,,standby,3.254,"Hey Neo, turn off the living room light",turn off the living room light,false,,纯英文唤醒+英文设备控制指令
+clip_007,audio/clip_007.wav,true,clean_no_bgm,speech,false,false,none,1,false,,standby,3.298,Neo，查询客厅温度和湿度,查询客厅温度和湿度,false,,干净环境传感器查询指令
+clip_008,audio/clip_008.wav,false,clean_no_bgm,speech,false,false,none,1,false,,standby,4.421,今天天气真不错，下午去公园走走吧,,false,今天天气真不错，下午去公园走走吧,普通日常闲聊，无唤醒词
+clip_009,audio/clip_009.wav,false,clean_no_bgm,speech,false,false,none,1,false,,standby,4.648,我刚才跟朋友聊到Neo这个助手挺好用的,,false,我刚才跟朋友聊到Neo这个助手挺好用的,第三人称提及 Neo（非向 Neo 下达指令）
+clip_010,audio/clip_010.wav,false,clean_no_bgm,speech,false,false,none,1,false,,standby,3.308,别管Neo了，我们先吃饭吧,,false,别管Neo了，我们先吃饭吧,否定/忽略 Neo 的旁白指令
+clip_011,audio/clip_011.wav,false,clean_no_bgm,speech,false,false,none,1,false,,standby,3.506,你好，今天晚饭想吃什么呀,,false,你好，今天晚饭想吃什么呀,近音陷阱：'你好' 日常问候，绝不能误唤 Neo
+clip_012,audio/clip_012.wav,false,clean_no_bgm,speech,false,false,none,1,false,,standby,2.969,你有打开阳台的窗户吗,,false,你有打开阳台的窗户吗,近音陷阱：'你有打开...吗' 问句，非指令
+clip_013,audio/clip_013.wav,false,clean_no_bgm,speech,false,false,none,1,false,,standby,3.396,"No, stop talking about New York weather",,false,"No, stop talking about New York weather",英文近音陷阱：No / New York
+clip_014,audio/clip_014.wav,false,clean_no_bgm,speech,false,false,none,1,false,,standby,4.542,打开客厅吸顶灯那个开关好像有点松了,,false,打开客厅吸顶灯那个开关好像有点松了,待机状态无唤醒词的设备讨论句
+clip_015,audio/clip_015.wav,true,song_singing,speech|song|bgm,true,true,none,1,false,6,standby,3.309,Neo，打开客厅吸顶灯,打开客厅吸顶灯,false,,《起风了》歌声背景 +6dB SNR 下达开灯指令
+clip_016,audio/clip_016.wav,true,song_singing,speech|song|bgm,true,true,none,1,false,3,standby,3.137,Neo，关闭卧室灯,关闭卧室灯,false,,《起风了》副歌人声 +3dB SNR 下达关灯指令
+clip_017,audio/clip_017.wav,true,song_singing,speech|song|bgm,true,true,none,1,false,0,standby,4.298,Neo，把小米音响音量调到20,把小米音响音量调到20,false,,《起风了》0dB 强歌声干扰下调小音量
+clip_018,audio/clip_018.wav,true,song_singing,speech|song|bgm,true,true,none,1,false,4,standby,3.141,Neo，暂停播放音乐,暂停播放音乐,false,,《漂洋过海来看你》+4dB SNR 暂停音乐
+clip_019,audio/clip_019.wav,true,song_singing,speech|song|bgm,true,true,none,1,false,1,standby,2.941,嘿Neo，打开空调,打开空调,false,,《漂洋过海来看你》+1dB 强歌声干扰下开空调
+clip_020,audio/clip_020.wav,true,song_singing,speech|song|bgm,true,true,none,1,false,4,standby,2.6,Neo关灯,关灯,false,,歌声背景中快速连读 'Neo关灯'
+clip_021,audio/clip_021.wav,true,song_singing,speech|song|bgm,true,true,none,1,false,3,standby,3.612,Neo，把台灯调亮一点,把台灯调亮一点,false,,《漂洋过海来看你》女声调亮台灯
+clip_022,audio/clip_022.wav,true,song_singing,speech|song|bgm,true,true,none,1,false,2,standby,2.6,Neo，静音,静音,false,,强歌曲播放 +2dB SNR 短指令静音
+clip_023,audio/clip_023.wav,true,song_singing,speech|song|bgm,true,true,none,1,false,2,standby,3.263,Neo，帮我关闭所有灯,帮我关闭所有灯,false,,《起风了》强歌声 +2dB 关闭所有灯
+clip_024,audio/clip_024.wav,true,song_singing,speech|song|bgm,true,true,none,1,false,-1,standby,2.727,Neo，打开窗帘,打开窗帘,false,,极端低信噪比 -1dB 强歌曲演唱背景开窗帘
+clip_025,audio/clip_025.wav,true,song_singing,speech|song|bgm,true,true,none,1,false,4,standby,3.096,"Hey Neo, pause the music",pause the music,false,,歌曲背景中英文暂停音乐指令
+clip_026,audio/clip_026.wav,false,song_singing,song|bgm,true,true,none,0,false,,standby,4,,,false,,纯歌曲《起风了》主歌演唱片段（无人指令）
+clip_027,audio/clip_027.wav,false,song_singing,song|bgm,true,true,none,0,false,,standby,4.2,,,false,,纯歌曲《起风了》高潮副歌演唱片段
+clip_028,audio/clip_028.wav,false,song_singing,song|bgm,true,true,none,0,false,,standby,4,,,false,,纯歌曲《起风了》尾段演唱片段
+clip_029,audio/clip_029.wav,false,song_singing,song|bgm,true,true,none,0,false,,standby,4.2,,,false,,纯歌曲《漂洋过海来看你》人声演唱片段1
+clip_030,audio/clip_030.wav,false,song_singing,song|bgm,true,true,none,0,false,,standby,4.2,,,false,,纯歌曲《漂洋过海来看你》人声演唱片段2
+clip_031,audio/clip_031.wav,false,song_singing,song|bgm,true,true,none,0,false,,standby,4,,,false,,纯歌曲《漂洋过海来看你》高潮演唱片段3
+clip_032,audio/clip_032.wav,false,song_singing,song|bgm,true,true,none,0,false,,standby,4,,,false,,纯流行英文/器乐演唱片段
+clip_033,audio/clip_033.wav,false,song_singing,speech|song|bgm,true,true,none,1,false,3,standby,5.321,这首歌真的很好听，我上学的时候经常听,,false,这首歌真的很好听，我上学的时候经常听,边听《起风了》边与家人聊天（非指令）
+clip_034,audio/clip_034.wav,false,song_singing,speech|song|bgm,true,true,none,1,false,4,standby,5.157,我刚才听朋友说Neo这个语音项目挺有意思的,,false,我刚才听朋友说Neo这个语音项目挺有意思的,歌曲背景中第三人称提及 Neo（非指令）
+clip_035,audio/clip_035.wav,false,song_singing,speech|song|bgm,true,true,none,1,false,3,standby,4.424,你好，今天晚上咱们出去吃火锅吧,,false,你好，今天晚上咱们出去吃火锅吧,歌曲背景中'你好'聊天近音陷阱
+clip_036,audio/clip_036.wav,false,song_singing,speech|song|bgm,true,true,none,1,false,4,standby,5.224,把客厅灯修好之后亮多了，晚上看书舒服,,false,把客厅灯修好之后亮多了，晚上看书舒服,歌曲背景中谈论灯光但无唤醒词
+clip_037,audio/clip_037.wav,true,instrumental_bgm,speech|bgm,true,false,none,1,false,5,standby,3.041,Neo，打开书房台灯,打开书房台灯,false,,真实歌曲纯伴奏 BGM +5dB 开台灯
+clip_038,audio/clip_038.wav,true,instrumental_bgm,speech|bgm,true,false,none,1,false,1,standby,3.949,Neo，把空调调到26度,把空调调到26度,false,,真实伴奏 BGM +1dB 调空调温度
+clip_039,audio/clip_039.wav,true,instrumental_bgm,speech|bgm,true,false,none,1,false,3,standby,2.97,Neo，打开净化器,打开净化器,false,,真实伴奏2 BGM +3dB 开净化器
+clip_040,audio/clip_040.wav,true,instrumental_bgm,speech|bgm,true,false,none,1,false,2,standby,2.945,Neo，关闭客厅风扇,关闭客厅风扇,false,,Lo-Fi 钢琴伴奏 BGM +2dB 关风扇
+clip_041,audio/clip_041.wav,true,instrumental_bgm,speech|bgm,true,false,none,1,false,0,standby,3.306,Neo，喂猫出粮两份,喂猫出粮两份,false,,强电子鼓点 BGM 0dB 喂猫出粮
+clip_042,audio/clip_042.wav,true,instrumental_bgm,speech|bgm,true,false,none,1,false,4,standby,3.025,Neo，切换观影模式,切换观影模式,false,,木吉他分解和弦 BGM +4dB 切场景
+clip_043,audio/clip_043.wav,true,instrumental_bgm,speech|bgm,true,false,none,1,false,-1,standby,3.868,Neo，把客厅灯亮度调到50,把客厅灯亮度调到50,false,,极强伴奏 BGM -1dB 调亮度
+clip_044,audio/clip_044.wav,true,instrumental_bgm,speech|bgm,true,false,none,1,false,3,standby,2.6,Neo，下一首歌,下一首歌,false,,电子节奏 BGM +3dB 切歌
+clip_045,audio/clip_045.wav,false,instrumental_bgm,bgm,true,false,none,0,false,,standby,3.8,,,false,,纯伴奏音乐1（无任何说话）
+clip_046,audio/clip_046.wav,false,instrumental_bgm,bgm,true,false,none,0,false,,standby,3.8,,,false,,纯伴奏音乐2（无任何说话）
+clip_047,audio/clip_047.wav,false,instrumental_bgm,bgm,true,false,none,0,false,,standby,3.8,,,false,,纯 Lo-Fi 钢琴背景音乐
+clip_048,audio/clip_048.wav,false,instrumental_bgm,bgm,true,false,none,0,false,,standby,3.8,,,false,,纯强鼓点电子背景音乐
+clip_049,audio/clip_049.wav,false,instrumental_bgm,speech|bgm,true,false,none,1,false,4,standby,5.144,周末准备去海边玩两天，机票订好了吗,,false,周末准备去海边玩两天，机票订好了吗,纯吉他BGM中普通对话
+clip_050,audio/clip_050.wav,false,instrumental_bgm,speech|bgm,true,false,none,1,false,3,standby,4.167,我觉得Neo的界面设计还挺简洁的,,false,我觉得Neo的界面设计还挺简洁的,钢琴BGM中第三人称评价Neo
+clip_051,audio/clip_051.wav,false,instrumental_bgm,speech|bgm,true,false,none,1,false,4,standby,3.8,你有看到我放在桌上的耳机吗,,false,你有看到我放在桌上的耳机吗,伴奏BGM中'你有...'近音聊天
+clip_052,audio/clip_052.wav,false,instrumental_bgm,speech|bgm,true,false,none,1,false,3,standby,3.8,This background beat sounds super chill tonight,,false,This background beat sounds super chill tonight,电子BGM中纯英文闲聊
+clip_053,audio/clip_053.wav,true,ambient_noise,speech|noise,false,false,fan_hum,1,false,2,standby,3.209,Neo，打开客厅吸顶灯,打开客厅吸顶灯,false,,风扇+50Hz交流嗡声 +2dB 开灯
+clip_054,audio/clip_054.wav,true,ambient_noise,speech|noise,false,false,fan_hum,1,false,-1,standby,3.6,Neo，把卧室空调关掉,把卧室空调关掉,false,,强风扇宽带噪 -1dB 关空调
+clip_055,audio/clip_055.wav,true,ambient_noise,speech|noise,false,false,rain_broadband,1,false,1,standby,3.09,Neo，关闭阳台窗户,关闭阳台窗户,false,,大雨宽带白粉噪 +1dB 关窗
+clip_056,audio/clip_056.wav,true,ambient_noise,speech|noise,false,false,keyboard_clicks,1,false,4,standby,2.823,Neo，打开书房灯,打开书房灯,false,,高频机械键盘敲击脉冲 +4dB 开灯
+clip_057,audio/clip_057.wav,true,ambient_noise,speech|noise,false,false,tv_chatter,1,false,3,standby,2.725,Neo，把电视关掉,把电视关掉,false,,电视人声广播背景 +3dB 关电视
+clip_058,audio/clip_058.wav,true,ambient_noise,speech|noise,false,false,tv_chatter,1,false,1,standby,4.178,Neo，把客厅吸顶灯调暗一点,把客厅吸顶灯调暗一点,false,,强电视对话背景 +1dB 调暗灯
+clip_059,audio/clip_059.wav,true,ambient_noise,speech|noise,false,false,vacuum_roar,1,false,0,standby,3.283,Neo，打开空气净化器,打开空气净化器,false,,吸尘器轰鸣 0dB 开空气净化器
+clip_060,audio/clip_060.wav,true,ambient_noise,speech|noise,false,false,cafe_babble,1,false,2,standby,2.941,Neo，打开餐厅灯,打开餐厅灯,false,,多人嘈杂环境底噪 +2dB 开餐厅灯
+clip_061,audio/clip_061.wav,true,ambient_noise,speech|noise,false,false,rain_broadband,1,false,3,standby,3.482,Neo，查看当前室内湿度,查看当前室内湿度,false,,雨声环境查湿度
+clip_062,audio/clip_062.wav,false,ambient_noise,noise,false,false,fan_hum,0,false,,standby,3.6,,,false,,纯空调风扇+50Hz交流嗡声（无人声）
+clip_063,audio/clip_063.wav,false,ambient_noise,noise,false,false,rain_broadband,0,false,,standby,3.6,,,false,,纯大雨宽带背景音（无人声）
+clip_064,audio/clip_064.wav,false,ambient_noise,noise,false,false,keyboard_clicks,0,false,,standby,3.6,,,false,,纯机械键盘密集敲击声（无人声）
+clip_065,audio/clip_065.wav,false,ambient_noise,noise,false,false,vacuum_roar,0,false,,standby,3.6,,,false,,纯吸尘器马达轰鸣声（无人声）
+clip_066,audio/clip_066.wav,false,ambient_noise,noise,false,false,tv_chatter,0,false,,standby,3.6,,,false,,纯电视广播谈话背景声（无用户指令）
+clip_067,audio/clip_067.wav,false,ambient_noise,noise,false,false,cafe_babble,0,false,,standby,3.6,,,false,,纯多人嘈杂咖啡馆背景声
+clip_068,audio/clip_068.wav,false,ambient_noise,speech|noise,false,false,keyboard_clicks,1,false,4,standby,4.165,这段代码编译报错了，我看一下日志,,false,这段代码编译报错了，我看一下日志,敲键盘时自言自语（非指令）
+clip_069,audio/clip_069.wav,false,ambient_noise,speech|noise,false,false,tv_chatter,1,false,3,standby,4.864,刚才新闻里提到Neo芯片性能提升很大,,false,刚才新闻里提到Neo芯片性能提升很大,电视背景声下第三人称提及Neo
+clip_070,audio/clip_070.wav,false,ambient_noise,speech|noise,false,false,fan_hum,1,false,2,standby,3.891,今天好热啊，等下喝杯冰水吧,,false,今天好热啊，等下喝杯冰水吧,风扇噪声中日常聊天（无唤醒词）
+clip_071,audio/clip_071.wav,true,multi_speaker,speech|multi_speaker,false,false,none,2,true,,standby,5.359,Neo，打开客厅吸顶灯,打开客厅吸顶灯,false,你晚上想吃米饭还是面条呀,双人顺序讲话：说话人A日常聊天 -> 说话人B下达Neo开灯指令
+clip_072,audio/clip_072.wav,true,multi_speaker,speech|multi_speaker,false,false,none,2,false,,standby,5.356,Neo，关闭卧室灯,关闭卧室灯,false,明天早上别忘了带雨伞出门,双人顺序讲话：先下达Neo关灯指令 -> 另一人紧接着聊无关话题（不可把后人聊天拼成指令）
+clip_073,audio/clip_073.wav,true,multi_speaker,speech|multi_speaker,false,false,none,3,true,,standby,7.359,Neo，把空调调到25度,把空调调到25度,false,周末电影票买好了吗 | 买好了是下午三点的场次,三人顺序对话：中间插播主人的Neo空调指令
+clip_074,audio/clip_074.wav,true,multi_speaker,speech|multi_speaker,false,false,none,2,true,,standby,5.122,Neo，打开书房台灯,打开书房台灯,false,昨天超市打折买了不少水果放在冰箱里记得吃,双人同时重叠并发讲话（+4dB 主人女声背景干扰）：提取主人开台灯指令
+clip_075,audio/clip_075.wav,true,multi_speaker,speech|multi_speaker,false,false,none,2,true,,standby,5.348,Neo，把小米音响音量调到30,把小米音响音量调到30,false,明天开会的材料我都整理好发到群里了你记得看一下,双人高强度重叠讲话（+2dB SIR）：提取主人音量指令
+clip_076,audio/clip_076.wav,true,multi_speaker,speech|multi_speaker|bgm,true,false,none,2,true,4,standby,4.995,Neo，关闭客厅风扇,关闭客厅风扇,false,厨房里的水烧开了我去泡茶,双人对话 + BGM 复合场景：分离BGM与说话人后执行关风扇
+clip_077,audio/clip_077.wav,true,multi_speaker,speech|multi_speaker|song|bgm,true,true,none,2,false,4,standby,4.992,Neo，把音量调小一点,把音量调小一点,false,这首歌声音有点大了,双人对话 + 真实歌声背景终极复合场景：调小音量
+clip_078,audio/clip_078.wav,true,multi_speaker,speech|multi_speaker|noise,false,false,tv_chatter,2,false,4,standby,4.218,Neo，关闭窗帘,关闭窗帘,false,快看外面好像下雨了,双人对话 + 电视人声噪声背景：关闭窗帘
+clip_079,audio/clip_079.wav,true,multi_speaker,speech|multi_speaker,false,false,none,2,true,,standby,3.203,Neo，打开客厅灯,打开客厅灯,false,Did you finish reading that article from yesterday,中英双人同时重叠讲话：英文旁白叠中文主人指令
+clip_080,audio/clip_080.wav,false,multi_speaker,speech|multi_speaker,false,false,none,2,true,,standby,5.362,晚上我们吃烤鱼还是炒菜呀,,false,晚上我们吃烤鱼还是炒菜呀 | 随便吧炒两个青菜就行,双人日常家庭对话（无指令）
+clip_081,audio/clip_081.wav,false,multi_speaker,speech|multi_speaker,false,false,none,2,true,,standby,5.606,你觉得Neo这个语音助手好用吗,,false,你觉得Neo这个语音助手好用吗 | 我觉得还不错反应挺快的,双人讨论第三人称 Neo（非下达指令）
+clip_082,audio/clip_082.wav,false,multi_speaker,speech|multi_speaker,false,false,none,2,true,,standby,5.811,我刚跟同事聊到Neo的时候大家都很感兴趣,,false,我刚跟同事聊到Neo的时候大家都很感兴趣 | 对呀我也想在家里装一个,双人聊天转述提及 Neo
+clip_083,audio/clip_083.wav,false,multi_speaker,speech|multi_speaker,false,false,none,2,true,,standby,4.161,快递放在门口了谁去拿一下,,false,快递放在门口了谁去拿一下 | 我马上去拿顺便把垃圾也倒了,双人同时重叠家务对话（非指令）
+clip_084,audio/clip_084.wav,false,multi_speaker,speech|multi_speaker,false,false,none,2,true,,standby,5.311,别管Neo了先把客厅收拾一下吧,,false,别管Neo了先把客厅收拾一下吧 | 好我把茶几擦干净,双人对话中包含否定提及 Neo
+clip_085,audio/clip_085.wav,false,multi_speaker,speech|multi_speaker|bgm,true,false,none,2,false,4,standby,5.234,这首吉他曲挺放松的,,false,这首吉他曲挺放松的 | 嗯适合晚上看书的时候听,双人聊天 + 纯器乐BGM（非指令）
+clip_086,audio/clip_086.wav,false,multi_speaker,speech|multi_speaker|song|bgm,true,true,none,2,true,3,standby,4.996,你好，帮我把桌上那杯水递过来,,false,你好，帮我把桌上那杯水递过来 | 给，小心有点烫,双人对话 + 真实歌声背景 + '你好'近音陷阱
+clip_087,audio/clip_087.wav,false,multi_speaker,speech|multi_speaker,false,false,none,3,true,,standby,6.866,今天外面太阳好大呀,,false,今天外面太阳好大呀 | 是啊我把阳台的衣服都收进来了 | 晚上应该会凉快一点,三人日常闲聊（无指令）
+clip_088,audio/clip_088.wav,false,multi_speaker,speech|multi_speaker|noise,false,false,cafe_babble,2,true,3,standby,6.259,"No, I think we should take the subway instead",,false,"No, I think we should take the subway instead | Sounds good, traffic near downtown is heavy",英文双人聊天 + 咖啡馆背景音 + No/Near 陷阱
+clip_089,audio/clip_089.wav,true,conversation_scenes,speech,false,false,none,1,false,,conversation,2.6,再调亮一点,再调亮一点,false,,连续对话免唤醒追问：调亮灯光
+clip_090,audio/clip_090.wav,true,conversation_scenes,speech|bgm,true,false,none,1,false,3,conversation,2.6,声音小一点,声音小一点,false,,连续对话 + BGM 背景下免唤醒调小声音
+clip_091,audio/clip_091.wav,true,conversation_scenes,speech|song|bgm,true,true,none,1,false,4,conversation,2.6,换一首歌,换一首歌,false,,连续对话 + 真实歌声背景免唤醒切歌
+clip_092,audio/clip_092.wav,true,conversation_scenes,speech|noise,false,false,fan_hum,1,false,2,conversation,2.6,把卧室灯也关掉,把卧室灯也关掉,false,,连续对话 + 风扇噪声下免唤醒关卧室灯
+clip_093,audio/clip_093.wav,true,conversation_scenes,speech,false,false,none,1,false,,conversation,2.743,顺便打开书房台灯,顺便打开书房台灯,false,,连续对话免唤醒顺便开书房台灯
+clip_094,audio/clip_094.wav,true,conversation_scenes,speech|multi_speaker,false,false,none,2,false,,conversation,4.462,把亮度调到80,把亮度调到80,false,我去厨房洗点水果,连续对话 + 多人场景：家人旁白后主人免唤醒续聊调亮度
+clip_095,audio/clip_095.wav,false,conversation_scenes,speech,false,false,none,1,false,,conversation,3.978,晚饭吃什么呀，帮我拿双筷子,,false,晚饭吃什么呀，帮我拿双筷子,连续对话窗口内的家人旁白（必须拒绝）
+clip_096,audio/clip_096.wav,false,conversation_scenes,speech,false,false,none,1,false,,conversation,2.6,已打开客厅吸顶灯,,false,已打开客厅吸顶灯,连续对话窗口内的 TTS 扬声器自回声（必须抑制）
+clip_097,audio/clip_097.wav,false,conversation_scenes,speech,false,false,none,1,false,,conversation,4.346,哈哈今天上班太累了，待会早点睡,,false,哈哈今天上班太累了，待会早点睡,连续对话窗口内的日常感叹旁白
+clip_098,audio/clip_098.wav,false,conversation_scenes,speech,false,false,none,1,false,,conversation,2.6,好了谢谢不用了,,false,好了谢谢不用了,连续对话窗口内的礼貌告别/结束对话口令
+clip_099,audio/clip_099.wav,false,conversation_scenes,song|bgm,true,true,none,0,false,,conversation,4,,,false,,连续对话窗口内只有歌曲演唱（绝不能把歌词当免唤醒指令）
+clip_100,audio/clip_100.wav,false,conversation_scenes,speech|noise,false,false,tv_chatter,1,false,2,conversation,4.129,你去拿一下外卖吧，我在接电话,,false,你去拿一下外卖吧，我在接电话,连续对话窗口 + 电视背景音中的家人旁白

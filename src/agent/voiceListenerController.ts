@@ -16,6 +16,7 @@ import {
 import { TypedEmitter } from "../core/contracts.ts";
 import { createBoundedFetch, type FetchLike } from "../core/httpTimeout.ts";
 import { decodeWavPcm, encodeWavPcm16, isWavBuffer, resampleLinear } from "./audioPcm.ts";
+import type { SeparatedAudioStreamInfo, SoundTypeTag } from "./audioSourceSeparator.ts";
 import { formatExitConversationAck, formatWakeAck } from "./cavemanReplyPolicy.ts";
 import { LocalVoiceEngine, type LocalVoiceEngineStatus } from "./localVoiceEngine.ts";
 import type {
@@ -93,6 +94,9 @@ export interface VoiceLastMetrics {
   vadEngine?: string;
   speechRatio?: number;
   asrEngine?: string;
+  detectedSoundTypes?: SoundTypeTag[];
+  detectedSpeakerCount?: number;
+  separatedStreams?: SeparatedAudioStreamInfo[];
   voiceprint?: VoiceprintIdentifyResult | null;
   acousticWake?: WakeWordAcousticHit | null;
   intent?: CommandIntentChoice;
@@ -162,6 +166,7 @@ export interface HandleTranscriptOptions {
   snrGainDb?: number;
   timingsBase?: Partial<VoicePipelineTimings>;
   llmAttentionOverride?: AttentionLlmEvaluator;
+  precomputedAttention?: AttentionDecision;
 }
 
 export interface HandleTranscriptResult {
@@ -190,6 +195,9 @@ export interface ProcessAudioUploadResult extends HandleTranscriptResult {
   snrGainDb?: number;
   speechRatio?: number;
   acousticEvent?: string;
+  detectedSoundTypes?: SoundTypeTag[];
+  detectedSpeakerCount?: number;
+  separatedStreams?: SeparatedAudioStreamInfo[];
 }
 
 export type VoiceListenerEvents = {
@@ -521,6 +529,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         // 开启监听时预连接 SystemOne 网关，并异步预热本地 ONNX 模型与 openWakeWord 零样本原型
         this._agent.systemOneClient?.preconnect();
         void this._localEngine.warmup();
+        if (this.config.sourceSeparationMode !== "off") {
+          this._localEngine.sourceSeparator.warmup();
+        }
         if (this.config.owwEnabled) {
           void this._localEngine.openWakeWord
             .bootstrapWakeWords(this.config.wakeWords)
@@ -649,28 +660,30 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       this._lastWakeHit = { ...options.acousticWake, timestamp: now };
     }
 
-    const decision = await evaluateVoiceAttention({
-      rawText: text,
-      altText: options.altText,
-      wakeWordEnabled: cfg.wakeWordEnabled,
-      wakeWords: cfg.wakeWords,
-      attentionMode: cfg.attentionMode,
-      bypassWakeWord: options.bypassWakeWord,
-      awakeActive,
-      inConversation,
-      dialogState: this._dialogState,
-      acousticWake: options.acousticWake ?? null,
-      owwActiveForWord,
-      systemOneClient: this._agent.systemOneClient,
-      recentTurns: this._agent.recentConversationTurns(5),
-      lastSpokenReply: this._lastSpokenReply,
-      lastSpokenAt: this._lastSpokenAt,
-      now,
-      acousticEvent: options.acousticEvent,
-      voiceprint: options.voiceprint,
-      voiceprintMode: cfg.voiceprintMode,
-      llmEvaluator,
-    });
+    const decision =
+      options.precomputedAttention ??
+      (await evaluateVoiceAttention({
+        rawText: text,
+        altText: options.altText,
+        wakeWordEnabled: cfg.wakeWordEnabled,
+        wakeWords: cfg.wakeWords,
+        attentionMode: cfg.attentionMode,
+        bypassWakeWord: options.bypassWakeWord,
+        awakeActive,
+        inConversation,
+        dialogState: this._dialogState,
+        acousticWake: options.acousticWake ?? null,
+        owwActiveForWord,
+        systemOneClient: this._agent.systemOneClient,
+        recentTurns: this._agent.recentConversationTurns(5),
+        lastSpokenReply: this._lastSpokenReply,
+        lastSpokenAt: this._lastSpokenAt,
+        now,
+        acousticEvent: options.acousticEvent,
+        voiceprint: options.voiceprint,
+        voiceprintMode: cfg.voiceprintMode,
+        llmEvaluator,
+      }));
 
     const preMs =
       (options.timingsBase?.denoiseMs ?? 0) +
@@ -955,6 +968,189 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         ? decoded.samples
         : resampleLinear(decoded.samples, decoded.sampleRate, 16000);
 
+    // ---- Stage 1.5: 本地自适应多级声源分离与说话人隔离主通道（S_Fused 最终方案） ----
+    const sttAuthPre = resolveEffectiveSttAuth(cfg);
+    const hasCloudSttPre = Boolean(
+      sttAuthPre.baseUrl && (sttAuthPre.apiKey || isLocalEndpointUrl(sttAuthPre.baseUrl)),
+    );
+    const engineStatusPre = this._localEngine.getStatus();
+    const prefPre = options.preferredEngine ?? (cfg.voiceEngine === "whisper" ? "whisper" : "auto");
+    const useLocalPre =
+      prefPre === "local" ||
+      (prefPre === "auto" && engineStatusPre.readyForLocalAsr) ||
+      (prefPre === "whisper" && !hasCloudSttPre && engineStatusPre.readyForLocalAsr);
+
+    if (
+      useLocalPre &&
+      cfg.sourceSeparationMode !== "off" &&
+      engineStatusPre.readyForSourceSeparation
+    ) {
+      const now = Date.now();
+      const segDurMs = Math.round((pcm16k.length / 16000) * 1000);
+      const speechStartedAt = Math.max(0, now - Math.min(8000, segDurMs));
+      const awakeActive =
+        this._awakeUntil !== null && (now < this._awakeUntil || speechStartedAt < this._awakeUntil);
+      const convWindowActive =
+        cfg.conversationWindowSec > 0 &&
+        this._conversationUntil !== null &&
+        (now < this._conversationUntil || speechStartedAt < this._conversationUntil);
+      const inConversation =
+        this._dialogState === "conversation" || awakeActive || convWindowActive;
+
+      let voiceprintResult: VoiceprintIdentifyResult | null = null;
+      let voiceprintMs = 0;
+      const profiles = listPublicVoiceprints();
+      if (cfg.voiceprintMode !== "off" && profiles.length > 0 && pcm16k.length >= 4000) {
+        const denForVp = this._localEngine.denoise(pcm16k, 16000, cfg.noiseSuppressionMode);
+        const emb = this._localEngine.extractSpeakerEmbedding(denForVp.samples, 16000);
+        voiceprintMs = emb.durationMs;
+        voiceprintResult = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
+      }
+
+      const llmEvaluator: AttentionLlmEvaluator | undefined =
+        options.llmAttentionOverride ??
+        (cfg.provider !== "local"
+          ? async (promptText: string) => {
+              const raw = await this._agent.evaluateAttention(promptText, 3500);
+              if (!raw) throw new Error("no llm verdict");
+              return raw;
+            }
+          : undefined);
+
+      const sep = await this._localEngine.sourceSeparator.separateAndRecognize(pcm16k, 16000, {
+        mode: cfg.sourceSeparationMode,
+        voiceLang: lang,
+        wakeWordEnabled: cfg.wakeWordEnabled,
+        wakeWords: cfg.wakeWords,
+        attentionMode: cfg.attentionMode,
+        bypassWakeWord: options.bypassWakeWord,
+        awakeActive,
+        inConversation,
+        dialogState: this._dialogState,
+        recentTurns: this._agent.recentConversationTurns(5),
+        lastSpokenReply: this._lastSpokenReply,
+        lastSpokenAt: this._lastSpokenAt,
+        now,
+        voiceprint: voiceprintResult,
+        voiceprintMode: cfg.voiceprintMode,
+        systemOneClient: this._agent.systemOneClient,
+        llmEvaluator,
+      });
+
+      if (sep.acousticWake?.matched) {
+        this._lastWakeHit = { ...sep.acousticWake, timestamp: now };
+      }
+
+      const timingsBase: Partial<VoicePipelineTimings> = {
+        denoiseMs: (sep.stageTimingsMs.gtcrnMs ?? 0) + (sep.stageTimingsMs.dpdfnetMs ?? 0) + (sep.stageTimingsMs.spleeterMs ?? 0),
+        vadMs: (sep.stageTimingsMs.cedSceneMs ?? 0) + (sep.stageTimingsMs.diarizationMs ?? 0),
+        voiceprintMs,
+        asrMs: Math.max(0, sep.totalMs - ((sep.stageTimingsMs.gtcrnMs ?? 0) + (sep.stageTimingsMs.dpdfnetMs ?? 0) + (sep.stageTimingsMs.spleeterMs ?? 0) + (sep.stageTimingsMs.cedSceneMs ?? 0) + (sep.stageTimingsMs.diarizationMs ?? 0))),
+      };
+
+      this._lastMetrics = {
+        denoiseEngine: sep.denoiseEngine,
+        snrGainDb: sep.snrGainDb,
+        vadEngine: sep.vadEngine,
+        speechRatio: sep.speechDetected ? 1 : 0,
+        asrEngine: sep.asrEngine,
+        detectedSoundTypes: sep.detectedSoundTypes,
+        detectedSpeakerCount: sep.detectedSpeakerCount,
+        separatedStreams: sep.separatedStreams,
+        voiceprint: voiceprintResult,
+        acousticWake: sep.acousticWake,
+        attention: sep.attention,
+        timings: { ...timingsBase, totalMs: Math.round(performance.now() - totalStart) },
+        updatedAt: Date.now(),
+      };
+
+      if (!sep.speechDetected || !sep.text.trim()) {
+        return {
+          ok: true,
+          text: sep.text,
+          speechDetected: false,
+          denoiseEngine: sep.denoiseEngine,
+          vadEngine: sep.vadEngine,
+          asrEngine: sep.asrEngine,
+          inputSnrDb: sep.inputSnrDb,
+          outputSnrDb: sep.outputSnrDb,
+          snrGainDb: sep.snrGainDb,
+          acousticEvent: sep.acousticEvent,
+          detectedSoundTypes: sep.detectedSoundTypes,
+          detectedSpeakerCount: sep.detectedSpeakerCount,
+          separatedStreams: sep.separatedStreams,
+          voiceprint: voiceprintResult,
+          acousticWake: sep.acousticWake,
+          attention: sep.attention,
+          matched: false,
+          wokeOnly: false,
+          command: "",
+          timings: { ...timingsBase, totalMs: Math.round(performance.now() - totalStart) },
+          voiceState: this.snapshot(),
+        };
+      }
+
+      if (!autoDispatch) {
+        return {
+          ok: true,
+          text: sep.text,
+          speechDetected: true,
+          denoiseEngine: sep.denoiseEngine,
+          vadEngine: sep.vadEngine,
+          asrEngine: sep.asrEngine,
+          inputSnrDb: sep.inputSnrDb,
+          outputSnrDb: sep.outputSnrDb,
+          snrGainDb: sep.snrGainDb,
+          acousticEvent: sep.acousticEvent,
+          detectedSoundTypes: sep.detectedSoundTypes,
+          detectedSpeakerCount: sep.detectedSpeakerCount,
+          separatedStreams: sep.separatedStreams,
+          voiceprint: voiceprintResult,
+          acousticWake: sep.acousticWake,
+          attention: sep.attention,
+          matched: false,
+          wokeOnly: false,
+          command: "",
+          timings: { ...timingsBase, totalMs: Math.round(performance.now() - totalStart) },
+          voiceState: this.snapshot(),
+        };
+      }
+
+      const dispatched = await this.handleTranscript(sep.text, {
+        isFinal: true,
+        bypassWakeWord: options.bypassWakeWord,
+        engine: "local",
+        now,
+        segmentDurationMs: segDurMs,
+        acousticEvent: sep.acousticEvent,
+        altText: sep.altText,
+        acousticWake: sep.acousticWake,
+        owwEvaluated: Boolean(cfg.owwEnabled && this._localEngine.openWakeWord.isReady),
+        voiceprint: voiceprintResult,
+        snrGainDb: sep.snrGainDb,
+        timingsBase,
+        llmAttentionOverride: options.llmAttentionOverride,
+        precomputedAttention: sep.attention,
+      });
+
+      return {
+        ...dispatched,
+        text: sep.text,
+        speechDetected: true,
+        denoiseEngine: sep.denoiseEngine,
+        vadEngine: sep.vadEngine,
+        asrEngine: sep.asrEngine,
+        inputSnrDb: sep.inputSnrDb,
+        outputSnrDb: sep.outputSnrDb,
+        snrGainDb: sep.snrGainDb,
+        acousticEvent: sep.acousticEvent,
+        detectedSoundTypes: sep.detectedSoundTypes,
+        detectedSpeakerCount: sep.detectedSpeakerCount,
+        separatedStreams: sep.separatedStreams,
+        acousticWake: sep.acousticWake,
+      };
+    }
+
     // ---- Stage 2: 环境降噪（GTCRN 神经语音增强 / 纯 TS 频谱减法） ----
     const denoised = this._localEngine.denoise(pcm16k, 16000, cfg.noiseSuppressionMode);
 
@@ -1221,6 +1417,139 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     let runtimeEngine: VoiceRuntimeEngine = "local";
 
     if (useLocal) {
+      const sepReady =
+        cfg.sourceSeparationMode !== "off" &&
+        this._localEngine.getStatus().readyForSourceSeparation &&
+        segment.rawSamples.length >= 3200;
+
+      if (sepReady) {
+        const now = Date.now();
+        const segDurMs = Math.round(segment.durationSec * 1000);
+        const speechStartedAt = Math.max(0, now - Math.min(8000, segDurMs));
+        const awakeActive =
+          this._awakeUntil !== null && (now < this._awakeUntil || speechStartedAt < this._awakeUntil);
+        const convWindowActive =
+          cfg.conversationWindowSec > 0 &&
+          this._conversationUntil !== null &&
+          (now < this._conversationUntil || speechStartedAt < this._conversationUntil);
+        const inConversation =
+          this._dialogState === "conversation" || awakeActive || convWindowActive;
+
+        const llmEvaluator: AttentionLlmEvaluator | undefined =
+          options.llmAttentionOverride ??
+          (cfg.provider !== "local"
+            ? async (promptText: string) => {
+                const raw = await this._agent.evaluateAttention(promptText, 3500);
+                if (!raw) throw new Error("no llm verdict");
+                return raw;
+              }
+            : undefined);
+
+        const sep = await this._localEngine.sourceSeparator.separateAndRecognize(
+          segment.rawSamples,
+          16000,
+          {
+            mode: cfg.sourceSeparationMode,
+            voiceLang: lang,
+            wakeWordEnabled: cfg.wakeWordEnabled,
+            wakeWords: cfg.wakeWords,
+            attentionMode: cfg.attentionMode,
+            bypassWakeWord: options.bypassWakeWord,
+            awakeActive,
+            inConversation,
+            dialogState: this._dialogState,
+            recentTurns: this._agent.recentConversationTurns(5),
+            lastSpokenReply: this._lastSpokenReply,
+            lastSpokenAt: this._lastSpokenAt,
+            now,
+            voiceprint: voiceprintResult,
+            voiceprintMode: cfg.voiceprintMode,
+            systemOneClient: this._agent.systemOneClient,
+            llmEvaluator,
+          },
+        );
+
+        const effectiveWake = sep.acousticWake ?? acousticWake;
+        if (effectiveWake?.matched) {
+          this._lastWakeHit = { ...effectiveWake, timestamp: now };
+        }
+
+        this._lastMetrics = {
+          denoiseEngine: sep.denoiseEngine,
+          snrGainDb: sep.snrGainDb,
+          vadEngine: sep.vadEngine,
+          speechRatio: sep.speechDetected ? 1 : 0,
+          asrEngine: sep.asrEngine,
+          detectedSoundTypes: sep.detectedSoundTypes,
+          detectedSpeakerCount: sep.detectedSpeakerCount,
+          separatedStreams: sep.separatedStreams,
+          voiceprint: voiceprintResult,
+          acousticWake: effectiveWake,
+          attention: sep.attention,
+          updatedAt: Date.now(),
+        };
+
+        if (!sep.speechDetected || !sep.text.trim()) {
+          return {
+            ok: true,
+            text: "",
+            speechDetected: false,
+            denoiseEngine: sep.denoiseEngine,
+            vadEngine: sep.vadEngine,
+            asrEngine: sep.asrEngine,
+            inputSnrDb: sep.inputSnrDb,
+            outputSnrDb: sep.outputSnrDb,
+            snrGainDb: sep.snrGainDb,
+            acousticEvent: sep.acousticEvent,
+            detectedSoundTypes: sep.detectedSoundTypes,
+            detectedSpeakerCount: sep.detectedSpeakerCount,
+            separatedStreams: sep.separatedStreams,
+            voiceprint: voiceprintResult,
+            acousticWake: effectiveWake,
+            attention: sep.attention,
+            matched: false,
+            wokeOnly: false,
+            command: "",
+            timings: { voiceprintMs, asrMs: sep.totalMs, totalMs: Math.round(performance.now() - totalStart) },
+            voiceState: this.snapshot(),
+          };
+        }
+
+        const dispatched = await this.handleTranscript(sep.text, {
+          isFinal: true,
+          bypassWakeWord: options.bypassWakeWord,
+          engine: "local",
+          now,
+          segmentDurationMs: segDurMs,
+          acousticEvent: sep.acousticEvent,
+          altText: sep.altText,
+          acousticWake: effectiveWake,
+          owwEvaluated,
+          voiceprint: voiceprintResult,
+          snrGainDb: sep.snrGainDb,
+          timingsBase: { voiceprintMs, asrMs: sep.totalMs },
+          llmAttentionOverride: options.llmAttentionOverride,
+          precomputedAttention: sep.attention,
+        });
+
+        return {
+          ...dispatched,
+          text: sep.text,
+          speechDetected: true,
+          denoiseEngine: sep.denoiseEngine,
+          vadEngine: sep.vadEngine,
+          asrEngine: sep.asrEngine,
+          inputSnrDb: sep.inputSnrDb,
+          outputSnrDb: sep.outputSnrDb,
+          snrGainDb: sep.snrGainDb,
+          acousticEvent: sep.acousticEvent,
+          detectedSoundTypes: sep.detectedSoundTypes,
+          detectedSpeakerCount: sep.detectedSpeakerCount,
+          separatedStreams: sep.separatedStreams,
+          acousticWake: effectiveWake,
+        };
+      }
+
       const sv = await this._localEngine.transcribeDualTrack(
         segment.rawSamples,
         segment.denoisedSamples,

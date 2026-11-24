@@ -1,0 +1,4397 @@
+{
+  "version": 1,
+  "generatedAt": "2026-11-24T16:50:19.005Z",
+  "totalClips": 100,
+  "neoCommandCount": 50,
+  "nonNeoCount": 50,
+  "ownerRefWav": "owner_ref.wav",
+  "familyRefWav": "family_ref.wav",
+  "categories": {
+    "clean_no_bgm": {
+      "total": 14,
+      "neo": 7,
+      "nonNeo": 7
+    },
+    "song_singing": {
+      "total": 22,
+      "neo": 11,
+      "nonNeo": 11
+    },
+    "instrumental_bgm": {
+      "total": 16,
+      "neo": 8,
+      "nonNeo": 8
+    },
+    "ambient_noise": {
+      "total": 18,
+      "neo": 9,
+      "nonNeo": 9
+    },
+    "multi_speaker": {
+      "total": 18,
+      "neo": 9,
+      "nonNeo": 9
+    },
+    "conversation_scenes": {
+      "total": 12,
+      "neo": 6,
+      "nonNeo": 6
+    }
+  },
+  "clips": [
+    {
+      "id": "clip_001",
+      "index": 1,
+      "filename": "audio/clip_001.wav",
+      "durationSec": 2.859,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "clean_no_bgm",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，打开客厅吸顶灯",
+      "distractorTranscript": "",
+      "expectedCommand": "打开客厅吸顶灯",
+      "expectedCommandKeywords": [
+        [
+          "打开",
+          "开"
+        ],
+        [
+          "客厅",
+          "吸顶灯",
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.3,
+          "endSec": 2.409,
+          "text": "Neo，打开客厅吸顶灯",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "干净环境标准句首唤醒+完整控制指令（男声）"
+    },
+    {
+      "id": "clip_002",
+      "index": 2,
+      "filename": "audio/clip_002.wav",
+      "durationSec": 2.6,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "clean_no_bgm",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo关灯",
+      "distractorTranscript": "",
+      "expectedCommand": "关灯",
+      "expectedCommandKeywords": [
+        [
+          "关",
+          "熄",
+          "灭"
+        ],
+        [
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.25,
+          "endSec": 0.947,
+          "text": "Neo关灯",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "快速连读短指令 'Neo关灯' 回归测试"
+    },
+    {
+      "id": "clip_003",
+      "index": 3,
+      "filename": "audio/clip_003.wav",
+      "durationSec": 3.11,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "clean_no_bgm",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "嘿Neo，把卧室灯关掉",
+      "distractorTranscript": "",
+      "expectedCommand": "把卧室灯关掉",
+      "expectedCommandKeywords": [
+        [
+          "关",
+          "关闭",
+          "关掉"
+        ],
+        [
+          "卧室",
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.3,
+          "endSec": 2.66,
+          "text": "嘿Neo，把卧室灯关掉",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "女声呼唤前缀 + 设备关闭指令"
+    },
+    {
+      "id": "clip_004",
+      "index": 4,
+      "filename": "audio/clip_004.wav",
+      "durationSec": 4.042,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "clean_no_bgm",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，把小米音响音量调到35",
+      "distractorTranscript": "",
+      "expectedCommand": "把小米音响音量调到35",
+      "expectedCommandKeywords": [
+        [
+          "音量",
+          "声音",
+          "音响",
+          "音箱"
+        ],
+        [
+          "35",
+          "三十五"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f2",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 0.3,
+          "endSec": 3.592,
+          "text": "Neo，把小米音响音量调到35",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "干净环境数字调节指令（女声2）"
+    },
+    {
+      "id": "clip_005",
+      "index": 5,
+      "filename": "audio/clip_005.wav",
+      "durationSec": 2.6,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "clean_no_bgm",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo在吗",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": true,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.35,
+          "endSec": 1.146,
+          "text": "Neo在吗",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "干净环境纯唤醒询问"
+    },
+    {
+      "id": "clip_006",
+      "index": 6,
+      "filename": "audio/clip_006.wav",
+      "durationSec": 3.254,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "clean_no_bgm",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Hey Neo, turn off the living room light",
+      "distractorTranscript": "",
+      "expectedCommand": "turn off the living room light",
+      "expectedCommandKeywords": [
+        [
+          "turn off",
+          "off",
+          "close",
+          "关"
+        ],
+        [
+          "light",
+          "living",
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_en",
+          "voice": "Microsoft David",
+          "role": "owner",
+          "startSec": 0.3,
+          "endSec": 2.804,
+          "text": "Hey Neo, turn off the living room light",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "纯英文唤醒+英文设备控制指令"
+    },
+    {
+      "id": "clip_007",
+      "index": 7,
+      "filename": "audio/clip_007.wav",
+      "durationSec": 3.298,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "clean_no_bgm",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，查询客厅温度和湿度",
+      "distractorTranscript": "",
+      "expectedCommand": "查询客厅温度和湿度",
+      "expectedCommandKeywords": [
+        [
+          "查",
+          "温度",
+          "湿度"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.3,
+          "endSec": 2.848,
+          "text": "Neo，查询客厅温度和湿度",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "干净环境传感器查询指令"
+    },
+    {
+      "id": "clip_008",
+      "index": 8,
+      "filename": "audio/clip_008.wav",
+      "durationSec": 4.421,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "clean_no_bgm",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "今天天气真不错，下午去公园走走吧",
+      "distractorTranscript": "今天天气真不错，下午去公园走走吧",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.3,
+          "endSec": 3.971,
+          "text": "今天天气真不错，下午去公园走走吧",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "普通日常闲聊，无唤醒词"
+    },
+    {
+      "id": "clip_009",
+      "index": 9,
+      "filename": "audio/clip_009.wav",
+      "durationSec": 4.648,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "clean_no_bgm",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "我刚才跟朋友聊到Neo这个助手挺好用的",
+      "distractorTranscript": "我刚才跟朋友聊到Neo这个助手挺好用的",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.3,
+          "endSec": 4.198,
+          "text": "我刚才跟朋友聊到Neo这个助手挺好用的",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "第三人称提及 Neo（非向 Neo 下达指令）"
+    },
+    {
+      "id": "clip_010",
+      "index": 10,
+      "filename": "audio/clip_010.wav",
+      "durationSec": 3.308,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "clean_no_bgm",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "别管Neo了，我们先吃饭吧",
+      "distractorTranscript": "别管Neo了，我们先吃饭吧",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.3,
+          "endSec": 2.858,
+          "text": "别管Neo了，我们先吃饭吧",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "否定/忽略 Neo 的旁白指令"
+    },
+    {
+      "id": "clip_011",
+      "index": 11,
+      "filename": "audio/clip_011.wav",
+      "durationSec": 3.506,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "clean_no_bgm",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "你好，今天晚饭想吃什么呀",
+      "distractorTranscript": "你好，今天晚饭想吃什么呀",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f2",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 0.3,
+          "endSec": 3.056,
+          "text": "你好，今天晚饭想吃什么呀",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "近音陷阱：'你好' 日常问候，绝不能误唤 Neo"
+    },
+    {
+      "id": "clip_012",
+      "index": 12,
+      "filename": "audio/clip_012.wav",
+      "durationSec": 2.969,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "clean_no_bgm",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "你有打开阳台的窗户吗",
+      "distractorTranscript": "你有打开阳台的窗户吗",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.3,
+          "endSec": 2.519,
+          "text": "你有打开阳台的窗户吗",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "近音陷阱：'你有打开...吗' 问句，非指令"
+    },
+    {
+      "id": "clip_013",
+      "index": 13,
+      "filename": "audio/clip_013.wav",
+      "durationSec": 3.396,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "clean_no_bgm",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "No, stop talking about New York weather",
+      "distractorTranscript": "No, stop talking about New York weather",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_en",
+          "voice": "Microsoft David",
+          "role": "owner",
+          "startSec": 0.3,
+          "endSec": 2.946,
+          "text": "No, stop talking about New York weather",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "英文近音陷阱：No / New York"
+    },
+    {
+      "id": "clip_014",
+      "index": 14,
+      "filename": "audio/clip_014.wav",
+      "durationSec": 4.542,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "clean_no_bgm",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "打开客厅吸顶灯那个开关好像有点松了",
+      "distractorTranscript": "打开客厅吸顶灯那个开关好像有点松了",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.3,
+          "endSec": 4.092,
+          "text": "打开客厅吸顶灯那个开关好像有点松了",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "待机状态无唤醒词的设备讨论句"
+    },
+    {
+      "id": "clip_015",
+      "index": 15,
+      "filename": "audio/clip_015.wav",
+      "durationSec": 3.309,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "song_singing",
+      "soundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 6,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，打开客厅吸顶灯",
+      "distractorTranscript": "",
+      "expectedCommand": "打开客厅吸顶灯",
+      "expectedCommandKeywords": [
+        [
+          "打开",
+          "开"
+        ],
+        [
+          "客厅",
+          "吸顶灯",
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.75,
+          "endSec": 2.859,
+          "text": "Neo，打开客厅吸顶灯",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "《起风了》歌声背景 +6dB SNR 下达开灯指令"
+    },
+    {
+      "id": "clip_016",
+      "index": 16,
+      "filename": "audio/clip_016.wav",
+      "durationSec": 3.137,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "song_singing",
+      "soundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 3,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，关闭卧室灯",
+      "distractorTranscript": "",
+      "expectedCommand": "关闭卧室灯",
+      "expectedCommandKeywords": [
+        [
+          "关",
+          "关闭"
+        ],
+        [
+          "卧室",
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_s",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.75,
+          "endSec": 2.687,
+          "text": "Neo，关闭卧室灯",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "《起风了》副歌人声 +3dB SNR 下达关灯指令"
+    },
+    {
+      "id": "clip_017",
+      "index": 17,
+      "filename": "audio/clip_017.wav",
+      "durationSec": 4.298,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "song_singing",
+      "soundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 0,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，把小米音响音量调到20",
+      "distractorTranscript": "",
+      "expectedCommand": "把小米音响音量调到20",
+      "expectedCommandKeywords": [
+        [
+          "音量",
+          "声音",
+          "音响",
+          "音箱"
+        ],
+        [
+          "20",
+          "二十"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.75,
+          "endSec": 3.848,
+          "text": "Neo，把小米音响音量调到20",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "《起风了》0dB 强歌声干扰下调小音量"
+    },
+    {
+      "id": "clip_018",
+      "index": 18,
+      "filename": "audio/clip_018.wav",
+      "durationSec": 3.141,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "song_singing",
+      "soundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 4,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，暂停播放音乐",
+      "distractorTranscript": "",
+      "expectedCommand": "暂停播放音乐",
+      "expectedCommandKeywords": [
+        [
+          "暂停",
+          "停止",
+          "停"
+        ],
+        [
+          "音乐",
+          "播放",
+          "歌"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_s",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 0.75,
+          "endSec": 2.691,
+          "text": "Neo，暂停播放音乐",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "《漂洋过海来看你》+4dB SNR 暂停音乐"
+    },
+    {
+      "id": "clip_019",
+      "index": 19,
+      "filename": "audio/clip_019.wav",
+      "durationSec": 2.941,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "song_singing",
+      "soundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 1,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "嘿Neo，打开空调",
+      "distractorTranscript": "",
+      "expectedCommand": "打开空调",
+      "expectedCommandKeywords": [
+        [
+          "打开",
+          "开"
+        ],
+        [
+          "空调"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.75,
+          "endSec": 2.491,
+          "text": "嘿Neo，打开空调",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "《漂洋过海来看你》+1dB 强歌声干扰下开空调"
+    },
+    {
+      "id": "clip_020",
+      "index": 20,
+      "filename": "audio/clip_020.wav",
+      "durationSec": 2.6,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "song_singing",
+      "soundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 4,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo关灯",
+      "distractorTranscript": "",
+      "expectedCommand": "关灯",
+      "expectedCommandKeywords": [
+        [
+          "关",
+          "熄",
+          "灭"
+        ],
+        [
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.75,
+          "endSec": 1.482,
+          "text": "Neo关灯",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "歌声背景中快速连读 'Neo关灯'"
+    },
+    {
+      "id": "clip_021",
+      "index": 21,
+      "filename": "audio/clip_021.wav",
+      "durationSec": 3.612,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "song_singing",
+      "soundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 3,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，把台灯调亮一点",
+      "distractorTranscript": "",
+      "expectedCommand": "把台灯调亮一点",
+      "expectedCommandKeywords": [
+        [
+          "亮",
+          "调亮",
+          "台灯",
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_s",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.75,
+          "endSec": 3.162,
+          "text": "Neo，把台灯调亮一点",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "《漂洋过海来看你》女声调亮台灯"
+    },
+    {
+      "id": "clip_022",
+      "index": 22,
+      "filename": "audio/clip_022.wav",
+      "durationSec": 2.6,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "song_singing",
+      "soundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 2,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，静音",
+      "distractorTranscript": "",
+      "expectedCommand": "静音",
+      "expectedCommandKeywords": [
+        [
+          "静音",
+          "闭麦",
+          "关声",
+          "无声"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.75,
+          "endSec": 1.79,
+          "text": "Neo，静音",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "强歌曲播放 +2dB SNR 短指令静音"
+    },
+    {
+      "id": "clip_023",
+      "index": 23,
+      "filename": "audio/clip_023.wav",
+      "durationSec": 3.263,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "song_singing",
+      "soundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 2,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，帮我关闭所有灯",
+      "distractorTranscript": "",
+      "expectedCommand": "帮我关闭所有灯",
+      "expectedCommandKeywords": [
+        [
+          "关",
+          "关闭"
+        ],
+        [
+          "所有",
+          "全部",
+          "全屋",
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_s",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 0.75,
+          "endSec": 2.813,
+          "text": "Neo，帮我关闭所有灯",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "《起风了》强歌声 +2dB 关闭所有灯"
+    },
+    {
+      "id": "clip_024",
+      "index": 24,
+      "filename": "audio/clip_024.wav",
+      "durationSec": 2.727,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "song_singing",
+      "soundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": -1,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，打开窗帘",
+      "distractorTranscript": "",
+      "expectedCommand": "打开窗帘",
+      "expectedCommandKeywords": [
+        [
+          "打开",
+          "开"
+        ],
+        [
+          "窗帘",
+          "窗"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.75,
+          "endSec": 2.277,
+          "text": "Neo，打开窗帘",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "极端低信噪比 -1dB 强歌曲演唱背景开窗帘"
+    },
+    {
+      "id": "clip_025",
+      "index": 25,
+      "filename": "audio/clip_025.wav",
+      "durationSec": 3.096,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "song_singing",
+      "soundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 4,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Hey Neo, pause the music",
+      "distractorTranscript": "",
+      "expectedCommand": "pause the music",
+      "expectedCommandKeywords": [
+        [
+          "pause",
+          "stop",
+          "暂停",
+          "停"
+        ],
+        [
+          "music",
+          "音乐",
+          "歌"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_s",
+          "voice": "Microsoft David",
+          "role": "family",
+          "startSec": 0.75,
+          "endSec": 2.646,
+          "text": "Hey Neo, pause the music",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "歌曲背景中英文暂停音乐指令"
+    },
+    {
+      "id": "clip_026",
+      "index": 26,
+      "filename": "audio/clip_026.wav",
+      "durationSec": 4,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "song_singing",
+      "soundTypes": [
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "纯歌曲《起风了》主歌演唱片段（无人指令）"
+    },
+    {
+      "id": "clip_027",
+      "index": 27,
+      "filename": "audio/clip_027.wav",
+      "durationSec": 4.2,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "song_singing",
+      "soundTypes": [
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "纯歌曲《起风了》高潮副歌演唱片段"
+    },
+    {
+      "id": "clip_028",
+      "index": 28,
+      "filename": "audio/clip_028.wav",
+      "durationSec": 4,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "song_singing",
+      "soundTypes": [
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "纯歌曲《起风了》尾段演唱片段"
+    },
+    {
+      "id": "clip_029",
+      "index": 29,
+      "filename": "audio/clip_029.wav",
+      "durationSec": 4.2,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "song_singing",
+      "soundTypes": [
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "纯歌曲《漂洋过海来看你》人声演唱片段1"
+    },
+    {
+      "id": "clip_030",
+      "index": 30,
+      "filename": "audio/clip_030.wav",
+      "durationSec": 4.2,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "song_singing",
+      "soundTypes": [
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "纯歌曲《漂洋过海来看你》人声演唱片段2"
+    },
+    {
+      "id": "clip_031",
+      "index": 31,
+      "filename": "audio/clip_031.wav",
+      "durationSec": 4,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "song_singing",
+      "soundTypes": [
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "纯歌曲《漂洋过海来看你》高潮演唱片段3"
+    },
+    {
+      "id": "clip_032",
+      "index": 32,
+      "filename": "audio/clip_032.wav",
+      "durationSec": 4,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "song_singing",
+      "soundTypes": [
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "纯流行英文/器乐演唱片段"
+    },
+    {
+      "id": "clip_033",
+      "index": 33,
+      "filename": "audio/clip_033.wav",
+      "durationSec": 5.321,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "song_singing",
+      "soundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 3,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "这首歌真的很好听，我上学的时候经常听",
+      "distractorTranscript": "这首歌真的很好听，我上学的时候经常听",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "chat_s",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.6,
+          "endSec": 4.871,
+          "text": "这首歌真的很好听，我上学的时候经常听",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "边听《起风了》边与家人聊天（非指令）"
+    },
+    {
+      "id": "clip_034",
+      "index": 34,
+      "filename": "audio/clip_034.wav",
+      "durationSec": 5.157,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "song_singing",
+      "soundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 4,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "我刚才听朋友说Neo这个语音项目挺有意思的",
+      "distractorTranscript": "我刚才听朋友说Neo这个语音项目挺有意思的",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "chat_s",
+          "voice": "Microsoft Kangkang",
+          "role": "family",
+          "startSec": 0.6,
+          "endSec": 4.707,
+          "text": "我刚才听朋友说Neo这个语音项目挺有意思的",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "歌曲背景中第三人称提及 Neo（非指令）"
+    },
+    {
+      "id": "clip_035",
+      "index": 35,
+      "filename": "audio/clip_035.wav",
+      "durationSec": 4.424,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "song_singing",
+      "soundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 3,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "你好，今天晚上咱们出去吃火锅吧",
+      "distractorTranscript": "你好，今天晚上咱们出去吃火锅吧",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "chat_s",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 0.6,
+          "endSec": 3.974,
+          "text": "你好，今天晚上咱们出去吃火锅吧",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "歌曲背景中'你好'聊天近音陷阱"
+    },
+    {
+      "id": "clip_036",
+      "index": 36,
+      "filename": "audio/clip_036.wav",
+      "durationSec": 5.224,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "song_singing",
+      "soundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 4,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "把客厅灯修好之后亮多了，晚上看书舒服",
+      "distractorTranscript": "把客厅灯修好之后亮多了，晚上看书舒服",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "chat_s",
+          "voice": "Microsoft Kangkang",
+          "role": "family",
+          "startSec": 0.6,
+          "endSec": 4.774,
+          "text": "把客厅灯修好之后亮多了，晚上看书舒服",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "歌曲背景中谈论灯光但无唤醒词"
+    },
+    {
+      "id": "clip_037",
+      "index": 37,
+      "filename": "audio/clip_037.wav",
+      "durationSec": 3.041,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "instrumental_bgm",
+      "soundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 5,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，打开书房台灯",
+      "distractorTranscript": "",
+      "expectedCommand": "打开书房台灯",
+      "expectedCommandKeywords": [
+        [
+          "打开",
+          "开"
+        ],
+        [
+          "书房",
+          "台灯",
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.65,
+          "endSec": 2.591,
+          "text": "Neo，打开书房台灯",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "真实歌曲纯伴奏 BGM +5dB 开台灯"
+    },
+    {
+      "id": "clip_038",
+      "index": 38,
+      "filename": "audio/clip_038.wav",
+      "durationSec": 3.949,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "instrumental_bgm",
+      "soundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 1,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，把空调调到26度",
+      "distractorTranscript": "",
+      "expectedCommand": "把空调调到26度",
+      "expectedCommandKeywords": [
+        [
+          "空调"
+        ],
+        [
+          "26",
+          "二十六"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_s",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.65,
+          "endSec": 3.498,
+          "text": "Neo，把空调调到26度",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "真实伴奏 BGM +1dB 调空调温度"
+    },
+    {
+      "id": "clip_039",
+      "index": 39,
+      "filename": "audio/clip_039.wav",
+      "durationSec": 2.97,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "instrumental_bgm",
+      "soundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 3,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，打开净化器",
+      "distractorTranscript": "",
+      "expectedCommand": "打开净化器",
+      "expectedCommandKeywords": [
+        [
+          "打开",
+          "开"
+        ],
+        [
+          "净化器",
+          "净化"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_s",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 0.65,
+          "endSec": 2.52,
+          "text": "Neo，打开净化器",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "真实伴奏2 BGM +3dB 开净化器"
+    },
+    {
+      "id": "clip_040",
+      "index": 40,
+      "filename": "audio/clip_040.wav",
+      "durationSec": 2.945,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "instrumental_bgm",
+      "soundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 2,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，关闭客厅风扇",
+      "distractorTranscript": "",
+      "expectedCommand": "关闭客厅风扇",
+      "expectedCommandKeywords": [
+        [
+          "关",
+          "关闭"
+        ],
+        [
+          "风扇",
+          "客厅"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.65,
+          "endSec": 2.495,
+          "text": "Neo，关闭客厅风扇",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "Lo-Fi 钢琴伴奏 BGM +2dB 关风扇"
+    },
+    {
+      "id": "clip_041",
+      "index": 41,
+      "filename": "audio/clip_041.wav",
+      "durationSec": 3.306,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "instrumental_bgm",
+      "soundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 0,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，喂猫出粮两份",
+      "distractorTranscript": "",
+      "expectedCommand": "喂猫出粮两份",
+      "expectedCommandKeywords": [
+        [
+          "喂",
+          "出粮"
+        ],
+        [
+          "两",
+          "2"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_s",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.65,
+          "endSec": 2.856,
+          "text": "Neo，喂猫出粮两份",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "强电子鼓点 BGM 0dB 喂猫出粮"
+    },
+    {
+      "id": "clip_042",
+      "index": 42,
+      "filename": "audio/clip_042.wav",
+      "durationSec": 3.025,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "instrumental_bgm",
+      "soundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 4,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，切换观影模式",
+      "distractorTranscript": "",
+      "expectedCommand": "切换观影模式",
+      "expectedCommandKeywords": [
+        [
+          "观影",
+          "模式",
+          "场景",
+          "切换"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.65,
+          "endSec": 2.575,
+          "text": "Neo，切换观影模式",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "木吉他分解和弦 BGM +4dB 切场景"
+    },
+    {
+      "id": "clip_043",
+      "index": 43,
+      "filename": "audio/clip_043.wav",
+      "durationSec": 3.868,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "instrumental_bgm",
+      "soundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": -1,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，把客厅灯亮度调到50",
+      "distractorTranscript": "",
+      "expectedCommand": "把客厅灯亮度调到50",
+      "expectedCommandKeywords": [
+        [
+          "亮度",
+          "灯",
+          "客厅"
+        ],
+        [
+          "50",
+          "五十"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_s",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 0.65,
+          "endSec": 3.418,
+          "text": "Neo，把客厅灯亮度调到50",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "极强伴奏 BGM -1dB 调亮度"
+    },
+    {
+      "id": "clip_044",
+      "index": 44,
+      "filename": "audio/clip_044.wav",
+      "durationSec": 2.6,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "instrumental_bgm",
+      "soundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 3,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，下一首歌",
+      "distractorTranscript": "",
+      "expectedCommand": "下一首歌",
+      "expectedCommandKeywords": [
+        [
+          "下一首",
+          "切歌",
+          "换歌"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.65,
+          "endSec": 2.012,
+          "text": "Neo，下一首歌",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "电子节奏 BGM +3dB 切歌"
+    },
+    {
+      "id": "clip_045",
+      "index": 45,
+      "filename": "audio/clip_045.wav",
+      "durationSec": 3.8,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "instrumental_bgm",
+      "soundTypes": [
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "纯伴奏音乐1（无任何说话）"
+    },
+    {
+      "id": "clip_046",
+      "index": 46,
+      "filename": "audio/clip_046.wav",
+      "durationSec": 3.8,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "instrumental_bgm",
+      "soundTypes": [
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "纯伴奏音乐2（无任何说话）"
+    },
+    {
+      "id": "clip_047",
+      "index": 47,
+      "filename": "audio/clip_047.wav",
+      "durationSec": 3.8,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "instrumental_bgm",
+      "soundTypes": [
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "纯 Lo-Fi 钢琴背景音乐"
+    },
+    {
+      "id": "clip_048",
+      "index": 48,
+      "filename": "audio/clip_048.wav",
+      "durationSec": 3.8,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "instrumental_bgm",
+      "soundTypes": [
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "纯强鼓点电子背景音乐"
+    },
+    {
+      "id": "clip_049",
+      "index": 49,
+      "filename": "audio/clip_049.wav",
+      "durationSec": 5.144,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "instrumental_bgm",
+      "soundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 4,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "周末准备去海边玩两天，机票订好了吗",
+      "distractorTranscript": "周末准备去海边玩两天，机票订好了吗",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "chat_b",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.55,
+          "endSec": 4.694,
+          "text": "周末准备去海边玩两天，机票订好了吗",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "纯吉他BGM中普通对话"
+    },
+    {
+      "id": "clip_050",
+      "index": 50,
+      "filename": "audio/clip_050.wav",
+      "durationSec": 4.167,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "instrumental_bgm",
+      "soundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 3,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "我觉得Neo的界面设计还挺简洁的",
+      "distractorTranscript": "我觉得Neo的界面设计还挺简洁的",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "chat_b",
+          "voice": "Microsoft Kangkang",
+          "role": "family",
+          "startSec": 0.55,
+          "endSec": 3.717,
+          "text": "我觉得Neo的界面设计还挺简洁的",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "钢琴BGM中第三人称评价Neo"
+    },
+    {
+      "id": "clip_051",
+      "index": 51,
+      "filename": "audio/clip_051.wav",
+      "durationSec": 3.8,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "instrumental_bgm",
+      "soundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 4,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "你有看到我放在桌上的耳机吗",
+      "distractorTranscript": "你有看到我放在桌上的耳机吗",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "chat_b",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 0.55,
+          "endSec": 3.29,
+          "text": "你有看到我放在桌上的耳机吗",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "伴奏BGM中'你有...'近音聊天"
+    },
+    {
+      "id": "clip_052",
+      "index": 52,
+      "filename": "audio/clip_052.wav",
+      "durationSec": 3.8,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "instrumental_bgm",
+      "soundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 3,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "This background beat sounds super chill tonight",
+      "distractorTranscript": "This background beat sounds super chill tonight",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "chat_b",
+          "voice": "Microsoft Mark",
+          "role": "family",
+          "startSec": 0.55,
+          "endSec": 2.939,
+          "text": "This background beat sounds super chill tonight",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "电子BGM中纯英文闲聊"
+    },
+    {
+      "id": "clip_053",
+      "index": 53,
+      "filename": "audio/clip_053.wav",
+      "durationSec": 3.209,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "speech",
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "fan_hum",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 2,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，打开客厅吸顶灯",
+      "distractorTranscript": "",
+      "expectedCommand": "打开客厅吸顶灯",
+      "expectedCommandKeywords": [
+        [
+          "打开",
+          "开"
+        ],
+        [
+          "客厅",
+          "吸顶灯",
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.65,
+          "endSec": 2.759,
+          "text": "Neo，打开客厅吸顶灯",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "风扇+50Hz交流嗡声 +2dB 开灯"
+    },
+    {
+      "id": "clip_054",
+      "index": 54,
+      "filename": "audio/clip_054.wav",
+      "durationSec": 3.6,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "speech",
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "fan_hum",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": -1,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，把卧室空调关掉",
+      "distractorTranscript": "",
+      "expectedCommand": "把卧室空调关掉",
+      "expectedCommandKeywords": [
+        [
+          "关",
+          "关掉",
+          "关闭"
+        ],
+        [
+          "空调",
+          "卧室"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_n",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.65,
+          "endSec": 3.15,
+          "text": "Neo，把卧室空调关掉",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "强风扇宽带噪 -1dB 关空调"
+    },
+    {
+      "id": "clip_055",
+      "index": 55,
+      "filename": "audio/clip_055.wav",
+      "durationSec": 3.09,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "speech",
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "rain_broadband",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 1,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，关闭阳台窗户",
+      "distractorTranscript": "",
+      "expectedCommand": "关闭阳台窗户",
+      "expectedCommandKeywords": [
+        [
+          "关",
+          "关闭"
+        ],
+        [
+          "窗",
+          "阳台"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_n",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 0.65,
+          "endSec": 2.64,
+          "text": "Neo，关闭阳台窗户",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "大雨宽带白粉噪 +1dB 关窗"
+    },
+    {
+      "id": "clip_056",
+      "index": 56,
+      "filename": "audio/clip_056.wav",
+      "durationSec": 2.823,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "speech",
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "keyboard_clicks",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 4,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，打开书房灯",
+      "distractorTranscript": "",
+      "expectedCommand": "打开书房灯",
+      "expectedCommandKeywords": [
+        [
+          "打开",
+          "开"
+        ],
+        [
+          "书房",
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.65,
+          "endSec": 2.373,
+          "text": "Neo，打开书房灯",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "高频机械键盘敲击脉冲 +4dB 开灯"
+    },
+    {
+      "id": "clip_057",
+      "index": 57,
+      "filename": "audio/clip_057.wav",
+      "durationSec": 2.725,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "speech",
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "tv_chatter",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 3,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，把电视关掉",
+      "distractorTranscript": "",
+      "expectedCommand": "把电视关掉",
+      "expectedCommandKeywords": [
+        [
+          "关",
+          "关掉",
+          "关闭"
+        ],
+        [
+          "电视"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.65,
+          "endSec": 2.275,
+          "text": "Neo，把电视关掉",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "电视人声广播背景 +3dB 关电视"
+    },
+    {
+      "id": "clip_058",
+      "index": 58,
+      "filename": "audio/clip_058.wav",
+      "durationSec": 4.178,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "speech",
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "tv_chatter",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 1,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，把客厅吸顶灯调暗一点",
+      "distractorTranscript": "",
+      "expectedCommand": "把客厅吸顶灯调暗一点",
+      "expectedCommandKeywords": [
+        [
+          "暗",
+          "调暗",
+          "灯",
+          "吸顶灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_n",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.65,
+          "endSec": 3.728,
+          "text": "Neo，把客厅吸顶灯调暗一点",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "强电视对话背景 +1dB 调暗灯"
+    },
+    {
+      "id": "clip_059",
+      "index": 59,
+      "filename": "audio/clip_059.wav",
+      "durationSec": 3.283,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "speech",
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "vacuum_roar",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 0,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，打开空气净化器",
+      "distractorTranscript": "",
+      "expectedCommand": "打开空气净化器",
+      "expectedCommandKeywords": [
+        [
+          "打开",
+          "开"
+        ],
+        [
+          "净化器",
+          "空气"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.65,
+          "endSec": 2.833,
+          "text": "Neo，打开空气净化器",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "吸尘器轰鸣 0dB 开空气净化器"
+    },
+    {
+      "id": "clip_060",
+      "index": 60,
+      "filename": "audio/clip_060.wav",
+      "durationSec": 2.941,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "speech",
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "cafe_babble",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 2,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，打开餐厅灯",
+      "distractorTranscript": "",
+      "expectedCommand": "打开餐厅灯",
+      "expectedCommandKeywords": [
+        [
+          "打开",
+          "开"
+        ],
+        [
+          "餐厅",
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_n",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 0.65,
+          "endSec": 2.491,
+          "text": "Neo，打开餐厅灯",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "多人嘈杂环境底噪 +2dB 开餐厅灯"
+    },
+    {
+      "id": "clip_061",
+      "index": 61,
+      "filename": "audio/clip_061.wav",
+      "durationSec": 3.482,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "speech",
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "rain_broadband",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 3,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，查看当前室内湿度",
+      "distractorTranscript": "",
+      "expectedCommand": "查看当前室内湿度",
+      "expectedCommandKeywords": [
+        [
+          "查",
+          "看",
+          "湿度"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.65,
+          "endSec": 3.033,
+          "text": "Neo，查看当前室内湿度",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "雨声环境查湿度"
+    },
+    {
+      "id": "clip_062",
+      "index": 62,
+      "filename": "audio/clip_062.wav",
+      "durationSec": 3.6,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "fan_hum",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "纯空调风扇+50Hz交流嗡声（无人声）"
+    },
+    {
+      "id": "clip_063",
+      "index": 63,
+      "filename": "audio/clip_063.wav",
+      "durationSec": 3.6,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "rain_broadband",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "纯大雨宽带背景音（无人声）"
+    },
+    {
+      "id": "clip_064",
+      "index": 64,
+      "filename": "audio/clip_064.wav",
+      "durationSec": 3.6,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "keyboard_clicks",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "纯机械键盘密集敲击声（无人声）"
+    },
+    {
+      "id": "clip_065",
+      "index": 65,
+      "filename": "audio/clip_065.wav",
+      "durationSec": 3.6,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "vacuum_roar",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "纯吸尘器马达轰鸣声（无人声）"
+    },
+    {
+      "id": "clip_066",
+      "index": 66,
+      "filename": "audio/clip_066.wav",
+      "durationSec": 3.6,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "tv_chatter",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "纯电视广播谈话背景声（无用户指令）"
+    },
+    {
+      "id": "clip_067",
+      "index": 67,
+      "filename": "audio/clip_067.wav",
+      "durationSec": 3.6,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "cafe_babble",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "纯多人嘈杂咖啡馆背景声"
+    },
+    {
+      "id": "clip_068",
+      "index": 68,
+      "filename": "audio/clip_068.wav",
+      "durationSec": 4.165,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "speech",
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "keyboard_clicks",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 4,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "这段代码编译报错了，我看一下日志",
+      "distractorTranscript": "这段代码编译报错了，我看一下日志",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "chat_n",
+          "voice": "Microsoft Kangkang",
+          "role": "family",
+          "startSec": 0.55,
+          "endSec": 3.715,
+          "text": "这段代码编译报错了，我看一下日志",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "敲键盘时自言自语（非指令）"
+    },
+    {
+      "id": "clip_069",
+      "index": 69,
+      "filename": "audio/clip_069.wav",
+      "durationSec": 4.864,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "speech",
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "tv_chatter",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 3,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "刚才新闻里提到Neo芯片性能提升很大",
+      "distractorTranscript": "刚才新闻里提到Neo芯片性能提升很大",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "chat_n",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.55,
+          "endSec": 4.414,
+          "text": "刚才新闻里提到Neo芯片性能提升很大",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "电视背景声下第三人称提及Neo"
+    },
+    {
+      "id": "clip_070",
+      "index": 70,
+      "filename": "audio/clip_070.wav",
+      "durationSec": 3.891,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "ambient_noise",
+      "soundTypes": [
+        "speech",
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "fan_hum",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 2,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "今天好热啊，等下喝杯冰水吧",
+      "distractorTranscript": "今天好热啊，等下喝杯冰水吧",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "chat_n",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 0.55,
+          "endSec": 3.441,
+          "text": "今天好热啊，等下喝杯冰水吧",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "风扇噪声中日常聊天（无唤醒词）"
+    },
+    {
+      "id": "clip_071",
+      "index": 71,
+      "filename": "audio/clip_071.wav",
+      "durationSec": 5.359,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 2,
+      "overlappingSpeakers": true,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，打开客厅吸顶灯",
+      "distractorTranscript": "你晚上想吃米饭还是面条呀",
+      "expectedCommand": "打开客厅吸顶灯",
+      "expectedCommandKeywords": [
+        [
+          "打开",
+          "开"
+        ],
+        [
+          "客厅",
+          "吸顶灯",
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.25,
+          "endSec": 3.033,
+          "text": "你晚上想吃米饭还是面条呀",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 2.8,
+          "endSec": 4.909,
+          "text": "Neo，打开客厅吸顶灯",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "双人顺序讲话：说话人A日常聊天 -> 说话人B下达Neo开灯指令"
+    },
+    {
+      "id": "clip_072",
+      "index": 72,
+      "filename": "audio/clip_072.wav",
+      "durationSec": 5.356,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 2,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，关闭卧室灯",
+      "distractorTranscript": "明天早上别忘了带雨伞出门",
+      "expectedCommand": "关闭卧室灯",
+      "expectedCommandKeywords": [
+        [
+          "关",
+          "关闭"
+        ],
+        [
+          "卧室",
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.25,
+          "endSec": 1.862,
+          "text": "Neo，关闭卧室灯",
+          "isNeoSpeaker": true
+        },
+        {
+          "speakerId": "family_f2",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 2.3,
+          "endSec": 4.906,
+          "text": "明天早上别忘了带雨伞出门",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "双人顺序讲话：先下达Neo关灯指令 -> 另一人紧接着聊无关话题（不可把后人聊天拼成指令）"
+    },
+    {
+      "id": "clip_073",
+      "index": 73,
+      "filename": "audio/clip_073.wav",
+      "durationSec": 7.359,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 3,
+      "overlappingSpeakers": true,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，把空调调到25度",
+      "distractorTranscript": "周末电影票买好了吗 | 买好了是下午三点的场次",
+      "expectedCommand": "把空调调到25度",
+      "expectedCommandKeywords": [
+        [
+          "空调"
+        ],
+        [
+          "25",
+          "二十五"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.2,
+          "endSec": 2.176,
+          "text": "周末电影票买好了吗",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 2.2,
+          "endSec": 4.798,
+          "text": "Neo，把空调调到25度",
+          "isNeoSpeaker": true
+        },
+        {
+          "speakerId": "family_f2",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 4.5,
+          "endSec": 6.909,
+          "text": "买好了是下午三点的场次",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "三人顺序对话：中间插播主人的Neo空调指令"
+    },
+    {
+      "id": "clip_074",
+      "index": 74,
+      "filename": "audio/clip_074.wav",
+      "durationSec": 5.122,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 2,
+      "overlappingSpeakers": true,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，打开书房台灯",
+      "distractorTranscript": "昨天超市打折买了不少水果放在冰箱里记得吃",
+      "expectedCommand": "打开书房台灯",
+      "expectedCommandKeywords": [
+        [
+          "打开",
+          "开"
+        ],
+        [
+          "书房",
+          "台灯",
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.2,
+          "endSec": 4.672,
+          "text": "昨天超市打折买了不少水果放在冰箱里记得吃",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.9,
+          "endSec": 2.841,
+          "text": "Neo，打开书房台灯",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "双人同时重叠并发讲话（+4dB 主人女声背景干扰）：提取主人开台灯指令"
+    },
+    {
+      "id": "clip_075",
+      "index": 75,
+      "filename": "audio/clip_075.wav",
+      "durationSec": 5.348,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 2,
+      "overlappingSpeakers": true,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，把小米音响音量调到30",
+      "distractorTranscript": "明天开会的材料我都整理好发到群里了你记得看一下",
+      "expectedCommand": "把小米音响音量调到30",
+      "expectedCommandKeywords": [
+        [
+          "音量",
+          "声音",
+          "音响",
+          "音箱"
+        ],
+        [
+          "30",
+          "三十"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f2",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 0.15,
+          "endSec": 4.898,
+          "text": "明天开会的材料我都整理好发到群里了你记得看一下",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.85,
+          "endSec": 3.991,
+          "text": "Neo，把小米音响音量调到30",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "双人高强度重叠讲话（+2dB SIR）：提取主人音量指令"
+    },
+    {
+      "id": "clip_076",
+      "index": 76,
+      "filename": "audio/clip_076.wav",
+      "durationSec": 4.995,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 2,
+      "overlappingSpeakers": true,
+      "snrDb": 4,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，关闭客厅风扇",
+      "distractorTranscript": "厨房里的水烧开了我去泡茶",
+      "expectedCommand": "关闭客厅风扇",
+      "expectedCommandKeywords": [
+        [
+          "关",
+          "关闭"
+        ],
+        [
+          "风扇",
+          "客厅"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.3,
+          "endSec": 2.988,
+          "text": "厨房里的水烧开了我去泡茶",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 2.7,
+          "endSec": 4.545,
+          "text": "Neo，关闭客厅风扇",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "双人对话 + BGM 复合场景：分离BGM与说话人后执行关风扇"
+    },
+    {
+      "id": "clip_077",
+      "index": 77,
+      "filename": "audio/clip_077.wav",
+      "durationSec": 4.992,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 2,
+      "overlappingSpeakers": false,
+      "snrDb": 4,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，把音量调小一点",
+      "distractorTranscript": "这首歌声音有点大了",
+      "expectedCommand": "把音量调小一点",
+      "expectedCommandKeywords": [
+        [
+          "音量",
+          "声音"
+        ],
+        [
+          "小",
+          "低",
+          "降"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f2",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 0.35,
+          "endSec": 2.328,
+          "text": "这首歌声音有点大了",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 2.4,
+          "endSec": 4.542,
+          "text": "Neo，把音量调小一点",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "双人对话 + 真实歌声背景终极复合场景：调小音量"
+    },
+    {
+      "id": "clip_078",
+      "index": 78,
+      "filename": "audio/clip_078.wav",
+      "durationSec": 4.218,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker",
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "tv_chatter",
+      "speakerCount": 2,
+      "overlappingSpeakers": false,
+      "snrDb": 4,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，关闭窗帘",
+      "distractorTranscript": "快看外面好像下雨了",
+      "expectedCommand": "关闭窗帘",
+      "expectedCommandKeywords": [
+        [
+          "关",
+          "关闭"
+        ],
+        [
+          "窗帘",
+          "窗"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.3,
+          "endSec": 2.382,
+          "text": "快看外面好像下雨了",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 2.3,
+          "endSec": 3.768,
+          "text": "Neo，关闭窗帘",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "双人对话 + 电视人声噪声背景：关闭窗帘"
+    },
+    {
+      "id": "clip_079",
+      "index": 79,
+      "filename": "audio/clip_079.wav",
+      "durationSec": 3.203,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 2,
+      "overlappingSpeakers": true,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "Neo，打开客厅灯",
+      "distractorTranscript": "Did you finish reading that article from yesterday",
+      "expectedCommand": "打开客厅灯",
+      "expectedCommandKeywords": [
+        [
+          "打开",
+          "开"
+        ],
+        [
+          "客厅",
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "bystander_en",
+          "voice": "Microsoft Zira",
+          "role": "bystander",
+          "startSec": 0.2,
+          "endSec": 2.753,
+          "text": "Did you finish reading that article from yesterday",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.75,
+          "endSec": 2.483,
+          "text": "Neo，打开客厅灯",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "中英双人同时重叠讲话：英文旁白叠中文主人指令"
+    },
+    {
+      "id": "clip_080",
+      "index": 80,
+      "filename": "audio/clip_080.wav",
+      "durationSec": 5.362,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 2,
+      "overlappingSpeakers": true,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "晚上我们吃烤鱼还是炒菜呀",
+      "distractorTranscript": "晚上我们吃烤鱼还是炒菜呀 | 随便吧炒两个青菜就行",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.25,
+          "endSec": 2.964,
+          "text": "晚上我们吃烤鱼还是炒菜呀",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 2.6,
+          "endSec": 4.912,
+          "text": "随便吧炒两个青菜就行",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "双人日常家庭对话（无指令）"
+    },
+    {
+      "id": "clip_081",
+      "index": 81,
+      "filename": "audio/clip_081.wav",
+      "durationSec": 5.606,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 2,
+      "overlappingSpeakers": true,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "你觉得Neo这个语音助手好用吗",
+      "distractorTranscript": "你觉得Neo这个语音助手好用吗 | 我觉得还不错反应挺快的",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.25,
+          "endSec": 3.155,
+          "text": "你觉得Neo这个语音助手好用吗",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 2.7,
+          "endSec": 5.156,
+          "text": "我觉得还不错反应挺快的",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "双人讨论第三人称 Neo（非下达指令）"
+    },
+    {
+      "id": "clip_082",
+      "index": 82,
+      "filename": "audio/clip_082.wav",
+      "durationSec": 5.811,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 2,
+      "overlappingSpeakers": true,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "我刚跟同事聊到Neo的时候大家都很感兴趣",
+      "distractorTranscript": "我刚跟同事聊到Neo的时候大家都很感兴趣 | 对呀我也想在家里装一个",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.2,
+          "endSec": 4.378,
+          "text": "我刚跟同事聊到Neo的时候大家都很感兴趣",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "family_f2",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 3.1,
+          "endSec": 5.361,
+          "text": "对呀我也想在家里装一个",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "双人聊天转述提及 Neo"
+    },
+    {
+      "id": "clip_083",
+      "index": 83,
+      "filename": "audio/clip_083.wav",
+      "durationSec": 4.161,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 2,
+      "overlappingSpeakers": true,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "快递放在门口了谁去拿一下",
+      "distractorTranscript": "快递放在门口了谁去拿一下 | 我马上去拿顺便把垃圾也倒了",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.2,
+          "endSec": 2.936,
+          "text": "快递放在门口了谁去拿一下",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.9,
+          "endSec": 3.711,
+          "text": "我马上去拿顺便把垃圾也倒了",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "双人同时重叠家务对话（非指令）"
+    },
+    {
+      "id": "clip_084",
+      "index": 84,
+      "filename": "audio/clip_084.wav",
+      "durationSec": 5.311,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 2,
+      "overlappingSpeakers": true,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "别管Neo了先把客厅收拾一下吧",
+      "distractorTranscript": "别管Neo了先把客厅收拾一下吧 | 好我把茶几擦干净",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.2,
+          "endSec": 3.403,
+          "text": "别管Neo了先把客厅收拾一下吧",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 2.9,
+          "endSec": 4.861,
+          "text": "好我把茶几擦干净",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "双人对话中包含否定提及 Neo"
+    },
+    {
+      "id": "clip_085",
+      "index": 85,
+      "filename": "audio/clip_085.wav",
+      "durationSec": 5.234,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 2,
+      "overlappingSpeakers": false,
+      "snrDb": 4,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "这首吉他曲挺放松的",
+      "distractorTranscript": "这首吉他曲挺放松的 | 嗯适合晚上看书的时候听",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f2",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 0.3,
+          "endSec": 2.179,
+          "text": "这首吉他曲挺放松的",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 2.3,
+          "endSec": 4.784,
+          "text": "嗯适合晚上看书的时候听",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "双人聊天 + 纯器乐BGM（非指令）"
+    },
+    {
+      "id": "clip_086",
+      "index": 86,
+      "filename": "audio/clip_086.wav",
+      "durationSec": 4.996,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 2,
+      "overlappingSpeakers": true,
+      "snrDb": 3,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "你好，帮我把桌上那杯水递过来",
+      "distractorTranscript": "你好，帮我把桌上那杯水递过来 | 给，小心有点烫",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.35,
+          "endSec": 3.788,
+          "text": "你好，帮我把桌上那杯水递过来",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 2.8,
+          "endSec": 4.546,
+          "text": "给，小心有点烫",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "双人对话 + 真实歌声背景 + '你好'近音陷阱"
+    },
+    {
+      "id": "clip_087",
+      "index": 87,
+      "filename": "audio/clip_087.wav",
+      "durationSec": 6.866,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 3,
+      "overlappingSpeakers": true,
+      "snrDb": null,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "今天外面太阳好大呀",
+      "distractorTranscript": "今天外面太阳好大呀 | 是啊我把阳台的衣服都收进来了 | 晚上应该会凉快一点",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.2,
+          "endSec": 2.301,
+          "text": "今天外面太阳好大呀",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "family_f2",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 2,
+          "endSec": 4.848,
+          "text": "是啊我把阳台的衣服都收进来了",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 4.4,
+          "endSec": 6.416,
+          "text": "晚上应该会凉快一点",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "三人日常闲聊（无指令）"
+    },
+    {
+      "id": "clip_088",
+      "index": 88,
+      "filename": "audio/clip_088.wav",
+      "durationSec": 6.259,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "multi_speaker",
+      "soundTypes": [
+        "speech",
+        "multi_speaker",
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "cafe_babble",
+      "speakerCount": 2,
+      "overlappingSpeakers": true,
+      "snrDb": 3,
+      "dialogState": "standby",
+      "recentHistory": [],
+      "targetTranscript": "No, I think we should take the subway instead",
+      "distractorTranscript": "No, I think we should take the subway instead | Sounds good, traffic near downtown is heavy",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_en",
+          "voice": "Microsoft David",
+          "role": "owner",
+          "startSec": 0.3,
+          "endSec": 3.246,
+          "text": "No, I think we should take the subway instead",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "bystander_en",
+          "voice": "Microsoft Zira",
+          "role": "bystander",
+          "startSec": 2.9,
+          "endSec": 5.809,
+          "text": "Sounds good, traffic near downtown is heavy",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "英文双人聊天 + 咖啡馆背景音 + No/Near 陷阱"
+    },
+    {
+      "id": "clip_089",
+      "index": 89,
+      "filename": "audio/clip_089.wav",
+      "durationSec": 2.6,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "conversation_scenes",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "conversation",
+      "recentHistory": [
+        {
+          "role": "user",
+          "text": "Neo，打开客厅吸顶灯"
+        },
+        {
+          "role": "assistant",
+          "text": "已打开客厅吸顶灯。"
+        }
+      ],
+      "targetTranscript": "再调亮一点",
+      "distractorTranscript": "",
+      "expectedCommand": "再调亮一点",
+      "expectedCommandKeywords": [
+        [
+          "亮",
+          "调亮"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.3,
+          "endSec": 1.538,
+          "text": "再调亮一点",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "连续对话免唤醒追问：调亮灯光"
+    },
+    {
+      "id": "clip_090",
+      "index": 90,
+      "filename": "audio/clip_090.wav",
+      "durationSec": 2.6,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "conversation_scenes",
+      "soundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 3,
+      "dialogState": "conversation",
+      "recentHistory": [
+        {
+          "role": "user",
+          "text": "Neo，播放轻音乐"
+        },
+        {
+          "role": "assistant",
+          "text": "已开始播放轻音乐。"
+        }
+      ],
+      "targetTranscript": "声音小一点",
+      "distractorTranscript": "",
+      "expectedCommand": "声音小一点",
+      "expectedCommandKeywords": [
+        [
+          "声音",
+          "音量"
+        ],
+        [
+          "小",
+          "低"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.55,
+          "endSec": 1.862,
+          "text": "声音小一点",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "连续对话 + BGM 背景下免唤醒调小声音"
+    },
+    {
+      "id": "clip_091",
+      "index": 91,
+      "filename": "audio/clip_091.wav",
+      "durationSec": 2.6,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "conversation_scenes",
+      "soundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 4,
+      "dialogState": "conversation",
+      "recentHistory": [
+        {
+          "role": "user",
+          "text": "Neo，播放轻音乐"
+        },
+        {
+          "role": "assistant",
+          "text": "已开始播放轻音乐。"
+        }
+      ],
+      "targetTranscript": "换一首歌",
+      "distractorTranscript": "",
+      "expectedCommand": "换一首歌",
+      "expectedCommandKeywords": [
+        [
+          "换",
+          "下一首",
+          "切"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.65,
+          "endSec": 1.52,
+          "text": "换一首歌",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "连续对话 + 真实歌声背景免唤醒切歌"
+    },
+    {
+      "id": "clip_092",
+      "index": 92,
+      "filename": "audio/clip_092.wav",
+      "durationSec": 2.6,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "conversation_scenes",
+      "soundTypes": [
+        "speech",
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "fan_hum",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 2,
+      "dialogState": "conversation",
+      "recentHistory": [
+        {
+          "role": "user",
+          "text": "Neo，打开客厅吸顶灯"
+        },
+        {
+          "role": "assistant",
+          "text": "已打开客厅吸顶灯。"
+        }
+      ],
+      "targetTranscript": "把卧室灯也关掉",
+      "distractorTranscript": "",
+      "expectedCommand": "把卧室灯也关掉",
+      "expectedCommandKeywords": [
+        [
+          "关",
+          "关掉",
+          "关闭"
+        ],
+        [
+          "卧室",
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.5,
+          "endSec": 2.111,
+          "text": "把卧室灯也关掉",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "连续对话 + 风扇噪声下免唤醒关卧室灯"
+    },
+    {
+      "id": "clip_093",
+      "index": 93,
+      "filename": "audio/clip_093.wav",
+      "durationSec": 2.743,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "conversation_scenes",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "conversation",
+      "recentHistory": [
+        {
+          "role": "user",
+          "text": "Neo，打开客厅吸顶灯"
+        },
+        {
+          "role": "assistant",
+          "text": "已打开客厅吸顶灯。"
+        }
+      ],
+      "targetTranscript": "顺便打开书房台灯",
+      "distractorTranscript": "",
+      "expectedCommand": "顺便打开书房台灯",
+      "expectedCommandKeywords": [
+        [
+          "打开",
+          "开"
+        ],
+        [
+          "书房",
+          "台灯",
+          "灯"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.3,
+          "endSec": 2.293,
+          "text": "顺便打开书房台灯",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "连续对话免唤醒顺便开书房台灯"
+    },
+    {
+      "id": "clip_094",
+      "index": 94,
+      "filename": "audio/clip_094.wav",
+      "durationSec": 4.462,
+      "sampleRate": 16000,
+      "isNeoCommand": true,
+      "category": "conversation_scenes",
+      "soundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 2,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "conversation",
+      "recentHistory": [
+        {
+          "role": "user",
+          "text": "Neo，打开客厅吸顶灯"
+        },
+        {
+          "role": "assistant",
+          "text": "已打开客厅吸顶灯。"
+        }
+      ],
+      "targetTranscript": "把亮度调到80",
+      "distractorTranscript": "我去厨房洗点水果",
+      "expectedCommand": "把亮度调到80",
+      "expectedCommandKeywords": [
+        [
+          "亮度",
+          "调到"
+        ],
+        [
+          "80",
+          "八十"
+        ]
+      ],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.25,
+          "endSec": 2.121,
+          "text": "我去厨房洗点水果",
+          "isNeoSpeaker": false
+        },
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 2.3,
+          "endSec": 4.012,
+          "text": "把亮度调到80",
+          "isNeoSpeaker": true
+        }
+      ],
+      "notes": "连续对话 + 多人场景：家人旁白后主人免唤醒续聊调亮度"
+    },
+    {
+      "id": "clip_095",
+      "index": 95,
+      "filename": "audio/clip_095.wav",
+      "durationSec": 3.978,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "conversation_scenes",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "conversation",
+      "recentHistory": [
+        {
+          "role": "user",
+          "text": "Neo，打开客厅吸顶灯"
+        },
+        {
+          "role": "assistant",
+          "text": "已打开客厅吸顶灯。"
+        }
+      ],
+      "targetTranscript": "晚饭吃什么呀，帮我拿双筷子",
+      "distractorTranscript": "晚饭吃什么呀，帮我拿双筷子",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.3,
+          "endSec": 3.528,
+          "text": "晚饭吃什么呀，帮我拿双筷子",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "连续对话窗口内的家人旁白（必须拒绝）"
+    },
+    {
+      "id": "clip_096",
+      "index": 96,
+      "filename": "audio/clip_096.wav",
+      "durationSec": 2.6,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "conversation_scenes",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "conversation",
+      "recentHistory": [
+        {
+          "role": "user",
+          "text": "Neo，打开客厅吸顶灯"
+        },
+        {
+          "role": "assistant",
+          "text": "已打开客厅吸顶灯。"
+        }
+      ],
+      "lastSpokenReply": "已打开客厅吸顶灯。",
+      "targetTranscript": "已打开客厅吸顶灯",
+      "distractorTranscript": "已打开客厅吸顶灯",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.25,
+          "endSec": 2.065,
+          "text": "已打开客厅吸顶灯",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "连续对话窗口内的 TTS 扬声器自回声（必须抑制）"
+    },
+    {
+      "id": "clip_097",
+      "index": 97,
+      "filename": "audio/clip_097.wav",
+      "durationSec": 4.346,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "conversation_scenes",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "conversation",
+      "recentHistory": [
+        {
+          "role": "user",
+          "text": "Neo，打开客厅吸顶灯"
+        },
+        {
+          "role": "assistant",
+          "text": "已打开客厅吸顶灯。"
+        }
+      ],
+      "targetTranscript": "哈哈今天上班太累了，待会早点睡",
+      "distractorTranscript": "哈哈今天上班太累了，待会早点睡",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "owner_m1",
+          "voice": "Microsoft Kangkang",
+          "role": "owner",
+          "startSec": 0.3,
+          "endSec": 3.896,
+          "text": "哈哈今天上班太累了，待会早点睡",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "连续对话窗口内的日常感叹旁白"
+    },
+    {
+      "id": "clip_098",
+      "index": 98,
+      "filename": "audio/clip_098.wav",
+      "durationSec": 2.6,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "conversation_scenes",
+      "soundTypes": [
+        "speech"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "none",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "conversation",
+      "recentHistory": [
+        {
+          "role": "user",
+          "text": "Neo，打开客厅吸顶灯"
+        },
+        {
+          "role": "assistant",
+          "text": "已打开客厅吸顶灯。"
+        }
+      ],
+      "targetTranscript": "好了谢谢不用了",
+      "distractorTranscript": "好了谢谢不用了",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f2",
+          "voice": "Microsoft Yaoyao",
+          "role": "family",
+          "startSec": 0.3,
+          "endSec": 1.82,
+          "text": "好了谢谢不用了",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "连续对话窗口内的礼貌告别/结束对话口令"
+    },
+    {
+      "id": "clip_099",
+      "index": 99,
+      "filename": "audio/clip_099.wav",
+      "durationSec": 4,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "conversation_scenes",
+      "soundTypes": [
+        "song",
+        "bgm"
+      ],
+      "hasBgm": true,
+      "hasSong": true,
+      "noiseType": "none",
+      "speakerCount": 0,
+      "overlappingSpeakers": false,
+      "snrDb": null,
+      "dialogState": "conversation",
+      "recentHistory": [
+        {
+          "role": "user",
+          "text": "Neo，播放轻音乐"
+        },
+        {
+          "role": "assistant",
+          "text": "已开始播放轻音乐。"
+        }
+      ],
+      "targetTranscript": "",
+      "distractorTranscript": "",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [],
+      "notes": "连续对话窗口内只有歌曲演唱（绝不能把歌词当免唤醒指令）"
+    },
+    {
+      "id": "clip_100",
+      "index": 100,
+      "filename": "audio/clip_100.wav",
+      "durationSec": 4.129,
+      "sampleRate": 16000,
+      "isNeoCommand": false,
+      "category": "conversation_scenes",
+      "soundTypes": [
+        "speech",
+        "noise"
+      ],
+      "hasBgm": false,
+      "hasSong": false,
+      "noiseType": "tv_chatter",
+      "speakerCount": 1,
+      "overlappingSpeakers": false,
+      "snrDb": 2,
+      "dialogState": "conversation",
+      "recentHistory": [
+        {
+          "role": "user",
+          "text": "Neo，打开客厅吸顶灯"
+        },
+        {
+          "role": "assistant",
+          "text": "已打开客厅吸顶灯。"
+        }
+      ],
+      "targetTranscript": "你去拿一下外卖吧，我在接电话",
+      "distractorTranscript": "你去拿一下外卖吧，我在接电话",
+      "expectedCommand": "",
+      "expectedCommandKeywords": [],
+      "expectedWokeOnly": false,
+      "speakers": [
+        {
+          "speakerId": "family_f1",
+          "voice": "Microsoft Huihui",
+          "role": "family",
+          "startSec": 0.45,
+          "endSec": 3.679,
+          "text": "你去拿一下外卖吧，我在接电话",
+          "isNeoSpeaker": false
+        }
+      ],
+      "notes": "连续对话窗口 + 电视背景音中的家人旁白"
+    }
+  ]
+}

@@ -273,6 +273,25 @@ const REFERENTIAL_AFTER_RE =
 const DIRECT_COMMAND_START_RE =
   /^(?:请|帮我|给我|麻烦|快|赶紧|顺便|现在|把|将|打开|开启|开灯|关灯|熄灯|灭灯|亮灯|开机|关机|开空调|关空调|开风扇|关风扇|开窗|关窗|开电视|关电视|开音箱|关音箱|开音响|关音响|开插座|关插座|开开关|关开关|全开|全关|关掉|关闭|关上|开一下|关一下|调|设置|设定|设为|改成|换成|切换|播放|放一首|来一首|放歌|放音乐|播音乐|听歌|切歌|换歌|下一首|上一首|暂停|继续|停止|静音|取消静音|闭麦|开麦|声音|音量|大一点|小一点|亮一点|暗一点|暖一点|冷一点|查|查看|查询|看看|告诉我|卧室|客厅|餐厅|书房|厨房|阳台|主卧|次卧|玄关|卫生间|全屋|所有|全部|小爱|小米|灯|吸顶灯|台灯|空调|风扇|插座|开关|窗帘|喂食器|出粮|喂食|喂猫|喂狗|喂|场景|模式|回家|离家|睡眠|观影|温度|湿度|空气|turn|open|close|set|play|pause|stop|mute|check|what)/i;
 
+// 真实智能家居设备与控制领域语义词表（用于区分设备指令与 "你好，帮我递杯水" 等日常家务聊天）
+const SMART_HOME_DOMAIN_RE =
+  /(?:灯|吸顶灯|台灯|照明|空调|温度|湿度|空气|净化器|风扇|窗帘|窗户|电视|音响|音箱|音量|声音|静音|闭麦|开麦|音乐|歌|播放|暂停|继续|停止|下一首|上一首|切歌|换歌|换一首|亮度|调亮|调暗|亮一点|暗一点|大一点|小一点|高一点|低一点|暖一点|冷一点|色温|插座|开关|喂猫|喂狗|喂食|喂食器|出粮|场景|模式|观影|睡眠|回家|离家|全屋|客厅|卧室|书房|餐厅|厨房|阳台|主卧|次卧|玄关|卫生间|light|lamp|ac|air\s*conditioner|fan|curtain|tv|speaker|volume|music|pause|play|mute|bright|dim|temp|humidity)/i;
+
+// 严防声学唤醒覆盖第三人称讨论或否定呼唤语境（含噪声下 SenseVoice 把 "别管Neo" 听成 "别管你用/别管你了"）
+const STRICT_THIRD_PERSON_NEO_RE =
+  /(?:提到|聊到|说到|说起|讲到|谈到|听说|觉得|认为|喜欢|讨厌|别管|别理|不用管|不要管|没叫|没喊|谁叫|谁在叫|什么叫|叫做|名叫|名字叫|介绍|对比|评论|新闻里|同事|朋友).{0,8}(?:neo|小派|尼奥|尼欧|妮奥|妮欧|new|near|neil|你o|你用|你又|你有|你了|你呀|那个)/i;
+
+const STRICT_THIRD_PERSON_NEO_AFTER_RE =
+  /(?:neo|小派|尼奥|尼欧|妮奥|妮欧).{0,3}(?:这个|那个|的(?:界面|功能|名字|性能|芯片|声音|模型|反应|效果|设计)|好用|不错|挺快|挺聪明|挺有意思|怎么样|好不好用|芯片|软件|助手|项目)/i;
+
+export function hasSmartHomeDomainIntent(text: string): boolean {
+  return SMART_HOME_DOMAIN_RE.test(text);
+}
+
+export function isThirdPersonNeoMention(text: string): boolean {
+  return STRICT_THIRD_PERSON_NEO_RE.test(text) || STRICT_THIRD_PERSON_NEO_AFTER_RE.test(text);
+}
+
 export function looksLikeDirectDeviceCommand(text: string): boolean {
   return DIRECT_COMMAND_START_RE.test(text.trim());
 }
@@ -648,9 +667,15 @@ export function findWakeWordSpan(
 
       if (requireDirectCmdAfter) {
         const surfaceLower = cand.surface.toLowerCase();
-        // 问候类别名（如 "你好" / "你给"）绝不可作为纯唤醒询问触发，且必须位于句首并紧跟明确设备控制指令（如 "你好关灯"）
+        // 问候类别名（如 "你好" / "你给"）绝不可作为纯唤醒询问触发，且必须位于句首并紧跟明确智能家居控制指令（如 "你好关灯"，拦截 "你好，帮我递杯水"）
         if (COMMAND_ONLY_NOISE_ALIASES.has(cand.surface)) {
-          if (beforeText.length > 0 || isWakeQuery || afterText.length < 2 || !DIRECT_COMMAND_START_RE.test(afterText)) {
+          if (
+            beforeText.length > 0 ||
+            isWakeQuery ||
+            afterText.length < 2 ||
+            !DIRECT_COMMAND_START_RE.test(afterText) ||
+            !SMART_HOME_DOMAIN_RE.test(afterText)
+          ) {
             continue;
           }
         }

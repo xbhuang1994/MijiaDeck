@@ -170,6 +170,28 @@ export function getPrimaryOwnerRefWavPath(): string | null {
   return dataFile(preferred.refWavFilename);
 }
 
+/**
+ * 返回全部已保存参考语音 WAV 的声纹档案（主人优先），供自适应多说话人 VoxLock TSE 声源分离使用。
+ */
+export function listVoiceprintRefWavPaths(): Array<{
+  id: string;
+  name: string;
+  role: VoiceprintRole;
+  wavPath: string;
+}> {
+  const profiles = loadVoiceprints();
+  const sorted = [...profiles].sort((a, b) => (a.role === "owner" ? -1 : b.role === "owner" ? 1 : 0));
+  const out: Array<{ id: string; name: string; role: VoiceprintRole; wavPath: string }> = [];
+  for (const p of sorted) {
+    if (!p.refWavFilename) continue;
+    const wavPath = dataFile(p.refWavFilename);
+    if (existsSync(wavPath)) {
+      out.push({ id: p.id, name: p.name, role: p.role, wavPath });
+    }
+  }
+  return out;
+}
+
 export function loadVoiceprints(): VoiceprintProfileRecord[] {
   const raw = readJson<Record<string, unknown>>(
     dataFile(FILENAME),

@@ -1,0 +1,2931 @@
+{
+  "solutionId": "prod_audio_source_separator",
+  "solutionName": "Production src/agent/audioSourceSeparator.ts (Final Shipped S_Fused)",
+  "description": "生产落地版 AudioSourceSeparator.separateAndRecognize (src/agent/audioSourceSeparator.ts) 100条全量验收。",
+  "totalClips": 100,
+  "strictCorrect": 96,
+  "strictAccuracyPct": 96,
+  "passed95Bar": true,
+  "routingCorrect": 97,
+  "routingAccuracyPct": 97,
+  "tp": 47,
+  "tn": 50,
+  "fp": 0,
+  "fn": 3,
+  "commandMismatchOnTp": 1,
+  "precisionPct": 100,
+  "recallPct": 94,
+  "f1Pct": 96.91,
+  "fprPct": 0,
+  "fnrPct": 6,
+  "positiveCommandAccuracyPct": 92,
+  "soundTypeMacroF1Pct": 88.17,
+  "soundTypeMetrics": {
+    "speech": {
+      "tp": 82,
+      "fp": 3,
+      "fn": 0,
+      "precision": 96.5,
+      "recall": 100,
+      "f1": 98.2
+    },
+    "song": {
+      "tp": 18,
+      "fp": 1,
+      "fn": 8,
+      "precision": 94.7,
+      "recall": 69.2,
+      "f1": 80
+    },
+    "bgm": {
+      "tp": 45,
+      "fp": 0,
+      "fn": 0,
+      "precision": 100,
+      "recall": 100,
+      "f1": 100
+    },
+    "noise": {
+      "tp": 19,
+      "fp": 2,
+      "fn": 3,
+      "precision": 90.5,
+      "recall": 86.4,
+      "f1": 88.4
+    },
+    "multi_speaker": {
+      "tp": 13,
+      "fp": 3,
+      "fn": 6,
+      "precision": 81.3,
+      "recall": 68.4,
+      "f1": 74.3
+    }
+  },
+  "categoryBreakdown": {
+    "clean_no_bgm": {
+      "total": 14,
+      "strictCorrect": 14,
+      "strictAccuracyPct": 100,
+      "routingCorrect": 14,
+      "fp": 0,
+      "fn": 0,
+      "cmdMismatch": 0,
+      "meanLatencyMs": 3728
+    },
+    "song_singing": {
+      "total": 22,
+      "strictCorrect": 22,
+      "strictAccuracyPct": 100,
+      "routingCorrect": 22,
+      "fp": 0,
+      "fn": 0,
+      "cmdMismatch": 0,
+      "meanLatencyMs": 4334
+    },
+    "instrumental_bgm": {
+      "total": 16,
+      "strictCorrect": 16,
+      "strictAccuracyPct": 100,
+      "routingCorrect": 16,
+      "fp": 0,
+      "fn": 0,
+      "cmdMismatch": 0,
+      "meanLatencyMs": 4010
+    },
+    "ambient_noise": {
+      "total": 18,
+      "strictCorrect": 16,
+      "strictAccuracyPct": 88.9,
+      "routingCorrect": 17,
+      "fp": 0,
+      "fn": 1,
+      "cmdMismatch": 1,
+      "meanLatencyMs": 4604
+    },
+    "multi_speaker": {
+      "total": 18,
+      "strictCorrect": 16,
+      "strictAccuracyPct": 88.9,
+      "routingCorrect": 16,
+      "fp": 0,
+      "fn": 2,
+      "cmdMismatch": 0,
+      "meanLatencyMs": 6673
+    },
+    "conversation_scenes": {
+      "total": 12,
+      "strictCorrect": 12,
+      "strictAccuracyPct": 100,
+      "routingCorrect": 12,
+      "fp": 0,
+      "fn": 0,
+      "cmdMismatch": 0,
+      "meanLatencyMs": 1916
+    }
+  },
+  "latency": {
+    "meanMs": 4377,
+    "p50Ms": 3551,
+    "p95Ms": 11231,
+    "maxMs": 19639,
+    "totalSec": 437.7,
+    "totalAudioSec": 388.49,
+    "rtf": 1.127
+  },
+  "failures": [
+    {
+      "id": "clip_058",
+      "category": "ambient_noise",
+      "expectedIsNeo": true,
+      "predictedIsNeo": false,
+      "routingCorrect": false,
+      "commandCorrect": false,
+      "strictCorrect": false,
+      "expectedCommand": "把客厅吸顶灯调暗一点",
+      "predictedCommand": "",
+      "rawTranscript": "换日志的音雄把下面我们来模放时建设一点。 日志的日行。",
+      "expectedSoundTypes": [
+        "speech",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "speech",
+        "multi_speaker"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 13710,
+      "durationSec": 4.178,
+      "failureType": "false_negative"
+    },
+    {
+      "id": "clip_060",
+      "category": "ambient_noise",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": false,
+      "strictCorrect": false,
+      "expectedCommand": "打开餐厅灯",
+      "predictedCommand": "<WOKE_ONLY>",
+      "rawTranscript": "ちをった会社ど。",
+      "expectedSoundTypes": [
+        "speech",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」，开启聆听对话窗口",
+      "latencyMs": 9064,
+      "durationSec": 2.941,
+      "failureType": "command_mismatch"
+    },
+    {
+      "id": "clip_071",
+      "category": "multi_speaker",
+      "expectedIsNeo": true,
+      "predictedIsNeo": false,
+      "routingCorrect": false,
+      "commandCorrect": false,
+      "strictCorrect": false,
+      "expectedCommand": "打开客厅吸顶灯",
+      "predictedCommand": "",
+      "rawTranscript": "你晚上想吃米饭还是面条呀？ 打开客厅吸顶灯。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "predictedSoundTypes": [
+        "multi_speaker",
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 11231,
+      "durationSec": 5.359,
+      "failureType": "false_negative"
+    },
+    {
+      "id": "clip_076",
+      "category": "multi_speaker",
+      "expectedIsNeo": true,
+      "predictedIsNeo": false,
+      "routingCorrect": false,
+      "commandCorrect": false,
+      "strictCorrect": false,
+      "expectedCommand": "关闭客厅风扇",
+      "predictedCommand": "",
+      "rawTranscript": "厨房里的水烧开了，我去泡茶。 关闭客厅风扇。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "multi_speaker",
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 19639,
+      "durationSec": 4.995,
+      "failureType": "false_negative"
+    }
+  ],
+  "records": [
+    {
+      "id": "clip_001",
+      "category": "clean_no_bgm",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "打开客厅吸顶灯",
+      "predictedCommand": "打开客厅吸顶灯",
+      "rawTranscript": "nil打开客厅吸顶灯。",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 4536,
+      "durationSec": 2.859,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_002",
+      "category": "clean_no_bgm",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "关灯",
+      "predictedCommand": "关灯",
+      "rawTranscript": "你要关灯。",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 1079,
+      "durationSec": 2.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_003",
+      "category": "clean_no_bgm",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "把卧室灯关掉",
+      "predictedCommand": "把卧室灯关掉",
+      "rawTranscript": "嘿你把卧室灯关掉。",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 1600,
+      "durationSec": 3.11,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_004",
+      "category": "clean_no_bgm",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "把小米音响音量调到35",
+      "predictedCommand": "把小米音响音量调到35",
+      "rawTranscript": "no把小米音响音量调到35。",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 2232,
+      "durationSec": 4.042,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_005",
+      "category": "clean_no_bgm",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "<WOKE_ONLY>",
+      "predictedCommand": "<WOKE_ONLY>",
+      "rawTranscript": "你o在吗？",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」，开启聆听对话窗口",
+      "latencyMs": 1093,
+      "durationSec": 2.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_006",
+      "category": "clean_no_bgm",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "turn off the living room light",
+      "predictedCommand": "Turn off the living room light",
+      "rawTranscript": "Hey, Neo. Turn off the living room light.",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "同说话人唤醒词与后续指令自动无缝续接",
+      "latencyMs": 4019,
+      "durationSec": 3.254,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_007",
+      "category": "clean_no_bgm",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "查询客厅温度和湿度",
+      "predictedCommand": "查询客厅温度和湿度",
+      "rawTranscript": "nil查询客厅温度和湿度。",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 1695,
+      "durationSec": 3.298,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_008",
+      "category": "clean_no_bgm",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "今天天气真不错，下午去公园走走吧。",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "清晰非指令日常对话，无唤醒与设备控制意图",
+      "latencyMs": 2357,
+      "durationSec": 4.421,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_009",
+      "category": "clean_no_bgm",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "我刚才跟朋友聊到你这个助手挺好用的。",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "pragmatic-reject",
+      "attentionReason": "检测到第三人称提及或否定呼唤语境，拒绝触发",
+      "latencyMs": 2065,
+      "durationSec": 4.648,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_010",
+      "category": "clean_no_bgm",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "别管neo了，我们先吃饭吧。",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "pragmatic-reject",
+      "attentionReason": "判定为第三人称提及或否定呼唤，跳过重型分离",
+      "latencyMs": 1152,
+      "durationSec": 3.308,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_011",
+      "category": "clean_no_bgm",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "你好，今天晚饭想吃什么呀？",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 9288,
+      "durationSec": 3.506,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_012",
+      "category": "clean_no_bgm",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "你有打开阳台的窗户吗？",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "pragmatic-reject",
+      "attentionReason": "中文日常问句近音陷阱，禁止误唤",
+      "latencyMs": 1038,
+      "durationSec": 2.969,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_013",
+      "category": "clean_no_bgm",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "No. Stop talking about New York weather.",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "清晰非指令日常对话，无唤醒与设备控制意图",
+      "latencyMs": 2298,
+      "durationSec": 3.396,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_014",
+      "category": "clean_no_bgm",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "打开客厅吸顶灯，那个开关好像有点松了。",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 17744,
+      "durationSec": 4.542,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_015",
+      "category": "song_singing",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "打开客厅吸顶灯",
+      "predictedCommand": "打开客厅吸顶灯",
+      "rawTranscript": "new打开客厅吸顶灯。",
+      "expectedSoundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "识别到「Neo」后紧跟明确设备控制指令",
+      "latencyMs": 5210,
+      "durationSec": 3.309,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_016",
+      "category": "song_singing",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "关闭卧室灯",
+      "predictedCommand": "关闭卧室灯",
+      "rawTranscript": "意关闭卧室灯。",
+      "expectedSoundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech",
+        "song"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 8440,
+      "durationSec": 3.137,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_017",
+      "category": "song_singing",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "把小米音响音量调到20",
+      "predictedCommand": "把小米音响音量调到20",
+      "rawTranscript": "把小米音响音量调到20。",
+      "expectedSoundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 4807,
+      "durationSec": 4.298,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_018",
+      "category": "song_singing",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "暂停播放音乐",
+      "predictedCommand": "暂停播放音乐",
+      "rawTranscript": "newo暂停播放音乐。",
+      "expectedSoundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "识别到「Neo」后紧跟明确设备控制指令",
+      "latencyMs": 4241,
+      "durationSec": 3.141,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_019",
+      "category": "song_singing",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "打开空调",
+      "predictedCommand": "打开空调",
+      "rawTranscript": "heme打开空调。",
+      "expectedSoundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 10342,
+      "durationSec": 2.941,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_020",
+      "category": "song_singing",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "关灯",
+      "predictedCommand": "关灯过",
+      "rawTranscript": "溜璃关灯过。",
+      "expectedSoundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 7649,
+      "durationSec": 2.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_021",
+      "category": "song_singing",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "把台灯调亮一点",
+      "predictedCommand": "调亮一点",
+      "rawTranscript": "生把来灯调亮一点。",
+      "expectedSoundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 10379,
+      "durationSec": 3.612,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_022",
+      "category": "song_singing",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "静音",
+      "predictedCommand": "静音",
+      "rawTranscript": "你有静音。",
+      "expectedSoundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 2831,
+      "durationSec": 2.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_023",
+      "category": "song_singing",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "帮我关闭所有灯",
+      "predictedCommand": "帮我关闭所有灯",
+      "rawTranscript": "放如你有帮我关闭所有灯。",
+      "expectedSoundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 5315,
+      "durationSec": 3.263,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_024",
+      "category": "song_singing",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "打开窗帘",
+      "predictedCommand": "打开窗帘",
+      "rawTranscript": "钮打开窗帘。",
+      "expectedSoundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "识别到「Neo」后紧跟明确设备控制指令",
+      "latencyMs": 3199,
+      "durationSec": 2.727,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_025",
+      "category": "song_singing",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "pause the music",
+      "predictedCommand": "pause the music",
+      "rawTranscript": "Hey Neo pause the music.",
+      "expectedSoundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 4132,
+      "durationSec": 3.096,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_026",
+      "category": "song_singing",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "",
+      "expectedSoundTypes": [
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 0,
+      "attentionStage": "acoustic",
+      "attentionReason": "并行场景分类判定为纯歌曲演唱（无用户语音指令）",
+      "latencyMs": 22,
+      "durationSec": 4,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_027",
+      "category": "song_singing",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "",
+      "expectedSoundTypes": [
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 0,
+      "attentionStage": "acoustic",
+      "attentionReason": "并行场景分类判定为纯歌曲演唱（无用户语音指令）",
+      "latencyMs": 25,
+      "durationSec": 4.2,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_028",
+      "category": "song_singing",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "",
+      "expectedSoundTypes": [
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 0,
+      "attentionStage": "acoustic",
+      "attentionReason": "并行场景分类判定为纯歌曲演唱（无用户语音指令）",
+      "latencyMs": 20,
+      "durationSec": 4,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_029",
+      "category": "song_singing",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "",
+      "expectedSoundTypes": [
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 0,
+      "attentionStage": "acoustic",
+      "attentionReason": "并行场景分类判定为纯歌曲演唱（无用户语音指令）",
+      "latencyMs": 23,
+      "durationSec": 4.2,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_030",
+      "category": "song_singing",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "",
+      "expectedSoundTypes": [
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 0,
+      "attentionStage": "acoustic",
+      "attentionReason": "并行场景分类判定为纯歌曲演唱（无用户语音指令）",
+      "latencyMs": 23,
+      "durationSec": 4.2,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_031",
+      "category": "song_singing",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "",
+      "expectedSoundTypes": [
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 0,
+      "attentionStage": "acoustic",
+      "attentionReason": "并行场景分类判定为纯歌曲演唱（无用户语音指令）",
+      "latencyMs": 21,
+      "durationSec": 4,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_032",
+      "category": "song_singing",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "",
+      "expectedSoundTypes": [
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 0,
+      "attentionStage": "acoustic",
+      "attentionReason": "并行场景分类判定为纯歌曲演唱（无用户语音指令）",
+      "latencyMs": 24,
+      "durationSec": 4,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_033",
+      "category": "song_singing",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "这首歌真的很好听。 我上学的时候经常听。",
+      "expectedSoundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "清晰非指令日常对话，无唤醒与设备控制意图",
+      "latencyMs": 6635,
+      "durationSec": 5.321,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_034",
+      "category": "song_singing",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "我刚才听朋友说no这个语音项目挺有意思的。",
+      "expectedSoundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 10376,
+      "durationSec": 5.157,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_035",
+      "category": "song_singing",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "你好，今天晚上咱们出去吃火锅吧。",
+      "expectedSoundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "清晰非指令日常对话，无唤醒与设备控制意图",
+      "latencyMs": 5061,
+      "durationSec": 4.424,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_036",
+      "category": "song_singing",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "把客厅灯修好之后亮多了，晚上看书舒服。 好之后量多了。",
+      "expectedSoundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "清晰非指令日常对话，无唤醒与设备控制意图",
+      "latencyMs": 6583,
+      "durationSec": 5.224,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_037",
+      "category": "instrumental_bgm",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "打开书房台灯",
+      "predictedCommand": "打开书房台灯",
+      "rawTranscript": "new打开书房台灯。",
+      "expectedSoundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 3396,
+      "durationSec": 3.041,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_038",
+      "category": "instrumental_bgm",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "把空调调到26度",
+      "predictedCommand": "把空调调到26度",
+      "rawTranscript": "调把空调调到26度。",
+      "expectedSoundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 5578,
+      "durationSec": 3.949,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_039",
+      "category": "instrumental_bgm",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "打开净化器",
+      "predictedCommand": "打开净化器",
+      "rawTranscript": "leo打开净化器。",
+      "expectedSoundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 3283,
+      "durationSec": 2.97,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_040",
+      "category": "instrumental_bgm",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "关闭客厅风扇",
+      "predictedCommand": "关闭客厅风扇",
+      "rawTranscript": "nil,关闭客厅风扇。",
+      "expectedSoundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 3269,
+      "durationSec": 2.945,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_041",
+      "category": "instrumental_bgm",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "喂猫出粮两份",
+      "predictedCommand": "出粮两份",
+      "rawTranscript": "6为猫出粮两份。",
+      "expectedSoundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 3713,
+      "durationSec": 3.306,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_042",
+      "category": "instrumental_bgm",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "切换观影模式",
+      "predictedCommand": "切换观影模式",
+      "rawTranscript": "nil切换观影模式。",
+      "expectedSoundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 3355,
+      "durationSec": 3.025,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_043",
+      "category": "instrumental_bgm",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "把客厅灯亮度调到50",
+      "predictedCommand": "把客厅灯亮度调到50",
+      "rawTranscript": "newo把客厅灯亮度调到50。",
+      "expectedSoundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 4847,
+      "durationSec": 3.868,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_044",
+      "category": "instrumental_bgm",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "下一首歌",
+      "predictedCommand": "下一首歌",
+      "rawTranscript": "nil,下一首歌。",
+      "expectedSoundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 2901,
+      "durationSec": 2.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_045",
+      "category": "instrumental_bgm",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "",
+      "expectedSoundTypes": [
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 0,
+      "attentionStage": "acoustic",
+      "attentionReason": "Spleeter 分离确认仅含纯器乐伴奏无有效人声",
+      "latencyMs": 4408,
+      "durationSec": 3.8,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_046",
+      "category": "instrumental_bgm",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "",
+      "expectedSoundTypes": [
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 0,
+      "attentionStage": "acoustic",
+      "attentionReason": "Spleeter 分离确认仅含纯器乐伴奏无有效人声",
+      "latencyMs": 4772,
+      "durationSec": 3.8,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_047",
+      "category": "instrumental_bgm",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "",
+      "expectedSoundTypes": [
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 0,
+      "attentionStage": "acoustic",
+      "attentionReason": "并行场景分类与神经 VAD 判定为纯非语音背景音/纯音乐",
+      "latencyMs": 751,
+      "durationSec": 3.8,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_048",
+      "category": "instrumental_bgm",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "",
+      "expectedSoundTypes": [
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 0,
+      "attentionStage": "acoustic",
+      "attentionReason": "并行场景分类与神经 VAD 判定为纯非语音背景音/纯音乐",
+      "latencyMs": 747,
+      "durationSec": 3.8,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_049",
+      "category": "instrumental_bgm",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "周末准备去海边玩两天。 机票定好了吗？",
+      "expectedSoundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "清晰非指令日常对话，无唤醒与设备控制意图",
+      "latencyMs": 6168,
+      "durationSec": 5.144,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_050",
+      "category": "instrumental_bgm",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "我觉得no的界面设计还挺简洁的。",
+      "expectedSoundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 8831,
+      "durationSec": 4.167,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_051",
+      "category": "instrumental_bgm",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "你有看到我放在桌上的耳机吗？",
+      "expectedSoundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "清晰非指令日常对话，无唤醒与设备控制意图",
+      "latencyMs": 4012,
+      "durationSec": 3.8,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_052",
+      "category": "instrumental_bgm",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "This background beat sounds super chill tonight.",
+      "expectedSoundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 4130,
+      "durationSec": 3.8,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_053",
+      "category": "ambient_noise",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "打开客厅吸顶灯",
+      "predictedCommand": "打开客厅吸顶灯",
+      "rawTranscript": "new打开客厅吸顶灯。",
+      "expectedSoundTypes": [
+        "speech",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 3551,
+      "durationSec": 3.209,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_054",
+      "category": "ambient_noise",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "把卧室空调关掉",
+      "predictedCommand": "把卧室空调关掉",
+      "rawTranscript": "把卧室空调关掉。",
+      "expectedSoundTypes": [
+        "speech",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 3945,
+      "durationSec": 3.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_055",
+      "category": "ambient_noise",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "关闭阳台窗户",
+      "predictedCommand": "关闭阳台窗户",
+      "rawTranscript": "new关闭阳台窗户。",
+      "expectedSoundTypes": [
+        "speech",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 3390,
+      "durationSec": 3.09,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_056",
+      "category": "ambient_noise",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "打开书房灯",
+      "predictedCommand": "打开书房灯",
+      "rawTranscript": "new打开书房灯。",
+      "expectedSoundTypes": [
+        "speech",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 1211,
+      "durationSec": 2.823,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_057",
+      "category": "ambient_noise",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "把电视关掉",
+      "predictedCommand": "把电视关掉",
+      "rawTranscript": "你有把电视关掉。",
+      "expectedSoundTypes": [
+        "speech",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 4858,
+      "durationSec": 2.725,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_058",
+      "category": "ambient_noise",
+      "expectedIsNeo": true,
+      "predictedIsNeo": false,
+      "routingCorrect": false,
+      "commandCorrect": false,
+      "strictCorrect": false,
+      "expectedCommand": "把客厅吸顶灯调暗一点",
+      "predictedCommand": "",
+      "rawTranscript": "换日志的音雄把下面我们来模放时建设一点。 日志的日行。",
+      "expectedSoundTypes": [
+        "speech",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "speech",
+        "multi_speaker"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 13710,
+      "durationSec": 4.178,
+      "failureType": "false_negative"
+    },
+    {
+      "id": "clip_059",
+      "category": "ambient_noise",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "打开空气净化器",
+      "predictedCommand": "打开风气净化器",
+      "rawTranscript": "new打开风气净化器。",
+      "expectedSoundTypes": [
+        "speech",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "识别到「Neo」后紧跟明确设备控制指令",
+      "latencyMs": 4223,
+      "durationSec": 3.283,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_060",
+      "category": "ambient_noise",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": false,
+      "strictCorrect": false,
+      "expectedCommand": "打开餐厅灯",
+      "predictedCommand": "<WOKE_ONLY>",
+      "rawTranscript": "ちをった会社ど。",
+      "expectedSoundTypes": [
+        "speech",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」，开启聆听对话窗口",
+      "latencyMs": 9064,
+      "durationSec": 2.941,
+      "failureType": "command_mismatch"
+    },
+    {
+      "id": "clip_061",
+      "category": "ambient_noise",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "查看当前室内湿度",
+      "predictedCommand": "查看当前室内湿度",
+      "rawTranscript": "new查看当前室内湿度。",
+      "expectedSoundTypes": [
+        "speech",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 4390,
+      "durationSec": 3.482,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_062",
+      "category": "ambient_noise",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "",
+      "expectedSoundTypes": [
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 0,
+      "attentionStage": "acoustic",
+      "attentionReason": "并行场景分类与神经 VAD 判定为纯非语音背景音/纯音乐",
+      "latencyMs": 715,
+      "durationSec": 3.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_063",
+      "category": "ambient_noise",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "",
+      "expectedSoundTypes": [
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 0,
+      "attentionStage": "acoustic",
+      "attentionReason": "并行场景分类与神经 VAD 判定为纯非语音背景音/纯音乐",
+      "latencyMs": 721,
+      "durationSec": 3.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_064",
+      "category": "ambient_noise",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "",
+      "expectedSoundTypes": [
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 0,
+      "attentionStage": "acoustic",
+      "attentionReason": "并行场景分类与神经 VAD 判定为纯非语音背景音/纯音乐",
+      "latencyMs": 716,
+      "durationSec": 3.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_065",
+      "category": "ambient_noise",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "Yeah.",
+      "expectedSoundTypes": [
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "speech"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 4005,
+      "durationSec": 3.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_066",
+      "category": "ambient_noise",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "social easy。 非常累的时候。 就会站在阳台。",
+      "expectedSoundTypes": [
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "multi_speaker",
+        "speech"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 11585,
+      "durationSec": 3.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_067",
+      "category": "ambient_noise",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "现在不需要测需要去切换的你这吧。",
+      "expectedSoundTypes": [
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "speech"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 4244,
+      "durationSec": 3.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_068",
+      "category": "ambient_noise",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "这段代码编译报错了，我看一下日志。",
+      "expectedSoundTypes": [
+        "speech",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "清晰非指令日常对话，无唤醒与设备控制意图",
+      "latencyMs": 2130,
+      "durationSec": 4.165,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_069",
+      "category": "ambient_noise",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "各刚才新闻里提到的芯片性能一升很大。 上台。",
+      "expectedSoundTypes": [
+        "speech",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 5987,
+      "durationSec": 4.864,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_070",
+      "category": "ambient_noise",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "今天好热呀，等下喝杯冰水吧。",
+      "expectedSoundTypes": [
+        "speech",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 4429,
+      "durationSec": 3.891,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_071",
+      "category": "multi_speaker",
+      "expectedIsNeo": true,
+      "predictedIsNeo": false,
+      "routingCorrect": false,
+      "commandCorrect": false,
+      "strictCorrect": false,
+      "expectedCommand": "打开客厅吸顶灯",
+      "predictedCommand": "",
+      "rawTranscript": "你晚上想吃米饭还是面条呀？ 打开客厅吸顶灯。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "predictedSoundTypes": [
+        "multi_speaker",
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 11231,
+      "durationSec": 5.359,
+      "failureType": "false_negative"
+    },
+    {
+      "id": "clip_072",
+      "category": "multi_speaker",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "关闭卧室灯",
+      "predictedCommand": "关闭卧室灯",
+      "rawTranscript": "nil关闭卧室灯。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "predictedSoundTypes": [
+        "multi_speaker",
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 2607,
+      "durationSec": 5.356,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_073",
+      "category": "multi_speaker",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "把空调调到25度",
+      "predictedCommand": "把空调调到25度",
+      "rawTranscript": "把空调调到25度，点好了，是下午3点的场次。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "predictedSoundTypes": [
+        "multi_speaker",
+        "speech"
+      ],
+      "expectedSpeakerCount": 3,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 3611,
+      "durationSec": 7.359,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_074",
+      "category": "multi_speaker",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "打开书房台灯",
+      "predictedCommand": "打开书房台灯",
+      "rawTranscript": "1、打开书房台灯。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 3722,
+      "durationSec": 5.122,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_075",
+      "category": "multi_speaker",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "把小米音响音量调到30",
+      "predictedCommand": "把小米音响音量调到30",
+      "rawTranscript": "明天把小米音响音量调到30。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 8340,
+      "durationSec": 5.348,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_076",
+      "category": "multi_speaker",
+      "expectedIsNeo": true,
+      "predictedIsNeo": false,
+      "routingCorrect": false,
+      "commandCorrect": false,
+      "strictCorrect": false,
+      "expectedCommand": "关闭客厅风扇",
+      "predictedCommand": "",
+      "rawTranscript": "厨房里的水烧开了，我去泡茶。 关闭客厅风扇。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "multi_speaker",
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 19639,
+      "durationSec": 4.995,
+      "failureType": "false_negative"
+    },
+    {
+      "id": "clip_077",
+      "category": "multi_speaker",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "把音量调小一点",
+      "predictedCommand": "把音量调小一点",
+      "rawTranscript": "了new把音量调小一点。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song",
+        "multi_speaker",
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "fast-wake",
+      "attentionReason": "识别到「Neo」后紧跟明确设备控制指令",
+      "latencyMs": 5955,
+      "durationSec": 4.992,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_078",
+      "category": "multi_speaker",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "关闭窗帘",
+      "predictedCommand": "关闭窗帘",
+      "rawTranscript": "有关闭窗帘。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 10542,
+      "durationSec": 4.218,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_079",
+      "category": "multi_speaker",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "打开客厅灯",
+      "predictedCommand": "打开客厅灯",
+      "rawTranscript": "6打开客厅灯。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-wake",
+      "attentionReason": "句首明确呼唤「Neo」并下达操作指令",
+      "latencyMs": 7109,
+      "durationSec": 3.203,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_080",
+      "category": "multi_speaker",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "晚上我们吃烤鱼还是炒菜呀？ 随便把它炒两个青菜就行。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "predictedSoundTypes": [
+        "multi_speaker",
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "no-wake",
+      "attentionReason": "清晰非指令日常对话，无唤醒与设备控制意图",
+      "latencyMs": 2940,
+      "durationSec": 5.362,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_081",
+      "category": "multi_speaker",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "你觉得no这个语音助手好用吗？ 还不错，反应挺快的。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "multi_speaker",
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 14120,
+      "durationSec": 5.606,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_082",
+      "category": "multi_speaker",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "我刚跟同事聊到neO的时候，大家也我也想。 虽然我也想在家里装一个。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "pragmatic-reject",
+      "attentionReason": "判定为第三人称提及或否定呼唤，跳过重型分离",
+      "latencyMs": 2193,
+      "durationSec": 5.811,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_083",
+      "category": "multi_speaker",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "快递放在门口了，回去拿一下机也到了。 快递放在门口了，谁去拿一下。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "清晰非指令日常对话，无唤醒与设备控制意图",
+      "latencyMs": 2865,
+      "durationSec": 4.161,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_084",
+      "category": "multi_speaker",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "别管你用了，先把客厅收拾一下吧。 而我把茶几擦干净。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "predictedSoundTypes": [
+        "multi_speaker",
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "pragmatic-reject",
+      "attentionReason": "判定为第三人称提及或否定呼唤，跳过重型分离",
+      "latencyMs": 2281,
+      "durationSec": 5.311,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_085",
+      "category": "multi_speaker",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "这首吉他区挺放松的。 嗯适合晚上看书的时候听。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "multi_speaker",
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 5966,
+      "durationSec": 5.234,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_086",
+      "category": "multi_speaker",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "你好，帮我把桌上那杯水递过来。 有点胖。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song",
+        "multi_speaker",
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "no-wake",
+      "attentionReason": "清晰非指令日常对话，无唤醒与设备控制意图",
+      "latencyMs": 6031,
+      "durationSec": 4.996,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_087",
+      "category": "multi_speaker",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "今天外面太阳好大呀。 既然我把阳台的衣服都收进来。 晚上应该会凉快一点。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "predictedSoundTypes": [
+        "multi_speaker",
+        "speech"
+      ],
+      "expectedSpeakerCount": 3,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "no-wake",
+      "attentionReason": "清晰非指令日常对话，无唤醒与设备控制意图",
+      "latencyMs": 3942,
+      "durationSec": 6.866,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_088",
+      "category": "multi_speaker",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "Nope, I think we should take the subway instead. Good traffic near downtown is heavy.",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "multi_speaker",
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "no-wake",
+      "attentionReason": "未检测到有效唤醒词或受控声学唤醒信号",
+      "latencyMs": 7026,
+      "durationSec": 6.259,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_089",
+      "category": "conversation_scenes",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "再调亮一点",
+      "predictedCommand": "再调亮一点",
+      "rawTranscript": "再调亮一点。",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-followup",
+      "attentionReason": "连续对话中明确续聊控制指令",
+      "latencyMs": 988,
+      "durationSec": 2.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_090",
+      "category": "conversation_scenes",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "声音小一点",
+      "predictedCommand": "声音小一点",
+      "rawTranscript": "声音小一点。",
+      "expectedSoundTypes": [
+        "speech",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-followup",
+      "attentionReason": "连续对话中明确续聊控制指令",
+      "latencyMs": 2809,
+      "durationSec": 2.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_091",
+      "category": "conversation_scenes",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "换一首歌",
+      "predictedCommand": "换一首歌",
+      "rawTranscript": "换一首歌。",
+      "expectedSoundTypes": [
+        "speech",
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "multi_speaker",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "fast-followup",
+      "attentionReason": "连续对话中明确续聊控制指令",
+      "latencyMs": 3251,
+      "durationSec": 2.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_092",
+      "category": "conversation_scenes",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "把卧室灯也关掉",
+      "predictedCommand": "把卧室灯也关掉",
+      "rawTranscript": "把卧室灯也关掉。",
+      "expectedSoundTypes": [
+        "speech",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "noise",
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-followup",
+      "attentionReason": "连续对话中明确续聊控制指令",
+      "latencyMs": 2876,
+      "durationSec": 2.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_093",
+      "category": "conversation_scenes",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "顺便打开书房台灯",
+      "predictedCommand": "顺便打开书房台灯",
+      "rawTranscript": "顺便打开书房台灯。",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "fast-followup",
+      "attentionReason": "连续对话中明确续聊控制指令",
+      "latencyMs": 1204,
+      "durationSec": 2.743,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_094",
+      "category": "conversation_scenes",
+      "expectedIsNeo": true,
+      "predictedIsNeo": true,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "把亮度调到80",
+      "predictedCommand": "把亮度调到80",
+      "rawTranscript": "把亮度调到80。",
+      "expectedSoundTypes": [
+        "speech",
+        "multi_speaker"
+      ],
+      "predictedSoundTypes": [
+        "multi_speaker",
+        "speech"
+      ],
+      "expectedSpeakerCount": 2,
+      "predictedSpeakerCount": 2,
+      "attentionStage": "fast-followup",
+      "attentionReason": "连续对话中明确续聊控制指令",
+      "latencyMs": 2370,
+      "durationSec": 4.462,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_095",
+      "category": "conversation_scenes",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "晚饭吃什么呀？ 帮我拿双筷子。",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "清晰非指令日常对话，无唤醒与设备控制意图",
+      "latencyMs": 2131,
+      "durationSec": 3.978,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_096",
+      "category": "conversation_scenes",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "以打开客厅吸顶灯。",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "echo",
+      "attentionReason": "检测到系统语音播报回声，已自动抑制",
+      "latencyMs": 1151,
+      "durationSec": 2.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_097",
+      "category": "conversation_scenes",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "哈哈今天上班太累了，待会早点睡。",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "清晰非指令日常对话，无唤醒与设备控制意图",
+      "latencyMs": 2227,
+      "durationSec": 4.346,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_098",
+      "category": "conversation_scenes",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "好了，谢谢，不用了。",
+      "expectedSoundTypes": [
+        "speech"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "pragmatic-reject",
+      "attentionReason": "连续对话窗口内未识别为明确指令，已忽略并保留对话窗口",
+      "latencyMs": 1035,
+      "durationSec": 2.6,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_099",
+      "category": "conversation_scenes",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "",
+      "expectedSoundTypes": [
+        "song",
+        "bgm"
+      ],
+      "predictedSoundTypes": [
+        "bgm",
+        "song"
+      ],
+      "expectedSpeakerCount": 0,
+      "predictedSpeakerCount": 0,
+      "attentionStage": "acoustic",
+      "attentionReason": "并行场景分类判定为纯歌曲演唱（无用户语音指令）",
+      "latencyMs": 18,
+      "durationSec": 4,
+      "failureType": "none"
+    },
+    {
+      "id": "clip_100",
+      "category": "conversation_scenes",
+      "expectedIsNeo": false,
+      "predictedIsNeo": false,
+      "routingCorrect": true,
+      "commandCorrect": true,
+      "strictCorrect": true,
+      "expectedCommand": "",
+      "predictedCommand": "",
+      "rawTranscript": "你拿一下外卖吧，我在接电话。 你去拿一下外卖吧，我在接电话。",
+      "expectedSoundTypes": [
+        "speech",
+        "noise"
+      ],
+      "predictedSoundTypes": [
+        "speech"
+      ],
+      "expectedSpeakerCount": 1,
+      "predictedSpeakerCount": 1,
+      "attentionStage": "no-wake",
+      "attentionReason": "清晰非指令日常对话，无唤醒与设备控制意图",
+      "latencyMs": 2935,
+      "durationSec": 4.129,
+      "failureType": "none"
+    }
+  ]
+}
