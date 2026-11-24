@@ -44,6 +44,7 @@ export interface StartServerOptions {
   updateFetcher?: typeof fetch;
   sttFetcher?: typeof fetch;
   modelFetcher?: typeof fetch;
+  systemOneFetcher?: typeof fetch;
   agentStreamFn?: StreamFn;
   agentModel?: Model<Api>;
   autoStart?: boolean;
@@ -120,6 +121,7 @@ function handleWsMessage(
   ws: { send(data: string): number | void; data: WsData },
   raw: string | Buffer | Uint8Array,
   runtime: AppRuntime,
+  activeVoiceStreams: Set<VoiceStreamSession>,
 ): void {
   // 二进制帧：来自浏览器 AudioWorklet 的 16kHz Int16 PCM 实时音频流（零 JSON 开销）
   if (typeof raw !== "string") {
@@ -149,8 +151,11 @@ function handleWsMessage(
       const snapshot = serializeState(runtime);
       ws.send(JSON.stringify({ type: "state", data: snapshot, state: snapshot }));
     } else if (parsed.type === "voice_stream_start") {
-      ws.data.voiceStream?.dispose();
-      ws.data.voiceStream = null;
+      if (ws.data.voiceStream) {
+        activeVoiceStreams.delete(ws.data.voiceStream);
+        ws.data.voiceStream.dispose();
+        ws.data.voiceStream = null;
+      }
       const vl = runtime.voiceListener;
       if (!vl) return;
       const cfg = vl.config;
@@ -169,7 +174,32 @@ function handleWsMessage(
         bypassWakeWord,
         lang,
         engine: preferredEngine,
+        wakeWords: cfg.wakeWords,
+        owwEnabled: cfg.owwEnabled,
+        owwThreshold: cfg.owwThreshold,
+        onWakeWordSpot: (hit) => {
+          vl.recordWakeWordSpot(hit);
+          try {
+            ws.send(
+              JSON.stringify({
+                type: "voice_stream_event",
+                kind: "wake_spot",
+                wakeWord: hit.wakeWord,
+                score: hit.score,
+                rawScore: hit.rawScore,
+                threshold: hit.threshold,
+                source: hit.source,
+                matched: hit.matched,
+                latencyMs: hit.latencyMs,
+                hit,
+              }),
+            );
+          } catch {
+            // ignore closed socket
+          }
+        },
         onSpeechActivity: (speaking) => {
+          vl.setSpeechInProgress(speaking);
           try {
             ws.send(
               JSON.stringify({
@@ -199,6 +229,7 @@ function handleWsMessage(
                 reply: result.reply,
                 attention: result.attention,
                 voiceprint: result.voiceprint,
+                acousticWake: result.acousticWake,
                 snrGainDb: result.snrGainDb,
                 asrEngine: result.asrEngine,
                 timings: result.timings,
@@ -213,6 +244,7 @@ function handleWsMessage(
         },
       });
       ws.data.voiceStream = session;
+      activeVoiceStreams.add(session);
       ws.send(
         JSON.stringify({
           type: "voice_stream_event",
@@ -223,8 +255,30 @@ function handleWsMessage(
     } else if (parsed.type === "voice_stream_flush") {
       void ws.data.voiceStream?.flush();
     } else if (parsed.type === "voice_stream_stop") {
-      ws.data.voiceStream?.dispose();
-      ws.data.voiceStream = null;
+      if (ws.data.voiceStream) {
+        activeVoiceStreams.delete(ws.data.voiceStream);
+        ws.data.voiceStream.dispose();
+        ws.data.voiceStream = null;
+      }
+      runtime.voiceListener?.setSpeechInProgress(false);
+    } else if (parsed.type === "voice_dialog_control") {
+      const vl = runtime.voiceListener;
+      if (!vl) return;
+      const action = typeof parsed.action === "string" ? parsed.action.trim() : "";
+      const speakAck = parsed.speakAck === true;
+      if (action === "enter") {
+        vl.enterConversation("ws_control", { speakAck });
+      } else if (action === "exit") {
+        vl.exitConversation("ws_control", { speakAck });
+      } else if (action === "toggle") {
+        vl.toggleConversation();
+      }
+    } else if (parsed.type === "voice_tts_state") {
+      const vl = runtime.voiceListener;
+      if (!vl) return;
+      if (typeof parsed.speaking === "boolean") {
+        vl.setTtsSpeaking(parsed.speaking);
+      }
     }
   } catch {
     // 忽略非 JSON 心跳或未知文本帧
@@ -305,6 +359,7 @@ export async function startMijiaDeckServer(
   });
 
   const broadcaster = new StateBroadcaster();
+  const activeVoiceStreams = new Set<VoiceStreamSession>();
   const speakerAudioProps = new Map<string, { volName: string; muteName: string }>();
   const pendingSpeakerLookups = new Set<string>();
 
@@ -345,6 +400,11 @@ export async function startMijiaDeckServer(
         state: snapshot,
       });
     },
+    reloadVoiceStreams: (wakeWords, threshold) => {
+      for (const stream of activeVoiceStreams) {
+        stream.reloadWakeWords(wakeWords, threshold);
+      }
+    },
   };
 
   const piAgent = new PiAgentService({
@@ -357,6 +417,7 @@ export async function startMijiaDeckServer(
     },
     ...(options.agentStreamFn ? { customStreamFn: options.agentStreamFn } : {}),
     ...(options.agentModel ? { customModel: options.agentModel } : {}),
+    ...(options.systemOneFetcher ? { systemOneFetcher: options.systemOneFetcher } : {}),
   });
   const voiceListener = new VoiceListenerController(piAgent, {
     fetcher: options.sttFetcher,
@@ -467,11 +528,15 @@ export async function startMijiaDeckServer(
         }
       },
       message(ws, message) {
-        handleWsMessage(ws, message, runtime);
+        handleWsMessage(ws, message, runtime, activeVoiceStreams);
       },
       close(ws) {
-        ws.data.voiceStream?.dispose();
-        ws.data.voiceStream = null;
+        if (ws.data.voiceStream) {
+          activeVoiceStreams.delete(ws.data.voiceStream);
+          ws.data.voiceStream.dispose();
+          ws.data.voiceStream = null;
+          runtime.voiceListener?.setSpeechInProgress(false);
+        }
         broadcaster.remove(ws);
       },
     },
@@ -494,6 +559,10 @@ export async function startMijiaDeckServer(
       return;
     }
     stopped = true;
+    for (const stream of activeVoiceStreams) {
+      stream.dispose();
+    }
+    activeVoiceStreams.clear();
     for (const unsub of unsubscribers) {
       unsub();
     }

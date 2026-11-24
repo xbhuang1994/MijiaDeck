@@ -27,6 +27,15 @@ import {
   spectralSubtractDenoise,
 } from "./audioPcm.ts";
 import {
+  OPEN_WAKEWORD_MODEL_URLS,
+  OpenWakeWordEngine,
+  type OpenWakeWordScoreClipOptions,
+  type OpenWakeWordStreamOptions,
+  type OpenWakeWordStreamSession,
+  type WakeWordAcousticHit,
+} from "./openWakeWordEngine.ts";
+import type { SystemOneClient } from "./systemOneClient.ts";
+import {
   findWakeWordSpan,
   isWakeQueryText,
   looksLikeDirectDeviceCommand,
@@ -49,6 +58,9 @@ export interface LocalVoiceModelPaths {
   senseVoiceDir: string;
   senseVoiceModel: string;
   senseVoiceTokens: string;
+  openWakeWordDir: string;
+  openWakeWordMel: string;
+  openWakeWordEmbedding: string;
 }
 
 export interface LocalVoiceEngineStatus {
@@ -62,6 +74,7 @@ export interface LocalVoiceEngineStatus {
     sileroVad: boolean;
     speakerCampp: boolean;
     senseVoice: boolean;
+    openWakeWord: boolean;
   };
   readyForDenoise: boolean;
   readyForDpdfnet: boolean;
@@ -69,6 +82,7 @@ export interface LocalVoiceEngineStatus {
   readyForVad: boolean;
   readyForVoiceprint: boolean;
   readyForLocalAsr: boolean;
+  readyForWakeWord: boolean;
   downloading: boolean;
   lastError: string | null;
 }
@@ -108,6 +122,8 @@ export interface LocalAsrOutput {
   engine: "sensevoice-local" | "sensevoice-dual-raw" | "sensevoice-dual-denoised";
   durationMs: number;
   altText?: string;
+  enHeadText?: string;
+  scoreMargin?: number;
 }
 
 export interface OnlineDenoiserHandleLike {
@@ -210,6 +226,7 @@ export function resolveVoiceModelPaths(modelsDirOverride?: string): LocalVoiceMo
   );
   const senseVoiceDir = path.join(modelsDir, SENSE_VOICE_DIR_NAME);
   const voxlockDir = path.join(modelsDir, VOXLOCK_DIR_NAME);
+  const openWakeWordDir = path.join(modelsDir, "openwakeword");
   return {
     modelsDir,
     gtcrn: path.join(modelsDir, "gtcrn_simple.onnx"),
@@ -222,6 +239,9 @@ export function resolveVoiceModelPaths(modelsDirOverride?: string): LocalVoiceMo
     senseVoiceDir,
     senseVoiceModel: path.join(senseVoiceDir, "model.int8.onnx"),
     senseVoiceTokens: path.join(senseVoiceDir, "tokens.txt"),
+    openWakeWordDir,
+    openWakeWordMel: path.join(openWakeWordDir, "melspectrogram.onnx"),
+    openWakeWordEmbedding: path.join(openWakeWordDir, "embedding_model.onnx"),
   };
 }
 
@@ -298,6 +318,7 @@ export function chooseBestAsrCandidate(
 
   const rawScore = score(rawAsr, "raw");
   const denScore = score(denoisedAsr, "denoised");
+  const scoreMargin = Number(Math.abs(rawScore - denScore).toFixed(2));
 
   if (rawScore >= denScore) {
     return {
@@ -305,6 +326,7 @@ export function chooseBestAsrCandidate(
       engine: "sensevoice-dual-raw",
       durationMs: rawAsr.durationMs + denoisedAsr.durationMs,
       altText: denoisedAsr.text,
+      scoreMargin,
     };
   }
   return {
@@ -312,11 +334,13 @@ export function chooseBestAsrCandidate(
     engine: "sensevoice-dual-denoised",
     durationMs: rawAsr.durationMs + denoisedAsr.durationMs,
     altText: rawAsr.text,
+    scoreMargin,
   };
 }
 
 export class LocalVoiceEngine {
   private readonly _modelsDirOverride?: string;
+  private readonly _oww: OpenWakeWordEngine;
   private _gtcrnDenoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
   private _dpdfnetDenoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
   private _voxlockDenoiser: {
@@ -334,10 +358,37 @@ export class LocalVoiceEngine {
 
   constructor(options: { modelsDir?: string } = {}) {
     this._modelsDirOverride = options.modelsDir;
+    const p = resolveVoiceModelPaths(options.modelsDir);
+    this._oww = new OpenWakeWordEngine({ modelsDir: p.modelsDir });
   }
 
   get paths(): LocalVoiceModelPaths {
     return resolveVoiceModelPaths(this._modelsDirOverride);
+  }
+
+  get openWakeWord(): OpenWakeWordEngine {
+    return this._oww;
+  }
+
+  createWakeWordStream(
+    wakeWords: readonly string[],
+    opts?: OpenWakeWordStreamOptions,
+  ): OpenWakeWordStreamSession | null {
+    if (!this._oww.isReady && !this._oww.ensureLoaded()) {
+      return null;
+    }
+    return this._oww.createStreamSession(wakeWords, opts);
+  }
+
+  scoreWakeWordAudio(
+    pcm16k: Float32Array,
+    wakeWords: readonly string[],
+    opts?: OpenWakeWordScoreClipOptions,
+  ): WakeWordAcousticHit | null {
+    if (!this._oww.isReady && !this._oww.ensureLoaded()) {
+      return null;
+    }
+    return this._oww.scoreClip(pcm16k, wakeWords, opts);
   }
 
   getStatus(): LocalVoiceEngineStatus {
@@ -349,18 +400,20 @@ export class LocalVoiceEngine {
     const sileroVad = existsSync(p.sileroVad);
     const speakerCampp = existsSync(p.speakerCampp);
     const senseVoice = existsSync(p.senseVoiceModel) && existsSync(p.senseVoiceTokens);
+    const openWakeWord = existsSync(p.openWakeWordMel) && existsSync(p.openWakeWordEmbedding);
     const addonAvailable = sherpa !== null;
     return {
       addonAvailable,
       addonVersion: sherpa?.version ?? null,
       modelsDir: p.modelsDir,
-      models: { gtcrn, dpdfnet4, voxlock, sileroVad, speakerCampp, senseVoice },
+      models: { gtcrn, dpdfnet4, voxlock, sileroVad, speakerCampp, senseVoice, openWakeWord },
       readyForDenoise: addonAvailable && gtcrn,
       readyForDpdfnet: addonAvailable && dpdfnet4,
       readyForVoxlock: addonAvailable && voxlock,
       readyForVad: addonAvailable && sileroVad,
       readyForVoiceprint: addonAvailable && speakerCampp,
       readyForLocalAsr: addonAvailable && senseVoice,
+      readyForWakeWord: this._oww.getStatus().ready,
       downloading: this._downloading,
       lastError: this._lastError,
     };
@@ -371,10 +424,11 @@ export class LocalVoiceEngine {
   }
 
   /**
-   * 后台异步预热本地 ONNX 模型（GTCRN / CAM++ / SenseVoice），消除首句冷启动延迟。
+   * 后台异步预热本地 ONNX 模型（GTCRN / CAM++ / SenseVoice / openWakeWord），消除首句冷启动延迟。
    */
   async warmup(): Promise<void> {
     try {
+      this._oww.ensureLoaded();
       this._ensureGtcrnDenoiser();
       this._ensureSpeakerExtractor();
       await this._ensureRecognizer("auto");
@@ -866,6 +920,8 @@ export class LocalVoiceEngine {
       wakeWords?: readonly string[];
       inputSnrDb?: number;
       forceDual?: boolean;
+      systemOneClient?: SystemOneClient | null;
+      acousticWake?: WakeWordAcousticHit | null;
     } = {},
   ): Promise<LocalAsrOutput> {
     const lang = options.voiceLang || "zh-CN";
@@ -874,6 +930,8 @@ export class LocalVoiceEngine {
     const hasAsciiWake = wakeWords.some((w) => /^[a-z][a-z0-9\s-]*$/i.test(w.trim()));
 
     let best: LocalAsrOutput;
+    let dualRawRes: LocalAsrOutput | null = null;
+    let dualDenRes: LocalAsrOutput | null = null;
     const hpRaw = applyHighPassFilter(rawPcm16k, 16000, 85);
 
     // 非常安静的环境：若无需唤醒词检查或降噪单轨已清晰命中唤醒词，直接单轨返回保持最低延迟
@@ -890,6 +948,8 @@ export class LocalVoiceEngine {
       }
       // 降噪轨未检出唤醒词时补跑一次高通原始轨（避免 GTCRN 轻度抑制句首短英文音节如 "嘿Neo"）
       const rawRes = await this.transcribeLocal(hpRaw, 16000, lang);
+      dualRawRes = rawRes;
+      dualDenRes = single;
       best = chooseBestAsrCandidate(rawRes, single, { wakeWords, inputSnrDb });
     } else {
       const [rawRes, denRes] = await Promise.all([
@@ -906,7 +966,90 @@ export class LocalVoiceEngine {
               durationMs: 0,
             }),
       ]);
+      dualRawRes = rawRes;
+      dualDenRes = denRes;
       best = chooseBestAsrCandidate(rawRes, denRes, { wakeWords, inputSnrDb });
+    }
+
+    // SystemOne 双轨 ASR 候选择优（双轨出现不同非空候选且分差较近或处于 BGM 场景）
+    const acousticWake = options.acousticWake ?? null;
+    if (dualRawRes && dualDenRes && options.systemOneClient?.enabled) {
+      const trackA = dualRawRes.text.trim();
+      const trackB = dualDenRes.text.trim();
+      const isBgm =
+        dualRawRes.event.toUpperCase().includes("BGM") ||
+        dualDenRes.event.toUpperCase().includes("BGM");
+      const scoreMargin = best.scoreMargin ?? 0;
+      if (trackA && trackB && trackA !== trackB && (scoreMargin < 30 || isBgm)) {
+        const sel = await options.systemOneClient.selectDualTrackAsr({
+          trackA,
+          trackB,
+          wakeWords,
+          acousticEvent: best.event || dualRawRes.event || dualDenRes.event || undefined,
+          inputSnrDb,
+        });
+        if (sel) {
+          if (sel.choice === "neither_noise" && sel.confidence >= 0.75) {
+            if (!acousticWake?.matched) {
+              return {
+                ...best,
+                text: "",
+                durationMs: best.durationMs + sel.latencyMs,
+              };
+            }
+          } else if (sel.choice === "track_a") {
+            best = {
+              ...dualRawRes,
+              engine: "sensevoice-dual-raw",
+              durationMs: dualRawRes.durationMs + dualDenRes.durationMs + sel.latencyMs,
+              altText: dualDenRes.text,
+              scoreMargin: best.scoreMargin,
+            };
+          } else if (sel.choice === "track_b") {
+            best = {
+              ...dualDenRes,
+              engine: "sensevoice-dual-denoised",
+              durationMs: dualRawRes.durationMs + dualDenRes.durationMs + sel.latencyMs,
+              altText: dualRawRes.text,
+              scoreMargin: best.scoreMargin,
+            };
+          }
+        }
+      }
+    }
+
+    // openWakeWord 声学唤醒词直救：若本地声学引擎已确信命中唤醒词，但主 ASR 吞掉了句首唤醒词（如 "Neo"）
+    // 或将其误译为乱码（如 "2お"），直接补全规范唤醒词，免去额外 en-head ASR 探针延迟！
+    if (acousticWake?.matched && wakeWords.length > 0 && !findWakeWordSpan(best.text, wakeWords)) {
+      const cleanBest = best.text.trim();
+      const stripped = stripLeadingVocativeOrFragment(cleanBest);
+      const meaningfulChars = cleanBest.replace(/[\s,，。．.、!！?？:：;；\-—~～"'“”‘’]/g, "");
+      const hasWeirdScript = /[\u3040-\u30ff\uac00-\ud7af]/.test(cleanBest);
+      const primaryLen = denoisedPcm16k.length >= 1600 ? denoisedPcm16k.length : hpRaw.length;
+      const isShortClip = primaryLen <= 16000 * 1.9;
+      const looksLikeCmd =
+        stripped.length >= 2 &&
+        (looksLikeDirectDeviceCommand(stripped) || isWakeQueryText(stripped));
+
+      if (looksLikeCmd) {
+        const cmdPart = isWakeQueryText(stripped) ? "" : stripped;
+        return {
+          ...best,
+          text: cmdPart ? `${acousticWake.wakeWord}，${cmdPart}` : acousticWake.wakeWord,
+        };
+      }
+      if (isShortClip || meaningfulChars.length <= 4 || hasWeirdScript || !cleanBest) {
+        return {
+          ...best,
+          text: acousticWake.wakeWord,
+        };
+      }
+      if (stripped.length >= 2) {
+        return {
+          ...best,
+          text: `${acousticWake.wakeWord}，${stripped}`,
+        };
+      }
     }
 
     // 中英混说英文唤醒词句首恢复（仅在配置了英文唤醒词、中文/自动模式且主解码未命中唤醒词时触发）
@@ -999,7 +1142,8 @@ export class LocalVoiceEngine {
         ...best,
         text: recoveredText,
         durationMs: best.durationMs + extraMs,
-        altText: `${best.text} [en-head:${enRes.text}]`,
+        altText: best.altText || best.text,
+        enHeadText: enRes.text,
       };
     }
 
@@ -1014,6 +1158,7 @@ export class LocalVoiceEngine {
         engine: best.engine,
         durationMs: best.durationMs + extraMs,
         altText: best.text,
+        enHeadText: enRes.text,
       };
     }
 
@@ -1021,7 +1166,7 @@ export class LocalVoiceEngine {
   }
 
   /**
-   * 一键补齐下载缺失的本地 ONNX 模型（GTCRN / DPDFNet4 / Silero VAD / 3D-Speaker CAM++ / SenseVoiceSmall int8）。
+   * 一键补齐下载缺失的本地 ONNX 模型（GTCRN / DPDFNet4 / Silero VAD / 3D-Speaker CAM++ / SenseVoiceSmall int8 / openWakeWord）。
    */
   async downloadMissingModels(): Promise<LocalVoiceEngineStatus> {
     if (this._downloading) {
@@ -1033,6 +1178,7 @@ export class LocalVoiceEngine {
 
     try {
       mkdirSync(p.modelsDir, { recursive: true });
+      mkdirSync(p.openWakeWordDir, { recursive: true });
 
       const fetchFile = async (url: string, dest: string) => {
         if (existsSync(dest)) return;
@@ -1050,6 +1196,9 @@ export class LocalVoiceEngine {
       await fetchFile(MODEL_URLS.dpdfnet4, p.dpdfnet4);
       await fetchFile(MODEL_URLS.sileroVad, p.sileroVad);
       await fetchFile(MODEL_URLS.speakerCampp, p.speakerCampp);
+      await fetchFile(OPEN_WAKEWORD_MODEL_URLS.mel, p.openWakeWordMel);
+      await fetchFile(OPEN_WAKEWORD_MODEL_URLS.embedding, p.openWakeWordEmbedding);
+      this._oww.ensureLoaded();
 
       if (!existsSync(p.senseVoiceModel) || !existsSync(p.senseVoiceTokens)) {
         const tarPath = path.join(p.modelsDir, "sensevoice.tar.bz2");
@@ -1080,6 +1229,7 @@ export class LocalVoiceEngine {
   }
 
   dispose(): void {
+    this._oww.dispose();
     this._gtcrnDenoiser = null;
     this._dpdfnetDenoiser = null;
     this._voxlockDenoiser = null;

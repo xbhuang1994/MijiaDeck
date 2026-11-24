@@ -33,6 +33,10 @@
           </svg>
           <span id="voice-listen-label" class="title-action-label">语音监听</span>
         </button>
+        <button type="button" id="voice-dialog-badge-btn" class="title-dialog-badge is-standby" hidden title="点击切换待唤醒 / 对话模式" aria-label="切换语音对话模式" aria-pressed="false">
+          <span class="dialog-badge-dot" aria-hidden="true"></span>
+          <span id="voice-dialog-badge-label" class="dialog-badge-label">待唤醒</span>
+        </button>
         <button type="button" id="pi-agent-toggle-btn" class="title-action-btn pi-agent-btn" title="打开 / 收起内置 Pi Agent 智能设备控制面板" aria-label="打开或收起内置 Pi Agent 面板" aria-expanded="false">
           <span class="pi-symbol" aria-hidden="true">π</span>
           <span class="title-action-label">Pi Agent</span>
@@ -228,6 +232,15 @@
 
     <!-- Voice Listener Control Card -->
     <div id="pi-voice-strip" class="pi-voice-strip">
+      <div id="pi-dialog-banner" class="pi-dialog-banner is-standby">
+        <div class="pi-dialog-banner-row">
+          <span id="pi-dialog-state-badge" class="pi-dialog-state-badge">非对话模式 · 未开启监听</span>
+          <button type="button" id="pi-dialog-mode-btn" class="pi-dialog-mode-btn">进入对话</button>
+        </div>
+        <div id="pi-dialog-timer-track" class="pi-dialog-timer-track" hidden>
+          <div id="pi-dialog-timer-fill" class="pi-dialog-timer-fill"></div>
+        </div>
+      </div>
       <div class="pi-voice-top">
         <div id="pi-voice-wave" class="pi-voice-wave" aria-hidden="true">
           <span class="pi-wave-bar"></span>
@@ -238,13 +251,14 @@
         </div>
         <div class="pi-voice-info">
           <div id="pi-voice-status-text" class="pi-voice-status">语音监听待机中</div>
-          <div id="pi-voice-sub-text" class="pi-voice-sub">点击「开启持续监听」或按 Alt+V 单次说话</div>
+          <div id="pi-voice-sub-text" class="pi-voice-sub">点击「进入对话」或按 Alt+V 单次说话</div>
         </div>
       </div>
       <div class="pi-voice-controls">
         <button type="button" id="pi-voice-start-btn" class="primary-button btn-compact">开启持续监听</button>
         <button type="button" id="pi-voice-oneshot-btn" class="secondary-button btn-compact" title="免唤醒单次语音输入（快捷键 Alt+V）">单次说话</button>
         <button type="button" id="pi-voice-wake-toggle-btn" class="pi-wake-pill active" title="点击切换唤醒词模式或免唤醒直达模式">唤醒词：小派</button>
+        <button type="button" id="pi-caveman-toggle-btn" class="pi-caveman-pill active" title="点击切换 Caveman 极简回复风格">极简 · Full</button>
       </div>
       <div id="pi-voice-telemetry" class="pi-voice-telemetry" hidden></div>
     </div>
@@ -645,6 +659,19 @@
 
           <div class="setting-card setting-card-wrap">
             <div class="setting-info">
+              <div class="setting-label">Caveman 极简回复风格</div>
+              <div class="setting-desc" id="set-agent-caveman-desc">极简直给，去寒暄废话、保留关键数值与结果 · 例：“客厅灯已开，亮度 85%。”</div>
+            </div>
+            <select id="set-agent-caveman-mode" class="md-select" aria-label="Caveman 极简回复风格">
+              <option value="full">极简洞穴人 Full · 推荐</option>
+              <option value="ultra">电报极简 Ultra · 最快语音</option>
+              <option value="lite">精炼自然 Lite</option>
+              <option value="off">标准自然</option>
+            </select>
+          </div>
+
+          <div class="setting-card setting-card-wrap">
+            <div class="setting-info">
               <div class="setting-label">附加指令（可选）</div>
               <div class="setting-desc">告诉 Pi Agent 你的家庭习惯、房间别名或偏好（如“我说睡了就关客厅和餐厅所有灯”）</div>
             </div>
@@ -656,7 +683,7 @@
           <div class="setting-card setting-card-wrap" id="voice-pipeline-status-card">
             <div class="setting-info">
               <div class="setting-label">本地离线语音 AI 引擎状态（Sherpa-ONNX）</div>
-              <div class="setting-desc" id="voice-pipeline-status-desc">本地离线运行 GTCRN 神经降噪、Silero VAD、3D-Speaker 中文声纹与 SenseVoice 多语种识别，国内无需联网即可稳定识别</div>
+              <div class="setting-desc" id="voice-pipeline-status-desc">本地离线运行 GTCRN 神经降噪、Silero VAD、3D-Speaker 中文声纹、openWakeWord 唤醒与 SenseVoice 多语种识别，国内无需联网即可稳定识别</div>
             </div>
             <div class="voice-status-row">
               <div class="voice-status-badges" id="voice-model-badges">
@@ -666,6 +693,7 @@
                 <span class="voice-badge-pill" id="badge-model-vad">Silero VAD</span>
                 <span class="voice-badge-pill" id="badge-model-vp">3D-Speaker 声纹</span>
                 <span class="voice-badge-pill" id="badge-model-asr">SenseVoice 识别</span>
+                <span class="voice-badge-pill" id="badge-model-oww">openWakeWord 唤醒</span>
               </div>
               <button type="button" id="voice-download-models-btn" class="secondary-button btn-compact" hidden>一键补齐模型</button>
             </div>
@@ -734,32 +762,66 @@
 
           <div class="setting-card setting-card-wrap" id="setting-row-wake-words">
             <div class="setting-info">
-              <div class="setting-label">唤醒词列表与唤醒窗口</div>
-              <div class="setting-desc">多个唤醒词用逗号分隔（支持中英文混说与同音/近音容错，如 Neo、小派）；仅喊唤醒词后进入等待窗口</div>
+              <div class="setting-label">自定义唤醒词与 openWakeWord 声学唤醒</div>
+              <div class="setting-desc">多个唤醒词用逗号分隔（支持中英文与自定义词，如 Neo、小派）；命中唤醒词后进入持续对话，超时无声自动退回待唤醒</div>
             </div>
             <div class="agent-wake-grid">
-              <input type="text" id="set-voice-wake-words" class="md-text-input" placeholder="小派, 派派, pi, 米家助手" aria-label="唤醒词列表">
-              <div class="agent-window-box">
-                <input type="number" id="set-voice-wake-window" class="md-num-input" min="3" max="60" value="12" aria-label="唤醒等待秒数">
-                <span class="agent-unit">秒</span>
+              <input type="text" id="set-voice-wake-words" class="md-text-input" placeholder="Neo, 小派, 派派, pi, 米家助手" aria-label="唤醒词列表">
+              <div class="agent-window-box" title="命中唤醒词后持续对话的无声自动退出超时（5~120 秒）">
+                <input type="number" id="set-voice-conv-window" class="md-num-input" min="5" max="120" value="25" aria-label="持续对话超时秒数">
+                <span class="agent-unit">秒对话</span>
               </div>
+            </div>
+            <div class="oww-enroll-box">
+              <div class="oww-enroll-head">
+                <label class="voice-mini-check">
+                  <input type="checkbox" id="set-oww-enabled" checked>
+                  <span>启用 openWakeWord 声学唤醒</span>
+                </label>
+                <div class="agent-window-box" title="声学唤醒触发阈值（0.25~0.95，越小越灵敏，默认 0.60）">
+                  <span class="agent-unit">阈值</span>
+                  <input type="number" id="set-oww-threshold" class="md-num-input" min="0.25" max="0.95" step="0.02" value="0.60" aria-label="openWakeWord 唤醒阈值">
+                </div>
+              </div>
+              <div class="oww-enroll-controls">
+                <input type="text" id="oww-target-word" class="md-text-input oww-word-input" placeholder="目标唤醒词（如 Neo）" maxlength="32" aria-label="目标唤醒词">
+                <button type="button" id="oww-record-sample-btn" class="primary-button btn-compact">录制样本 (1.8s)</button>
+                <button type="button" id="oww-test-sample-btn" class="secondary-button btn-compact">试喊测试</button>
+                <button type="button" id="oww-bootstrap-btn" class="secondary-button btn-compact" title="为当前唤醒词列表自动合成声学模板">重新合成</button>
+              </div>
+              <div id="oww-level-meter" class="oww-level-meter" hidden>
+                <div id="oww-level-fill" class="oww-level-fill"></div>
+              </div>
+              <div id="oww-status-line" class="oww-status-line">可为任意自定义唤醒词录制 2~3 条真人样本提升准确率，或点击「重新合成」快速生成模板</div>
+              <div id="oww-prototype-list" class="oww-prototype-list"></div>
             </div>
           </div>
 
-          <div class="setting-card setting-card-wrap">
+          <div class="setting-card setting-card-wrap" id="setting-row-systemone">
             <div class="setting-info">
-              <div class="setting-label">唤醒词注意力机制（防误触思考门控）</div>
-              <div class="setting-desc">提到唤醒词或处于连续对话时，先由 Pi Agent 思考“是在叫我还是旁白提及”，确认后再操作设备</div>
+              <div class="setting-label">SystemOne 智能决策门控（防误触与旁白过滤）</div>
+              <div class="setting-desc" id="set-systemone-status-desc">在对话模式中实时判断语音是在下达指令还是他人旁白，连续旁白达上限自动退回待唤醒</div>
             </div>
-            <div class="voice-triple-grid">
-              <select id="set-voice-attention-mode" class="md-select" aria-label="唤醒词注意力模式">
-                <option value="smart">智能注意力（直呼极速响应 · 歧义/续聊先思考）</option>
-                <option value="strict">严格思考模式（每次提及唤醒词均经 LLM 复核）</option>
-                <option value="off">关闭注意力思考（仅关键词匹配）</option>
-              </select>
-              <div class="agent-window-box" title="执行完指令后免唤醒续聊窗口，期间旁白会自动被注意力门控过滤">
-                <input type="number" id="set-voice-conv-window" class="md-num-input" min="0" max="60" value="18" aria-label="连续对话窗口秒数">
-                <span class="agent-unit">秒续聊</span>
+            <div class="systemone-grid">
+              <div class="systemone-row">
+                <select id="set-systemone-mode" class="md-select" aria-label="SystemOne 决策模式">
+                  <option value="auto">SystemOne：自动启用</option>
+                  <option value="on">SystemOne：强制启用</option>
+                  <option value="off">SystemOne：关闭</option>
+                </select>
+                <select id="set-voice-attention-mode" class="md-select" aria-label="唤醒词注意力模式">
+                  <option value="smart">注意力：智能门控</option>
+                  <option value="strict">注意力：严格复核</option>
+                  <option value="off">注意力：关闭</option>
+                </select>
+                <div class="agent-window-box" title="对话模式下连续旁白达到此次数自动退回待唤醒（1~10 次）">
+                  <input type="number" id="set-voice-sidetalk-limit" class="md-num-input" min="1" max="10" value="3" aria-label="连续旁白自动退出次数">
+                  <span class="agent-unit">次旁白退出</span>
+                </div>
+              </div>
+              <div class="systemone-row">
+                <input type="text" id="set-systemone-model" class="md-text-input" placeholder="karpo/karpo-decision-31b" spellcheck="false" aria-label="SystemOne 决策模型 ID">
+                <input type="text" id="set-systemone-base-url" class="md-text-input" placeholder="留空默认复用上方主网关地址" spellcheck="false" aria-label="SystemOne Base URL">
               </div>
             </div>
           </div>

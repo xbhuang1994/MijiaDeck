@@ -357,6 +357,98 @@ function findSpeakerAudioProps(props: readonly PropInfo[]): {
   return { volumeProp, speakerMuteProp, micMuteProp };
 }
 
+function formatPropUnitSuffix(unit?: string | null): string {
+  if (unit === "celsius") return "°C";
+  if (unit === "percentage") return "%";
+  if (unit === "kelvin") return "K";
+  return unit ? ` ${unit}` : "";
+}
+
+function joinDeviceLabel(name: string, tail: string): string {
+  if (!tail) return name;
+  const needsSpace = /[A-Za-z0-9]$/.test(name) || /^[A-Za-z0-9]/.test(tail);
+  return needsSpace ? `${name} ${tail}` : `${name}${tail}`;
+}
+
+function formatDeviceDetailUiSummary(
+  device: DeviceInfo,
+  values: Record<string, unknown>,
+  props: readonly PropInfo[],
+): string {
+  if (!device.online) {
+    return joinDeviceLabel(device.name, "离线");
+  }
+
+  const temp = values["temperature"];
+  const hum = values["relative-humidity"] ?? values["humidity"];
+  const bat = values["battery-level"] ?? values["battery"];
+  if (typeof temp === "number" || typeof hum === "number") {
+    const sensorParts: string[] = [];
+    if (typeof temp === "number") sensorParts.push(`${temp}°C`);
+    if (typeof hum === "number") sensorParts.push(`湿度 ${hum}%`);
+    if (typeof bat === "number" && bat < 20) sensorParts.push(`电量 ${bat}%`);
+    return `${device.name} ${sensorParts.join("，")}`;
+  }
+
+  const hasLightVal =
+    isLight(device) ||
+    typeof values["brightness"] === "number" ||
+    typeof values["color-temperature"] === "number";
+  if (hasLightVal && typeof values["on"] === "boolean") {
+    if (!values["on"]) {
+      return joinDeviceLabel(device.name, "已关");
+    }
+    const parts: string[] = [];
+    if (typeof values["brightness"] === "number") parts.push(`亮度 ${values["brightness"]}%`);
+    if (typeof values["color-temperature"] === "number") parts.push(`${values["color-temperature"]}K`);
+    return parts.length > 0
+      ? joinDeviceLabel(device.name, `已开，${parts.join("，")}`)
+      : joinDeviceLabel(device.name, "已开");
+  }
+
+  if (isSpeaker(device)) {
+    const parts: string[] = [];
+    if (typeof values["volume"] === "number") parts.push(`音量 ${values["volume"]}%`);
+    const muted = values["mute"] === true || values["mute-2"] === true;
+    if (muted) parts.push("已静音");
+    return parts.length > 0 ? `${device.name} ${parts.join("，")}` : joinDeviceLabel(device.name, "在线");
+  }
+
+  if (typeof values["on"] === "boolean") {
+    return joinDeviceLabel(device.name, values["on"] ? "已开" : "已关");
+  }
+
+  const propParts: string[] = [];
+  for (const p of props) {
+    if (isSensitivePropertyName(p.name)) continue;
+    const val = values[p.name];
+    if (val === undefined || val === null) continue;
+    let formatted: string;
+    if (typeof val === "boolean") {
+      formatted = val ? "开" : "关";
+    } else if (p.value_list) {
+      const optItem = p.value_list.find((o) => o.value === val);
+      formatted = optItem?.desc_zh_cn ?? optItem?.description ?? String(val);
+    } else {
+      formatted = `${String(val)}${formatPropUnitSuffix(p.unit)}`;
+    }
+    propParts.push(`${p.desc || p.name} ${formatted}`);
+    if (propParts.length >= 2) break;
+  }
+
+  return propParts.length > 0
+    ? `${device.name} ${propParts.join("，")}`
+    : joinDeviceLabel(device.name, "在线");
+}
+
+function formatListUiSummary(names: readonly string[], unitLabel: string): string {
+  if (names.length === 0) return `未找到${unitLabel}`;
+  if (names.length <= 4) {
+    return `共 ${names.length} ${unitLabel}：${names.join("、")}`;
+  }
+  return `共 ${names.length} ${unitLabel}：${names.slice(0, 3).join("、")}等`;
+}
+
 async function applySpeakerPower(
   deps: SmartHomeToolDeps,
   device: DeviceInfo,
@@ -385,7 +477,8 @@ async function applySpeakerPower(
     targetOn = state === "on";
   }
 
-  const steps: string[] = [];
+  let paused = false;
+  let muted = false;
   if (!targetOn) {
     // 关闭小爱音箱：暂停/停止播放并开启扬声器静音（智能音箱无物理断电开关，采用暂停+静音待机）
     const pauseAction =
@@ -394,20 +487,19 @@ async function applySpeakerPower(
     if (pauseAction) {
       try {
         await runJob(deps.jobs, () => deps.service.runAction(device.did, pauseAction.name), 1);
-        steps.push("已暂停播放");
+        paused = true;
       } catch {
         // 未在播放时暂停可能报错，不阻断静音
       }
     }
     if (speakerMuteProp) {
       await runJob(deps.jobs, () => deps.service.writeProp(device.did, speakerMuteProp.name, true), 1);
-      steps.push("已开启静音待机");
+      muted = true;
     }
   } else {
     // 打开小爱音箱：解除扬声器静音，并唤醒/恢复
     if (speakerMuteProp) {
       await runJob(deps.jobs, () => deps.service.writeProp(device.did, speakerMuteProp.name, false), 1);
-      steps.push("已取消静音");
     }
     const wakeAction =
       detail.actions.find((a) => a.name === "wake-up") ??
@@ -415,7 +507,6 @@ async function applySpeakerPower(
     if (wakeAction) {
       try {
         await runJob(deps.jobs, () => deps.service.runAction(device.did, wakeAction.name), 1);
-        steps.push(wakeAction.name === "wake-up" ? "已唤醒" : "已恢复播放");
       } catch {
         // 唤醒或播放失败不影响取消静音成功
       }
@@ -435,12 +526,15 @@ async function applySpeakerPower(
   if (deps.mainWindow.tray) {
     deps.mainWindow.tray.refreshAudioAfterCommand(device.did);
   }
-  const note =
-    steps.length > 0
-      ? `${targetOn ? "打开" : "关闭"}（${steps.join("，")}）`
-      : targetOn
-        ? "已打开"
-        : "已关闭";
+  const note = targetOn
+    ? "已唤醒"
+    : muted && paused
+      ? "已静音暂停"
+      : muted
+        ? "已静音"
+        : paused
+          ? "已暂停"
+          : "已静音暂停";
   return { on: targetOn, note, values };
 }
 
@@ -482,6 +576,13 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         list = list.filter((d) => d.online);
       }
       const items = list.map((d) => formatDeviceSummary(d, deps.mainWindow));
+      const uiSummary =
+        items.length === 0
+          ? "未找到匹配设备"
+          : formatListUiSummary(
+              items.map((it) => String(it.name)),
+              "台",
+            );
       const summary =
         items.length === 0
           ? "未找到符合条件的智能设备。"
@@ -494,7 +595,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
                   }${it.metrics ? ` · ${it.metrics}` : ""}）[did=${it.did}]`,
               )
               .join("\n");
-      return textResult(summary, { ok: true, count: items.length, devices: items });
+      return textResult(summary, { ok: true, count: items.length, devices: items, uiSummary });
     },
   };
 
@@ -512,7 +613,8 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
 
       const device = resolveSingleDevice(deps.mainWindow.allDevices, params.target);
       if (!device) {
-        return textResult(`未找到名为「${params.target}」的设备。`, { ok: false }, true);
+        const msg = `未找到设备：${params.target}`;
+        return textResult(msg, { ok: false, uiSummary: msg }, true);
       }
 
       const detail = await runJob(deps.jobs, () => deps.service.deviceDetail(device.did), 2);
@@ -583,6 +685,9 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         (a) => `- ${a.desc || a.name} (${a.name})${a.in?.length ? ` 参数: ${a.in.map((i) => `${i.desc || i.name}:${i.type}`).join(", ")}` : ""}`,
       );
 
+      const publicProps = detail.props.filter((p) => !isSensitivePropertyName(p.name));
+      const uiSummary = formatDeviceDetailUiSummary(device, values, publicProps);
+
       const text = [
         `设备：${device.name}（${device.room_name} · ${deviceCategoryLabel(device)} · ${device.online ? "在线" : "离线"}）[did=${device.did}]`,
         readableLines.length > 0 ? `属性状态：\n${readableLines.join("\n")}` : "无公开属性。",
@@ -595,10 +700,13 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         ok: true,
         did: device.did,
         name: device.name,
+        room: device.room_name,
+        category: deviceCategoryLabel(device),
         online: device.online,
         values,
-        props: detail.props.filter((p) => !isSensitivePropertyName(p.name)),
+        props: publicProps,
         actions: detail.actions,
+        uiSummary,
       });
     },
   };
@@ -645,7 +753,8 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
 
       if (candidates.length === 0) {
         const desc = [params.room, params.target, params.category].filter(Boolean).join(" ") || "指定条件";
-        return textResult(`未找到可控制开关的设备（${desc}）。`, { ok: false }, true);
+        const msg = `未找到可控设备：${desc}`;
+        return textResult(msg, { ok: false, uiSummary: msg }, true);
       }
 
       const succeeded: Array<{ did: string; name: string; state: boolean; note?: string }> = [];
@@ -653,7 +762,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
 
       for (const dev of candidates) {
         if (!dev.online) {
-          failed.push({ did: dev.did, name: dev.name, reason: "设备已离线" });
+          failed.push({ did: dev.did, name: dev.name, reason: "离线" });
           continue;
         }
         try {
@@ -686,20 +795,44 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         deps.broadcastState();
       }
 
-      const okParts = succeeded.map((s) =>
-        s.note ? `「${s.name}」${s.note}` : `${s.state ? "打开" : "关闭"}「${s.name}」`,
-      );
-      const errParts = failed.map((f) => `「${f.name}」失败(${f.reason})`);
-      const summary = [
-        okParts.length > 0 ? `已${okParts.join("、")}` : "",
-        errParts.length > 0 ? errParts.join("；") : "",
-      ]
-        .filter(Boolean)
-        .join("；");
+      let okSummary = "";
+      if (succeeded.length === 1) {
+        const s = succeeded[0]!;
+        okSummary = s.note ? `${s.name} ${s.note}` : joinDeviceLabel(s.name, s.state ? "已开" : "已关");
+      } else if (succeeded.length > 1) {
+        const allPlain = succeeded.every((s) => !s.note);
+        const allSameState = succeeded.every((s) => s.state === succeeded[0]!.state);
+        if (allPlain && allSameState) {
+          const verb = succeeded[0]!.state ? "已开" : "已关";
+          if (succeeded.length <= 3) {
+            okSummary = `${verb}：${succeeded.map((s) => s.name).join("、")}`;
+          } else {
+            okSummary = `${verb} ${succeeded.length} 台（${succeeded.slice(0, 3).map((s) => s.name).join("、")}等）`;
+          }
+        } else {
+          const itemLabels = succeeded.map((s) =>
+            s.note ? `${s.name} ${s.note}` : joinDeviceLabel(s.name, s.state ? "已开" : "已关"),
+          );
+          okSummary =
+            itemLabels.length <= 3
+              ? itemLabels.join("，")
+              : `${itemLabels.slice(0, 3).join("，")}等 ${itemLabels.length} 台`;
+        }
+      }
+
+      const failSummary = failed
+        .map((f) =>
+          f.reason === "离线" || f.reason === "设备已离线"
+            ? joinDeviceLabel(f.name, "离线")
+            : `${f.name}失败（${f.reason}）`,
+        )
+        .join("，");
+
+      const summary = [okSummary, failSummary].filter(Boolean).join("；") || "未执行任何开关操作";
 
       return textResult(
-        summary || "未执行任何开关操作。",
-        { ok: succeeded.length > 0, succeeded, failed },
+        summary,
+        { ok: succeeded.length > 0, succeeded, failed, uiSummary: summary },
         succeeded.length === 0,
       );
     },
@@ -733,10 +866,12 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       ) ?? resolveSingleDevice(deps.mainWindow.allDevices, params.target);
 
       if (!device) {
-        return textResult(`未找到名为「${params.target}」的灯具。`, { ok: false }, true);
+        const msg = `未找到灯具：${params.target}`;
+        return textResult(msg, { ok: false, uiSummary: msg }, true);
       }
       if (!device.online) {
-        return textResult(`「${device.name}」当前离线，无法调节。`, { ok: false }, true);
+        const msg = `${joinDeviceLabel(device.name, "离线")}，无法调节`;
+        return textResult(msg, { ok: false, uiSummary: msg }, true);
       }
 
       const detail = await runJob(deps.jobs, () => deps.service.deviceDetail(device.did), 2);
@@ -757,31 +892,35 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         deps.mainWindow.applyPowerState(device.did, false);
         deps.mainWindow.updateTrayDevices();
         deps.broadcastState();
-        return textResult(`已关闭「${device.name}」。`, { ok: true, did: device.did, on: false });
+        const msg = joinDeviceLabel(device.name, "已关");
+        return textResult(msg, { ok: true, did: device.did, name: device.name, on: false, uiSummary: msg });
       }
 
+      let turnedOn = false;
       if (params.on === true || (hasVisualAdjust && deps.mainWindow.knownPower[device.did] === false)) {
         await runJob(deps.jobs, () => deps.service.setPowerState(device.did, true), 1);
         deps.mainWindow.applyPowerState(device.did, true);
-        changes.push("打开开关");
+        turnedOn = true;
       }
 
       if (params.brightness !== undefined) {
         const bProp = controls.brightness;
         if (!bProp) {
-          return textResult(`「${device.name}」不支持亮度调节。`, { ok: false }, true);
+          const msg = `${device.name}不支持亮度调节`;
+          return textResult(msg, { ok: false, uiSummary: msg }, true);
         }
         const high = bProp.range && bProp.range.length >= 2 ? bProp.range[1] : 100;
         const scaled = high === 100 ? params.brightness : (params.brightness / 100) * high;
         const val = clampToPropRange(bProp, scaled);
         await runJob(deps.jobs, () => deps.service.writeProp(device.did, bProp.name, val), 1);
-        changes.push(`亮度调至 ${Math.round(params.brightness)}%`);
+        changes.push(`亮度 ${Math.round(params.brightness)}%`);
       }
 
       if (params.color_temperature !== undefined || params.temperature_preset !== undefined) {
         const tProp = controls.temperature;
         if (!tProp) {
-          return textResult(`「${device.name}」不支持色温调节。`, { ok: false }, true);
+          const msg = `${device.name}不支持色温调节`;
+          return textResult(msg, { ok: false, uiSummary: msg }, true);
         }
         const low = tProp.range && tProp.range.length >= 2 ? tProp.range[0] : 2700;
         const high = tProp.range && tProp.range.length >= 2 ? tProp.range[1] : 6500;
@@ -793,20 +932,22 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         }
         const val = clampToPropRange(tProp, targetK);
         await runJob(deps.jobs, () => deps.service.writeProp(device.did, tProp.name, val), 1);
-        changes.push(`色温调至 ${val}K`);
+        changes.push(`色温 ${val}K`);
       }
 
       if (params.color !== undefined) {
         const cProp = controls.color;
         if (!cProp) {
-          return textResult(`「${device.name}」不支持颜色调节。`, { ok: false }, true);
+          const msg = `${device.name}不支持颜色调节`;
+          return textResult(msg, { ok: false, uiSummary: msg }, true);
         }
         const rgb = parseColorToRgbInt(params.color);
         if (rgb === null) {
-          return textResult(`无法识别颜色值「${params.color}」，请使用常见颜色名或 #RRGGBB 格式。`, { ok: false }, true);
+          const msg = `无法识别颜色：${params.color}，请使用常见颜色名或 #RRGGBB`;
+          return textResult(msg, { ok: false, uiSummary: msg }, true);
         }
         await runJob(deps.jobs, () => deps.service.writeProp(device.did, cProp.name, rgb), 1);
-        changes.push(`颜色调至 ${params.color}`);
+        changes.push(`颜色 ${params.color}`);
       }
 
       if (params.mode !== undefined) {
@@ -826,7 +967,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
           const coerced = coercePropWriteValue(modeProp, modeVal);
           if (coerced.ok) {
             await runJob(deps.jobs, () => deps.service.writeProp(device.did, modeProp.name, coerced.value), 1);
-            changes.push(`模式切换为 ${params.mode}`);
+            changes.push(params.mode.endsWith("模式") ? params.mode : `${params.mode}模式`);
           }
         }
       }
@@ -849,11 +990,23 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       deps.mainWindow.updateTrayDevices();
       deps.broadcastState();
 
+      const allChanges = turnedOn ? ["已开", ...changes] : changes;
       const msg =
-        changes.length > 0
-          ? `已将「${device.name}」${changes.join("，")}。`
-          : `「${device.name}」未指定需要调整的灯光参数。`;
-      return textResult(msg, { ok: true, did: device.did, name: device.name, changes, values: readback });
+        turnedOn && changes.length > 0
+          ? joinDeviceLabel(device.name, `已开，${changes.join("，")}`)
+          : turnedOn
+            ? joinDeviceLabel(device.name, "已开")
+            : changes.length > 0
+              ? joinDeviceLabel(device.name, changes.join("，"))
+              : `${device.name}未指定调节参数`;
+      return textResult(msg, {
+        ok: true,
+        did: device.did,
+        name: device.name,
+        changes: allChanges,
+        values: readback,
+        uiSummary: msg,
+      });
     },
   };
 
@@ -873,10 +1026,12 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
 
       const device = resolveSingleDevice(deps.mainWindow.allDevices, params.target);
       if (!device) {
-        return textResult(`未找到名为「${params.target}」的设备。`, { ok: false }, true);
+        const msg = `未找到设备：${params.target}`;
+        return textResult(msg, { ok: false, uiSummary: msg }, true);
       }
       if (!device.online) {
-        return textResult(`「${device.name}」当前离线，无法设置属性。`, { ok: false }, true);
+        const msg = `${joinDeviceLabel(device.name, "离线")}，无法设置属性`;
+        return textResult(msg, { ok: false, uiSummary: msg }, true);
       }
 
       const detail = await runJob(deps.jobs, () => deps.service.deviceDetail(device.did), 2);
@@ -896,7 +1051,8 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       }
 
       if (!prop) {
-        return textResult(`「${device.name}」未找到可写属性「${rawKey}」。`, { ok: false }, true);
+        const msg = `${device.name}未找到可写属性：${rawKey}`;
+        return textResult(msg, { ok: false, uiSummary: msg }, true);
       }
 
       let rawVal = params.value;
@@ -915,7 +1071,8 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
 
       const coerced = coercePropWriteValue(prop, rawVal);
       if (!coerced.ok) {
-        return textResult(`属性「${prop.desc || prop.name}」参数无效：${coerced.error}`, { ok: false }, true);
+        const msg = `属性 ${prop.desc || prop.name} 参数无效：${coerced.error}`;
+        return textResult(msg, { ok: false, uiSummary: msg }, true);
       }
 
       await runJob(deps.jobs, () => deps.service.writeProp(device.did, prop.name, coerced.value), 1);
@@ -930,10 +1087,28 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       }
       deps.broadcastState();
 
-      return textResult(
-        `已将「${device.name}」的${prop.desc || prop.name}设置为 ${String(coerced.value)}。`,
-        { ok: true, did: device.did, name: device.name, property: prop.name, value: coerced.value },
-      );
+      let displayVal: string;
+      if (typeof coerced.value === "boolean") {
+        displayVal = coerced.value ? "开" : "关";
+      } else if (prop.value_list) {
+        const matchedOpt = prop.value_list.find((o) => o.value === coerced.value);
+        displayVal =
+          matchedOpt?.desc_zh_cn ??
+          matchedOpt?.description ??
+          `${String(coerced.value)}${formatPropUnitSuffix(prop.unit)}`;
+      } else {
+        displayVal = `${String(coerced.value)}${formatPropUnitSuffix(prop.unit)}`;
+      }
+      const msg = joinDeviceLabel(device.name, `${prop.desc || prop.name}已设为 ${displayVal}`);
+
+      return textResult(msg, {
+        ok: true,
+        did: device.did,
+        name: device.name,
+        property: prop.name,
+        value: coerced.value,
+        uiSummary: msg,
+      });
     },
   };
 
@@ -953,10 +1128,12 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
 
       const device = resolveSingleDevice(deps.mainWindow.allDevices, params.target);
       if (!device) {
-        return textResult(`未找到名为「${params.target}」的设备。`, { ok: false }, true);
+        const msg = `未找到设备：${params.target}`;
+        return textResult(msg, { ok: false, uiSummary: msg }, true);
       }
       if (!device.online) {
-        return textResult(`「${device.name}」当前离线，无法执行动作。`, { ok: false }, true);
+        const msg = `${joinDeviceLabel(device.name, "离线")}，无法执行`;
+        return textResult(msg, { ok: false, uiSummary: msg }, true);
       }
 
       const detail = await runJob(deps.jobs, () => deps.service.deviceDetail(device.did), 2);
@@ -980,11 +1157,26 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       }
       deps.broadcastState();
 
-      const paramNote = params.params && params.params.length > 0 ? `（参数：${params.params.join(", ")}）` : "";
-      return textResult(
-        `已对「${device.name}」执行「${actionLabel}」${paramNote}。`,
-        { ok: true, did: device.did, name: device.name, action: actionName, params: params.params ?? [] },
-      );
+      let msg: string;
+      if (actionName === "pet-food-out" || normAct.includes("出粮")) {
+        const portions = params.params?.[0];
+        msg =
+          portions !== undefined && portions !== null
+            ? joinDeviceLabel(device.name, `已出粮 ${portions} 份`)
+            : joinDeviceLabel(device.name, "已出粮");
+      } else {
+        const paramNote =
+          params.params && params.params.length > 0 ? `（${params.params.join("、")}）` : "";
+        msg = joinDeviceLabel(device.name, `已执行${actionLabel}${paramNote}`);
+      }
+      return textResult(msg, {
+        ok: true,
+        did: device.did,
+        name: device.name,
+        action: actionName,
+        params: params.params ?? [],
+        uiSummary: msg,
+      });
     },
   };
 
@@ -1017,12 +1209,19 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         scenes = scenes.filter((s) => normalizeQuery(s.name).includes(kw));
       }
 
+      const uiSummary =
+        scenes.length === 0
+          ? "暂无手动场景"
+          : formatListUiSummary(
+              scenes.map((s) => s.name),
+              "个场景",
+            );
       const text =
         scenes.length === 0
           ? "当前没有匹配的手动场景。"
           : `共有 ${scenes.length} 个手动场景：\n` +
             scenes.map((s) => `- ${s.name}${s.home_name ? `（${s.home_name}）` : ""} [id=${s.scene_id}]`).join("\n");
-      return textResult(text, { ok: true, count: scenes.length, scenes });
+      return textResult(text, { ok: true, count: scenes.length, scenes, uiSummary });
     },
   };
 
@@ -1046,7 +1245,8 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         scenes.find((s) => normalizeQuery(s.name).includes(norm) || norm.includes(normalizeQuery(s.name)));
 
       if (!found) {
-        return textResult(`未找到名为「${raw}」的手动场景。`, { ok: false }, true);
+        const msg = `未找到场景：${raw}`;
+        return textResult(msg, { ok: false, uiSummary: msg }, true);
       }
 
       const scene = createSceneInfo(found);
@@ -1068,10 +1268,12 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       }
       deps.broadcastState();
 
-      return textResult(`已执行手动场景「${scene.name}」。`, {
+      const msg = `已执行：${scene.name}`;
+      return textResult(msg, {
         ok: true,
         scene_id: scene.scene_id,
         name: scene.name,
+        uiSummary: msg,
       });
     },
   };
@@ -1122,11 +1324,13 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       }
       deps.broadcastState();
 
-      return textResult(`已通过「${targetSpeaker.name}」向小爱同学发送指令：${directive}`, {
+      const msg = `已发给小爱：${directive}`;
+      return textResult(msg, {
         ok: true,
         did: targetSpeaker.did,
         speaker: targetSpeaker.name,
         text: directive,
+        uiSummary: msg,
       });
     },
   };
@@ -1195,7 +1399,8 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
 
       if (typeof params.mute === "boolean") {
         if (!speakerMuteProp) {
-          return textResult(`「${speaker.name}」不支持扬声器静音属性控制。`, { ok: false }, true);
+          const msg = `${speaker.name}不支持静音控制`;
+          return textResult(msg, { ok: false, uiSummary: msg }, true);
         }
         await runJob(deps.jobs, () => deps.service.writeProp(speaker!.did, speakerMuteProp.name, params.mute), 1);
         changes.push(params.mute ? "已静音" : "已取消静音");
@@ -1203,15 +1408,17 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
 
       if (typeof params.mic_mute === "boolean") {
         if (!micMuteProp) {
-          return textResult(`「${speaker.name}」不支持麦克风静音属性控制。`, { ok: false }, true);
+          const msg = `${speaker.name}不支持麦克风静音控制`;
+          return textResult(msg, { ok: false, uiSummary: msg }, true);
         }
         await runJob(deps.jobs, () => deps.service.writeProp(speaker!.did, micMuteProp.name, params.mic_mute), 1);
-        changes.push(params.mic_mute ? "已关闭麦克风" : "已开启麦克风");
+        changes.push(params.mic_mute ? "麦克风已静音" : "麦克风已开启");
       }
 
       if (params.volume !== undefined || params.volume_delta !== undefined) {
         if (!volumeProp) {
-          return textResult(`「${speaker.name}」不支持音量属性调节。`, { ok: false }, true);
+          const msg = `${speaker.name}不支持音量调节`;
+          return textResult(msg, { ok: false, uiSummary: msg }, true);
         }
         let targetVol: number;
         if (params.volume !== undefined) {
@@ -1230,7 +1437,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         }
         const clamped = clampToPropRange(volumeProp, targetVol);
         await runJob(deps.jobs, () => deps.service.writeProp(speaker!.did, volumeProp.name, clamped), 1);
-        changes.push(`音量调至 ${clamped}%`);
+        changes.push(`音量 ${clamped}%`);
       }
 
       if (params.play_music && params.play_music.trim()) {
@@ -1241,29 +1448,29 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
             const mVal = await runJob(deps.jobs, () => deps.service.readProp(speaker!.did, speakerMuteProp.name), 2);
             if (mVal === true) {
               await runJob(deps.jobs, () => deps.service.writeProp(speaker!.did, speakerMuteProp.name, false), 1);
-              changes.push("已取消静音");
             }
           } catch {
             // ignore
           }
         }
+        const songClean = song.replace(/^播放\s*/, "");
         const directive = /^播放/.test(song) ? song : `播放${song}`;
         await runJob(
           deps.jobs,
           () => deps.service.runAction(speaker!.did, "execute-text-directive", [directive, 0]),
           1,
         );
-        changes.push(`开始${directive}`);
+        changes.push(`播放${songClean}`);
       }
 
       if (params.playback) {
         const pb = params.playback;
         const labelMap: Record<string, string> = {
           play: "继续播放",
-          pause: "暂停播放",
-          stop: "停止播放",
-          next: "切换下一首",
-          previous: "切换上一首",
+          pause: "已暂停",
+          stop: "已停止",
+          next: "下一首",
+          previous: "上一首",
         };
         await runJob(deps.jobs, () => deps.service.runAction(speaker!.did, pb), 1);
         changes.push(labelMap[pb] ?? pb);
@@ -1272,7 +1479,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       if (params.speak_text && params.speak_text.trim()) {
         const txt = params.speak_text.trim();
         await runJob(deps.jobs, () => deps.service.runAction(speaker!.did, "play-text", [txt]), 1);
-        changes.push(`已朗读“${txt}”`);
+        changes.push("已播报");
       }
 
       // 回读音箱实时音量与静音状态
@@ -1295,8 +1502,8 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
 
       const summary =
         changes.length > 0
-          ? `已对「${speaker.name}」执行：${changes.join("，")}。`
-          : `未对「${speaker.name}」指定需要执行的操作。`;
+          ? `${speaker.name} ${changes.join("，")}`
+          : `${speaker.name}未指定操作`;
 
       return textResult(summary, {
         ok: true,
@@ -1304,6 +1511,8 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         name: speaker.name,
         changes,
         values: readback,
+        ...(params.speak_text?.trim() ? { speak_text: params.speak_text.trim() } : {}),
+        uiSummary: summary,
       });
     },
   };

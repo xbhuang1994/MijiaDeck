@@ -31,7 +31,16 @@ export interface ClientVoiceConfig {
   voiceprintThreshold?: number;
   attentionMode?: "smart" | "strict" | "off";
   conversationWindowSec?: number;
+  maxConsecutiveSidetalk?: number;
   bargeInEnabled?: boolean;
+  systemOneMode?: "auto" | "on" | "off";
+  systemOneBaseUrl?: string;
+  systemOneModel?: string;
+  systemOneTimeoutMs?: number;
+  systemOneConfidenceThreshold?: number;
+  cavemanMode?: "ultra" | "full" | "lite" | "off";
+  owwEnabled?: boolean;
+  owwThreshold?: number;
   effectiveSttConfigured: boolean;
   localAsrReady?: boolean;
 }
@@ -110,6 +119,53 @@ export function isBrowserSpeechSupported(): boolean {
 
 export function isMicrophoneAudioSupported(): boolean {
   return typeof navigator !== "undefined" && Boolean(navigator.mediaDevices?.getUserMedia);
+}
+
+const TTS_MAX_CHARS = 90;
+const TTS_TRUNCATE_SUFFIX = "，详情见面板";
+
+/**
+ * 将 Pi Agent 回复净化为适合浏览器语音播报的简短口语文本：
+ * - 去除 Markdown 标记（** / * / ` / #）、直角引号「」与 [did=...] 标识符
+ * - 将 °C / ℃ 转为更自然的“度”
+ * - 合并换行为中文逗号
+ * - 超出约 90 字时优先在标点边界截断并附加“，详情见面板”
+ */
+export function sanitizeBrowserTts(text: string): string {
+  const cleaned = String(text ?? "")
+    .replace(/\[did=[^\]]*\]/gi, "")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/```[\s\S]*?```/g, (block) => block.replace(/```[^\n]*\n?|```/g, ""))
+    .replace(/^\s*[-•]\s+/gm, "")
+    .replace(/\*\*|\*|`|[「」]|#+/g, "")
+    .replace(/°\s*[Cc]|℃/g, "度")
+    .replace(/\r?\n+/g, "，")
+    .replace(/\s+/g, " ")
+    .replace(/([。！？；，,.!?;、])\s*，+/g, "$1")
+    .replace(/，{2,}/g, "，")
+    .replace(/^[，,\s]+|[，,\s]+$/g, "")
+    .trim();
+
+  if (!cleaned) return "";
+  if (cleaned.length <= TTS_MAX_CHARS) return cleaned;
+
+  const head = cleaned.slice(0, TTS_MAX_CHARS);
+  const punctRe = /[。！？；，,.!?;、]/g;
+  let cutIdx = -1;
+  let match: RegExpExecArray | null;
+  while ((match = punctRe.exec(head)) !== null) {
+    cutIdx = match.index;
+  }
+
+  let base: string;
+  if (cutIdx >= 24) {
+    base = head.slice(0, cutIdx);
+  } else {
+    const spaceIdx = head.lastIndexOf(" ");
+    base = spaceIdx >= 60 ? head.slice(0, spaceIdx) : head.slice(0, TTS_MAX_CHARS - 4);
+  }
+  base = base.replace(/[。！？；，,.!?;、\s]+$/g, "").trim();
+  return base ? `${base}${TTS_TRUNCATE_SUFFIX}` : cleaned.slice(0, TTS_MAX_CHARS);
 }
 
 /**
@@ -506,7 +562,8 @@ export class VoiceListenerClient {
     voiceprintMode: "tag",
     voiceprintThreshold: 0.42,
     attentionMode: "smart",
-    conversationWindowSec: 18,
+    conversationWindowSec: 25,
+    maxConsecutiveSidetalk: 3,
     bargeInEnabled: true,
     effectiveSttConfigured: false,
     localAsrReady: false,
@@ -523,6 +580,7 @@ export class VoiceListenerClient {
   // Streaming TTS Queue + Watchdog（解决 Chrome/Edge speechSynthesis 偶发卡死）
   private ttsQueue: string[] = [];
   private ttsSpeaking = false;
+  private ttsNotifiedSpeaking = false;
   private ttsWatchdogTimer: number | null = null;
   private ttsReleaseTimer: number | null = null;
 
@@ -639,15 +697,30 @@ export class VoiceListenerClient {
   }
 
   /**
-   * 接收服务端 WebSocket 实时语音流回执（语音开始/结束/识别结果）。
+   * 接收服务端 WebSocket 实时语音流回执（语音开始/结束/唤醒命中/识别结果）。
    */
-  handleStreamServerEvent(ev: { kind?: string; text?: string; matched?: boolean }): void {
-    if (!this.active || !this.streamingOverWs) return;
+  handleStreamServerEvent(ev: {
+    kind?: string;
+    text?: string;
+    matched?: boolean;
+    wakeWord?: string;
+    score?: number;
+    threshold?: number;
+    source?: string;
+  }): void {
+    if (!this.active) return;
+    if (ev.kind === "wake_spot") {
+      const word = typeof ev.wakeWord === "string" && ev.wakeWord.trim() ? ev.wakeWord.trim() : "";
+      this.interimTranscript = word ? `⚡ 命中「${word}」` : "⚡ 已唤醒";
+      this.emitState(false);
+      return;
+    }
+    if (!this.streamingOverWs) return;
     if (ev.kind === "speech_start") {
-      this.interimTranscript = "检测到人声，正在抗噪双轨识别…";
+      this.interimTranscript = "收音中…";
       this.emitState(false);
     } else if (ev.kind === "speech_end") {
-      this.interimTranscript = "正在识别与注意力判断…";
+      this.interimTranscript = "识别中…";
       this.emitState(false);
     } else if (ev.kind === "result") {
       this.interimTranscript = "";
@@ -682,9 +755,13 @@ export class VoiceListenerClient {
       // ignore
     }
     this.workletNode?.port.postMessage({ type: "pause", paused: false });
+    if (this.ttsNotifiedSpeaking) {
+      this.ttsNotifiedSpeaking = false;
+      this.cb.sendVoiceStreamControl?.({ type: "voice_tts_state", speaking: false });
+    }
     if (this.active && this.mode === "speaking") {
       this.mode = "listening";
-      this.emitState(true);
+      this.emitState(false);
     }
   }
 
@@ -692,11 +769,11 @@ export class VoiceListenerClient {
    * 整句播报（兼容旧事件）。
    */
   speak(text: string): void {
-    const cleaned = text.trim();
+    const cleaned = sanitizeBrowserTts(text);
     if (!cleaned || !this.config.autoSpeakReply) return;
     if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
     this.cancelSpeaking();
-    this.ttsQueue.push(cleaned.slice(0, 260));
+    this.ttsQueue.push(cleaned);
     this.pumpTtsQueue();
   }
 
@@ -704,14 +781,14 @@ export class VoiceListenerClient {
    * 流式分句播报：收到 Pi Agent 首句即刻朗读，大幅降低首字语音延迟（TTFA）。
    */
   enqueueSpeakChunk(text: string): void {
-    const cleaned = text.trim();
+    const cleaned = sanitizeBrowserTts(text);
     if (!cleaned || !this.config.autoSpeakReply) return;
     if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
     if (this.ttsReleaseTimer !== null) {
       window.clearTimeout(this.ttsReleaseTimer);
       this.ttsReleaseTimer = null;
     }
-    this.ttsQueue.push(cleaned.slice(0, 220));
+    this.ttsQueue.push(cleaned);
     if (!this.ttsSpeaking) {
       this.pumpTtsQueue();
     }
@@ -721,14 +798,18 @@ export class VoiceListenerClient {
     if (this.ttsSpeaking) return;
     const next = this.ttsQueue.shift();
     if (!next) {
-      // 所有分段播报结束：延迟 320ms 解除防回声静音
+      // 所有分段播报结束：延迟 320ms 解除防回声静音，并通过 voice_tts_state 恢复服务端计时（不覆盖 dialogState）
       this.ttsReleaseTimer = window.setTimeout(() => {
         this.ttsReleaseTimer = null;
         this.speakingMuted = false;
         this.workletNode?.port.postMessage({ type: "pause", paused: false });
+        if (this.ttsNotifiedSpeaking) {
+          this.ttsNotifiedSpeaking = false;
+          this.cb.sendVoiceStreamControl?.({ type: "voice_tts_state", speaking: false });
+        }
         if (this.active && this.mode === "speaking") {
           this.mode = "listening";
-          this.emitState(true);
+          this.emitState(false);
         }
       }, 320);
       return;
@@ -738,14 +819,18 @@ export class VoiceListenerClient {
       this.ttsSpeaking = true;
       this.speakingMuted = true;
       this.workletNode?.port.postMessage({ type: "pause", paused: true });
+      if (!this.ttsNotifiedSpeaking) {
+        this.ttsNotifiedSpeaking = true;
+        this.cb.sendVoiceStreamControl?.({ type: "voice_tts_state", speaking: true });
+      }
       if (this.active && this.mode !== "speaking") {
         this.mode = "speaking";
-        this.emitState(true);
+        this.emitState(false);
       }
 
       const utter = new SpeechSynthesisUtterance(next);
       utter.lang = this.config.voiceLang || "zh-CN";
-      utter.rate = 1.08;
+      utter.rate = 1.12;
 
       let settled = false;
       const finishChunk = () => {
@@ -769,6 +854,14 @@ export class VoiceListenerClient {
       this.ttsSpeaking = false;
       this.speakingMuted = false;
       this.workletNode?.port.postMessage({ type: "pause", paused: false });
+      if (this.ttsNotifiedSpeaking) {
+        this.ttsNotifiedSpeaking = false;
+        this.cb.sendVoiceStreamControl?.({ type: "voice_tts_state", speaking: false });
+      }
+      if (this.active && this.mode === "speaking") {
+        this.mode = "listening";
+        this.emitState(false);
+      }
     }
   }
 
@@ -1096,7 +1189,7 @@ export class VoiceListenerClient {
           } else if (msg.type === "barge_in") {
             if (this.config.bargeInEnabled !== false && this.speakingMuted) {
               this.cancelSpeaking();
-              this.interimTranscript = "已打断播报，正在聆听…";
+              this.interimTranscript = "已打断，请说…";
               this.emitState(false);
             }
           } else if (msg.type === "pcm_frame" && msg.buffer instanceof ArrayBuffer) {
@@ -1110,7 +1203,7 @@ export class VoiceListenerClient {
             }
           } else if (msg.type === "speech_start") {
             if (!this.uploading) {
-              this.interimTranscript = "正在收音（已开启降噪与防吞字缓冲）…";
+              this.interimTranscript = "收音中…";
               this.emitState(false);
             }
           } else if (msg.type === "speech_cancel") {
@@ -1178,7 +1271,7 @@ export class VoiceListenerClient {
           lastLoud = now;
           chunks.length = 0;
           chunks.push(...preRoll);
-          this.interimTranscript = "正在收音…";
+          this.interimTranscript = "收音中…";
           this.emitState(false);
         }
       } else {
@@ -1215,8 +1308,7 @@ export class VoiceListenerClient {
 
   private async dispatchAudioBlob(blob: Blob, engine: "local" | "whisper"): Promise<void> {
     this.uploading = true;
-    this.interimTranscript =
-      engine === "local" ? "降噪 · 声纹 · 离线识别中…" : "降噪 · 语音转写中…";
+    this.interimTranscript = "识别中…";
     this.emitState(false);
     const bypass = this.oneShot;
     try {

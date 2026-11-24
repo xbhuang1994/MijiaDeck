@@ -6,10 +6,13 @@ import { renderQrSvg } from "../ui/qrSvg.ts";
 import { DeviceDetailModalController } from "./deviceDetailModal.ts";
 import {
   PiAgentPanelController,
+  type UiCavemanMode,
   type UiLocalVoiceStatus,
   type UiProviderPreset,
   type UiPublicAgentConfig,
   type UiVoiceprintProfile,
+  type UiWakeWordHit,
+  type UiWakeWordPrototypeSummary,
 } from "./piAgentPanel.ts";
 import { recordShortWavSample } from "./voiceListener.ts";
 
@@ -241,6 +244,23 @@ const PTZ_LABELS: Record<number, { arrow: string; label: string; dx: number; dy:
   3: { arrow: "↑", label: "向上转动", dx: 0, dy: -1 },
   4: { arrow: "↓", label: "向下转动", dx: 0, dy: 1 },
 };
+
+const CAVEMAN_PREVIEW_DESCS: Readonly<Record<UiCavemanMode, string>> = {
+  full: "极简直给，去寒暄废话、保留关键数值与结果 · 例：“客厅灯已开，亮度 85%。”",
+  ultra: "电报体极致压缩，语音首字播报最快 · 例：“客厅灯开 85%。”",
+  lite: "精炼自然口语，保留基本礼貌与清晰表述 · 例：“好的，客厅吸顶灯已打开，亮度 85%。”",
+  off: "标准自然对话回复，不做字数压缩 · 例：“好的，已经为您打开了客厅吸顶灯，并将亮度调整到了 85%。”",
+};
+
+function safeUrlHost(rawUrl: string): string {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return "";
+  try {
+    return new URL(trimmed).host;
+  } catch {
+    return "";
+  }
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -1103,7 +1123,10 @@ export class MijiaDeckWebApp {
   private agentProvidersCache: UiProviderPreset[] = [];
   private localVoiceStatusCache: UiLocalVoiceStatus | null = null;
   private voiceprintProfilesCache: UiVoiceprintProfile[] = [];
+  private owwPrototypesCache: UiWakeWordPrototypeSummary[] = [];
   private vpRecordingBusy = false;
+  private owwRecordingBusy = false;
+  private lastAutoFilledWakeWord = "";
   private agentClearKeyPending = false;
   private sttClearKeyPending = false;
   private agentModelsFetchGen = 0;
@@ -1904,6 +1927,16 @@ export class MijiaDeckWebApp {
         break;
       case "voice_state":
         this.piAgentPanel.applyVoiceSnapshot(payload);
+        if (this.activeModal === "settings" && this.settingsDraft.tab === "voice-agent") {
+          const snap = this.piAgentPanel.getVoiceSnapshot();
+          if (snap?.localEngine) this.localVoiceStatusCache = snap.localEngine;
+          if (Array.isArray(snap?.wakeWordPrototypes)) {
+            this.owwPrototypesCache = snap.wakeWordPrototypes;
+            this.renderOwwPrototypes();
+          }
+          this.renderVoicePipelineStatus();
+          this.syncSystemOneStatusDesc();
+        }
         break;
       case "agent_speak": {
         const p = asRecord(payload) ?? msg;
@@ -3242,6 +3275,19 @@ export class MijiaDeckWebApp {
     } catch {
       // use cached pipeline status
     }
+    try {
+      const oww = await apiGet<{
+        ok?: boolean;
+        engineStatus?: Record<string, unknown>;
+        prototypes?: UiWakeWordPrototypeSummary[];
+        lastWakeHit?: UiWakeWordHit | null;
+      }>("/api/voice/wakewords/prototypes");
+      if (Array.isArray(oww?.prototypes)) {
+        this.owwPrototypesCache = oww.prototypes;
+      }
+    } catch {
+      // use cached voice snapshot prototypes
+    }
 
     const s = this.state.settings;
     this.settingsOriginal = { mode: s.theme, color: s.theme_color };
@@ -3372,6 +3418,8 @@ export class MijiaDeckWebApp {
         ? "已检测到环境变量密钥，也可在此覆盖"
         : "输入新的 API Key（留空保持不变）";
     el("set-agent-clear-key-btn").hidden = !cfg?.hasApiKey;
+    el<HTMLSelectElement>("set-agent-caveman-mode").value = cfg?.cavemanMode || "full";
+    this.syncCavemanDesc();
     el<HTMLTextAreaElement>("set-agent-system-prompt").value = cfg?.systemPromptExtra || "";
 
     el<HTMLSelectElement>("set-voice-engine").value = cfg?.voiceEngine || "auto";
@@ -3382,10 +3430,24 @@ export class MijiaDeckWebApp {
     const wakeEnabled = cfg?.wakeWordEnabled ?? true;
     el<HTMLInputElement>("set-voice-wake-enabled").checked = wakeEnabled;
     el("setting-row-wake-words").classList.toggle("is-disabled", !wakeEnabled);
-    el<HTMLInputElement>("set-voice-wake-words").value = (cfg?.wakeWords ?? ["小派", "pi"]).join(", ");
-    el<HTMLInputElement>("set-voice-wake-window").value = String(cfg?.wakeWindowSec ?? 12);
+    const wakeList = cfg?.wakeWords && cfg.wakeWords.length > 0 ? cfg.wakeWords : ["小派", "pi"];
+    el<HTMLInputElement>("set-voice-wake-words").value = wakeList.join(", ");
+    el<HTMLInputElement>("set-voice-conv-window").value = String(cfg?.conversationWindowSec ?? 25);
+
+    el<HTMLInputElement>("set-oww-enabled").checked = cfg?.owwEnabled ?? true;
+    el<HTMLInputElement>("set-oww-threshold").value = (cfg?.owwThreshold ?? 0.6).toFixed(2);
+    const firstWake = wakeList[0] ?? "Neo";
+    el<HTMLInputElement>("oww-target-word").value = firstWake;
+    this.lastAutoFilledWakeWord = firstWake;
+
+    el<HTMLSelectElement>("set-systemone-mode").value = cfg?.systemOneMode || "auto";
     el<HTMLSelectElement>("set-voice-attention-mode").value = cfg?.attentionMode || "smart";
-    el<HTMLInputElement>("set-voice-conv-window").value = String(cfg?.conversationWindowSec ?? 18);
+    el<HTMLInputElement>("set-voice-sidetalk-limit").value = String(cfg?.maxConsecutiveSidetalk ?? 3);
+    el<HTMLInputElement>("set-systemone-model").value =
+      cfg?.systemOneModel || "karpo/karpo-decision-31b";
+    el<HTMLInputElement>("set-systemone-base-url").value = cfg?.systemOneBaseUrl || "";
+    this.syncSystemOneStatusDesc();
+
     el<HTMLSelectElement>("set-voiceprint-mode").value = cfg?.voiceprintMode || "tag";
     el<HTMLInputElement>("set-voiceprint-threshold").value = String(cfg?.voiceprintThreshold ?? 0.42);
     el<HTMLInputElement>("set-voice-barge-in").checked = cfg?.bargeInEnabled ?? true;
@@ -3401,6 +3463,7 @@ export class MijiaDeckWebApp {
     el("set-stt-clear-key-btn").hidden = !cfg?.hasSttApiKey;
 
     this.renderVoicePipelineStatus();
+    this.renderOwwPrototypes();
     this.renderVoiceprintProfiles();
     this.syncAgentProviderFormHints(false);
   }
@@ -3422,6 +3485,7 @@ export class MijiaDeckWebApp {
     const vadOk = Boolean(status?.readyForVad);
     const vpOk = Boolean(status?.readyForVoiceprint);
     const asrOk = Boolean(status?.readyForLocalAsr);
+    const owwOk = Boolean(status?.readyForWakeWord ?? status?.models?.openWakeWord);
 
     setBadge("badge-model-gtcrn", "GTCRN 降噪", gtcrnOk);
     setBadge("badge-model-dpdfnet", "DPDFNet4 强噪", dpdfOk);
@@ -3429,8 +3493,10 @@ export class MijiaDeckWebApp {
     setBadge("badge-model-vad", "Silero VAD", vadOk);
     setBadge("badge-model-vp", "3D-Speaker 声纹", vpOk);
     setBadge("badge-model-asr", "SenseVoice 识别", asrOk);
+    setBadge("badge-model-oww", "openWakeWord 唤醒", owwOk);
 
-    const allReady = gtcrnOk && vadOk && vpOk && asrOk;
+    const coreReady = gtcrnOk && vadOk && vpOk && asrOk;
+    const allReady = coreReady && owwOk;
     const dlBtn = document.getElementById("voice-download-models-btn") as HTMLButtonElement | null;
     if (dlBtn) {
       dlBtn.hidden = allReady || !status?.addonAvailable;
@@ -3440,8 +3506,328 @@ export class MijiaDeckWebApp {
     const desc = document.getElementById("voice-pipeline-status-desc");
     if (desc) {
       desc.textContent = allReady
-        ? "本地流式语音 AI 管线已就绪（WebSocket 连续流 + 双轨抗音乐/强噪融合 + Silero VAD + 3D-Speaker 声纹 + SenseVoice 离线识别）"
-        : "本地离线语音模型尚未完全就绪，可点击「一键补齐模型」自动下载，未就绪项将自动使用 DSP/云端降级";
+        ? "本地流式语音 AI 管线已就绪（WebSocket 连续流 + openWakeWord 唤醒 + 双轨抗音乐/强噪融合 + Silero VAD + 3D-Speaker 声纹 + SenseVoice 离线识别）"
+        : coreReady
+          ? "核心离线语音模型已就绪（openWakeWord 声学唤醒模型未下载时将自动使用 SenseVoice 唤醒兜底，可一键补齐）"
+          : "本地离线语音模型尚未完全就绪，可点击「一键补齐模型」自动下载，未就绪项将自动使用 DSP/云端降级";
+    }
+  }
+
+  private syncCavemanDesc(): void {
+    const sel = document.getElementById("set-agent-caveman-mode") as HTMLSelectElement | null;
+    const desc = document.getElementById("set-agent-caveman-desc");
+    if (!sel || !desc) return;
+    const raw = sel.value;
+    const mode: UiCavemanMode =
+      raw === "ultra" || raw === "full" || raw === "lite" || raw === "off" ? raw : "full";
+    desc.textContent = CAVEMAN_PREVIEW_DESCS[mode];
+  }
+
+  private syncSystemOneStatusDesc(): void {
+    const desc = document.getElementById("set-systemone-status-desc");
+    const modeSel = document.getElementById("set-systemone-mode") as HTMLSelectElement | null;
+    if (!desc || !modeSel) return;
+    const mode = modeSel.value;
+    const cfg = this.agentConfigCache ?? this.piAgentPanel.getConfig();
+    const health = this.piAgentPanel.getVoiceSnapshot()?.systemOneHealth ?? null;
+
+    if (mode === "off") {
+      desc.textContent = "已关闭 SystemOne 决策模型，仅使用本地规则与注意力门控判定旁白";
+      return;
+    }
+    if (health?.circuitState === "open") {
+      desc.textContent = `SystemOne 熔断保护中（${health.openReason || "近期请求异常"}），已自动降级规则门控；连续旁白达上限自动退回待唤醒`;
+      return;
+    }
+    if (health?.enabled) {
+      const host = health.endpointHost ? ` · ${health.endpointHost}` : "";
+      const lat = typeof health.lastLatencyMs === "number" ? ` · 最近 ${Math.round(health.lastLatencyMs)}ms` : "";
+      desc.textContent = `SystemOne 已启用（${health.model}${host}${lat}）· 对话中实时区分定向指令与旁白`;
+      return;
+    }
+    if (cfg?.effectiveSystemOneConfigured) {
+      const host = safeUrlHost(cfg.effectiveSystemOneBaseUrl || "");
+      desc.textContent = `SystemOne 已配置${host ? `（${host}）` : ""}，对话模式下自动拦截他人旁白并在连续旁白达上限后退回待唤醒`;
+      return;
+    }
+    desc.textContent =
+      "在对话模式中由决策模型判定语音是指令还是旁白（配置主网关或下方 Base URL 后自动生效）；连续旁白达上限自动退回待唤醒";
+  }
+
+  private parseConfiguredWakeWords(): string[] {
+    const raw = (document.getElementById("set-voice-wake-words") as HTMLInputElement | null)?.value ?? "";
+    const seen = new Set<string>();
+    const list: string[] = [];
+    for (const part of raw.split(/[,，、;\n]+/)) {
+      const word = part.trim();
+      if (!word) continue;
+      const key = word.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      list.push(word);
+    }
+    return list;
+  }
+
+  private renderOwwPrototypes(): void {
+    const listEl = document.getElementById("oww-prototype-list");
+    if (!listEl) return;
+    const prototypes =
+      this.owwPrototypesCache.length > 0
+        ? this.owwPrototypesCache
+        : (this.piAgentPanel.getVoiceSnapshot()?.wakeWordPrototypes ?? []);
+
+    listEl.replaceChildren();
+    if (prototypes.length === 0) {
+      const empty = document.createElement("span");
+      empty.className = "oww-proto-empty";
+      empty.textContent = "暂无已建库唤醒词模板（录制样本或点击「重新合成」即可生成）";
+      listEl.appendChild(empty);
+      return;
+    }
+
+    for (const proto of prototypes) {
+      const chip = document.createElement("div");
+      chip.className = "oww-proto-chip";
+
+      const labelBtn = document.createElement("button");
+      labelBtn.type = "button";
+      labelBtn.className = "oww-proto-label-btn";
+      labelBtn.textContent = `${proto.wakeWord} · 已录 ${proto.enrolledCount} / 合成 ${proto.ttsCount}`;
+      labelBtn.title = `点击选中「${proto.wakeWord}」继续录制样本`;
+      labelBtn.addEventListener("click", () => {
+        const input = document.getElementById("oww-target-word") as HTMLInputElement | null;
+        if (input) {
+          input.value = proto.wakeWord;
+          input.focus();
+        }
+      });
+
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "oww-proto-del-btn";
+      delBtn.textContent = "×";
+      delBtn.title = `删除「${proto.wakeWord}」声学模板`;
+      delBtn.setAttribute("aria-label", `删除 ${proto.wakeWord} 声学模板`);
+      delBtn.addEventListener("click", () => {
+        void this.deleteOwwPrototype(proto.wakeWord);
+      });
+
+      chip.append(labelBtn, delBtn);
+      listEl.appendChild(chip);
+    }
+  }
+
+  private setOwwControlsDisabled(disabled: boolean): void {
+    const ids = ["oww-record-sample-btn", "oww-test-sample-btn", "oww-bootstrap-btn"];
+    for (const id of ids) {
+      const btn = document.getElementById(id) as HTMLButtonElement | null;
+      if (btn) btn.disabled = disabled;
+    }
+  }
+
+  private async handleRecordOwwSample(): Promise<void> {
+    if (this.owwRecordingBusy || this.vpRecordingBusy) return;
+    const wordInput = el<HTMLInputElement>("oww-target-word");
+    const configured = this.parseConfiguredWakeWords();
+    const wakeWord = wordInput.value.trim() || configured[0] || "Neo";
+    wordInput.value = wakeWord;
+
+    const btn = el<HTMLButtonElement>("oww-record-sample-btn");
+    const statusEl = el("oww-status-line");
+    const meter = el("oww-level-meter");
+    const fill = el("oww-level-fill");
+    const prevLabel = btn.textContent || "录制样本 (1.8s)";
+
+    this.owwRecordingBusy = true;
+    this.setOwwControlsDisabled(true);
+    meter.hidden = false;
+    fill.style.width = "6%";
+    statusEl.textContent = `正在为「${wakeWord}」录制 1.8 秒样本，请清晰喊出“${wakeWord}”…`;
+
+    try {
+      const wavBlob = await recordShortWavSample(1800, (ratio, level) => {
+        const rem = Math.max(0.1, (1 - ratio) * 1.8);
+        btn.textContent = `录音中 ${rem.toFixed(1)}s…`;
+        const pct = Math.max(6, Math.min(100, Math.round(level * 100)));
+        fill.style.width = `${pct}%`;
+      });
+      btn.textContent = "提取特征…";
+      const form = new FormData();
+      form.append("audio", wavBlob, "wakeword.wav");
+      form.append("wakeWord", wakeWord);
+
+      const res = await fetch("/api/voice/wakewords/enroll", { method: "POST", body: form });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        summary?: UiWakeWordPrototypeSummary;
+        prototypes?: UiWakeWordPrototypeSummary[];
+        voice?: unknown;
+      };
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.error || `唤醒词录制失败 (${res.status})`);
+      }
+      if (Array.isArray(data.prototypes)) {
+        this.owwPrototypesCache = data.prototypes;
+      }
+      if (data.voice) {
+        this.piAgentPanel.applyVoiceSnapshot(data.voice);
+      }
+      this.renderOwwPrototypes();
+      const s = data.summary;
+      statusEl.textContent = s
+        ? `✓ 已录制「${s.wakeWord}」样本（已录 ${s.enrolledCount} / 合成 ${s.ttsCount}），建议录制 2~3 条不同语速`
+        : `✓ 已为「${wakeWord}」保存声学唤醒样本`;
+      this.showToast(`唤醒词样本已保存：${wakeWord}`, 2400);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      statusEl.textContent = `录制失败：${msg}`;
+      this.showToast(`唤醒词样本录制失败：${msg}`, 3500);
+    } finally {
+      this.owwRecordingBusy = false;
+      meter.hidden = true;
+      fill.style.width = "0%";
+      this.setOwwControlsDisabled(false);
+      btn.textContent = prevLabel;
+    }
+  }
+
+  private async handleTestOwwSample(): Promise<void> {
+    if (this.owwRecordingBusy || this.vpRecordingBusy) return;
+    const btn = el<HTMLButtonElement>("oww-test-sample-btn");
+    const statusEl = el("oww-status-line");
+    const meter = el("oww-level-meter");
+    const fill = el("oww-level-fill");
+    const prevLabel = btn.textContent || "试喊测试";
+
+    this.owwRecordingBusy = true;
+    this.setOwwControlsDisabled(true);
+    meter.hidden = false;
+    fill.style.width = "6%";
+    statusEl.textContent = "请自然喊出你的唤醒词（录制 1.8 秒进行声学匹配测试）…";
+
+    try {
+      const wavBlob = await recordShortWavSample(1800, (ratio, level) => {
+        const rem = Math.max(0.1, (1 - ratio) * 1.8);
+        btn.textContent = `测试中 ${rem.toFixed(1)}s…`;
+        const pct = Math.max(6, Math.min(100, Math.round(level * 100)));
+        fill.style.width = `${pct}%`;
+      });
+      btn.textContent = "比对中…";
+      const form = new FormData();
+      form.append("audio", wavBlob, "verify-wake.wav");
+
+      const res = await fetch("/api/voice/wakewords/verify", { method: "POST", body: form });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        matched?: boolean;
+        hit?: { wakeWord: string; score: number; threshold?: number; source?: string } | null;
+        threshold?: number;
+        latencyMs?: number;
+      };
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.error || `试喊测试失败 (${res.status})`);
+      }
+      const thresh = data.hit?.threshold ?? data.threshold ?? 0.6;
+      const lat = typeof data.latencyMs === "number" ? ` · ${Math.round(data.latencyMs)}ms` : "";
+      if (data.matched && data.hit) {
+        statusEl.textContent = `✓ 命中「${data.hit.wakeWord}」· 得分 ${data.hit.score.toFixed(2)} ≥ 阈值 ${thresh.toFixed(2)}${lat}`;
+      } else if (data.hit) {
+        statusEl.textContent = `✕ 未触发唤醒 · 最高「${data.hit.wakeWord}」得分 ${data.hit.score.toFixed(2)} < 阈值 ${thresh.toFixed(2)}${lat}`;
+      } else {
+        statusEl.textContent = `✕ 未检测到匹配唤醒词（阈值 ${thresh.toFixed(2)}${lat}），可先录制样本或点击「重新合成」`;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      statusEl.textContent = `试喊测试失败：${msg}`;
+      this.showToast(`试喊测试失败：${msg}`, 3500);
+    } finally {
+      this.owwRecordingBusy = false;
+      meter.hidden = true;
+      fill.style.width = "0%";
+      this.setOwwControlsDisabled(false);
+      btn.textContent = prevLabel;
+    }
+  }
+
+  private async handleBootstrapOww(): Promise<void> {
+    if (this.owwRecordingBusy || this.vpRecordingBusy) return;
+    const btn = el<HTMLButtonElement>("oww-bootstrap-btn");
+    const statusEl = el("oww-status-line");
+    const prevLabel = btn.textContent || "重新合成";
+    const wakeWords = this.parseConfiguredWakeWords();
+
+    this.owwRecordingBusy = true;
+    this.setOwwControlsDisabled(true);
+    btn.textContent = "合成中…";
+    statusEl.textContent = "正在为当前唤醒词列表生成声学模板，请稍候…";
+
+    try {
+      const res = await apiPost<{
+        ok?: boolean;
+        bootstrapped?: string[] | number;
+        skipped?: string[] | number;
+        durationMs?: number;
+        prototypes?: UiWakeWordPrototypeSummary[];
+        voice?: unknown;
+      }>("/api/voice/wakewords/bootstrap", {
+        wakeWords: wakeWords.length > 0 ? wakeWords : undefined,
+        force: true,
+      });
+      if (Array.isArray(res.prototypes)) {
+        this.owwPrototypesCache = res.prototypes;
+      }
+      if (res.voice) {
+        this.piAgentPanel.applyVoiceSnapshot(res.voice);
+      }
+      this.renderOwwPrototypes();
+      const bCount = Array.isArray(res.bootstrapped)
+        ? res.bootstrapped.length
+        : Number(res.bootstrapped ?? 0);
+      const dur = typeof res.durationMs === "number" ? ` · ${Math.round(res.durationMs)}ms` : "";
+      statusEl.textContent = `✓ 声学模板已更新（合成 ${bCount} 个唤醒词${dur}）`;
+      this.showToast("唤醒词声学模板重新合成完成", 2400);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      statusEl.textContent = `合成失败：${msg}`;
+      this.showToast(`重新合成失败：${msg}`, 3500);
+    } finally {
+      this.owwRecordingBusy = false;
+      this.setOwwControlsDisabled(false);
+      btn.textContent = prevLabel;
+    }
+  }
+
+  private async deleteOwwPrototype(wakeWord: string): Promise<void> {
+    try {
+      const res = await fetch(
+        `/api/voice/wakewords/prototypes/${encodeURIComponent(wakeWord)}`,
+        { method: "DELETE" },
+      );
+      const data = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        deleted?: number;
+        prototypes?: UiWakeWordPrototypeSummary[];
+        voice?: unknown;
+      };
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.error || `删除失败 (${res.status})`);
+      }
+      if (Array.isArray(data.prototypes)) {
+        this.owwPrototypesCache = data.prototypes;
+      }
+      if (data.voice) {
+        this.piAgentPanel.applyVoiceSnapshot(data.voice);
+      }
+      this.renderOwwPrototypes();
+      el("oww-status-line").textContent = `已删除「${wakeWord}」的声学模板`;
+      this.showToast(`已删除唤醒词模板：${wakeWord}`, 2200);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.showToast(`删除唤醒词模板失败：${msg}`, 3000);
     }
   }
 
@@ -3512,7 +3898,7 @@ export class MijiaDeckWebApp {
   }
 
   private async handleRecordEnrollVoiceprint(): Promise<void> {
-    if (this.vpRecordingBusy) return;
+    if (this.vpRecordingBusy || this.owwRecordingBusy) return;
     const nameInput = el<HTMLInputElement>("vp-enroll-name");
     const name = nameInput.value.trim() || "主人";
     const role = el<HTMLSelectElement>("vp-enroll-role").value === "member" ? "member" : "owner";
@@ -3563,7 +3949,7 @@ export class MijiaDeckWebApp {
   }
 
   private async handleRecordVerifyVoiceprint(): Promise<void> {
-    if (this.vpRecordingBusy) return;
+    if (this.vpRecordingBusy || this.owwRecordingBusy) return;
     const btn = el<HTMLButtonElement>("vp-record-verify-btn");
     const statusEl = el("vp-status-text");
     this.vpRecordingBusy = true;
@@ -3890,12 +4276,26 @@ export class MijiaDeckWebApp {
       checkUpdateEnabled: checkUpdate,
     };
 
+    const convWindowRaw = Number(el<HTMLInputElement>("set-voice-conv-window").value);
+    const conversationWindowSec = Number.isFinite(convWindowRaw)
+      ? Math.min(120, Math.max(5, Math.round(convWindowRaw)))
+      : 25;
+    const sidetalkRaw = Number(el<HTMLInputElement>("set-voice-sidetalk-limit").value);
+    const maxConsecutiveSidetalk = Number.isFinite(sidetalkRaw)
+      ? Math.min(10, Math.max(1, Math.round(sidetalkRaw)))
+      : 3;
+    const owwThreshRaw = Number(el<HTMLInputElement>("set-oww-threshold").value);
+    const owwThreshold = Number.isFinite(owwThreshRaw)
+      ? Number(Math.min(0.95, Math.max(0.25, owwThreshRaw)).toFixed(2))
+      : 0.6;
+
     const agentPayload: Record<string, unknown> = {
       provider: el<HTMLSelectElement>("set-agent-provider").value,
       customProviderName: el<HTMLInputElement>("set-agent-custom-name").value.trim(),
       customApiType: el<HTMLSelectElement>("set-agent-api-type").value,
       modelId: el<HTMLInputElement>("set-agent-model").value.trim(),
       baseUrl: el<HTMLInputElement>("set-agent-base-url").value.trim(),
+      cavemanMode: el<HTMLSelectElement>("set-agent-caveman-mode").value,
       systemPromptExtra: el<HTMLTextAreaElement>("set-agent-system-prompt").value.trim(),
       voiceEngine: el<HTMLSelectElement>("set-voice-engine").value,
       voiceLang: el<HTMLSelectElement>("set-voice-lang").value,
@@ -3904,9 +4304,14 @@ export class MijiaDeckWebApp {
       vadSilenceMs: Number(el<HTMLInputElement>("set-voice-vad-silence").value) || 750,
       wakeWordEnabled: el<HTMLInputElement>("set-voice-wake-enabled").checked,
       wakeWords: el<HTMLInputElement>("set-voice-wake-words").value,
-      wakeWindowSec: Number(el<HTMLInputElement>("set-voice-wake-window").value) || 12,
+      conversationWindowSec,
+      maxConsecutiveSidetalk,
+      owwEnabled: el<HTMLInputElement>("set-oww-enabled").checked,
+      owwThreshold,
       attentionMode: el<HTMLSelectElement>("set-voice-attention-mode").value,
-      conversationWindowSec: Number(el<HTMLInputElement>("set-voice-conv-window").value) || 18,
+      systemOneMode: el<HTMLSelectElement>("set-systemone-mode").value,
+      systemOneModel: el<HTMLInputElement>("set-systemone-model").value.trim(),
+      systemOneBaseUrl: el<HTMLInputElement>("set-systemone-base-url").value.trim(),
       voiceprintMode: el<HTMLSelectElement>("set-voiceprint-mode").value,
       voiceprintThreshold: Number(el<HTMLInputElement>("set-voiceprint-threshold").value) || 0.42,
       bargeInEnabled: el<HTMLInputElement>("set-voice-barge-in").checked,
@@ -5323,9 +5728,38 @@ export class MijiaDeckWebApp {
       void this.fetchAgentModelsFromApi(false);
     });
 
+    el<HTMLSelectElement>("set-agent-caveman-mode").addEventListener("change", () => {
+      this.syncCavemanDesc();
+    });
+
     el<HTMLInputElement>("set-voice-wake-enabled").addEventListener("change", (e) => {
       const enabled = (e.target as HTMLInputElement).checked;
       el("setting-row-wake-words").classList.toggle("is-disabled", !enabled);
+    });
+
+    el<HTMLInputElement>("set-voice-wake-words").addEventListener("input", () => {
+      const first = this.parseConfiguredWakeWords()[0] ?? "";
+      const target = el<HTMLInputElement>("oww-target-word");
+      if (first && (!target.value.trim() || target.value.trim() === this.lastAutoFilledWakeWord)) {
+        target.value = first;
+        this.lastAutoFilledWakeWord = first;
+      }
+    });
+
+    el<HTMLSelectElement>("set-systemone-mode").addEventListener("change", () => {
+      this.syncSystemOneStatusDesc();
+    });
+
+    el("oww-record-sample-btn").addEventListener("click", () => {
+      void this.handleRecordOwwSample();
+    });
+
+    el("oww-test-sample-btn").addEventListener("click", () => {
+      void this.handleTestOwwSample();
+    });
+
+    el("oww-bootstrap-btn").addEventListener("click", () => {
+      void this.handleBootstrapOww();
     });
 
     el("voice-download-models-btn").addEventListener("click", () => {

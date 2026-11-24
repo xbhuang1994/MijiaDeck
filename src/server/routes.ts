@@ -16,6 +16,7 @@ import type {
   VoiceRuntimeEngine,
 } from "../agent/voiceListenerController.ts";
 import { listPublicVoiceprints } from "../agent/voiceprintStore.ts";
+import { listWakeWordPrototypeSummaries } from "../agent/wakewordPrototypeStore.ts";
 import type { AppMode } from "../cli/startup.ts";
 import * as agentConfigStoreModule from "../core/agentConfigStore.ts";
 import { APP_NAME, APP_VERSION, projectRoot } from "../core/appMeta.ts";
@@ -118,6 +119,7 @@ export interface AppRuntime {
   voiceListener?: VoiceListenerController;
   broadcaster?: StateBroadcaster;
   broadcastState?: () => void;
+  reloadVoiceStreams?: (wakeWords: readonly string[], threshold?: number) => void;
   speakerAudioProps?: Map<string, { volName: string; muteName: string }>;
 }
 
@@ -139,7 +141,7 @@ export class HttpError extends Error {
 }
 
 const SECRET_PATTERNS: ReadonlyArray<RegExp> = [
-  /(serviceToken|ssecurity|passToken|cUserId|userId|p2p_id|init_string|authorization|cookie|api[_-]?key|sttApiKey)\s*[:=]\s*[^\s,;'"&}]+/gi,
+  /(serviceToken|ssecurity|passToken|cUserId|userId|p2p_id|init_string|authorization|cookie|api[_-]?key|sttApiKey|systemOneApiKey)\s*[:=]\s*[^\s,;'"&}]+/gi,
   /Bearer\s+[A-Za-z0-9._~+/=-]+/gi,
   /sk-[A-Za-z0-9_\-]{8,}/g,
 ];
@@ -1855,13 +1857,42 @@ export function createRequestHandler(
         }
         if (runtime.voiceListener) {
           runtime.voiceListener.updateRuntimeState({});
+          if (updated.owwEnabled) {
+            void runtime.voiceListener.bootstrapWakeWords(updated.wakeWords).catch(() => {});
+          }
         }
+        runtime.reloadVoiceStreams?.(updated.wakeWords, updated.owwThreshold);
         emitBroadcast(runtime);
         return jsonResponse({
           ok: true,
           config: cfgStore.toPublicAgentVoiceConfig(updated),
           agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
           voice: runtime.voiceListener ? runtime.voiceListener.snapshot() : null,
+        });
+      }
+
+      if (method === "POST" && pathname === "/api/voice-listen/dialog") {
+        if (!runtime.voiceListener) {
+          throw new HttpError(503, "语音监听服务未初始化");
+        }
+        const body = await readJsonBody(req);
+        const action = typeof body.action === "string" ? body.action.trim() : "";
+        const reason = typeof body.reason === "string" && body.reason.trim() ? body.reason.trim() : "manual_api";
+        const speakAck = body.speakAck === true;
+        let voice: ReturnType<VoiceListenerController["snapshot"]>;
+        if (action === "enter") {
+          voice = runtime.voiceListener.enterConversation(reason, { speakAck });
+        } else if (action === "exit") {
+          voice = runtime.voiceListener.exitConversation(reason, { speakAck });
+        } else if (action === "toggle") {
+          voice = runtime.voiceListener.toggleConversation();
+        } else {
+          throw new HttpError(400, "无效的对话状态操作，仅支持 enter / exit / toggle");
+        }
+        return jsonResponse({
+          ok: true,
+          dialogState: voice.dialogState,
+          voice,
         });
       }
 
@@ -1980,6 +2011,9 @@ export function createRequestHandler(
         return jsonResponse({
           ok: true,
           localEngine: snap.localEngine,
+          openWakeWord: snap.openWakeWord,
+          wakeWordPrototypes: snap.wakeWordPrototypes,
+          systemOne: snap.systemOne,
           voiceprints: snap.voiceprints,
           lastMetrics: snap.lastMetrics,
           voice: snap,
@@ -1991,12 +2025,179 @@ export function createRequestHandler(
           throw new HttpError(503, "语音监听服务未初始化");
         }
         const status = await runtime.voiceListener.localEngine.downloadMissingModels();
+        if (runtime.voiceListener.config.owwEnabled) {
+          void runtime.voiceListener.bootstrapWakeWords().catch(() => {});
+        }
         const voice = runtime.voiceListener.snapshot();
         emitBroadcast(runtime);
         return jsonResponse({
           ok: true,
           localEngine: status,
           voice,
+        });
+      }
+
+      // ---------- openWakeWord 本地唤醒词原型管理 ----------
+
+      if (method === "GET" && pathname === "/api/voice/wakewords/prototypes") {
+        const cfgStore = runtime.agentConfigStore ?? agentConfigStoreModule;
+        const cfg =
+          runtime.voiceListener?.config ??
+          runtime.piAgent?.config ??
+          cfgStore.loadAgentVoiceConfig();
+        const prototypes = listWakeWordPrototypeSummaries(cfg.wakeWords);
+        const openWakeWord = runtime.voiceListener
+          ? runtime.voiceListener.localEngine.openWakeWord.getStatus()
+          : null;
+        const voiceSnap = runtime.voiceListener ? runtime.voiceListener.snapshot() : null;
+        return jsonResponse({
+          ok: true,
+          wakeWords: cfg.wakeWords,
+          owwEnabled: cfg.owwEnabled,
+          owwThreshold: cfg.owwThreshold,
+          engineStatus: openWakeWord,
+          openWakeWord,
+          lastWakeHit: voiceSnap?.lastWakeHit ?? null,
+          prototypes,
+          voice: voiceSnap,
+        });
+      }
+
+      if (method === "POST" && pathname === "/api/voice/wakewords/enroll") {
+        if (!runtime.voiceListener) {
+          throw new HttpError(503, "语音监听服务未初始化");
+        }
+        const contentType = req.headers.get("content-type") ?? "";
+        if (!contentType.includes("multipart/form-data")) {
+          throw new HttpError(400, "请使用 multipart/form-data 上传唤醒词 WAV 音频");
+        }
+        const form = await req.formData();
+        const audio = form.get("audio") ?? form.get("file");
+        if (!(audio instanceof Blob) || audio.size === 0) {
+          throw new HttpError(400, "缺少有效的唤醒词录音数据 audio");
+        }
+        const rawWord = form.get("wakeWord") ?? form.get("word");
+        const wakeWord = typeof rawWord === "string" ? rawWord.trim() : "";
+        if (!wakeWord) {
+          throw new HttpError(400, "请指定要录制的唤醒词 wakeWord");
+        }
+        const voiceTag =
+          typeof form.get("voiceTag") === "string" ? String(form.get("voiceTag")).trim() : undefined;
+        try {
+          const enrolled = await runtime.voiceListener.enrollWakeWordFromAudio(audio, wakeWord, {
+            ...(voiceTag ? { voiceTag } : {}),
+          });
+          runtime.reloadVoiceStreams?.(
+            runtime.voiceListener.config.wakeWords,
+            runtime.voiceListener.config.owwThreshold,
+          );
+          emitBroadcast(runtime);
+          return jsonResponse({
+            ok: true,
+            ...enrolled,
+            voice: runtime.voiceListener.snapshot(),
+          });
+        } catch (err) {
+          throw new HttpError(400, sanitizeErrorMessage(err));
+        }
+      }
+
+      if (method === "POST" && pathname === "/api/voice/wakewords/verify") {
+        if (!runtime.voiceListener) {
+          throw new HttpError(503, "语音监听服务未初始化");
+        }
+        const contentType = req.headers.get("content-type") ?? "";
+        if (!contentType.includes("multipart/form-data")) {
+          throw new HttpError(400, "请使用 multipart/form-data 上传待测试 WAV 音频");
+        }
+        const form = await req.formData();
+        const audio = form.get("audio") ?? form.get("file");
+        if (!(audio instanceof Blob) || audio.size === 0) {
+          throw new HttpError(400, "缺少有效的音频数据 audio");
+        }
+        const rawWordsField = form.get("wakeWords") ?? form.get("wakeWord") ?? form.get("word");
+        let wakeWords: string[] | undefined;
+        if (typeof rawWordsField === "string" && rawWordsField.trim()) {
+          const trimmed = rawWordsField.trim();
+          if (trimmed.startsWith("[")) {
+            try {
+              const parsedArr = JSON.parse(trimmed);
+              if (Array.isArray(parsedArr)) {
+                wakeWords = parsedArr.map((v) => String(v ?? "").trim()).filter(Boolean);
+              }
+            } catch {
+              wakeWords = trimmed.split(/[,，、;\n]+/).map((s) => s.trim()).filter(Boolean);
+            }
+          } else {
+            wakeWords = trimmed.split(/[,，、;\n]+/).map((s) => s.trim()).filter(Boolean);
+          }
+        }
+        try {
+          const verified = await runtime.voiceListener.verifyWakeWordFromAudio(audio, wakeWords);
+          return jsonResponse({
+            ok: true,
+            ...verified,
+          });
+        } catch (err) {
+          throw new HttpError(400, sanitizeErrorMessage(err));
+        }
+      }
+
+      if (method === "POST" && pathname === "/api/voice/wakewords/bootstrap") {
+        if (!runtime.voiceListener) {
+          throw new HttpError(503, "语音监听服务未初始化");
+        }
+        const body = await readJsonBody(req);
+        let wakeWords: string[] | undefined;
+        if (Array.isArray(body.wakeWords)) {
+          wakeWords = body.wakeWords.map((v) => String(v ?? "").trim()).filter(Boolean);
+        } else if (typeof body.wakeWords === "string" && body.wakeWords.trim()) {
+          wakeWords = body.wakeWords
+            .split(/[,，、;\n]+/)
+            .map((s) => s.trim())
+            .filter(Boolean);
+        }
+        const force = body.force === true;
+        try {
+          const result = await runtime.voiceListener.bootstrapWakeWords(wakeWords, force);
+          runtime.reloadVoiceStreams?.(
+            runtime.voiceListener.config.wakeWords,
+            runtime.voiceListener.config.owwThreshold,
+          );
+          emitBroadcast(runtime);
+          return jsonResponse({
+            ok: true,
+            ...result,
+            openWakeWord: runtime.voiceListener.localEngine.openWakeWord.getStatus(),
+            voice: runtime.voiceListener.snapshot(),
+          });
+        } catch (err) {
+          throw new HttpError(400, sanitizeErrorMessage(err));
+        }
+      }
+
+      const wwDeleteMatch = /^\/api\/voice\/wakewords\/prototypes\/([^/]+)$/.exec(pathname);
+      if (method === "DELETE" && wwDeleteMatch) {
+        if (!runtime.voiceListener) {
+          throw new HttpError(503, "语音监听服务未初始化");
+        }
+        const target = decodeSegment(wwDeleteMatch[1]!);
+        const enrolledOnly = url.searchParams.get("enrolledOnly") === "true";
+        const res = runtime.voiceListener.removeWakeWordPrototype(target, enrolledOnly);
+        if (!res.deleted) {
+          throw new HttpError(404, "未找到指定的唤醒词原型样本");
+        }
+        runtime.reloadVoiceStreams?.(
+          runtime.voiceListener.config.wakeWords,
+          runtime.voiceListener.config.owwThreshold,
+        );
+        emitBroadcast(runtime);
+        return jsonResponse({
+          ok: true,
+          deleted: res.removedCount,
+          removedCount: res.removedCount,
+          prototypes: res.prototypes,
+          voice: runtime.voiceListener.snapshot(),
         });
       }
 

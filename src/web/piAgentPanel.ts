@@ -45,6 +45,38 @@ export interface UiProviderPreset {
   requiresApiKey: boolean;
 }
 
+export type UiSystemOneMode = "auto" | "on" | "off";
+export type UiCavemanMode = "ultra" | "full" | "lite" | "off";
+
+export interface UiWakeWordPrototypeSummary {
+  wakeWord: string;
+  enrolledCount: number;
+  ttsCount: number;
+  totalCount: number;
+  sampleIds: string[];
+  enrolledIds: string[];
+  updatedAt: number | null;
+}
+
+export interface UiSystemOneHealth {
+  enabled: boolean;
+  model: string;
+  endpointHost: string;
+  circuitState: "closed" | "open" | "half-open";
+  openReason: string | null;
+  lastLatencyMs: number | null;
+  totalCalls: number;
+  cacheHits: number;
+}
+
+export interface UiWakeWordHit {
+  wakeWord: string;
+  score: number;
+  threshold: number;
+  source: "enrolled" | "tts-bootstrap" | "asr";
+  timestamp: number;
+}
+
 export interface UiPublicAgentConfig extends ClientVoiceConfig {
   provider: string;
   customProviderName?: string;
@@ -60,6 +92,19 @@ export interface UiPublicAgentConfig extends ClientVoiceConfig {
   envApiKeyDetected: boolean;
   hasSttApiKey: boolean;
   sttApiKeyPreview: string;
+  systemOneMode?: UiSystemOneMode;
+  systemOneBaseUrl?: string;
+  systemOneModel?: string;
+  systemOneTimeoutMs?: number;
+  systemOneConfidenceThreshold?: number;
+  hasSystemOneApiKey?: boolean;
+  systemOneApiKeyPreview?: string;
+  effectiveSystemOneBaseUrl?: string;
+  effectiveSystemOneConfigured?: boolean;
+  cavemanMode?: UiCavemanMode;
+  owwEnabled?: boolean;
+  owwThreshold?: number;
+  maxConsecutiveSidetalk?: number;
 }
 
 export interface UiPiAgentSnapshot {
@@ -82,6 +127,7 @@ export interface UiLocalVoiceStatus {
   readyForVad: boolean;
   readyForVoiceprint: boolean;
   readyForLocalAsr: boolean;
+  readyForWakeWord?: boolean;
   downloading?: boolean;
   models?: {
     gtcrn: boolean;
@@ -90,6 +136,7 @@ export interface UiLocalVoiceStatus {
     sileroVad: boolean;
     speakerCampp: boolean;
     senseVoice: boolean;
+    openWakeWord?: boolean;
   };
 }
 
@@ -111,6 +158,20 @@ export interface UiVoiceSnapshot {
   lastCommand: string;
   awakeUntil: number | null;
   conversationUntil?: number | null;
+  dialogState?: "standby" | "conversation";
+  conversationWindowSec?: number;
+  conversationRemainingMs?: number;
+  serverNow?: number;
+  timerPaused?: boolean;
+  consecutiveSidetalkCount?: number;
+  maxConsecutiveSidetalk?: number;
+  lastTransitionReason?: string | null;
+  cavemanMode?: UiCavemanMode;
+  systemOneHealth?: UiSystemOneHealth | null;
+  owwEnabled?: boolean;
+  owwThreshold?: number;
+  wakeWordPrototypes?: UiWakeWordPrototypeSummary[];
+  lastWakeHit?: UiWakeWordHit | null;
   error: string | null;
   wakeWordEnabled: boolean;
   wakeWords: string[];
@@ -165,6 +226,18 @@ const QUICK_SUGGESTIONS: ReadonlyArray<string> = [
   "小爱音箱音量调到 55",
 ];
 
+const CAVEMAN_CYCLE_ORDER: ReadonlyArray<UiCavemanMode> = ["full", "ultra", "lite", "off"];
+const CAVEMAN_LABELS: Readonly<Record<UiCavemanMode, string>> = {
+  full: "极简 · Full",
+  ultra: "电报 · Ultra",
+  lite: "精炼 · Lite",
+  off: "标准回复",
+};
+
+function normalizeUiCavemanMode(raw: unknown): UiCavemanMode {
+  return raw === "ultra" || raw === "full" || raw === "lite" || raw === "off" ? raw : "full";
+}
+
 function node<T extends HTMLElement = HTMLElement>(id: string): T {
   const el = document.getElementById(id);
   if (!el) throw new Error(`Missing DOM element: #${id}`);
@@ -215,12 +288,19 @@ export class PiAgentPanelController {
   };
   private audioLevel = 0;
   private livePillHideTimer: number | null = null;
+  private serverClockOffsetMs = 0;
+  private conversationDeadlineServerMs: number | null = null;
+  private frozenRemainingMs: number | null = null;
+  private dialogTimerInterval: number | null = null;
+  private wakeFlashTimer: number | null = null;
+  private lastSyncPromise: Promise<unknown> = Promise.resolve();
   private readonly voiceClient: VoiceListenerClient;
 
   constructor(private readonly deps: PiAgentPanelDeps) {
     this.voiceClient = new VoiceListenerClient({
       onStatusChange: (status) => {
         this.localClientState = status;
+        this.syncDialogTimer();
         this.renderTitleButtons();
         this.renderVoiceStrip();
         this.renderLivePill();
@@ -230,7 +310,9 @@ export class PiAgentPanelController {
         this.updateWaveformBars();
       },
       onSyncServerState: (patch) => {
-        void this.deps.apiPost("/api/voice-listen/state", patch).catch(() => {});
+        this.lastSyncPromise = this.deps
+          .apiPost("/api/voice-listen/state", patch)
+          .catch(() => {});
       },
       onTranscriptFinal: async (text, opts) => {
         try {
@@ -250,9 +332,9 @@ export class PiAgentPanelController {
           if (res.agent) this.applyAgentSnapshot(res.agent);
           if (res.voiceState) this.applyVoiceSnapshot(res.voiceState);
           if (res.matched && res.wokeOnly) {
-            this.flashLivePill("已唤醒，请说控制指令…", 4000);
+            this.flashLivePill("已唤醒，请说…", 4000);
           } else if (res.matched && res.reply) {
-            this.flashLivePill(`Pi Agent：${res.reply}`, 4200);
+            this.flashLivePill(`π ${res.reply}`, 4200);
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -287,18 +369,26 @@ export class PiAgentPanelController {
         if (data.agent) this.applyAgentSnapshot(data.agent);
         if (data.voiceState) this.applyVoiceSnapshot(data.voiceState);
         if (data.matched && data.wokeOnly) {
-          this.flashLivePill("已唤醒，请说控制指令…", 4000);
+          this.flashLivePill("已唤醒，请说…", 4000);
         } else if (data.matched && data.reply) {
-          this.flashLivePill(`Pi Agent：${data.reply}`, 4200);
+          this.flashLivePill(`π ${data.reply}`, 4200);
         } else if (
           data.text &&
           data.attention &&
           data.attention.accept === false &&
           (data.attention.stage === "llm-attention" ||
+            data.attention.stage === "systemone-attention" ||
+            data.attention.stage === "acoustic-veto" ||
+            data.attention.stage === "exit" ||
             data.attention.stage === "pragmatic-reject" ||
             data.attention.stage === "voiceprint")
         ) {
-          this.flashLivePill(`已忽略：${data.attention.reason || "非定向呼唤"}`, 2800);
+          this.flashLivePill(
+            data.attention.stage === "exit"
+              ? "已退出对话模式，回到待机"
+              : `已忽略：${data.attention.reason || "非定向呼唤"}`,
+            2800,
+          );
         }
       },
       isVoiceStreamReady: () => Boolean(this.deps.isWsOpen?.()),
@@ -318,25 +408,68 @@ export class PiAgentPanelController {
     const reply = typeof ev.reply === "string" ? ev.reply : "";
     const attention = asRec(ev.attention);
 
+    if (kind === "wake_spot") {
+      const wakeWord = typeof ev.wakeWord === "string" ? ev.wakeWord.trim() : "";
+      const score = typeof ev.score === "number" && Number.isFinite(ev.score) ? ev.score : undefined;
+      const threshold =
+        typeof ev.threshold === "number" && Number.isFinite(ev.threshold) ? ev.threshold : undefined;
+      const source = typeof ev.source === "string" ? ev.source : undefined;
+
+      this.voiceClient.handleStreamServerEvent({ kind, wakeWord, score, threshold, source });
+
+      if (ev.voiceState) {
+        this.applyVoiceSnapshot(ev.voiceState);
+      } else if (wakeWord && typeof score === "number") {
+        const hitSource: UiWakeWordHit["source"] =
+          source === "enrolled" || source === "tts-bootstrap" || source === "asr"
+            ? source
+            : "enrolled";
+        if (this.voiceState) {
+          this.voiceState = {
+            ...this.voiceState,
+            lastWakeHit: {
+              wakeWord,
+              score,
+              threshold: threshold ?? this.voiceState.owwThreshold ?? 0.6,
+              source: hitSource,
+              timestamp: Date.now(),
+            },
+          };
+        }
+      }
+
+      this.triggerWakeSpotGlow();
+      const pillText = wakeWord ? `⚡ 已唤醒「${wakeWord}」` : "⚡ 已唤醒";
+      this.flashLivePill(pillText, 2600, true);
+      this.renderTitleButtons();
+      this.renderVoiceStrip();
+      return;
+    }
+
     this.voiceClient.handleStreamServerEvent({ kind, text, matched });
 
     if (kind === "result") {
       if (ev.agent) this.applyAgentSnapshot(ev.agent);
       if (ev.voiceState) this.applyVoiceSnapshot(ev.voiceState);
       if (matched && wokeOnly) {
-        this.flashLivePill("已唤醒，请说控制指令…", 4000);
+        this.flashLivePill("已唤醒，请说…", 4000);
       } else if (matched && reply) {
-        this.flashLivePill(`Pi Agent：${reply}`, 4200);
+        this.flashLivePill(`π ${reply}`, 4200);
       } else if (
         text &&
         attention &&
         attention.accept === false &&
         (attention.stage === "llm-attention" ||
+          attention.stage === "systemone-attention" ||
+          attention.stage === "acoustic-veto" ||
+          attention.stage === "exit" ||
           attention.stage === "pragmatic-reject" ||
           attention.stage === "voiceprint")
       ) {
         this.flashLivePill(
-          `已忽略：${typeof attention.reason === "string" ? attention.reason : "非定向呼唤"}`,
+          attention.stage === "exit"
+            ? "已退出对话模式，回到待机"
+            : `已忽略：${typeof attention.reason === "string" ? attention.reason : "非定向呼唤"}`,
           2800,
         );
       }
@@ -346,6 +479,11 @@ export class PiAgentPanelController {
   bindEvents(): void {
     node("voice-listen-toggle-btn").addEventListener("click", () => {
       void this.toggleVoiceListening();
+    });
+
+    const titleDialogBtn = document.getElementById("voice-dialog-badge-btn");
+    titleDialogBtn?.addEventListener("click", () => {
+      void this.toggleDialogMode();
     });
 
     node("pi-agent-toggle-btn").addEventListener("click", () => {
@@ -368,6 +506,11 @@ export class PiAgentPanelController {
       void this.resetConversation();
     });
 
+    const dialogModeBtn = document.getElementById("pi-dialog-mode-btn");
+    dialogModeBtn?.addEventListener("click", () => {
+      void this.toggleDialogMode();
+    });
+
     node("pi-voice-start-btn").addEventListener("click", () => {
       void this.toggleVoiceListening();
     });
@@ -378,6 +521,11 @@ export class PiAgentPanelController {
 
     node("pi-voice-wake-toggle-btn").addEventListener("click", () => {
       void this.toggleWakeWordMode();
+    });
+
+    const cavemanBtn = document.getElementById("pi-caveman-toggle-btn");
+    cavemanBtn?.addEventListener("click", () => {
+      void this.cycleCavemanMode();
     });
 
     const input = node<HTMLInputElement>("pi-agent-input");
@@ -450,10 +598,68 @@ export class PiAgentPanelController {
         node<HTMLInputElement>("pi-agent-input").focus();
       }, 60);
     }
+    this.renderLivePill();
   }
 
   async toggleVoiceListening(): Promise<void> {
     await this.voiceClient.toggle();
+  }
+
+  async toggleDialogMode(forcedAction?: "enter" | "exit" | "toggle"): Promise<void> {
+    const current = this.effectiveDialogState();
+    const action: "enter" | "exit" =
+      forcedAction === "enter" || forcedAction === "exit"
+        ? forcedAction
+        : current === "conversation"
+          ? "exit"
+          : "enter";
+
+    if (action === "enter" && !this.localClientState.active) {
+      await this.voiceClient.start({ oneShot: false });
+      if (!this.voiceClient.isActive()) {
+        return;
+      }
+      await this.lastSyncPromise;
+    }
+
+    if (action === "exit") {
+      this.voiceClient.cancelSpeaking();
+    }
+
+    const sentWs = Boolean(
+      this.deps.isWsOpen?.() &&
+        this.deps.sendWsJson?.({ type: "voice_dialog_control", action }),
+    );
+    if (!sentWs) {
+      try {
+        const res = await this.deps.apiPost<{ ok?: boolean; voice?: UiVoiceSnapshot }>(
+          "/api/voice-listen/dialog",
+          { action },
+        );
+        if (res.voice) this.applyVoiceSnapshot(res.voice);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.deps.showToast(`切换对话模式失败：${msg}`, 3000);
+      }
+    }
+  }
+
+  async cycleCavemanMode(): Promise<void> {
+    const current = this.currentCavemanMode();
+    const idx = CAVEMAN_CYCLE_ORDER.indexOf(current);
+    const next = CAVEMAN_CYCLE_ORDER[(idx + 1) % CAVEMAN_CYCLE_ORDER.length] ?? "full";
+    try {
+      const res = await this.deps.apiPost<{
+        agent?: UiPiAgentSnapshot;
+        voice?: UiVoiceSnapshot;
+      }>("/api/agent/config", { cavemanMode: next });
+      if (res.agent) this.applyAgentSnapshot(res.agent);
+      if (res.voice) this.applyVoiceSnapshot(res.voice);
+      this.deps.showToast(`回复风格已切换：${CAVEMAN_LABELS[next]}`, 2000);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.deps.showToast(`切换回复风格失败：${msg}`, 3000);
+    }
   }
 
   async triggerOneShotVoice(): Promise<void> {
@@ -527,12 +733,33 @@ export class PiAgentPanelController {
   applyVoiceSnapshot(raw: unknown): void {
     const rec = asRec(raw);
     if (!rec) return;
-    this.voiceState = rec as unknown as UiVoiceSnapshot;
+    const vs = rec as unknown as UiVoiceSnapshot;
+    this.voiceState = vs;
+
+    if (typeof vs.serverNow === "number" && Number.isFinite(vs.serverNow)) {
+      this.serverClockOffsetMs = vs.serverNow - Date.now();
+    }
+    const anchorServerNow =
+      typeof vs.serverNow === "number" && Number.isFinite(vs.serverNow)
+        ? vs.serverNow
+        : Date.now() + this.serverClockOffsetMs;
+    if (typeof vs.conversationRemainingMs === "number" && Number.isFinite(vs.conversationRemainingMs)) {
+      this.frozenRemainingMs = Math.max(0, vs.conversationRemainingMs);
+      this.conversationDeadlineServerMs = anchorServerNow + this.frozenRemainingMs;
+    } else if (typeof vs.conversationUntil === "number" && Number.isFinite(vs.conversationUntil)) {
+      this.conversationDeadlineServerMs = vs.conversationUntil;
+      this.frozenRemainingMs = Math.max(0, vs.conversationUntil - anchorServerNow);
+    } else {
+      this.conversationDeadlineServerMs = null;
+      this.frozenRemainingMs = null;
+    }
+
     if (this.voiceState.localEngine) {
       this.voiceClient.updateConfig({
         localAsrReady: Boolean(this.voiceState.localEngine.readyForLocalAsr),
       });
     }
+    this.syncDialogTimer();
     this.renderTitleButtons();
     this.renderVoiceStrip();
     this.renderLivePill();
@@ -579,6 +806,7 @@ export class PiAgentPanelController {
   private effectiveMode(): ClientVoiceMode {
     if (this.agentState?.running || this.voiceState?.mode === "processing") return "processing";
     if (this.localClientState.active) {
+      if (this.localClientState.mode === "speaking") return "speaking";
       if (this.voiceState?.mode === "awake") return "awake";
       return this.localClientState.mode;
     }
@@ -587,7 +815,195 @@ export class PiAgentPanelController {
     return "idle";
   }
 
+  private currentCavemanMode(): UiCavemanMode {
+    const raw = this.agentState?.config.cavemanMode ?? this.voiceState?.cavemanMode;
+    return normalizeUiCavemanMode(raw);
+  }
+
+  private isWakeWordEnabled(): boolean {
+    if (typeof this.agentState?.config.wakeWordEnabled === "boolean") {
+      return this.agentState.config.wakeWordEnabled;
+    }
+    if (typeof this.voiceState?.wakeWordEnabled === "boolean") {
+      return this.voiceState.wakeWordEnabled;
+    }
+    return true;
+  }
+
+  private getConversationWindowSec(): number {
+    const raw =
+      this.voiceState?.conversationWindowSec ?? this.agentState?.config.conversationWindowSec ?? 25;
+    return Number.isFinite(raw) ? Math.max(0, Math.round(raw)) : 25;
+  }
+
+  private effectiveDialogState(): "standby" | "conversation" {
+    if (this.voiceState?.dialogState === "conversation") return "conversation";
+    if (this.voiceState?.dialogState === "standby") return "standby";
+    // 向后兼容未下发 dialogState 的旧快照
+    if (this.voiceState?.mode === "awake") return "conversation";
+    if (
+      typeof this.conversationDeadlineServerMs === "number" &&
+      this.conversationDeadlineServerMs > Date.now() + this.serverClockOffsetMs
+    ) {
+      return "conversation";
+    }
+    return "standby";
+  }
+
+  private isDialogTimerPaused(): boolean {
+    if (this.voiceState?.timerPaused === true) return true;
+    const mode = this.effectiveMode();
+    return mode === "processing" || mode === "speaking" || Boolean(this.agentState?.running);
+  }
+
+  private getRemainingDialogMs(): number {
+    if (this.effectiveDialogState() !== "conversation") return 0;
+    const windowMs = this.getConversationWindowSec() * 1000;
+    if (windowMs <= 0) return 0;
+    if (this.isDialogTimerPaused()) {
+      return this.frozenRemainingMs !== null ? Math.max(0, this.frozenRemainingMs) : windowMs;
+    }
+    if (this.conversationDeadlineServerMs !== null) {
+      const estServerNow = Date.now() + this.serverClockOffsetMs;
+      return Math.max(0, this.conversationDeadlineServerMs - estServerNow);
+    }
+    if (this.frozenRemainingMs !== null) {
+      return Math.max(0, this.frozenRemainingMs);
+    }
+    return windowMs;
+  }
+
+  private getRemainingDialogSec(): number {
+    return Math.max(0, Math.ceil(this.getRemainingDialogMs() / 1000));
+  }
+
+  private syncDialogTimer(): void {
+    const shouldTick =
+      this.effectiveDialogState() === "conversation" &&
+      !this.isDialogTimerPaused() &&
+      this.isWakeWordEnabled() &&
+      this.getConversationWindowSec() > 0;
+
+    if (shouldTick) {
+      if (this.dialogTimerInterval === null) {
+        this.dialogTimerInterval = window.setInterval(() => {
+          this.updateCountdownElements();
+        }, 250);
+      }
+    } else if (this.dialogTimerInterval !== null) {
+      window.clearInterval(this.dialogTimerInterval);
+      this.dialogTimerInterval = null;
+    }
+  }
+
+  private formatTitleDialogBadgeLabel(): string {
+    const dialogState = this.effectiveDialogState();
+    const mode = this.effectiveMode();
+    if (dialogState !== "conversation") {
+      return "待唤醒";
+    }
+    if (mode === "speaking") {
+      return "对话中 · 播报";
+    }
+    if (this.isDialogTimerPaused()) {
+      return "对话中 · 执行";
+    }
+    if (!this.isWakeWordEnabled() || this.getConversationWindowSec() === 0) {
+      return "对话中";
+    }
+    return `对话中 · ${this.getRemainingDialogSec()}s`;
+  }
+
+  private formatBannerStateLabel(): string {
+    const isListening = this.localClientState.active;
+    const dialogState = this.effectiveDialogState();
+    const wakeEnabled = this.isWakeWordEnabled();
+    const mode = this.effectiveMode();
+
+    if (!isListening && dialogState !== "conversation") {
+      return "非对话模式 · 未开启监听";
+    }
+    if (!wakeEnabled) {
+      return "免唤醒直达 · 持续对话";
+    }
+    if (dialogState !== "conversation") {
+      return "非对话模式 · 等待唤醒";
+    }
+    if (mode === "speaking") {
+      return "对话模式 · 播报中";
+    }
+    if (this.isDialogTimerPaused()) {
+      return "对话模式 · 执行中";
+    }
+    const windowSec = this.getConversationWindowSec();
+    if (windowSec === 0) {
+      return "免唤醒直达 · 持续对话";
+    }
+    return `对话模式 · 剩余 ${this.getRemainingDialogSec()}s`;
+  }
+
+  private formatLivePillConversationText(): string {
+    const mode = this.effectiveMode();
+    if (mode === "speaking") return "对话模式 · 播报中";
+    if (this.isDialogTimerPaused()) return "对话模式 · 执行中";
+    if (!this.isWakeWordEnabled() || this.getConversationWindowSec() === 0) {
+      return "免唤醒直达 · 持续对话";
+    }
+    return `对话模式 · 剩余 ${this.getRemainingDialogSec()}s`;
+  }
+
+  private updateCountdownElements(): void {
+    const dialogState = this.effectiveDialogState();
+    if (dialogState !== "conversation") {
+      this.syncDialogTimer();
+      return;
+    }
+
+    const titleLabel = document.getElementById("voice-dialog-badge-label");
+    if (titleLabel) {
+      titleLabel.textContent = this.formatTitleDialogBadgeLabel();
+    }
+
+    const bannerBadge = document.getElementById("pi-dialog-state-badge");
+    if (bannerBadge) {
+      bannerBadge.textContent = this.formatBannerStateLabel();
+    }
+
+    const fill = document.getElementById("pi-dialog-timer-fill");
+    const windowMs = Math.max(1000, this.getConversationWindowSec() * 1000);
+    const remMs = this.getRemainingDialogMs();
+    if (fill) {
+      const pct = Math.max(0, Math.min(100, (remMs / windowMs) * 100));
+      fill.style.width = `${pct.toFixed(1)}%`;
+      fill.classList.toggle("is-urgent", !this.isDialogTimerPaused() && remMs > 0 && remMs <= 5000);
+    }
+
+    if (!this.open && this.livePillHideTimer === null) {
+      const pill = document.getElementById("voice-live-pill");
+      const pillText = document.getElementById("voice-live-pill-text");
+      if (pill && !pill.hidden && pill.classList.contains("is-conversation") && pillText) {
+        pillText.textContent = this.formatLivePillConversationText();
+      }
+    }
+  }
+
+  private triggerWakeSpotGlow(): void {
+    const strip = document.getElementById("pi-voice-strip");
+    const badge = document.getElementById("voice-dialog-badge-btn");
+    strip?.classList.add("is-wake-flash");
+    badge?.classList.add("is-wake-flash");
+    if (this.wakeFlashTimer !== null) {
+      window.clearTimeout(this.wakeFlashTimer);
+    }
+    this.wakeFlashTimer = window.setTimeout(() => {
+      this.wakeFlashTimer = null;
+      strip?.classList.remove("is-wake-flash");
+      badge?.classList.remove("is-wake-flash");
+    }, 1350);
+  }
+
   private renderAll(): void {
+    this.syncDialogTimer();
     this.renderTitleButtons();
     this.renderHeader();
     this.renderVoiceStrip();
@@ -600,24 +1016,41 @@ export class PiAgentPanelController {
     const voiceBtn = node<HTMLButtonElement>("voice-listen-toggle-btn");
     const voiceLabel = node("voice-listen-label");
     const mode = this.effectiveMode();
-    const active = this.localClientState.active || mode === "awake" || mode === "processing";
+    const dialogState = this.effectiveDialogState();
+    const isConv = dialogState === "conversation";
+    const active = this.localClientState.active || mode === "awake" || mode === "processing" || isConv;
 
     voiceBtn.classList.toggle("active", active);
     voiceBtn.classList.toggle("is-listening", this.localClientState.active && mode === "listening");
-    voiceBtn.classList.toggle("is-awake", mode === "awake");
+    voiceBtn.classList.toggle("is-awake", mode === "awake" || isConv);
     voiceBtn.classList.toggle("is-processing", mode === "processing");
     voiceBtn.setAttribute("aria-pressed", String(this.localClientState.active));
 
     if (mode === "processing") {
       voiceLabel.textContent = "执行中…";
-    } else if (mode === "awake") {
-      voiceLabel.textContent = this.localClientState.oneShot ? "请说话…" : "已唤醒";
     } else if (mode === "speaking") {
       voiceLabel.textContent = "播报中";
+    } else if (mode === "awake" || isConv) {
+      voiceLabel.textContent = this.localClientState.oneShot ? "请说话…" : "已唤醒";
     } else if (this.localClientState.active) {
       voiceLabel.textContent = "监听中";
     } else {
       voiceLabel.textContent = "语音监听";
+    }
+
+    const dialogBadge = document.getElementById("voice-dialog-badge-btn") as HTMLButtonElement | null;
+    const dialogBadgeLabel = document.getElementById("voice-dialog-badge-label");
+    if (dialogBadge && dialogBadgeLabel) {
+      const hideBadge = !this.localClientState.active && mode === "idle" && !isConv;
+      dialogBadge.hidden = hideBadge;
+      dialogBadge.classList.toggle("is-conversation", isConv);
+      dialogBadge.classList.toggle("is-standby", !isConv);
+      dialogBadge.classList.toggle("is-paused", isConv && this.isDialogTimerPaused());
+      dialogBadge.setAttribute("aria-pressed", String(isConv));
+      dialogBadgeLabel.textContent = this.formatTitleDialogBadgeLabel();
+      dialogBadge.title = isConv
+        ? "当前处于对话模式，点击立即退回待唤醒（保持麦克风监听）"
+        : "当前处于待唤醒模式，点击立即进入免唤醒对话模式";
     }
 
     const agentBtn = node<HTMLButtonElement>("pi-agent-toggle-btn");
@@ -647,16 +1080,59 @@ export class PiAgentPanelController {
     const startBtn = node<HTMLButtonElement>("pi-voice-start-btn");
     const oneShotBtn = node<HTMLButtonElement>("pi-voice-oneshot-btn");
     const wakeBtn = node<HTMLButtonElement>("pi-voice-wake-toggle-btn");
+    const cavemanBtn = document.getElementById("pi-caveman-toggle-btn") as HTMLButtonElement | null;
 
     const mode = this.effectiveMode();
     const isListening = this.localClientState.active;
-    const wakeEnabled = this.agentState?.config.wakeWordEnabled ?? true;
-    const wakeWords = this.agentState?.config.wakeWords ?? ["小派", "pi"];
+    const dialogState = this.effectiveDialogState();
+    const isConv = dialogState === "conversation";
+    const paused = this.isDialogTimerPaused();
+    const wakeEnabled = this.isWakeWordEnabled();
+    const wakeWords = this.agentState?.config.wakeWords ?? this.voiceState?.wakeWords ?? ["小派", "pi"];
     const firstWake = wakeWords[0] ?? "小派";
+    const windowSec = this.getConversationWindowSec();
 
-    strip.classList.toggle("is-active", isListening || mode === "awake" || mode === "processing");
-    strip.classList.toggle("is-awake", mode === "awake");
+    strip.classList.toggle("is-active", isListening || mode === "awake" || mode === "processing" || isConv);
+    strip.classList.toggle("is-awake", mode === "awake" || isConv);
+    strip.classList.toggle("is-conversation", isConv);
     strip.classList.toggle("is-error", mode === "error");
+
+    // Dual-State Header Banner inside #pi-voice-strip
+    const banner = document.getElementById("pi-dialog-banner");
+    const stateBadge = document.getElementById("pi-dialog-state-badge");
+    const modeBtn = document.getElementById("pi-dialog-mode-btn") as HTMLButtonElement | null;
+    const timerTrack = document.getElementById("pi-dialog-timer-track");
+    const timerFill = document.getElementById("pi-dialog-timer-fill");
+
+    if (banner) {
+      banner.classList.toggle("is-conversation", isConv);
+      banner.classList.toggle("is-standby", !isConv);
+      banner.classList.toggle("is-paused", isConv && paused);
+    }
+    if (stateBadge) {
+      stateBadge.textContent = this.formatBannerStateLabel();
+    }
+    if (modeBtn) {
+      modeBtn.textContent = isConv ? "退出对话" : "进入对话";
+      modeBtn.classList.toggle("is-exit", isConv);
+      modeBtn.title = isConv
+        ? "退回待唤醒模式（保持麦克风监听开启）"
+        : isListening
+          ? "立即进入免唤醒持续对话模式"
+          : "自动开启麦克风并进入持续对话模式";
+    }
+    if (timerTrack && timerFill) {
+      const showTimer = isConv && wakeEnabled && windowSec > 0;
+      timerTrack.hidden = !showTimer;
+      if (showTimer) {
+        const remMs = this.getRemainingDialogMs();
+        const totalMs = Math.max(1000, windowSec * 1000);
+        const pct = Math.max(0, Math.min(100, (remMs / totalMs) * 100));
+        timerFill.style.width = `${pct.toFixed(1)}%`;
+        timerFill.classList.toggle("is-paused", paused);
+        timerFill.classList.toggle("is-urgent", !paused && remMs > 0 && remMs <= 5000);
+      }
+    }
 
     startBtn.textContent = isListening ? "停止监听" : "开启持续监听";
     startBtn.classList.toggle("primary-button", !isListening);
@@ -671,6 +1147,13 @@ export class PiAgentPanelController {
       ? `当前唤醒词：${wakeWords.join("、")}（点击切换免唤醒模式）`
       : "当前监听到的每句话都将直接交给 Pi Agent（点击开启唤醒词）";
 
+    if (cavemanBtn) {
+      const cm = this.currentCavemanMode();
+      cavemanBtn.textContent = CAVEMAN_LABELS[cm];
+      cavemanBtn.classList.toggle("active", cm !== "off");
+      cavemanBtn.title = `当前回复风格：${CAVEMAN_LABELS[cm]}（点击循环切换 Full / Ultra / Lite / 标准）`;
+    }
+
     const interim = this.localClientState.interimTranscript || this.voiceState?.interimTranscript || "";
     const err = this.localClientState.error || this.voiceState?.error || "";
 
@@ -682,12 +1165,14 @@ export class PiAgentPanelController {
       subEl.textContent = this.voiceState?.lastCommand
         ? `指令：“${this.voiceState.lastCommand}”`
         : "正在调度智能家居工具…";
-    } else if (mode === "awake") {
-      statusEl.textContent = this.localClientState.oneShot ? "请直接说出设备指令" : "已唤醒，请说控制指令";
-      subEl.textContent = interim ? `实时识别：${interim}` : "例如：“把客厅吸顶灯亮度调到 80%”";
     } else if (mode === "speaking") {
       statusEl.textContent = "正在语音播报执行结果…";
-      subEl.textContent = "播报期间自动静音防回声";
+      subEl.textContent = "播报期间自动防回声，说话可随时打断";
+    } else if (mode === "awake" || (isConv && isListening)) {
+      statusEl.textContent = this.localClientState.oneShot
+        ? "请直接说出设备指令"
+        : "对话模式中，请直接说指令";
+      subEl.textContent = interim ? `${interim}` : "可直接连续追问，无需重复喊唤醒词";
     } else if (isListening) {
       const engineLabel =
         this.localClientState.engine === "local"
@@ -697,16 +1182,16 @@ export class PiAgentPanelController {
             : "浏览器实时识别";
       statusEl.textContent = `语音监听运行中 · ${engineLabel}`;
       subEl.textContent = interim
-        ? `实时识别：${interim}`
+        ? `${interim}`
         : wakeEnabled
-          ? `说出“${firstWake}，打开客厅吸顶灯”即可控制设备`
+          ? `说出“${firstWake}，打开客厅吸顶灯”即可唤醒`
           : "免唤醒已开启，直接说出设备控制指令即可执行";
     } else {
       const readyHint = this.voiceState?.localEngine?.readyForLocalAsr
-        ? "本地 SenseVoice · GTCRN 降噪 · 声纹 · 注意力门控已就绪"
+        ? "本地 SenseVoice · openWakeWord · 降噪 · SystemOne 已就绪"
         : wakeEnabled
-          ? `点击「开启持续监听」或按 Alt+V 单次说话（唤醒词：${wakeWords.slice(0, 3).join(" / ")}）`
-          : "点击「开启持续监听」或按 Alt+V 即可语音操控 Pi Agent";
+          ? `点击「进入对话」或「开启持续监听」（唤醒词：${wakeWords.slice(0, 3).join(" / ")}）`
+          : "点击「进入对话」或按 Alt+V 即可语音操控 Pi Agent";
       statusEl.textContent = "语音监听待机中";
       subEl.textContent = readyHint;
     }
@@ -718,22 +1203,71 @@ export class PiAgentPanelController {
     const wrap = document.getElementById("pi-voice-telemetry");
     if (!wrap) return;
     const vs = this.voiceState;
-    const tags: string[] = [];
+    const cfg = this.agentState?.config;
+    const tags: Array<{ label: string; warn?: boolean; title?: string }> = [];
 
-    if (vs?.localEngine?.readyForLocalAsr) tags.push("离线 SenseVoice");
+    if (vs?.localEngine?.readyForLocalAsr) {
+      tags.push({ label: "离线 SenseVoice" });
+    }
+    const owwOn = (vs?.owwEnabled ?? cfg?.owwEnabled ?? true) !== false;
+    const owwReady = Boolean(vs?.localEngine?.readyForWakeWord ?? vs?.localEngine?.models?.openWakeWord);
+    if (owwOn && owwReady) {
+      tags.push({ label: "openWakeWord" });
+    }
     if (vs?.noiseSuppressionMode !== "off") {
-      tags.push(vs?.localEngine?.readyForDenoise ? "GTCRN 降噪" : "DSP 降噪");
+      const nMode = vs?.noiseSuppressionMode;
+      const nLabel =
+        nMode === "dpdfnet" && vs?.localEngine?.readyForDpdfnet
+          ? "DPDFNet4 降噪"
+          : nMode === "voxlock" && vs?.localEngine?.readyForVoxlock
+            ? "VoxLock 降噪"
+            : vs?.localEngine?.readyForDenoise
+              ? "GTCRN 降噪"
+              : "DSP 降噪";
+      tags.push({ label: nLabel });
     }
-    if (vs?.attentionMode && vs.attentionMode !== "off") {
-      tags.push(vs.attentionMode === "strict" ? "严格注意力" : "智能注意力");
+
+    const s1Health = vs?.systemOneHealth ?? null;
+    const s1Active = Boolean(
+      s1Health?.enabled || (cfg?.systemOneMode !== "off" && cfg?.effectiveSystemOneConfigured),
+    );
+    if (s1Active) {
+      if (s1Health?.circuitState === "open") {
+        tags.push({
+          label: "SystemOne 31B · 降级",
+          warn: true,
+          title: s1Health.openReason || "SystemOne 熔断保护中，暂由规则兜底",
+        });
+      } else {
+        tags.push({
+          label: "SystemOne 31B",
+          title: s1Health
+            ? `模型 ${s1Health.model} · 调用 ${s1Health.totalCalls} 次 · 缓存命中 ${s1Health.cacheHits} 次`
+            : "SystemOne 决策门控已启用",
+        });
+      }
+    } else if (vs?.attentionMode && vs.attentionMode !== "off") {
+      tags.push({ label: vs.attentionMode === "strict" ? "严格注意力" : "智能注意力" });
     }
+
+    const cavemanMode = this.currentCavemanMode();
+    if (cavemanMode !== "off") {
+      tags.push({ label: "Caveman", title: `回复风格：${CAVEMAN_LABELS[cavemanMode]}` });
+    }
+
     const vpCount = vs?.voiceprints?.length ?? 0;
     if (vs?.voiceprintMode && vs.voiceprintMode !== "off" && vpCount > 0) {
-      tags.push(`声纹(${vpCount})`);
+      tags.push({ label: `声纹(${vpCount})` });
     }
 
     const m = vs?.lastMetrics;
     const details: string[] = [];
+
+    if (vs?.lastWakeHit?.wakeWord) {
+      const hit = vs.lastWakeHit;
+      const prefix = hit.source === "asr" ? "⚡ 唤醒" : "⚡ openWakeWord";
+      details.push(`${prefix}「${hit.wakeWord}」${hit.score.toFixed(2)}`);
+    }
     if (m?.voiceprint?.evaluated) {
       details.push(
         m.voiceprint.matched && m.voiceprint.speakerName
@@ -753,7 +1287,9 @@ export class PiAgentPanelController {
       details.push(m.attention.accept ? `✓ ${m.attention.reason}` : `⊘ ${m.attention.reason}`);
     }
     if (typeof m?.timings?.totalMs === "number" && m.timings.totalMs > 0) {
-      details.push(`${m.timings.totalMs}ms`);
+      details.push(`${Math.round(m.timings.totalMs)}ms`);
+    } else if (typeof s1Health?.lastLatencyMs === "number" && s1Health.lastLatencyMs > 0) {
+      details.push(`S1 ${Math.round(s1Health.lastLatencyMs)}ms`);
     }
 
     if (tags.length === 0 && details.length === 0) {
@@ -767,8 +1303,9 @@ export class PiAgentPanelController {
     pillBar.className = "pi-voice-pill-row";
     for (const t of tags) {
       const sp = document.createElement("span");
-      sp.className = "pi-voice-mini-tag";
-      sp.textContent = t;
+      sp.className = `pi-voice-mini-tag${t.warn ? " is-warn" : ""}`;
+      sp.textContent = t.label;
+      if (t.title) sp.title = t.title;
       pillBar.appendChild(sp);
     }
     wrap.appendChild(pillBar);
@@ -917,39 +1454,47 @@ export class PiAgentPanelController {
     const textEl = node("voice-live-pill-text");
     const interim = this.localClientState.interimTranscript || this.voiceState?.interimTranscript || "";
     const mode = this.effectiveMode();
+    const isConv = this.effectiveDialogState() === "conversation";
 
     if (this.livePillHideTimer !== null) {
-      return; // 正在展示临时执行结果反馈
+      return; // 正在展示临时执行结果或唤醒命中反馈
     }
 
-    if (!this.open && (interim || mode === "awake" || mode === "processing")) {
+    if (!this.open && (interim || mode === "awake" || mode === "processing" || isConv)) {
       pill.hidden = false;
+      pill.classList.remove("is-wake-flash");
       pill.classList.toggle("is-awake", mode === "awake");
       pill.classList.toggle("is-processing", mode === "processing");
+      pill.classList.toggle("is-conversation", isConv && !interim && mode !== "processing");
       if (interim) {
-        textEl.textContent = `🎤 ${interim}`;
-      } else if (mode === "awake") {
-        textEl.textContent = "🎤 已唤醒，请说控制指令…";
-      } else {
+        textEl.textContent = interim.startsWith("⚡") ? interim : `🎤 ${interim}`;
+      } else if (mode === "processing") {
         textEl.textContent = `π Pi Agent 正在执行：${this.voiceState?.lastCommand || "设备控制…"}`;
+      } else if (isConv) {
+        textEl.textContent = this.formatLivePillConversationText();
+      } else {
+        textEl.textContent = "🎤 已唤醒，请说控制指令…";
       }
     } else {
       pill.hidden = true;
+      pill.classList.remove("is-conversation", "is-wake-flash");
     }
   }
 
-  private flashLivePill(message: string, durationMs = 3500): void {
+  private flashLivePill(message: string, durationMs = 3500, wakeGlow = false): void {
     if (this.open) return;
     const pill = node("voice-live-pill");
     const textEl = node("voice-live-pill-text");
     textEl.textContent = message;
     pill.hidden = false;
-    pill.classList.remove("is-awake", "is-processing");
+    pill.classList.remove("is-awake", "is-processing", "is-conversation");
+    pill.classList.toggle("is-wake-flash", wakeGlow);
     if (this.livePillHideTimer !== null) {
       window.clearTimeout(this.livePillHideTimer);
     }
     this.livePillHideTimer = window.setTimeout(() => {
       this.livePillHideTimer = null;
+      pill.classList.remove("is-wake-flash");
       this.renderLivePill();
     }, durationMs);
   }

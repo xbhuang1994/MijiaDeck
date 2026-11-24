@@ -28,6 +28,8 @@ export type NoiseSuppressionMode = "auto" | "neural" | "dpdfnet" | "voxlock" | "
 export type VadEngineMode = "silero" | "adaptive";
 export type VoiceprintPolicyMode = "off" | "tag" | "strict";
 export type AttentionMode = "smart" | "strict" | "off";
+export type SystemOneMode = "auto" | "on" | "off";
+export type CavemanReplyMode = "ultra" | "full" | "lite" | "off";
 export type CustomApiType =
   | "openai-completions"
   | "openai-responses"
@@ -142,6 +144,21 @@ const VALID_NOISE_MODES = new Set<string>(["auto", "neural", "dpdfnet", "voxlock
 const VALID_VAD_MODES = new Set<string>(["silero", "adaptive"]);
 const VALID_VOICEPRINT_MODES = new Set<string>(["off", "tag", "strict"]);
 const VALID_ATTENTION_MODES = new Set<string>(["smart", "strict", "off"]);
+const VALID_SYSTEMONE_MODES = new Set<string>(["auto", "on", "off"]);
+const VALID_CAVEMAN_MODES = new Set<string>(["ultra", "full", "lite", "off"]);
+const CAVEMAN_MODE_ALIASES: Readonly<Record<string, CavemanReplyMode>> = {
+  ultra: "ultra",
+  ultracave: "ultra",
+  "caveman-ultra": "ultra",
+  full: "full",
+  caveman: "full",
+  lite: "lite",
+  concise: "lite",
+  off: "off",
+  normal: "off",
+};
+export const DEFAULT_SYSTEMONE_MODEL = "karpo/karpo-decision-31b";
+export const DEFAULT_CAVEMAN_MODE: CavemanReplyMode = "full";
 const VALID_CUSTOM_APIS = new Set<string>([
   "openai-completions",
   "openai-responses",
@@ -177,20 +194,37 @@ export interface AgentVoiceConfig {
   voiceprintThreshold: number;
   attentionMode: AttentionMode;
   conversationWindowSec: number;
+  maxConsecutiveSidetalk: number;
   bargeInEnabled: boolean;
+  // SystemOne 决策模型（karpo/karpo-decision-31b）配置
+  systemOneMode: SystemOneMode;
+  systemOneBaseUrl: string;
+  systemOneApiKey: string;
+  systemOneModel: string;
+  systemOneTimeoutMs: number;
+  systemOneConfidenceThreshold: number;
+  // Caveman 极简回复风格（参考 juliusbrussee/caveman）
+  cavemanMode: CavemanReplyMode;
+  // openWakeWord 独立本地声学唤醒词优化（支持用户自定义唤醒词）
+  owwEnabled: boolean;
+  owwThreshold: number;
   sttBaseUrl: string;
   sttApiKey: string;
   sttModel: string;
 }
 
 export interface PublicAgentVoiceConfig
-  extends Omit<AgentVoiceConfig, "apiKey" | "sttApiKey"> {
+  extends Omit<AgentVoiceConfig, "apiKey" | "sttApiKey" | "systemOneApiKey"> {
   hasApiKey: boolean;
   apiKeyPreview: string;
   envApiKeyDetected: boolean;
   hasSttApiKey: boolean;
   sttApiKeyPreview: string;
   effectiveSttConfigured: boolean;
+  hasSystemOneApiKey: boolean;
+  systemOneApiKeyPreview: string;
+  effectiveSystemOneBaseUrl: string;
+  effectiveSystemOneConfigured: boolean;
 }
 
 export interface AgentConfigPatch {
@@ -219,7 +253,18 @@ export interface AgentConfigPatch {
   voiceprintThreshold?: unknown;
   attentionMode?: unknown;
   conversationWindowSec?: unknown;
+  maxConsecutiveSidetalk?: unknown;
   bargeInEnabled?: unknown;
+  systemOneMode?: unknown;
+  systemOneBaseUrl?: unknown;
+  systemOneApiKey?: unknown;
+  clearSystemOneApiKey?: unknown;
+  systemOneModel?: unknown;
+  systemOneTimeoutMs?: unknown;
+  systemOneConfidenceThreshold?: unknown;
+  cavemanMode?: unknown;
+  owwEnabled?: unknown;
+  owwThreshold?: unknown;
   sttBaseUrl?: unknown;
   sttApiKey?: unknown;
   clearSttApiKey?: unknown;
@@ -252,8 +297,18 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     voiceprintMode: "tag",
     voiceprintThreshold: 0.42,
     attentionMode: "smart",
-    conversationWindowSec: 18,
+    conversationWindowSec: 25,
+    maxConsecutiveSidetalk: 3,
     bargeInEnabled: true,
+    systemOneMode: "auto",
+    systemOneBaseUrl: "",
+    systemOneApiKey: "",
+    systemOneModel: DEFAULT_SYSTEMONE_MODEL,
+    systemOneTimeoutMs: 2000,
+    systemOneConfidenceThreshold: 0.65,
+    cavemanMode: DEFAULT_CAVEMAN_MODE,
+    owwEnabled: true,
+    owwThreshold: 0.6,
     sttBaseUrl: "",
     sttApiKey: "",
     sttModel: "whisper-1",
@@ -324,6 +379,28 @@ function normalizeUrl(value: unknown): string {
   }
 }
 
+export function normalizeCavemanMode(
+  value: unknown,
+  fallback: CavemanReplyMode = DEFAULT_CAVEMAN_MODE,
+): CavemanReplyMode {
+  if (typeof value !== "string") return fallback;
+  const key = value.trim().toLowerCase();
+  return CAVEMAN_MODE_ALIASES[key] ?? fallback;
+}
+
+function normalizeSystemOneBaseUrl(value: unknown): string {
+  const urlStr = normalizeUrl(value);
+  if (!urlStr) return "";
+  try {
+    const parsed = new URL(urlStr);
+    // Strip embedded credentials & query strings for safety
+    const cleanPath = parsed.pathname.replace(/\/systemone\/?$/i, "").replace(/\/+$/, "");
+    return `${parsed.origin}${cleanPath}`;
+  } catch {
+    return "";
+  }
+}
+
 export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVoiceConfig {
   const defaults = defaultAgentVoiceConfig();
   const providerRaw = typeof raw.provider === "string" ? raw.provider.trim() : defaults.provider;
@@ -380,6 +457,18 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     ? (attModeRaw as AttentionMode)
     : defaults.attentionMode;
 
+  const sysOneModeRaw =
+    typeof raw.systemOneMode === "string"
+      ? raw.systemOneMode.trim().toLowerCase()
+      : defaults.systemOneMode;
+  const systemOneMode: SystemOneMode = VALID_SYSTEMONE_MODES.has(sysOneModeRaw)
+    ? (sysOneModeRaw as SystemOneMode)
+    : defaults.systemOneMode;
+
+  const cavemanMode = normalizeCavemanMode(raw.cavemanMode, defaults.cavemanMode);
+  const sysOneModelRaw =
+    typeof raw.systemOneModel === "string" ? raw.systemOneModel.trim().slice(0, 128) : "";
+
   return {
     version: AGENT_CONFIG_VERSION,
     provider,
@@ -413,10 +502,31 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     ),
     attentionMode,
     conversationWindowSec: Math.round(
-      clampNumber(raw.conversationWindowSec, 0, 60, defaults.conversationWindowSec),
+      clampNumber(raw.conversationWindowSec, 0, 120, defaults.conversationWindowSec),
+    ),
+    maxConsecutiveSidetalk: Math.round(
+      clampNumber(raw.maxConsecutiveSidetalk, 1, 10, defaults.maxConsecutiveSidetalk),
     ),
     bargeInEnabled:
       typeof raw.bargeInEnabled === "boolean" ? raw.bargeInEnabled : defaults.bargeInEnabled,
+    systemOneMode,
+    systemOneBaseUrl: normalizeSystemOneBaseUrl(raw.systemOneBaseUrl),
+    systemOneApiKey: typeof raw.systemOneApiKey === "string" ? raw.systemOneApiKey.trim() : "",
+    systemOneModel: sysOneModelRaw || defaults.systemOneModel,
+    systemOneTimeoutMs: Math.round(
+      clampNumber(raw.systemOneTimeoutMs, 400, 8000, defaults.systemOneTimeoutMs),
+    ),
+    systemOneConfidenceThreshold: Number(
+      clampNumber(
+        raw.systemOneConfidenceThreshold,
+        0.3,
+        0.95,
+        defaults.systemOneConfidenceThreshold,
+      ).toFixed(2),
+    ),
+    cavemanMode,
+    owwEnabled: typeof raw.owwEnabled === "boolean" ? raw.owwEnabled : defaults.owwEnabled,
+    owwThreshold: Number(clampNumber(raw.owwThreshold, 0.25, 0.95, defaults.owwThreshold).toFixed(2)),
     sttBaseUrl: normalizeUrl(raw.sttBaseUrl),
     sttApiKey: typeof raw.sttApiKey === "string" ? raw.sttApiKey.trim() : "",
     sttModel:
@@ -487,13 +597,70 @@ export function isLocalEndpointUrl(urlStr: string): boolean {
   }
 }
 
+export function resolveEffectiveSystemOneAuth(config: AgentVoiceConfig): {
+  enabled: boolean;
+  baseUrl: string;
+  apiKey: string | undefined;
+  model: string;
+  timeoutMs: number;
+  confidenceThreshold: number;
+} {
+  const model = config.systemOneModel.trim() || DEFAULT_SYSTEMONE_MODEL;
+  const timeoutMs = config.systemOneTimeoutMs || 2000;
+  const confidenceThreshold = config.systemOneConfidenceThreshold || 0.65;
+  if (config.systemOneMode === "off") {
+    return { enabled: false, baseUrl: "", apiKey: undefined, model, timeoutMs, confidenceThreshold };
+  }
+
+  const mainBaseUrl =
+    config.provider === "local"
+      ? ""
+      : normalizeSystemOneBaseUrl(config.baseUrl) ||
+        normalizeSystemOneBaseUrl(getProviderPreset(config.provider).defaultBaseUrl);
+  const explicitBaseUrl = normalizeSystemOneBaseUrl(config.systemOneBaseUrl);
+  const envBaseUrl = normalizeSystemOneBaseUrl(process.env.SYSTEMONE_BASE_URL ?? "");
+  const effectiveBaseUrl = explicitBaseUrl || mainBaseUrl || envBaseUrl;
+
+  let differentOriginFromMain = false;
+  if (explicitBaseUrl) {
+    if (!mainBaseUrl) {
+      differentOriginFromMain = true;
+    } else {
+      try {
+        differentOriginFromMain = new URL(explicitBaseUrl).origin !== new URL(mainBaseUrl).origin;
+      } catch {
+        differentOriginFromMain = true;
+      }
+    }
+  }
+
+  // 安全边界：绝不把主 LLM 提供商的 apiKey 转发到不同源的自定义 systemOneBaseUrl！
+  const explicitKey = config.systemOneApiKey.trim();
+  const envKey = process.env.SYSTEMONE_API_KEY?.trim() || process.env.KARPO_API_KEY?.trim() || undefined;
+  const inheritedKey = !differentOriginFromMain ? resolveEffectiveApiKey(config) : undefined;
+  const apiKey = explicitKey || inheritedKey || envKey || undefined;
+
+  const enabled = Boolean(
+    effectiveBaseUrl && (apiKey || isLocalEndpointUrl(effectiveBaseUrl)),
+  );
+  return {
+    enabled,
+    baseUrl: effectiveBaseUrl,
+    apiKey,
+    model,
+    timeoutMs,
+    confidenceThreshold,
+  };
+}
+
 export function toPublicAgentVoiceConfig(config: AgentVoiceConfig): PublicAgentVoiceConfig {
   const envKey = resolveEnvApiKeyForProvider(config.provider);
   const stt = resolveEffectiveSttAuth(config);
   const effectiveSttConfigured = Boolean(
     stt.baseUrl && (stt.apiKey || isLocalEndpointUrl(stt.baseUrl)),
   );
-  const { apiKey, sttApiKey, ...rest } = config;
+  const sysOne = resolveEffectiveSystemOneAuth(config);
+  const { apiKey, sttApiKey, systemOneApiKey, ...rest } = config;
   return {
     ...rest,
     hasApiKey: apiKey.trim().length > 0,
@@ -502,6 +669,10 @@ export function toPublicAgentVoiceConfig(config: AgentVoiceConfig): PublicAgentV
     hasSttApiKey: sttApiKey.trim().length > 0,
     sttApiKeyPreview: maskSecret(sttApiKey),
     effectiveSttConfigured,
+    hasSystemOneApiKey: systemOneApiKey.trim().length > 0,
+    systemOneApiKeyPreview: maskSecret(systemOneApiKey),
+    effectiveSystemOneBaseUrl: sysOne.baseUrl,
+    effectiveSystemOneConfigured: sysOne.enabled,
   };
 }
 
@@ -644,8 +815,56 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
   if (patch.conversationWindowSec !== undefined) {
     nextRaw.conversationWindowSec = patch.conversationWindowSec;
   }
+  if (patch.maxConsecutiveSidetalk !== undefined) {
+    nextRaw.maxConsecutiveSidetalk = patch.maxConsecutiveSidetalk;
+  }
   if (patch.bargeInEnabled !== undefined) {
     nextRaw.bargeInEnabled = Boolean(patch.bargeInEnabled);
+  }
+  if (patch.systemOneMode !== undefined) {
+    const sm = String(patch.systemOneMode).trim().toLowerCase();
+    if (!VALID_SYSTEMONE_MODES.has(sm)) {
+      throw new Error(`不支持的 SystemOne 决策模式: ${sm}`);
+    }
+    nextRaw.systemOneMode = sm;
+  }
+  if (patch.systemOneBaseUrl !== undefined) {
+    const rawUrl = String(patch.systemOneBaseUrl).trim();
+    if (rawUrl && !normalizeSystemOneBaseUrl(rawUrl)) {
+      throw new Error("SystemOne 接口地址必须是以 http:// 或 https:// 开头的有效地址");
+    }
+    nextRaw.systemOneBaseUrl = rawUrl;
+  }
+  if (patch.clearSystemOneApiKey === true) {
+    nextRaw.systemOneApiKey = "";
+  } else if (typeof patch.systemOneApiKey === "string") {
+    const trimmed = patch.systemOneApiKey.trim();
+    if (trimmed.length > 0) {
+      nextRaw.systemOneApiKey = trimmed;
+    }
+  }
+  if (patch.systemOneModel !== undefined) {
+    nextRaw.systemOneModel = String(patch.systemOneModel).trim();
+  }
+  if (patch.systemOneTimeoutMs !== undefined) {
+    nextRaw.systemOneTimeoutMs = patch.systemOneTimeoutMs;
+  }
+  if (patch.systemOneConfidenceThreshold !== undefined) {
+    nextRaw.systemOneConfidenceThreshold = patch.systemOneConfidenceThreshold;
+  }
+  if (patch.cavemanMode !== undefined) {
+    const cmRaw = String(patch.cavemanMode).trim().toLowerCase();
+    const mapped = CAVEMAN_MODE_ALIASES[cmRaw];
+    if (!mapped || !VALID_CAVEMAN_MODES.has(mapped)) {
+      throw new Error(`不支持的回复精简模式: ${cmRaw}`);
+    }
+    nextRaw.cavemanMode = mapped;
+  }
+  if (patch.owwEnabled !== undefined) {
+    nextRaw.owwEnabled = Boolean(patch.owwEnabled);
+  }
+  if (patch.owwThreshold !== undefined) {
+    nextRaw.owwThreshold = patch.owwThreshold;
   }
 
   if (patch.sttBaseUrl !== undefined) {

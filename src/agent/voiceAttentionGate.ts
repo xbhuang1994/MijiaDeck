@@ -12,6 +12,8 @@
  * 只有确定是在与助手对话/叫助手操作时，才放行进入 Pi Agent 工具执行！
  */
 
+import type { WakeWordAcousticHit } from "./openWakeWordEngine.ts";
+import type { CommandIntentChoice, SystemOneClient } from "./systemOneClient.ts";
 import type { VoiceprintIdentifyResult } from "./voiceprintStore.ts";
 
 export type AttentionMode = "smart" | "strict" | "off";
@@ -41,6 +43,11 @@ export interface EvaluateAttentionInput {
   bypassWakeWord?: boolean;
   awakeActive?: boolean;
   inConversation?: boolean;
+  dialogState?: "standby" | "conversation";
+  altText?: string;
+  acousticWake?: WakeWordAcousticHit | null;
+  owwActiveForWord?: boolean;
+  systemOneClient?: SystemOneClient | null;
   recentTurns?: readonly ConversationTurnContext[];
   lastSpokenReply?: string;
   lastSpokenAt?: number;
@@ -61,10 +68,13 @@ export interface AttentionDecision {
     | "bypass"
     | "voiceprint"
     | "acoustic"
+    | "acoustic-veto"
     | "echo"
+    | "exit"
     | "fast-wake"
     | "fast-followup"
     | "pragmatic-reject"
+    | "systemone-attention"
     | "llm-attention"
     | "no-wake";
   reason: string;
@@ -72,6 +82,10 @@ export interface AttentionDecision {
   command: string;
   usedLlm: boolean;
   latencyMs: number;
+  exitConversation?: boolean;
+  intent?: CommandIntentChoice;
+  intentConfidence?: number;
+  selectedText?: string;
 }
 
 export interface WakeSpanMatch {
@@ -443,9 +457,17 @@ export function trimTrailingMusicLyrics(command: string): string {
   return kept.join("，").trim();
 }
 
-// 对话延续中非常明确的短指令特征
+// 对话延续中非常明确的短指令特征（不包含告别/退出词，告别词由 EXPLICIT_EXIT_RE 单独处理）
 const CLEAR_FOLLOWUP_RE =
-  /^(?:再|稍微|稍微再|还是|那就|帮我再|把它|把音量|把亮度|把色温|调大|调小|大一点|小一点|高一点|低一点|亮一点|暗一点|暖一点|冷一点|关了吧|关掉|打开|暂停|继续|停止|静音|取消静音|下一首|上一首|换一首|再来一份|出粮|谢谢|好的谢谢|算了|取消|不用了|退下|休息吧)/i;
+  /^(?:再|稍微|稍微再|还是|那就|帮我再|把它|把音量|把亮度|把色温|调大|调小|大一点|小一点|高一点|低一点|亮一点|暗一点|暖一点|冷一点|关了吧|关掉|打开|暂停|继续|停止|静音|取消静音|下一首|上一首|换一首|再来一份|出粮)/i;
+
+// 仅当整句（去除标点空白后）完全匹配时才触发零延迟退出连续对话，绝不误伤“好了，再把台灯关了”
+export const EXPLICIT_EXIT_RE =
+  /^(?:好的?谢谢|谢谢|算了|取消|不用了|没事了|退下|休息吧|再见|拜拜|退出对话|结束对话|先这样(?:吧)?|可以了|好了|行了|闭嘴|安静)$/i;
+
+function normalizeForExit(text: string): string {
+  return text.replace(/[\s,，。．.、!！?？:：;；\-—~～"'“”‘’]+/g, "").trim();
+}
 
 // 明显是家庭/旁白聊天的负向模式
 const OBVIOUS_SIDETALK_RE =
@@ -697,7 +719,7 @@ function buildAttentionPrompt(params: {
   const historyLines =
     params.recentTurns.length > 0
       ? params.recentTurns
-          .slice(-4)
+          .slice(-5)
           .map((t) => `- ${t.role === "user" ? "用户" : "助手"}: ${t.text.slice(0, 120)}`)
           .join("\n")
       : "（无近期对话）";
@@ -805,6 +827,8 @@ export async function evaluateVoiceAttention(
   const t0 = performance.now();
   const now = input.now ?? Date.now();
   const cleaned = input.rawText.trim();
+  const inConversationEffective =
+    input.dialogState === "conversation" || Boolean(input.inConversation) || Boolean(input.awakeActive);
   const wrap = (
     partial: Omit<AttentionDecision, "latencyMs">,
   ): AttentionDecision => ({
@@ -817,7 +841,7 @@ export async function evaluateVoiceAttention(
       accept: false,
       wokeOnly: false,
       addressed: false,
-      inConversation: Boolean(input.inConversation),
+      inConversation: inConversationEffective,
       confidence: 1,
       stage: "no-wake",
       reason: "识别结果为空",
@@ -863,20 +887,53 @@ export async function evaluateVoiceAttention(
     now - input.lastSpokenAt <= 4500
   ) {
     const overlap = computeEchoOverlap(cleaned, input.lastSpokenReply);
-    const echoThreshold = wakeSpan || DIRECT_COMMAND_START_RE.test(cleaned) ? 0.88 : 0.6;
-    if (overlap >= echoThreshold) {
+    const looksDirect = DIRECT_COMMAND_START_RE.test(cleaned);
+    const echoThreshold = wakeSpan || looksDirect ? 0.88 : 0.6;
+    const normHeard = normalizeForEcho(cleaned);
+    const normSpoken = normalizeForEcho(input.lastSpokenReply);
+    // Caveman 极短应答（如“在呢” / “已待机”）在 2.5s 内可能只回收到 1~2 字残片
+    const shortCavemanEcho =
+      now - input.lastSpokenAt <= 2500 &&
+      normHeard.length >= 1 &&
+      normHeard.length <= 2 &&
+      normSpoken.length > 0 &&
+      (normHeard === normSpoken || (normSpoken.length <= 6 && normSpoken.includes(normHeard)));
+
+    if (shortCavemanEcho || overlap >= echoThreshold) {
       return wrap({
         accept: false,
         wokeOnly: false,
         addressed: false,
-        inConversation: Boolean(input.inConversation),
-        confidence: overlap,
+        inConversation: inConversationEffective,
+        confidence: shortCavemanEcho ? 0.95 : overlap,
         stage: "echo",
         reason: "检测到系统语音播报回声，已自动抑制",
         wakeWord: null,
         command: "",
         usedLlm: false,
       });
+    }
+
+    // 灰区（0.40 <= overlap < echoThreshold）：调用 SystemOne 判别是回声残片还是用户反向新指令
+    if (overlap >= 0.4 && overlap < echoThreshold && input.systemOneClient?.enabled) {
+      const echoVerdict = await input.systemOneClient.classifyEchoOrCommand({
+        lastSpoken: input.lastSpokenReply,
+        heard: cleaned,
+      });
+      if (echoVerdict?.isEcho) {
+        return wrap({
+          accept: false,
+          wokeOnly: false,
+          addressed: false,
+          inConversation: inConversationEffective,
+          confidence: echoVerdict.confidence,
+          stage: "echo",
+          reason: "SystemOne 判定为系统语音播报回声，已自动抑制",
+          wakeWord: null,
+          command: "",
+          usedLlm: true,
+        });
+      }
     }
   }
 
@@ -886,7 +943,7 @@ export async function evaluateVoiceAttention(
       accept: false,
       wokeOnly: false,
       addressed: false,
-      inConversation: Boolean(input.inConversation),
+      inConversation: inConversationEffective,
       confidence: 0.9,
       stage: "acoustic",
       reason: `识别为纯环境声学事件 (${input.acousticEvent})，非用户指令`,
@@ -960,6 +1017,30 @@ export async function evaluateVoiceAttention(
 
   // ==================== 情况 A：句子中提到了唤醒词 ====================
   if (wakeSpan) {
+    // 混合 openWakeWord 声学否决：仅由模糊同音/噪声别名命中，且该唤醒词已启用本地声学原型但声学分 < 0.42（或缺失）时直接拦截
+    if (
+      wakeSpan.fuzzy &&
+      input.owwActiveForWord === true &&
+      (!input.acousticWake || input.acousticWake.score < 0.42)
+    ) {
+      return wrap({
+        accept: false,
+        wokeOnly: false,
+        addressed: false,
+        inConversation: inConversationEffective,
+        confidence: 0.9,
+        stage: "acoustic-veto",
+        reason: `模糊唤醒词「${wakeSpan.matchedSurface}」未通过本地声学唤醒校验${
+          input.acousticWake
+            ? `（得分 ${(input.acousticWake.score * 100).toFixed(0)}% < 42%）`
+            : "（无声学命中）"
+        }，已拦截误触发`,
+        wakeWord: wakeSpan.wakeWord,
+        command: "",
+        usedLlm: false,
+      });
+    }
+
     const cleanBefore = wakeSpan.beforeText;
     const cleanAfter = wakeSpan.afterText;
     const hasVocativeStart =
@@ -973,12 +1054,35 @@ export async function evaluateVoiceAttention(
     const isBgmContext = Boolean(input.acousticEvent?.toUpperCase().includes("BGM"));
     const trimmedCmd = isBgmContext ? trimTrailingMusicLyrics(cleanAfter) : cleanAfter;
 
-    // A1. 纯呼唤（例如“小派”、“嘿，小派”、“小派在吗”）
+    // 若在连续对话中带唤醒词发出纯退出指令（如“小派，退下” / “小派，再见”）
+    if (
+      inConversationEffective &&
+      hasVocativeStart &&
+      !hasReferentialBefore &&
+      cleanAfter.length > 0 &&
+      EXPLICIT_EXIT_RE.test(normalizeForExit(cleanAfter))
+    ) {
+      return wrap({
+        accept: false,
+        exitConversation: true,
+        wokeOnly: false,
+        addressed: true,
+        inConversation: false,
+        confidence: 0.96,
+        stage: "exit",
+        reason: "用户主动结束对话，回到待机模式",
+        wakeWord: wakeSpan.wakeWord,
+        command: "",
+        usedLlm: false,
+      });
+    }
+
+    // A1. 精确非模糊纯呼唤（例如“小派”、“嘿，小派”、“小派在吗”）
     const wakeOnlyPhrase =
       hasVocativeStart &&
       !hasReferentialBefore &&
       (cleanAfter.length === 0 || /^(?:在吗|你在吗|在不在|你好|您好)$/i.test(cleanAfter));
-    if (wakeOnlyPhrase && input.attentionMode !== "strict") {
+    if (!wakeSpan.fuzzy && wakeOnlyPhrase && input.attentionMode !== "strict") {
       return wrap({
         accept: true,
         wokeOnly: true,
@@ -993,40 +1097,157 @@ export async function evaluateVoiceAttention(
       });
     }
 
-    // A2. 句首明确呼唤（或背景音乐歌词前缀后紧跟呼唤且无第三人称语境）+ 清晰控制指令
-    // smart 模式下走快速通道，避免歌词前缀误杀或高延迟！
+    // A2. 精确非模糊句首呼唤 + 清晰控制指令（smart 模式且非 BGM 包裹、无第三人称语境）-> 0ms 快速通道
     if (
+      !wakeSpan.fuzzy &&
       input.attentionMode === "smart" &&
       !hasReferentialBefore &&
       !hasReferentialAfter &&
       looksDirectCommand &&
-      (hasVocativeStart || (isBgmContext && trimmedCmd.length >= 2))
+      hasVocativeStart &&
+      !isBgmContext
     ) {
       return wrap({
         accept: true,
         wokeOnly: false,
         addressed: true,
         inConversation: true,
-        confidence: hasVocativeStart ? 0.94 : 0.89,
+        confidence: 0.94,
         stage: "fast-wake",
-        reason: hasVocativeStart
-          ? `句首明确呼唤「${wakeSpan.wakeWord}」并下达操作指令`
-          : `音乐环境下识别到「${wakeSpan.wakeWord}」并紧跟明确控制指令（已剥离无关歌词）`,
+        reason: `句首明确呼唤「${wakeSpan.wakeWord}」并下达操作指令`,
         wakeWord: wakeSpan.wakeWord,
         command: trimmedCmd,
         usedLlm: false,
       });
     }
 
-    // A3. 存在歧义（句中提及唤醒词、第三人称/讨论信号、不明确的指令，或处于 strict 严格思考模式）：
-    // 先由 Pi Agent LLM 注意力门控认真思考“是不是在叫我”！
-    if (input.llmEvaluator) {
+    // A3-1. 主通道：SystemOne 单次批量唤醒注意力评估（含 intent 与可选双轨 asr_best）
+    let sysOneTransientFailure = false;
+    if (input.systemOneClient?.enabled) {
+      const s1 = await input.systemOneClient.evaluateWakeAttention(
+        {
+          utterance: cleaned,
+          altUtterance: input.altText,
+          wakeWords: input.wakeWords,
+          acousticEvent: input.acousticEvent,
+          speakerName: input.voiceprint?.speakerName ?? null,
+          acousticWake: input.acousticWake
+            ? { wakeWord: input.acousticWake.wakeWord, score: input.acousticWake.score }
+            : null,
+        },
+        {
+          includeIntent: true,
+          strict: input.attentionMode === "strict",
+        },
+      );
+      if (s1) {
+        if (s1.asrBest?.choice === "neither_noise" && s1.asrBest.confidence >= 0.75) {
+          return wrap({
+            accept: false,
+            wokeOnly: false,
+            addressed: false,
+            inConversation: inConversationEffective,
+            confidence: s1.asrBest.confidence,
+            stage: "systemone-attention",
+            reason: "SystemOne 判定双轨文本均为背景噪声/歌词，已忽略",
+            wakeWord: wakeSpan.wakeWord,
+            command: "",
+            usedLlm: true,
+            selectedText: "",
+          });
+        }
+
+        const selectedText =
+          s1.asrBest &&
+          (s1.asrBest.choice === "track_a" || s1.asrBest.choice === "track_b") &&
+          s1.asrBest.selectedText
+            ? s1.asrBest.selectedText
+            : cleaned;
+        const intentFields = s1.intent
+          ? { intent: s1.intent.choice, intentConfidence: s1.intent.confidence }
+          : {};
+        const selectedFields = selectedText !== cleaned ? { selectedText } : {};
+
+        if (!s1.accepted) {
+          return wrap({
+            accept: false,
+            wokeOnly: false,
+            addressed: false,
+            inConversation: inConversationEffective,
+            confidence: s1.confidence,
+            stage: "systemone-attention",
+            reason:
+              s1.decision === "ignore"
+                ? "SystemOne 判定为非定向提及/旁白/噪声，不执行操作"
+                : "SystemOne 置信度低于阈值，已保守忽略",
+            wakeWord: wakeSpan.wakeWord,
+            command: "",
+            usedLlm: true,
+            ...intentFields,
+            ...selectedFields,
+          });
+        }
+
+        if (s1.wokeOnly) {
+          return wrap({
+            accept: true,
+            wokeOnly: true,
+            addressed: true,
+            inConversation: true,
+            confidence: s1.confidence,
+            stage: "systemone-attention",
+            reason: `SystemOne 确认纯唤醒「${wakeSpan.wakeWord}」`,
+            wakeWord: wakeSpan.wakeWord,
+            command: "",
+            usedLlm: true,
+            ...intentFields,
+            ...selectedFields,
+          });
+        }
+
+        const effectiveSpan =
+          selectedText !== cleaned
+            ? (findWakeWordSpan(selectedText, input.wakeWords) ?? wakeSpan)
+            : wakeSpan;
+        const effectiveAfter = effectiveSpan.afterText;
+        const extractedCmd = effectiveAfter
+          ? isBgmContext
+            ? trimTrailingMusicLyrics(effectiveAfter)
+            : effectiveAfter
+          : effectiveSpan.beforeText &&
+              !VOCATIVE_PREFIX_RE.test(effectiveSpan.beforeText) &&
+              !REFERENTIAL_BEFORE_RE.test(effectiveSpan.beforeText)
+            ? effectiveSpan.beforeText
+            : "";
+
+        return wrap({
+          accept: true,
+          wokeOnly: extractedCmd.length === 0,
+          addressed: true,
+          inConversation: true,
+          confidence: s1.confidence,
+          stage: "systemone-attention",
+          reason: `SystemOne 确认呼唤「${effectiveSpan.wakeWord}」并下达指令`,
+          wakeWord: effectiveSpan.wakeWord,
+          command: extractedCmd,
+          usedLlm: true,
+          ...intentFields,
+          ...selectedFields,
+        });
+      }
+      const fk = input.systemOneClient.lastFailureKind;
+      sysOneTransientFailure = fk === "timeout" || fk === "network";
+    }
+
+    // A3-2. 预算感知降级：仅当 SystemOne 未启用或返回 unsupported/auth 时才回退到生成式 llmEvaluator；
+    // 若 SystemOne 已因 timeout/network 消耗延迟预算，直接进入 A4 零延迟确定性语用规则！
+    if (input.llmEvaluator && !sysOneTransientFailure) {
       const prompt = buildAttentionPrompt({
         text: cleaned,
         wakeWords: input.wakeWords,
         wakeSpan,
         awakeActive: Boolean(input.awakeActive),
-        inConversation: Boolean(input.inConversation),
+        inConversation: inConversationEffective,
         recentTurns: input.recentTurns ?? [],
         speakerName: input.voiceprint?.speakerName,
         speakerMatched: input.voiceprint?.evaluated ? input.voiceprint.matched : undefined,
@@ -1073,7 +1294,7 @@ export async function evaluateVoiceAttention(
       }
     }
 
-    // A4. 无 LLM（如本地引擎离线运行）时的确定性语用判别：
+    // A4. 无 LLM（如本地引擎离线运行或超时兜底）时的确定性语用判别：
     // 若无第三人称语境且唤醒词后紧跟明确智能家居指令，即使句首混入少量背景噪声/歌词也放行！
     if (!hasReferentialBefore && !hasReferentialAfter && looksDirectCommand) {
       return wrap({
@@ -1095,7 +1316,7 @@ export async function evaluateVoiceAttention(
         accept: false,
         wokeOnly: false,
         addressed: false,
-        inConversation: Boolean(input.inConversation),
+        inConversation: inConversationEffective,
         confidence: 0.82,
         stage: "pragmatic-reject",
         reason: hasReferentialBefore || hasReferentialAfter
@@ -1121,17 +1342,35 @@ export async function evaluateVoiceAttention(
     });
   }
 
-  // ==================== 情况 B：无唤醒词，但处于显式唤醒窗口或连续对话窗口 ====================
-  if (input.awakeActive || input.inConversation) {
+  // ==================== 情况 B：无唤醒词，但处于连续对话状态或显式唤醒窗口 ====================
+  if (inConversationEffective) {
     const cmd = cleaned.replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
 
-    // 明显是旁白/拟声词
+    // B1. 纯独立结束对话口令 -> 0ms 退出连续对话并回到待机
+    const normalizedExit = normalizeForExit(cmd);
+    if (normalizedExit.length > 0 && EXPLICIT_EXIT_RE.test(normalizedExit)) {
+      return wrap({
+        accept: false,
+        exitConversation: true,
+        wokeOnly: false,
+        addressed: true,
+        inConversation: false,
+        confidence: 0.96,
+        stage: "exit",
+        reason: "识别到明确结束对话口令，已回到待机模式",
+        wakeWord: null,
+        command: "",
+        usedLlm: false,
+      });
+    }
+
+    // B2. 明显是旁白/拟声词 -> 0ms 忽略并保留剩余对话窗口
     if (cmd.length <= 1 || OBVIOUS_SIDETALK_RE.test(cmd)) {
       return wrap({
         accept: false,
         wokeOnly: false,
         addressed: false,
-        inConversation: Boolean(input.inConversation),
+        inConversation: true,
         confidence: 0.88,
         stage: "pragmatic-reject",
         reason: "判定为非定向旁白/环境闲聊，未触发设备控制",
@@ -1141,7 +1380,118 @@ export async function evaluateVoiceAttention(
       });
     }
 
-    // 刚唤醒后的明确直接指令，或连续对话中极明确的续聊控制词
+    // B3. 主通道：SystemOne 5 轮连续对话决策（karpo/karpo-decision-31b）
+    let sysOneTransientFailure = false;
+    if (input.systemOneClient?.enabled) {
+      const recentHistory = (input.recentTurns ?? []).slice(-5).map((t) => ({
+        role: t.role,
+        text: t.text,
+      }));
+      const s1 = await input.systemOneClient.evaluateConversationTurn(
+        {
+          utterance: cleaned,
+          altUtterance: input.altText,
+          recentHistory,
+          wakeWords: input.wakeWords,
+          lastSpokenReply: input.lastSpokenReply,
+          acousticEvent: input.acousticEvent,
+          speakerName: input.voiceprint?.speakerName ?? null,
+        },
+        {
+          includeIntent: true,
+          strict: input.attentionMode === "strict",
+        },
+      );
+      if (s1) {
+        if (s1.asrBest?.choice === "neither_noise" && s1.asrBest.confidence >= 0.75) {
+          return wrap({
+            accept: false,
+            wokeOnly: false,
+            addressed: false,
+            inConversation: true,
+            confidence: s1.asrBest.confidence,
+            stage: "systemone-attention",
+            reason: "SystemOne 判定为背景噪声/歌词，保留对话窗口",
+            wakeWord: null,
+            command: "",
+            usedLlm: true,
+            selectedText: "",
+          });
+        }
+
+        const selectedText =
+          s1.asrBest &&
+          (s1.asrBest.choice === "track_a" || s1.asrBest.choice === "track_b") &&
+          s1.asrBest.selectedText
+            ? s1.asrBest.selectedText
+            : cleaned;
+        const effectiveCmd = selectedText
+          .replace(LEADING_PUNCT_RE, "")
+          .replace(TRAILING_PUNCT_RE, "")
+          .trim();
+        const intentFields = s1.intent
+          ? { intent: s1.intent.choice, intentConfidence: s1.intent.confidence }
+          : {};
+        const selectedFields = selectedText !== cleaned ? { selectedText } : {};
+
+        if (s1.shouldExitConversation) {
+          return wrap({
+            accept: false,
+            exitConversation: true,
+            wokeOnly: false,
+            addressed: true,
+            inConversation: false,
+            confidence: s1.confidence,
+            stage: "systemone-attention",
+            reason: "SystemOne 判定用户示意结束对话，已回到待机模式",
+            wakeWord: null,
+            command: "",
+            usedLlm: true,
+            ...intentFields,
+            ...selectedFields,
+          });
+        }
+
+        if (s1.accepted && effectiveCmd.length > 0) {
+          return wrap({
+            accept: true,
+            wokeOnly: false,
+            addressed: true,
+            inConversation: true,
+            confidence: s1.confidence,
+            stage: "systemone-attention",
+            reason: "SystemOne 确认正在继续与助手对话",
+            wakeWord: null,
+            command: effectiveCmd,
+            usedLlm: true,
+            ...intentFields,
+            ...selectedFields,
+          });
+        }
+
+        return wrap({
+          accept: false,
+          wokeOnly: false,
+          addressed: false,
+          inConversation: true,
+          confidence: s1.confidence,
+          stage: "systemone-attention",
+          reason:
+            s1.action === "side_talk"
+              ? "SystemOne 判定为旁白/闲聊，保留当前对话窗口"
+              : "SystemOne 置信度不足，已保守忽略并保留对话窗口",
+          wakeWord: null,
+          command: "",
+          usedLlm: true,
+          ...intentFields,
+          ...selectedFields,
+        });
+      }
+      const fk = input.systemOneClient.lastFailureKind;
+      sysOneTransientFailure = fk === "timeout" || fk === "network";
+    }
+
+    // B4. SystemOne 未启用或降级链：保持原有 smart 快速续聊 + llmEvaluator + 确定性降级
     const isClearDeviceCmd = DIRECT_COMMAND_START_RE.test(cmd) || CLEAR_FOLLOWUP_RE.test(cmd);
     if (input.attentionMode === "smart" && isClearDeviceCmd && (input.awakeActive || cmd.length <= 18)) {
       return wrap({
@@ -1158,14 +1508,14 @@ export async function evaluateVoiceAttention(
       });
     }
 
-    // 连续对话窗口内的不确定语句 -> 由 Pi Agent LLM 注意力门控判断是否仍在与助手对话！
-    if (input.llmEvaluator) {
+    // 连续对话窗口内的不确定语句 -> 由 Pi Agent LLM 注意力门控判断是否仍在与助手对话
+    if (input.llmEvaluator && !sysOneTransientFailure) {
       const prompt = buildAttentionPrompt({
         text: cleaned,
         wakeWords: input.wakeWords,
         wakeSpan: null,
         awakeActive: Boolean(input.awakeActive),
-        inConversation: Boolean(input.inConversation),
+        inConversation: true,
         recentTurns: input.recentTurns ?? [],
         speakerName: input.voiceprint?.speakerName,
         speakerMatched: input.voiceprint?.evaluated ? input.voiceprint.matched : undefined,
@@ -1221,6 +1571,19 @@ export async function evaluateVoiceAttention(
         usedLlm: false,
       });
     }
+
+    return wrap({
+      accept: false,
+      wokeOnly: false,
+      addressed: false,
+      inConversation: true,
+      confidence: 0.85,
+      stage: "pragmatic-reject",
+      reason: "连续对话窗口内未识别为明确指令，已忽略并保留对话窗口",
+      wakeWord: null,
+      command: "",
+      usedLlm: false,
+    });
   }
 
   return wrap({

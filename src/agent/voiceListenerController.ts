@@ -11,12 +11,21 @@ import {
   isLocalEndpointUrl,
   resolveEffectiveSttAuth,
   type AgentVoiceConfig,
+  type CavemanReplyMode,
 } from "../core/agentConfigStore.ts";
 import { TypedEmitter } from "../core/contracts.ts";
 import { createBoundedFetch, type FetchLike } from "../core/httpTimeout.ts";
 import { decodeWavPcm, encodeWavPcm16, isWavBuffer, resampleLinear } from "./audioPcm.ts";
+import { formatExitConversationAck, formatWakeAck } from "./cavemanReplyPolicy.ts";
 import { LocalVoiceEngine, type LocalVoiceEngineStatus } from "./localVoiceEngine.ts";
+import type {
+  OpenWakeWordBootstrapResult,
+  OpenWakeWordEngineStatus,
+  OpenWakeWordEnrollResult,
+  WakeWordAcousticHit,
+} from "./openWakeWordEngine.ts";
 import type { AgentToolCallRecord, PiAgentRunResult, PiAgentService } from "./piAgentService.ts";
+import type { CommandIntentChoice, SystemOneHealthSnapshot } from "./systemOneClient.ts";
 import type { VoiceStreamSegmentPayload } from "./voiceStreamSession.ts";
 import {
   evaluateVoiceAttention,
@@ -33,9 +42,21 @@ import {
   type VoiceprintIdentifyResult,
   type VoiceprintRole,
 } from "./voiceprintStore.ts";
+import {
+  deleteWakeWordPrototypeById,
+  deleteWakeWordPrototypesForWord,
+  getPrototypesForWords,
+  listWakeWordPrototypeSummaries,
+  type WakeWordPrototypeSummary,
+} from "./wakewordPrototypeStore.ts";
 
 export type VoiceListenMode = "idle" | "listening" | "awake" | "processing" | "speaking" | "error";
+export type VoiceDialogState = "standby" | "conversation";
 export type VoiceRuntimeEngine = "local" | "browser" | "whisper" | "manual";
+
+export interface WakeWordSpotRecord extends WakeWordAcousticHit {
+  timestamp: number;
+}
 
 export interface VoicePipelineTimings {
   denoiseMs?: number;
@@ -60,6 +81,8 @@ export interface VoiceTranscriptEntry {
   speakerScore?: number;
   attentionStage?: AttentionDecision["stage"];
   attentionReason?: string;
+  intent?: CommandIntentChoice;
+  acousticWakeScore?: number;
   snrGainDb?: number;
   timings?: VoicePipelineTimings;
 }
@@ -71,6 +94,8 @@ export interface VoiceLastMetrics {
   speechRatio?: number;
   asrEngine?: string;
   voiceprint?: VoiceprintIdentifyResult | null;
+  acousticWake?: WakeWordAcousticHit | null;
+  intent?: CommandIntentChoice;
   attention?: AttentionDecision | null;
   timings?: VoicePipelineTimings | null;
   updatedAt: number;
@@ -79,6 +104,15 @@ export interface VoiceLastMetrics {
 export interface VoiceListenerSnapshot {
   active: boolean;
   mode: VoiceListenMode;
+  dialogState: VoiceDialogState;
+  dialogEpoch: number;
+  serverNow: number;
+  timerPaused: boolean;
+  conversationRemainingMs: number;
+  conversationWindowSec: number;
+  maxConsecutiveSidetalk: number;
+  consecutiveSidetalkCount: number;
+  lastTransitionReason: string | null;
   engine: VoiceRuntimeEngine;
   interimTranscript: string;
   lastTranscript: string;
@@ -92,7 +126,15 @@ export interface VoiceListenerSnapshot {
   attentionMode: AgentVoiceConfig["attentionMode"];
   noiseSuppressionMode: AgentVoiceConfig["noiseSuppressionMode"];
   voiceprintMode: AgentVoiceConfig["voiceprintMode"];
+  cavemanMode: CavemanReplyMode;
+  owwEnabled: boolean;
+  owwThreshold: number;
   localEngine: LocalVoiceEngineStatus;
+  openWakeWord: OpenWakeWordEngineStatus;
+  wakeWordPrototypes: WakeWordPrototypeSummary[];
+  lastWakeHit: WakeWordSpotRecord | null;
+  systemOneHealth: SystemOneHealthSnapshot | null;
+  systemOne: SystemOneHealthSnapshot | null;
   voiceprints: PublicVoiceprintProfile[];
   lastMetrics: VoiceLastMetrics | null;
   history: VoiceTranscriptEntry[];
@@ -112,6 +154,10 @@ export interface HandleTranscriptOptions {
   now?: number;
   segmentDurationMs?: number;
   acousticEvent?: string;
+  altText?: string;
+  acousticWake?: WakeWordAcousticHit | null;
+  owwEvaluated?: boolean;
+  owwActiveForWord?: boolean;
   voiceprint?: VoiceprintIdentifyResult | null;
   snrGainDb?: number;
   timingsBase?: Partial<VoicePipelineTimings>;
@@ -127,6 +173,7 @@ export interface HandleTranscriptResult {
   toolCalls?: AgentToolCallRecord[];
   attention?: AttentionDecision;
   voiceprint?: VoiceprintIdentifyResult | null;
+  acousticWake?: WakeWordAcousticHit | null;
   timings?: VoicePipelineTimings;
   error?: string;
   voiceState: VoiceListenerSnapshot;
@@ -209,6 +256,15 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
 
   private _active = false;
   private _mode: VoiceListenMode = "idle";
+  private _dialogState: VoiceDialogState = "standby";
+  private _dialogEpoch = 0;
+  private _conversationTimer: ReturnType<typeof setTimeout> | null = null;
+  private _timerPaused = false;
+  private _remainingConversationMs = 0;
+  private _speechInProgress = false;
+  private _consecutiveSidetalkCount = 0;
+  private _lastTransitionReason: string | null = null;
+  private _lastWakeHit: WakeWordSpotRecord | null = null;
   private _engine: VoiceRuntimeEngine = "local";
   private _interimTranscript = "";
   private _lastTranscript = "";
@@ -250,6 +306,180 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     return this._localEngine;
   }
 
+  get dialogState(): VoiceDialogState {
+    return this._dialogState;
+  }
+
+  private _clearConversationTimer(): void {
+    if (this._conversationTimer !== null) {
+      clearTimeout(this._conversationTimer);
+      this._conversationTimer = null;
+    }
+  }
+
+  private _armConversationTimer(durationMs: number, epoch: number): void {
+    this._clearConversationTimer();
+    if (durationMs <= 0 || this._dialogState !== "conversation") {
+      return;
+    }
+    this._remainingConversationMs = Math.max(0, Math.round(durationMs));
+    if (this._timerPaused) {
+      return;
+    }
+    this._conversationTimer = setTimeout(() => {
+      this._conversationTimer = null;
+      if (this._dialogState !== "conversation" || this._dialogEpoch !== epoch) {
+        return;
+      }
+      if (this._timerPaused) {
+        return;
+      }
+      if (this._speechInProgress) {
+        const extendMs = 3500;
+        this._conversationUntil = Date.now() + extendMs;
+        this._armConversationTimer(extendMs, epoch);
+        this.emit("stateChanged", this.snapshot());
+        return;
+      }
+      this.exitConversation("timeout", { speakAck: false });
+    }, Math.max(50, Math.round(durationMs)));
+    (this._conversationTimer as { unref?: () => void }).unref?.();
+  }
+
+  /**
+   * 显式进入连续对话状态（由服务端状态机托管倒计时，到期自动推 WS 回归待机）。
+   */
+  enterConversation(
+    reason: string,
+    options: { speakAck?: boolean; now?: number; speakerName?: string | null } = {},
+  ): VoiceListenerSnapshot {
+    const now = options.now ?? Date.now();
+    const cfg = this.config;
+    const ttsGraceMs = options.speakAck && cfg.autoSpeakReply ? 1200 : 0;
+    this._dialogEpoch += 1;
+    const epoch = this._dialogEpoch;
+    this._dialogState = "conversation";
+    this._consecutiveSidetalkCount = 0;
+    this._lastTransitionReason = reason;
+    this._timerPaused = false;
+    this._awakeUntil = now + cfg.wakeWindowSec * 1000 + ttsGraceMs;
+    const convMs =
+      cfg.conversationWindowSec > 0 ? cfg.conversationWindowSec * 1000 + ttsGraceMs : 0;
+    this._conversationUntil = convMs > 0 ? now + convMs : null;
+    this._remainingConversationMs = convMs > 0 ? convMs : cfg.wakeWindowSec * 1000 + ttsGraceMs;
+    this._mode = "awake";
+
+    if (convMs > 0) {
+      this._armConversationTimer(convMs, epoch);
+    } else {
+      this._clearConversationTimer();
+    }
+
+    const snap = this.snapshot();
+    this.emit("stateChanged", snap);
+    if (options.speakAck && cfg.autoSpeakReply) {
+      const ack = formatWakeAck(cfg.cavemanMode, options.speakerName);
+      this._recordSpoken(ack, now);
+      this.emit("speakRequested", ack);
+    }
+    return snap;
+  }
+
+  /**
+   * 显式退出连续对话状态并回归待机监听。
+   */
+  exitConversation(
+    reason: string,
+    options: { speakAck?: boolean; now?: number } = {},
+  ): VoiceListenerSnapshot {
+    const now = options.now ?? Date.now();
+    const cfg = this.config;
+    this._dialogEpoch += 1;
+    this._clearConversationTimer();
+    this._dialogState = "standby";
+    this._awakeUntil = null;
+    this._conversationUntil = null;
+    this._remainingConversationMs = 0;
+    this._timerPaused = false;
+    this._consecutiveSidetalkCount = 0;
+    this._lastTransitionReason = reason;
+    if (this._mode !== "processing" && this._mode !== "error") {
+      this._mode = this._active ? "listening" : "idle";
+    }
+
+    const snap = this.snapshot();
+    this.emit("stateChanged", snap);
+    if (options.speakAck && cfg.autoSpeakReply) {
+      const ack = formatExitConversationAck(cfg.cavemanMode);
+      this._recordSpoken(ack, now);
+      this.emit("speakRequested", ack);
+    }
+    return snap;
+  }
+
+  /**
+   * 切换待机 / 连续对话状态（供标题栏胶囊按钮与快捷键调用）。
+   */
+  toggleConversation(): VoiceListenerSnapshot {
+    if (this._dialogState === "conversation") {
+      return this.exitConversation("manual_toggle", { speakAck: false });
+    }
+    return this.enterConversation("manual_toggle", { speakAck: false });
+  }
+
+  /**
+   * TTS 播报开始/结束通知：暂停/恢复对话倒计时，绝不覆盖 dialogState 或 mode="awake"。
+   */
+  setTtsSpeaking(speaking: boolean): void {
+    if (speaking) {
+      if (!this._timerPaused && this._dialogState === "conversation" && this._conversationUntil !== null) {
+        this._remainingConversationMs = Math.max(1000, this._conversationUntil - Date.now());
+      }
+      this._timerPaused = true;
+      this._clearConversationTimer();
+      return;
+    }
+    if (!this._timerPaused) return;
+    this._timerPaused = false;
+    if (this._dialogState === "conversation" && this.config.conversationWindowSec > 0) {
+      const resumeMs = Math.max(
+        3000,
+        this._remainingConversationMs > 0
+          ? this._remainingConversationMs
+          : this.config.conversationWindowSec * 1000,
+      );
+      this._conversationUntil = Date.now() + resumeMs;
+      this._armConversationTimer(resumeMs, this._dialogEpoch);
+      this.emit("stateChanged", this.snapshot());
+    }
+  }
+
+  /**
+   * 实时说话活动通知：若用户正说到一半临近超时，自动顺延 +3500ms 防止中断。
+   */
+  setSpeechInProgress(speaking: boolean): void {
+    this._speechInProgress = speaking;
+    if (
+      speaking &&
+      this._dialogState === "conversation" &&
+      !this._timerPaused &&
+      this.config.conversationWindowSec > 0 &&
+      this._conversationUntil !== null
+    ) {
+      const remaining = this._conversationUntil - Date.now();
+      if (remaining < 3500) {
+        const extended = Math.max(3500, remaining + 3500);
+        this._conversationUntil = Date.now() + extended;
+        this._armConversationTimer(extended, this._dialogEpoch);
+        this.emit("stateChanged", this.snapshot());
+      }
+    }
+  }
+
+  recordWakeWordSpot(hit: WakeWordAcousticHit): void {
+    this._lastWakeHit = { ...hit, timestamp: Date.now() };
+  }
+
   private _recordSpoken(text: string, now = Date.now()): void {
     const t = text.trim();
     if (!t) return;
@@ -271,17 +501,31 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     if (patch.active !== undefined) {
       this._active = Boolean(patch.active);
       if (!this._active) {
+        this._clearConversationTimer();
+        this._dialogEpoch += 1;
+        this._dialogState = "standby";
         this._mode = "idle";
         this._interimTranscript = "";
         this._awakeUntil = null;
         this._conversationUntil = null;
+        this._remainingConversationMs = 0;
+        this._timerPaused = false;
+        this._speechInProgress = false;
+        this._consecutiveSidetalkCount = 0;
+        this._lastTransitionReason = "stopped";
       } else if (this._mode === "idle" || this._mode === "error") {
         this._mode = "listening";
         this._error = null;
       }
       if (this._active) {
-        // 用户开启监听时异步预热本地 ONNX 模型，消除首句冷启动延迟
+        // 开启监听时预连接 SystemOne 网关，并异步预热本地 ONNX 模型与 openWakeWord 零样本原型
+        this._agent.systemOneClient?.preconnect();
         void this._localEngine.warmup();
+        if (this.config.owwEnabled) {
+          void this._localEngine.openWakeWord
+            .bootstrapWakeWords(this.config.wakeWords)
+            .catch(() => {});
+        }
       }
     }
     if (patch.engine !== undefined) {
@@ -361,34 +605,64 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     if (!awakeActive && this._awakeUntil !== null) {
       this._awakeUntil = null;
     }
-    const inConversation =
-      awakeActive ||
-      (cfg.conversationWindowSec > 0 &&
-        this._conversationUntil !== null &&
-        (now < this._conversationUntil || speechStartedAt < this._conversationUntil));
-    if (!inConversation && this._conversationUntil !== null) {
+    const convWindowActive =
+      cfg.conversationWindowSec > 0 &&
+      this._conversationUntil !== null &&
+      (now < this._conversationUntil || speechStartedAt < this._conversationUntil);
+    if (!convWindowActive && this._conversationUntil !== null) {
       this._conversationUntil = null;
     }
+    if (
+      this._dialogState === "conversation" &&
+      !awakeActive &&
+      !convWindowActive &&
+      !this._timerPaused
+    ) {
+      this._dialogState = "standby";
+      this._clearConversationTimer();
+      this._consecutiveSidetalkCount = 0;
+      this._lastTransitionReason = "timeout";
+    }
+    const inConversation =
+      this._dialogState === "conversation" || awakeActive || convWindowActive;
 
     const llmEvaluator: AttentionLlmEvaluator | undefined =
       options.llmAttentionOverride ??
       (cfg.provider !== "local"
         ? async (promptText: string) => {
-            const raw = await this._agent.evaluateAttention(promptText, 7000);
+            const raw = await this._agent.evaluateAttention(promptText, 3500);
             if (!raw) throw new Error("no llm verdict");
             return raw;
           }
         : undefined);
 
+    const wakeSpanForOww = findWakeWordSpan(text, cfg.wakeWords);
+    const owwActiveForWord =
+      options.owwActiveForWord ??
+      (Boolean(options.owwEvaluated) &&
+        cfg.owwEnabled &&
+        this._localEngine.openWakeWord.isReady &&
+        Boolean(wakeSpanForOww) &&
+        getPrototypesForWords([wakeSpanForOww!.wakeWord]).length > 0);
+
+    if (options.acousticWake?.matched) {
+      this._lastWakeHit = { ...options.acousticWake, timestamp: now };
+    }
+
     const decision = await evaluateVoiceAttention({
       rawText: text,
+      altText: options.altText,
       wakeWordEnabled: cfg.wakeWordEnabled,
       wakeWords: cfg.wakeWords,
       attentionMode: cfg.attentionMode,
       bypassWakeWord: options.bypassWakeWord,
       awakeActive,
       inConversation,
-      recentTurns: this._agent.recentConversationTurns(6),
+      dialogState: this._dialogState,
+      acousticWake: options.acousticWake ?? null,
+      owwActiveForWord,
+      systemOneClient: this._agent.systemOneClient,
+      recentTurns: this._agent.recentConversationTurns(5),
       lastSpokenReply: this._lastSpokenReply,
       lastSpokenAt: this._lastSpokenAt,
       now,
@@ -420,6 +694,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       speakerScore: options.voiceprint?.evaluated ? options.voiceprint.score : undefined,
       attentionStage: decision.stage,
       attentionReason: decision.reason,
+      ...(decision.intent ? { intent: decision.intent } : {}),
+      ...(options.acousticWake ? { acousticWakeScore: options.acousticWake.score } : {}),
       snrGainDb: options.snrGainDb,
       timings,
     };
@@ -431,29 +707,22 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._lastMetrics = {
       ...(this._lastMetrics ?? {}),
       voiceprint: options.voiceprint ?? this._lastMetrics?.voiceprint ?? null,
+      acousticWake: options.acousticWake ?? this._lastMetrics?.acousticWake ?? null,
+      ...(decision.intent ? { intent: decision.intent } : {}),
       attention: decision,
       timings,
       updatedAt: now,
     };
 
-    // 仅唤醒词：开启唤醒等待窗口与对话窗口（播报“我在，请说指令”期间额外预留 2.5s 语音播报宽限，避免短唤醒窗口被播报吃掉）
+    // 仅唤醒词：切入连续对话状态并播报 Caveman 唤醒确认（“在呢” / “${name}，在呢”）
     if (decision.accept && decision.wokeOnly) {
-      const ttsGraceMs = cfg.autoSpeakReply ? 2500 : 0;
-      this._awakeUntil = now + cfg.wakeWindowSec * 1000 + ttsGraceMs;
-      if (cfg.conversationWindowSec > 0) {
-        this._conversationUntil = now + cfg.conversationWindowSec * 1000 + ttsGraceMs;
-      }
-      this._mode = "awake";
-      const wakeReply = options.voiceprint?.speakerName
-        ? `${options.voiceprint.speakerName}，我在，请说指令`
-        : "我在，请说指令";
+      const wakeReply = formatWakeAck(cfg.cavemanMode, options.voiceprint?.speakerName);
       entry.reply = wakeReply;
-      const snap = this.snapshot();
-      this.emit("stateChanged", snap);
-      if (cfg.autoSpeakReply) {
-        this._recordSpoken(wakeReply, now);
-        this.emit("speakRequested", wakeReply);
-      }
+      const snap = this.enterConversation("wake_only", {
+        speakAck: true,
+        now,
+        speakerName: options.voiceprint?.speakerName,
+      });
       return {
         ok: true,
         matched: true,
@@ -462,17 +731,54 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         reply: wakeReply,
         attention: decision,
         voiceprint: options.voiceprint,
+        acousticWake: options.acousticWake ?? null,
         timings,
         voiceState: snap,
       };
     }
 
-    // 注意力门控拒绝（非定向提及/旁白/回声/声纹未通过）
-    // 仅在显式告别词时提前结束对话窗口，旁白/他人插话/回声不破坏用户当前剩余的短时对话窗口
+    // 显式退出连续对话（纯告别口令或 SystemOne goodbye 判定）：立即回到待机并播报“已待机”，不调用 Pi Agent
+    if (decision.exitConversation === true) {
+      const exitReply = formatExitConversationAck(cfg.cavemanMode);
+      entry.reply = exitReply;
+      const snap = this.exitConversation(
+        decision.stage === "systemone-attention" ? "systemone_goodbye" : "explicit_exit",
+        { speakAck: true, now },
+      );
+      return {
+        ok: true,
+        matched: false,
+        wokeOnly: false,
+        command: "",
+        reply: exitReply,
+        attention: decision,
+        voiceprint: options.voiceprint,
+        acousticWake: options.acousticWake ?? null,
+        timings,
+        voiceState: snap,
+      };
+    }
+
+    // 注意力门控拒绝（非定向提及/旁白/回声/声纹未通过/声学否决）
     if (!decision.accept || !decision.command) {
-      if (/(?:退下|再见|拜拜|不用了|没事了|闭嘴|安静|休息吧)/.test(text)) {
-        this._awakeUntil = null;
-        this._conversationUntil = null;
+      if (this._dialogState === "conversation") {
+        if (decision.stage !== "echo") {
+          this._consecutiveSidetalkCount += 1;
+          if (this._consecutiveSidetalkCount >= cfg.maxConsecutiveSidetalk) {
+            const snap = this.exitConversation("sidetalk_limit", { speakAck: false, now });
+            return {
+              ok: true,
+              matched: false,
+              wokeOnly: false,
+              command: "",
+              attention: decision,
+              voiceprint: options.voiceprint,
+              acousticWake: options.acousticWake ?? null,
+              timings,
+              voiceState: snap,
+            };
+          }
+        }
       }
       if (this._active && this._mode !== "awake") {
         this._mode = "listening";
@@ -486,12 +792,15 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         command: "",
         attention: decision,
         voiceprint: options.voiceprint,
+        acousticWake: options.acousticWake ?? null,
         timings,
         voiceState: snap,
       };
     }
 
     // 确认在呼叫/对话：进入 Pi Agent 工具执行循环
+    const commandEpoch = this._dialogEpoch;
+    this._consecutiveSidetalkCount = 0;
     this._awakeUntil = null;
     this._lastDispatchedText = text;
     this._lastDispatchedAt = now;
@@ -508,6 +817,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         speakerScore: options.voiceprint?.score,
         wakeWord: decision.wakeWord,
         attentionReason: decision.reason,
+        ...(decision.intent ? { intent: decision.intent } : {}),
       },
     });
     const agentMs = Math.round(performance.now() - agentStart);
@@ -527,12 +837,26 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       entry.error = runResult.error;
     }
 
-    // 执行完成后刷新连续对话窗口（后续多轮追问无需重复喊唤醒词，由注意力门控区分续聊与旁白）
-    if (cfg.conversationWindowSec > 0 && runResult.ok) {
-      this._conversationUntil = Date.now() + cfg.conversationWindowSec * 1000;
+    // 执行完成后若 epoch 未被手动退出打断，则维护双状态机连续对话窗口
+    if (commandEpoch === this._dialogEpoch) {
+      if (cfg.conversationWindowSec > 0 && runResult.ok) {
+        const convMs = cfg.conversationWindowSec * 1000;
+        this._dialogState = "conversation";
+        this._consecutiveSidetalkCount = 0;
+        this._lastTransitionReason = "command_done";
+        this._conversationUntil = Date.now() + convMs;
+        this._remainingConversationMs = convMs;
+        this._armConversationTimer(convMs, this._dialogEpoch);
+      } else if (cfg.conversationWindowSec <= 0) {
+        this._dialogState = "standby";
+        this._conversationUntil = null;
+        this._remainingConversationMs = 0;
+        this._clearConversationTimer();
+        this._lastTransitionReason = "command_done_no_window";
+      }
+      this._mode = this._active ? "listening" : "idle";
     }
 
-    this._mode = this._active ? "listening" : "idle";
     this._lastMetrics = {
       ...(this._lastMetrics ?? {}),
       attention: decision,
@@ -558,6 +882,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       toolCalls: runResult.toolCalls,
       attention: decision,
       voiceprint: options.voiceprint,
+      acousticWake: options.acousticWake ?? null,
       timings,
       ...(runResult.error ? { error: runResult.error } : {}),
       voiceState: finalSnap,
@@ -682,6 +1007,18 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       voiceprintResult = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
     }
 
+    // ---- Stage 4.5: 本地 openWakeWord 离线句首声学唤醒打分 ----
+    const owwEvaluated = Boolean(cfg.owwEnabled && this._localEngine.openWakeWord.isReady);
+    const acousticWake = owwEvaluated
+      ? this._localEngine.scoreWakeWordAudio(vad.speechSamples, cfg.wakeWords, {
+          threshold: cfg.owwThreshold,
+          headOnlySec: 2.0,
+        })
+      : null;
+    if (acousticWake?.matched) {
+      this._lastWakeHit = { ...acousticWake, timestamp: Date.now() };
+    }
+
     // ---- Stage 5: 语音识别（优先本地离线 SenseVoiceSmall int8，降级云端 Whisper） ----
     const sttAuth = resolveEffectiveSttAuth(cfg);
     const hasCloudStt = Boolean(sttAuth.baseUrl && (sttAuth.apiKey || isLocalEndpointUrl(sttAuth.baseUrl)));
@@ -689,6 +1026,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const pref = options.preferredEngine ?? (cfg.voiceEngine === "whisper" ? "whisper" : "auto");
 
     let transcript = "";
+    let altText: string | undefined;
     let acousticEvent = "";
     let asrEngine = "sensevoice-local";
     let asrMs = 0;
@@ -698,13 +1036,16 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       pref === "local" || (pref === "auto" && localReady) || (pref === "whisper" && !hasCloudStt && localReady);
 
     if (useLocal) {
-      // 双轨抗音乐/强噪融合识别：同时参考高通原始轨（零降噪伪影）与神经降噪轨，避免音乐场景吞字或误词！
+      // 双轨抗音乐/强噪融合识别：同时参考高通原始轨（零降噪伪影）与神经降噪轨，并结合 openWakeWord 与 SystemOne！
       const sv = await this._localEngine.transcribeDualTrack(pcm16k, vad.speechSamples, {
         voiceLang: lang,
         wakeWords: cfg.wakeWords,
         inputSnrDb: denoised.inputSnrDb,
+        systemOneClient: this._agent.systemOneClient,
+        acousticWake,
       });
       transcript = sv.text;
+      altText = sv.altText;
       acousticEvent = sv.event;
       asrEngine = sv.engine;
       asrMs = sv.durationMs;
@@ -727,6 +1068,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       speechRatio: vad.speechRatio,
       asrEngine,
       voiceprint: voiceprintResult,
+      acousticWake,
       updatedAt: Date.now(),
     };
 
@@ -752,6 +1094,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         speechRatio: vad.speechRatio,
         acousticEvent,
         voiceprint: voiceprintResult,
+        acousticWake,
         matched: false,
         wokeOnly: false,
         command: "",
@@ -767,6 +1110,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       engine: runtimeEngine,
       segmentDurationMs: Math.round((pcm16k.length / 16000) * 1000),
       acousticEvent,
+      altText,
+      acousticWake,
+      owwEvaluated,
       voiceprint: voiceprintResult,
       snrGainDb: denoised.snrGainDb,
       timingsBase,
@@ -785,6 +1131,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       snrGainDb: denoised.snrGainDb,
       speechRatio: vad.speechRatio,
       acousticEvent,
+      acousticWake,
     };
   }
 
@@ -817,7 +1164,22 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       voiceprintResult = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
     }
 
-    // 2. 双轨语音识别（优先本地 SenseVoice 双轨融合，降级云端 Whisper）
+    // 1.5 openWakeWord 声学命中（优先使用流式实时峰值，否则对当前音频段句首补打分）
+    const owwEvaluated = Boolean(cfg.owwEnabled && this._localEngine.openWakeWord.isReady);
+    const acousticWake =
+      segment.acousticWake !== undefined
+        ? segment.acousticWake
+        : owwEvaluated
+          ? this._localEngine.scoreWakeWordAudio(vpAudio, cfg.wakeWords, {
+              threshold: cfg.owwThreshold,
+              headOnlySec: 2.0,
+            })
+          : null;
+    if (acousticWake?.matched) {
+      this._lastWakeHit = { ...acousticWake, timestamp: Date.now() };
+    }
+
+    // 2. 双轨语音识别（优先本地 SenseVoice 双轨融合 + openWakeWord + SystemOne，降级云端 Whisper）
     const sttAuth = resolveEffectiveSttAuth(cfg);
     const hasCloudStt = Boolean(
       sttAuth.baseUrl && (sttAuth.apiKey || isLocalEndpointUrl(sttAuth.baseUrl)),
@@ -830,6 +1192,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       (pref === "whisper" && !hasCloudStt && localReady);
 
     let transcript = "";
+    let altText: string | undefined;
     let acousticEvent = "";
     let asrEngine = "sensevoice-dual-raw";
     let asrMs = 0;
@@ -844,9 +1207,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           wakeWords: cfg.wakeWords,
           inputSnrDb: segment.inputSnrDb,
           forceDual: segment.forcedRoll || segment.inputSnrDb < 20,
+          systemOneClient: this._agent.systemOneClient,
+          acousticWake,
         },
       );
       transcript = sv.text;
+      altText = sv.altText;
       acousticEvent = sv.event;
       asrEngine = sv.engine;
       asrMs = sv.durationMs;
@@ -868,6 +1234,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       speechRatio: 1,
       asrEngine,
       voiceprint: voiceprintResult,
+      acousticWake,
       updatedAt: Date.now(),
     };
 
@@ -884,6 +1251,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         snrGainDb: segment.snrGainDb,
         acousticEvent,
         voiceprint: voiceprintResult,
+        acousticWake,
         matched: false,
         wokeOnly: false,
         command: "",
@@ -898,6 +1266,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       engine: runtimeEngine,
       segmentDurationMs: Math.round(segment.durationSec * 1000),
       acousticEvent,
+      altText,
+      acousticWake,
+      owwEvaluated,
       voiceprint: voiceprintResult,
       snrGainDb: segment.snrGainDb,
       timingsBase: { voiceprintMs, asrMs },
@@ -915,6 +1286,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       outputSnrDb: segment.outputSnrDb,
       snrGainDb: segment.snrGainDb,
       acousticEvent,
+      acousticWake,
     };
   }
 
@@ -1009,6 +1381,121 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   }
 
   /**
+   * 录制并注册自定义唤醒词真声原型（openWakeWord 本地 96 维语音嵌入，0ms / +40ms 双相位保存）。
+   */
+  async enrollWakeWordFromAudio(
+    audioBlob: Blob,
+    wakeWord: string,
+    options: { voiceTag?: string } = {},
+  ): Promise<OpenWakeWordEnrollResult & { prototypes: WakeWordPrototypeSummary[] }> {
+    const cleanWord = wakeWord.trim();
+    if (!cleanWord) {
+      throw new Error("唤醒词不能为空");
+    }
+    const rawBuf = new Uint8Array(await audioBlob.arrayBuffer());
+    const decoded = decodeWavPcm(rawBuf);
+    const pcm16k =
+      decoded.sampleRate === 16000
+        ? decoded.samples
+        : resampleLinear(decoded.samples, decoded.sampleRate, 16000);
+
+    this._localEngine.openWakeWord.ensureLoaded();
+    const enrolled = this._localEngine.openWakeWord.enrollSample(cleanWord, pcm16k, options);
+    const prototypes = listWakeWordPrototypeSummaries(this.config.wakeWords);
+    this.emit("stateChanged", this.snapshot());
+    return {
+      ...enrolled,
+      prototypes,
+    };
+  }
+
+  /**
+   * 离线唤醒词声学测试：对上传 WAV 音频执行 openWakeWord 打分并返回最高命中与得分。
+   */
+  async verifyWakeWordFromAudio(
+    audioBlob: Blob,
+    wakeWords?: readonly string[],
+  ): Promise<{
+    hit: WakeWordAcousticHit | null;
+    matched: boolean;
+    wakeWords: string[];
+    threshold: number;
+    latencyMs: number;
+    durationMs: number;
+  }> {
+    const t0 = performance.now();
+    const rawBuf = new Uint8Array(await audioBlob.arrayBuffer());
+    const decoded = decodeWavPcm(rawBuf);
+    const pcm16k =
+      decoded.sampleRate === 16000
+        ? decoded.samples
+        : resampleLinear(decoded.samples, decoded.sampleRate, 16000);
+
+    const targetWords = wakeWords && wakeWords.length > 0 ? [...wakeWords] : [...this.config.wakeWords];
+    const threshold = this.config.owwThreshold;
+    this._localEngine.openWakeWord.ensureLoaded();
+    const hit = this._localEngine.scoreWakeWordAudio(pcm16k, targetWords, { threshold });
+    const durationMs = Number((performance.now() - t0).toFixed(2));
+    return {
+      hit,
+      matched: Boolean(hit?.matched),
+      wakeWords: targetWords,
+      threshold,
+      latencyMs: durationMs,
+      durationMs,
+    };
+  }
+
+  /**
+   * 触发 openWakeWord 零样本多音色 TTS 原型预热（幂等，绝不覆盖用户真声录制样本）。
+   */
+  async bootstrapWakeWords(
+    wakeWords?: readonly string[],
+    force = false,
+  ): Promise<OpenWakeWordBootstrapResult & { prototypes: WakeWordPrototypeSummary[] }> {
+    const targetWords = wakeWords && wakeWords.length > 0 ? [...wakeWords] : [...this.config.wakeWords];
+    this._localEngine.openWakeWord.ensureLoaded();
+    const result = await this._localEngine.openWakeWord.bootstrapWakeWords(targetWords, { force });
+    const prototypes = listWakeWordPrototypeSummaries(this.config.wakeWords);
+    this.emit("stateChanged", this.snapshot());
+    return {
+      ...result,
+      prototypes,
+    };
+  }
+
+  /**
+   * 删除指定 ID 的单条唤醒词原型，或删除某唤醒词对应的全部/仅用户录制原型。
+   */
+  removeWakeWordPrototype(
+    target: string,
+    enrolledOnly = false,
+  ): { deleted: boolean; removedCount: number; prototypes: WakeWordPrototypeSummary[] } {
+    const clean = target.trim();
+    if (!clean) {
+      return {
+        deleted: false,
+        removedCount: 0,
+        prototypes: listWakeWordPrototypeSummaries(this.config.wakeWords),
+      };
+    }
+    let removedCount = 0;
+    if (deleteWakeWordPrototypeById(clean)) {
+      removedCount = 1;
+    } else {
+      removedCount = deleteWakeWordPrototypesForWord(clean, { enrolledOnly });
+    }
+    if (removedCount > 0) {
+      this.emit("stateChanged", this.snapshot());
+    }
+    return {
+      deleted: removedCount > 0,
+      removedCount,
+      prototypes: listWakeWordPrototypeSummaries(this.config.wakeWords),
+    };
+  }
+
+  /**
    * 调用 OpenAI 兼容 /audio/transcriptions 接口（Whisper / SenseVoice / SiliconFlow / 本地 Whisper）转写音频。
    */
   async transcribeAudio(
@@ -1067,18 +1554,48 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   }
 
   clearHistory(): void {
+    this._clearConversationTimer();
+    this._dialogEpoch += 1;
+    this._dialogState = "standby";
     this._history = [];
     this._lastTranscript = "";
     this._lastCommand = "";
+    this._awakeUntil = null;
     this._conversationUntil = null;
+    this._remainingConversationMs = 0;
+    this._consecutiveSidetalkCount = 0;
+    this._lastTransitionReason = "cleared";
     this.emit("stateChanged", this.snapshot());
   }
 
   snapshot(): VoiceListenerSnapshot {
     const cfg = this.config;
+    const now = Date.now();
+    const conversationRemainingMs =
+      this._dialogState === "conversation"
+        ? this._timerPaused
+          ? Math.max(0, this._remainingConversationMs)
+          : this._conversationUntil !== null
+            ? Math.max(0, this._conversationUntil - now)
+            : this._awakeUntil !== null
+              ? Math.max(0, this._awakeUntil - now)
+              : 0
+        : 0;
+    const systemOneHealth = this._agent.systemOneClient
+      ? this._agent.systemOneClient.getStatus()
+      : null;
     return {
       active: this._active,
       mode: this._mode,
+      dialogState: this._dialogState,
+      dialogEpoch: this._dialogEpoch,
+      serverNow: now,
+      timerPaused: this._timerPaused,
+      conversationRemainingMs,
+      conversationWindowSec: cfg.conversationWindowSec,
+      maxConsecutiveSidetalk: cfg.maxConsecutiveSidetalk,
+      consecutiveSidetalkCount: this._consecutiveSidetalkCount,
+      lastTransitionReason: this._lastTransitionReason,
       engine: this._engine,
       interimTranscript: this._interimTranscript,
       lastTranscript: this._lastTranscript,
@@ -1092,7 +1609,15 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       attentionMode: cfg.attentionMode,
       noiseSuppressionMode: cfg.noiseSuppressionMode,
       voiceprintMode: cfg.voiceprintMode,
+      cavemanMode: cfg.cavemanMode,
+      owwEnabled: cfg.owwEnabled,
+      owwThreshold: cfg.owwThreshold,
       localEngine: this._localEngine.getStatus(),
+      openWakeWord: this._localEngine.openWakeWord.getStatus(),
+      wakeWordPrototypes: listWakeWordPrototypeSummaries(cfg.wakeWords),
+      lastWakeHit: this._lastWakeHit ? { ...this._lastWakeHit } : null,
+      systemOneHealth,
+      systemOne: systemOneHealth,
       voiceprints: listPublicVoiceprints(),
       lastMetrics: this._lastMetrics ? { ...this._lastMetrics } : null,
       history: this._history.map((h) => ({ ...h })),
@@ -1100,12 +1625,17 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   }
 
   dispose(): void {
+    this._clearConversationTimer();
     this._unsubAgentSpeak();
     this._localEngine.dispose();
     this._active = false;
+    this._dialogState = "standby";
     this._mode = "idle";
     this._awakeUntil = null;
     this._conversationUntil = null;
+    this._remainingConversationMs = 0;
+    this._timerPaused = false;
+    this._speechInProgress = false;
     this.clear();
   }
 }

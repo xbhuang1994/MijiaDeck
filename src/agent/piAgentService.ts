@@ -43,8 +43,21 @@ import {
 } from "../core/agentConfigStore.ts";
 import { TypedEmitter } from "../core/contracts.ts";
 import { deviceCategoryLabel } from "../core/deviceDetailModel.ts";
+import type { FetchLike } from "../core/httpTimeout.ts";
+import {
+  buildCavemanPromptBlock,
+  compressCavemanReply,
+  compressCavemanSpeakChunk,
+  isSilentSentinel,
+  type CavemanSpeakChunkState,
+} from "./cavemanReplyPolicy.ts";
 import { createLocalSmartHomeStreamFn } from "./localPlannerStream.ts";
 import { createSmartHomeTools, type SmartHomeToolDeps } from "./smartHomeTools.ts";
+import {
+  SystemOneClient,
+  type CommandIntentChoice,
+  type SystemOneHealthSnapshot,
+} from "./systemOneClient.ts";
 
 export interface AgentToolCallRecord {
   id: string;
@@ -78,6 +91,7 @@ export interface PiAgentSnapshot {
   timeline: AgentTimelineEntry[];
   config: PublicAgentVoiceConfig;
   providers: ReadonlyArray<ProviderPreset>;
+  systemOne: SystemOneHealthSnapshot | null;
   lastError: string | null;
 }
 
@@ -87,6 +101,7 @@ export interface VoicePromptMeta {
   speakerScore?: number;
   wakeWord?: string | null;
   attentionReason?: string;
+  intent?: CommandIntentChoice;
 }
 
 export interface PiAgentRunResult {
@@ -110,6 +125,7 @@ export interface PiAgentServiceOptions {
   initialConfig?: AgentVoiceConfig;
   customStreamFn?: StreamFn;
   customModel?: Model<Api>;
+  systemOneFetcher?: FetchLike;
 }
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -248,8 +264,10 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   private readonly _localStreamFn: StreamFn;
   private readonly _customStreamFn?: StreamFn;
   private readonly _customModel?: Model<Api>;
+  private readonly _systemOneFetcher?: FetchLike;
 
   private _config: AgentVoiceConfig;
+  private _systemOne: SystemOneClient | null = null;
   private _agent: Agent;
   private _unsubAgent: (() => void) | null = null;
   private _timeline: AgentTimelineEntry[] = [];
@@ -257,6 +275,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   private _activeSource: "text" | "voice" = "text";
   private _activeVoiceMeta: VoicePromptMeta | null = null;
   private _speakCursor = 0;
+  private _rawStreamText = "";
+  private _speakChunkState: CavemanSpeakChunkState = { emittedAny: false };
+  private _suppressedSilent = false;
   private _emittedSpeakChunks = false;
   private _lastError: string | null = null;
   private _running = false;
@@ -274,6 +295,8 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     this._config = options.initialConfig ?? loadAgentVoiceConfig();
     this._customStreamFn = options.customStreamFn;
     this._customModel = options.customModel;
+    this._systemOneFetcher = options.systemOneFetcher;
+    this._systemOne = SystemOneClient.fromConfig(this._config, this._systemOneFetcher);
     this._tools = createSmartHomeTools(this._deps);
     for (const tool of this._tools) {
       this._toolLabels.set(tool.name, tool.label || tool.name);
@@ -282,12 +305,31 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       getDevices: () => this._deps.mainWindow.allDevices,
       getScenes: () => this._deps.mainWindow.scenes ?? [],
       getKnownPower: () => this._deps.mainWindow.knownPower,
+      getCavemanMode: () => this._config.cavemanMode,
+      classifyImplicitAction: async (utterance: string) => {
+        const client = this._systemOne;
+        if (!client?.enabled) return null;
+        const recentHistory = this.recentConversationTurns(5).map((t) => ({
+          role: t.role,
+          text: t.text,
+        }));
+        const res = await client.classifyImplicitAction({ utterance, recentHistory });
+        if (!res) return null;
+        if (res.needsAgent) {
+          return res.action === "needs_llm_agent" ? "needs_llm_agent" : null;
+        }
+        return res.action;
+      },
     });
     this._agent = this._createAgent();
   }
 
   get config(): AgentVoiceConfig {
     return this._config;
+  }
+
+  get systemOneClient(): SystemOneClient | null {
+    return this._systemOne;
   }
 
   get running(): boolean {
@@ -328,28 +370,23 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
 
     const extra = this._config.systemPromptExtra.trim();
     const vm = this._activeVoiceMeta;
-    const voiceContextLine =
-      this._activeSource === "voice"
-        ? [
-            "当前为实时语音对话模式：",
-            vm?.speakerName
-              ? `说话人声纹已识别为「${vm.speakerName}」${vm.speakerRole === "owner" ? "（主人）" : ""}。`
-              : "",
-            "回复务必极简口语化（1 句优先，避免 Markdown、符号列表和长段落），以获得最低语音播报延迟。",
-            "如果发现语句其实是环境旁白或未指向你，不要调用任何设备工具，简短忽略即可。",
-          ]
-            .filter(Boolean)
-            .join("")
-        : "";
+    const cavemanBlock = buildCavemanPromptBlock(this._config.cavemanMode, {
+      isVoice: this._activeSource === "voice",
+      speakerName: vm?.speakerName,
+      speakerRole: vm?.speakerRole,
+    });
+    const intentHint = vm?.intent ? `Intent hint: ${vm.intent}.` : "";
     return [
       "你是 MijiaDeck 内置的智能家居控制助手（Pi Agent），专门负责响应用户的语音或文字指令，并通过工具真实地查询和控制用户的米家智能设备与手动场景。",
       "执行原则：",
       "1. 当用户要求开关设备、调节灯光亮度/色温/颜色、控制小米/小爱音箱（开关、播放指定歌曲、调节音量、静音、暂停/切歌）、设置设备属性、执行动作（如喂食器出粮）、执行场景或查询传感器状态时，必须调用对应工具完成实际操作，绝不虚构操作结果。",
       "2. 控制小米/小爱音箱（包括开关音箱、播放指定音乐/歌曲、设置或增减音量、静音、暂停/播放/切歌）优先使用 `control_speaker` 工具。",
       "3. 支持一次响应中包含多个工具调用（例如同时调节客厅灯亮度并关闭餐厅主灯）。",
-      "4. 完成工具调用后，用简短、自然、适合语音播报的中文回复（通常 1~2 句话），直接告知执行结果或读取到的数据，不要输出冗长代码块或表格。",
+      "4. 完成工具调用后直接告知执行结果或读取到的数据，严格遵循下方回复风格约束，不要输出内部 did/id 或冗长客套。",
       "5. 若设备离线、未登录或找不到匹配设备，诚实告知原因。",
-      voiceContextLine ? `\n${voiceContextLine}` : "",
+      "",
+      cavemanBlock,
+      ...(intentHint ? [intentHint] : []),
       "",
       `当前家庭：${mw.currentHome || "全部"} | 房间列表：${mw.tabNames.join("、") || "全屋"}`,
       "当前设备清单：",
@@ -465,6 +502,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         if (!entry) break;
         const ev = event.assistantMessageEvent;
         if (ev.type === "text_delta" && ev.delta) {
+          this._rawStreamText += ev.delta;
           entry.text += ev.delta;
           this.emit("streamEvent", {
             kind: "text_delta",
@@ -505,6 +543,12 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       case "tool_execution_end": {
         if (!entry) break;
         const existing = entry.toolCalls.find((t) => t.id === event.toolCallId);
+        const detailsUiSummary =
+          event.result?.details && typeof event.result.details === "object"
+            ? (event.result.details as { uiSummary?: unknown }).uiSummary
+            : undefined;
+        const cleanUiSummary =
+          typeof detailsUiSummary === "string" ? detailsUiSummary.trim() : "";
         const resultContent = Array.isArray(event.result?.content)
           ? (event.result.content as Array<{ type?: string; text?: string }>)
               .filter((c) => c.type === "text" && typeof c.text === "string")
@@ -512,10 +556,11 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
               .join(" ")
               .trim()
           : "";
-        const summary = resultContent
-          ? resultContent.length > 180
-            ? `${resultContent.slice(0, 180)}…`
-            : resultContent
+        const rawSummary = cleanUiSummary || resultContent;
+        const summary = rawSummary
+          ? rawSummary.length > 180
+            ? `${rawSummary.slice(0, 180)}…`
+            : rawSummary
           : event.isError
             ? "执行失败"
             : "执行完成";
@@ -543,6 +588,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             .join("")
             .trim();
           if (textBlocks) {
+            if (!this._rawStreamText) {
+              this._rawStreamText = textBlocks;
+            }
             entry.text = textBlocks;
           }
           if (msg.stopReason === "error") {
@@ -557,6 +605,17 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             if (!entry.text) {
               entry.text = "已中断当前操作。";
             }
+          } else if (entry.text) {
+            if (isSilentSentinel(entry.text)) {
+              entry.text = "";
+              this._suppressedSilent = true;
+            } else {
+              entry.text = compressCavemanReply(
+                entry.text,
+                this._config.cavemanMode,
+                this._activeSource === "voice",
+              );
+            }
           }
         }
         break;
@@ -567,26 +626,37 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   }
 
   private _flushReadySpeakSentences(entry: AgentTimelineEntry, final: boolean): void {
-    const remaining = entry.text.slice(this._speakCursor);
-    if (!remaining.trim()) return;
-
+    const sourceText = this._rawStreamText || entry.text;
     if (!final) {
-      const m = /^([\s\S]*?[。！？!?\n])/.exec(remaining);
-      if (!m) return;
-      const chunk = m[1]!.trim();
-      this._speakCursor += m[1]!.length;
-      if (chunk.length >= 2) {
-        this._emittedSpeakChunks = true;
-        this.emit("speakChunk", { entryId: entry.id, text: chunk, final: false });
+      while (this._speakCursor < sourceText.length) {
+        const remaining = sourceText.slice(this._speakCursor);
+        const m = /^([\s\S]*?(?:[。！？!?\n]|(?<!\d)\.(?=\s|$)))/.exec(remaining);
+        if (!m) break;
+        this._speakCursor += m[1]!.length;
+        const filtered = compressCavemanSpeakChunk(
+          m[1]!,
+          this._config.cavemanMode,
+          this._speakChunkState,
+        );
+        if (filtered.length >= 2) {
+          this._emittedSpeakChunks = true;
+          this.emit("speakChunk", { entryId: entry.id, text: filtered, final: false });
+        }
       }
       return;
     }
 
-    const tail = remaining.trim();
-    this._speakCursor = entry.text.length;
-    if (tail) {
+    const remaining = sourceText.slice(this._speakCursor);
+    this._speakCursor = sourceText.length;
+    if (!remaining.trim()) return;
+    const filtered = compressCavemanSpeakChunk(
+      remaining,
+      this._config.cavemanMode,
+      this._speakChunkState,
+    );
+    if (filtered) {
       this._emittedSpeakChunks = true;
-      this.emit("speakChunk", { entryId: entry.id, text: tail, final: true });
+      this.emit("speakChunk", { entryId: entry.id, text: filtered, final: true });
     }
   }
 
@@ -607,7 +677,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   /**
    * 轻量零工具 LLM 注意力思考调用（不污染主对话历史），供唤醒词注意力门控调用。
    */
-  async evaluateAttention(promptText: string, timeoutMs = 7000): Promise<string | null> {
+  async evaluateAttention(promptText: string, timeoutMs = 3500): Promise<string | null> {
     if (this._config.provider === "local" && !this._customStreamFn) {
       return null;
     }
@@ -680,6 +750,8 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       nextConfig.modelId !== this._config.modelId ||
       nextConfig.baseUrl !== this._config.baseUrl;
     this._config = nextConfig;
+    this._systemOne?.reset();
+    this._systemOne = SystemOneClient.fromConfig(this._config, this._systemOneFetcher);
     if (providerOrModelChanged && !this._running) {
       // 保留现有 UI timeline，但更新底层 Agent 的 model 配置
       this._agent.state.model = this._customModel ?? buildModelForConfig(this._config);
@@ -705,6 +777,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     this._activeSource = source;
     this._activeVoiceMeta = options.voiceMeta ?? null;
     this._speakCursor = 0;
+    this._rawStreamText = "";
+    this._speakChunkState = { emittedAny: false };
+    this._suppressedSilent = false;
     this._emittedSpeakChunks = false;
     this._running = true;
     this._lastError = null;
@@ -744,20 +819,22 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       if (assistantEntry.status === "streaming") {
         assistantEntry.status = "done";
       }
-      if (!assistantEntry.text.trim()) {
-        if (assistantEntry.error) {
-          assistantEntry.text = assistantEntry.error;
-        } else if (assistantEntry.toolCalls.length > 0) {
-          assistantEntry.text = assistantEntry.toolCalls
-            .map((t) => t.summary)
-            .filter(Boolean)
-            .join("\n");
-        } else {
-          assistantEntry.text = "已完成处理。";
+      if (!this._suppressedSilent) {
+        if (!assistantEntry.text.trim()) {
+          if (assistantEntry.error) {
+            assistantEntry.text = assistantEntry.error;
+          } else if (assistantEntry.toolCalls.length > 0) {
+            assistantEntry.text = assistantEntry.toolCalls
+              .map((t) => t.summary)
+              .filter(Boolean)
+              .join("\n");
+          } else {
+            assistantEntry.text = "已完成处理。";
+          }
         }
-      }
-      if (this._activeSource === "voice" && this._config.autoSpeakReply && this._emittedSpeakChunks) {
-        this._flushReadySpeakSentences(assistantEntry, true);
+        if (this._activeSource === "voice" && this._config.autoSpeakReply && this._emittedSpeakChunks) {
+          this._flushReadySpeakSentences(assistantEntry, true);
+        }
       }
     } catch (err) {
       const cleaned = redactSecretFromText(err instanceof Error ? err.message : String(err));
@@ -831,6 +908,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       })),
       config: toPublicAgentVoiceConfig(this._config),
       providers: PROVIDER_PRESETS,
+      systemOne: this._systemOne ? this._systemOne.getStatus() : null,
       lastError: this._lastError,
     };
   }

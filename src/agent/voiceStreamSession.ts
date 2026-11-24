@@ -23,6 +23,7 @@ import type {
   OnlineDenoiserHandleLike,
   StreamingVadHandleLike,
 } from "./localVoiceEngine.ts";
+import type { OpenWakeWordStreamSession, WakeWordAcousticHit } from "./openWakeWordEngine.ts";
 import type { ProcessAudioUploadResult } from "./voiceListenerController.ts";
 
 export interface VoiceStreamSegmentPayload {
@@ -35,6 +36,7 @@ export interface VoiceStreamSegmentPayload {
   startSec: number;
   durationSec: number;
   forcedRoll: boolean;
+  acousticWake?: WakeWordAcousticHit | null;
 }
 
 export interface VoiceStreamSessionOptions {
@@ -46,6 +48,10 @@ export interface VoiceStreamSessionOptions {
   bypassWakeWord?: boolean;
   lang?: string;
   engine?: "auto" | "local" | "whisper";
+  wakeWords?: readonly string[];
+  owwEnabled?: boolean;
+  owwThreshold?: number;
+  onWakeWordSpot?: (hit: WakeWordAcousticHit) => void;
   onSpeechActivity?: (speaking: boolean) => void;
   onSegmentReady: (
     seg: VoiceStreamSegmentPayload,
@@ -77,6 +83,9 @@ export class VoiceStreamSession {
   private readonly _onlineDenoiser: OnlineDenoiserHandleLike | null;
   private readonly _denoiseEngine: string;
   private readonly _vad: StreamingVadHandleLike | null;
+  private _oww: OpenWakeWordStreamSession | null;
+  private _wakeWords: string[];
+  private _owwThreshold: number | undefined;
 
   // 单调递增样本索引 + 环形原始音频缓存（用于按 Silero VAD 精确起止位置反取零伪影原始人声）
   private readonly _rawRing = new Float32Array(RAW_RING_CAPACITY);
@@ -98,6 +107,8 @@ export class VoiceStreamSession {
   constructor(options: VoiceStreamSessionOptions) {
     this._opts = options;
     this._inputRate = options.sampleRate ?? TARGET_SR;
+    this._wakeWords = [...(options.wakeWords ?? [])];
+    this._owwThreshold = options.owwThreshold;
 
     const online = options.localEngine.createOnlineDenoiser(options.noiseMode);
     this._onlineDenoiser = online?.denoiser ?? null;
@@ -110,6 +121,38 @@ export class VoiceStreamSession {
       minSpeechDuration: 0.18,
       maxSpeechDuration: 4.2,
     });
+
+    this._oww =
+      options.owwEnabled !== false
+        ? options.localEngine.createWakeWordStream(this._wakeWords, {
+            threshold: this._owwThreshold,
+            onSpot: options.onWakeWordSpot,
+          })
+        : null;
+  }
+
+  /**
+   * 热刷新实时流式会话的唤醒词原型与阈值（配置更新或新录制样本后立即生效，无需重连 WebSocket）。
+   */
+  reloadWakeWords(wakeWords: readonly string[], threshold?: number): void {
+    if (this._disposed) return;
+    this._wakeWords = [...wakeWords];
+    const thresholdChanged = threshold !== undefined && threshold !== this._owwThreshold;
+    if (threshold !== undefined) {
+      this._owwThreshold = threshold;
+    }
+    if (this._opts.owwEnabled === false) {
+      this._oww = null;
+      return;
+    }
+    if (!this._oww || thresholdChanged) {
+      this._oww = this._opts.localEngine.createWakeWordStream(this._wakeWords, {
+        threshold: this._owwThreshold,
+        onSpot: this._opts.onWakeWordSpot,
+      });
+      return;
+    }
+    this._oww.reloadPrototypes(this._wakeWords);
   }
 
   get bypassWakeWord(): boolean {
@@ -167,6 +210,15 @@ export class VoiceStreamSession {
       denoisedChunk = pcm16k;
     }
 
+    // 2.5 实时流式 openWakeWord 声学唤醒检测（80ms 步进，静音自动快路径跳过）
+    if (this._oww) {
+      try {
+        this._oww.pushSamples(denoisedChunk, this._rawTotalSamples);
+      } catch {
+        // 声学检测异常不得中断主音频流
+      }
+    }
+
     // 3. 送入流式 Silero VAD（512 采样窗口 = 32ms）
     if (this._vad) {
       const merged = new Float32Array(this._denoisedPending.length + denoisedChunk.length);
@@ -210,16 +262,25 @@ export class VoiceStreamSession {
     if (this._onlineDenoiser) {
       try {
         const tail = this._onlineDenoiser.flush();
-        if (tail.samples.length > 0 && this._vad) {
-          const merged = new Float32Array(this._denoisedPending.length + tail.samples.length);
-          merged.set(this._denoisedPending, 0);
-          merged.set(tail.samples, this._denoisedPending.length);
-          let off = 0;
-          while (off + 512 <= merged.length) {
-            this._vad.acceptWaveform(merged.subarray(off, off + 512));
-            off += 512;
+        if (tail.samples.length > 0) {
+          if (this._oww) {
+            try {
+              this._oww.pushSamples(tail.samples, this._rawTotalSamples);
+            } catch {
+              // ignore
+            }
           }
-          this._denoisedPending = new Float32Array(0);
+          if (this._vad) {
+            const merged = new Float32Array(this._denoisedPending.length + tail.samples.length);
+            merged.set(this._denoisedPending, 0);
+            merged.set(tail.samples, this._denoisedPending.length);
+            let off = 0;
+            while (off + 512 <= merged.length) {
+              this._vad.acceptWaveform(merged.subarray(off, off + 512));
+              off += 512;
+            }
+            this._denoisedPending = new Float32Array(0);
+          }
         }
       } catch {
         // ignore
@@ -287,6 +348,9 @@ export class VoiceStreamSession {
         this._lastDenOverlap = new Float32Array(0);
       }
 
+      const acousticWake = this._oww?.getHeadPeakHit(22) ?? this._oww?.getPeakHit() ?? null;
+      this._oww?.resetSegmentTracking();
+
       const inputSnrDb = estimateSnrDb(rawSlice, TARGET_SR);
       const outputSnrDb = estimateSnrDb(denSlice, TARGET_SR);
       const payload: VoiceStreamSegmentPayload = {
@@ -299,6 +363,7 @@ export class VoiceStreamSession {
         startSec: Number((seg.start / TARGET_SR).toFixed(2)),
         durationSec: Number((rawSlice.length / TARGET_SR).toFixed(2)),
         forcedRoll,
+        acousticWake,
       };
 
       this._enqueueSegment(payload);
@@ -315,6 +380,9 @@ export class VoiceStreamSession {
     this._fallbackChunks = [];
     this._fallbackTotal = 0;
 
+    const acousticWake = this._oww?.getHeadPeakHit(22) ?? this._oww?.getPeakHit() ?? null;
+    this._oww?.resetSegmentTracking();
+
     const denoised = this._opts.localEngine.denoise(merged, TARGET_SR, this._opts.noiseMode);
     this._enqueueSegment({
       rawSamples: merged,
@@ -326,6 +394,7 @@ export class VoiceStreamSession {
       startSec: 0,
       durationSec: Number((merged.length / TARGET_SR).toFixed(2)),
       forcedRoll: false,
+      acousticWake,
     });
   }
 
@@ -351,6 +420,12 @@ export class VoiceStreamSession {
     } catch {
       // ignore
     }
+    try {
+      this._oww?.reset();
+    } catch {
+      // ignore
+    }
+    this._oww = null;
     this._fallbackChunks = [];
     this._fallbackTotal = 0;
     this._lastRawOverlap = new Float32Array(0);

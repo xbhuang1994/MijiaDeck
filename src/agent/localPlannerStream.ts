@@ -25,15 +25,35 @@ import {
   type TranscriptContext,
   type Usage,
 } from "@earendil-works/pi-ai";
-import type { DeviceInfo, SceneInfo } from "../core/models.ts";
+import type { DeviceInfo, PropInfo, SceneInfo } from "../core/models.ts";
 import { isLight } from "../core/deviceControls.ts";
 import { isSpeaker } from "../core/models.ts";
+import {
+  DEFAULT_CAVEMAN_MODE,
+  normalizeCavemanMode,
+  sanitizeForVoiceTts,
+  type CavemanReplyMode,
+} from "./cavemanReplyPolicy.ts";
 
-export interface LocalPlannerContextProvider {
+export type ImplicitActionLabel =
+  | "light_brighter"
+  | "light_dimmer"
+  | "speaker_quieter"
+  | "speaker_louder"
+  | "power_off"
+  | "power_on"
+  | "query_status"
+  | "needs_llm_agent";
+
+export interface LocalPlannerDeps {
   getDevices(): readonly DeviceInfo[];
   getScenes(): readonly SceneInfo[];
   getKnownPower(): Readonly<Record<string, boolean | null>>;
+  getCavemanMode?: () => CavemanReplyMode;
+  classifyImplicitAction?: (utterance: string) => Promise<ImplicitActionLabel | null>;
 }
+
+export type LocalPlannerContextProvider = LocalPlannerDeps;
 
 interface PlannedCall {
   name: string;
@@ -215,13 +235,176 @@ function detectScene(clause: string, scenes: readonly SceneInfo[]): SceneInfo | 
   return undefined;
 }
 
+const RE_GREETING_OR_HELP =
+  /^(?:你好|您好|hi|hello|你是谁|你能做什么|你会做什么|有什么功能|帮助|help|在吗|小派)[，,！!？?。\s]*$/i;
+
+function isGreetingOrHelp(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  return RE_GREETING_OR_HELP.test(trimmed);
+}
+
+function findLatestUserText(messages: readonly Message[]): string {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const msg = messages[i]!;
+    if (msg.role === "user") {
+      return extractUserText(msg).trim();
+    }
+  }
+  return "";
+}
+
+function joinDeviceLabel(name: string, tail: string): string {
+  if (!tail) return name;
+  const needsSpace = /[A-Za-z0-9]$/.test(name) || /^[A-Za-z0-9]/.test(tail);
+  return needsSpace ? `${name} ${tail}` : `${name}${tail}`;
+}
+
+function formatPropUnit(unit?: string | null): string {
+  if (unit === "celsius") return "°C";
+  if (unit === "percentage") return "%";
+  if (unit === "kelvin") return "K";
+  return unit ? ` ${unit}` : "";
+}
+
+function pickTargetLight(
+  clause: string,
+  devices: readonly DeviceInfo[],
+  knownPower: Readonly<Record<string, boolean | null>>,
+  recentTarget: string | null,
+  preferState?: boolean,
+): DeviceInfo | undefined {
+  const lights = devices.filter(
+    (d) => isLight(d) || (d.switch_channels.length === 0 && /灯/.test(d.name)),
+  );
+  if (lights.length === 0) return undefined;
+
+  const named = detectNamedDevice(clause, lights);
+  if (named) return named;
+
+  const room = detectRoom(clause, lights);
+  const roomPool = room ? lights.filter((d) => d.room_name === room) : lights;
+  const pool = roomPool.length > 0 ? roomPool : lights;
+
+  if (recentTarget) {
+    const recent = pool.find((d) => (d.did === recentTarget || d.name === recentTarget) && d.online);
+    if (recent) return recent;
+  }
+  if (preferState !== undefined) {
+    const byState = pool.find((d) => d.online && isLight(d) && knownPower[d.did] === preferState)
+      ?? pool.find((d) => d.online && knownPower[d.did] === preferState);
+    if (byState) return byState;
+  }
+  return pool.find((d) => d.online && isLight(d)) ?? pool.find((d) => d.online) ?? pool[0];
+}
+
+function pickTargetSpeaker(
+  clause: string,
+  devices: readonly DeviceInfo[],
+  recentTarget: string | null,
+): DeviceInfo | undefined {
+  const speakers = devices.filter((d) => isSpeaker(d));
+  if (speakers.length === 0) return undefined;
+
+  const named = detectNamedDevice(clause, speakers);
+  if (named) return named;
+
+  const room = detectRoom(clause, speakers);
+  if (room) {
+    const inRoom = speakers.find((d) => d.room_name === room && d.online)
+      ?? speakers.find((d) => d.room_name === room);
+    if (inRoom) return inRoom;
+  }
+  if (recentTarget) {
+    const recent = speakers.find((d) => (d.did === recentTarget || d.name === recentTarget) && d.online);
+    if (recent) return recent;
+  }
+  return speakers.find((d) => d.online) ?? speakers[0];
+}
+
+function mapImplicitActionToToolCall(
+  label: ImplicitActionLabel,
+  clause: string,
+  devices: readonly DeviceInfo[],
+  knownPower: Readonly<Record<string, boolean | null>>,
+  recentTarget: string | null,
+): PlannedCall | null {
+  switch (label) {
+    case "light_dimmer": {
+      const light = pickTargetLight(clause, devices, knownPower, recentTarget, true);
+      if (!light) return null;
+      return { name: "control_light", arguments: { target: light.did, brightness: 35 } };
+    }
+    case "light_brighter": {
+      const light = pickTargetLight(clause, devices, knownPower, recentTarget, false);
+      if (!light) return null;
+      return { name: "control_light", arguments: { target: light.did, on: true, brightness: 85 } };
+    }
+    case "speaker_quieter": {
+      const spk = pickTargetSpeaker(clause, devices, recentTarget);
+      return {
+        name: "control_speaker",
+        arguments: { ...(spk ? { target: spk.did } : {}), volume_delta: -15 },
+      };
+    }
+    case "speaker_louder": {
+      const spk = pickTargetSpeaker(clause, devices, recentTarget);
+      return {
+        name: "control_speaker",
+        arguments: { ...(spk ? { target: spk.did } : {}), volume_delta: 15 },
+      };
+    }
+    case "power_off":
+    case "power_on": {
+      const state = label === "power_off" ? "off" : "on";
+      const named = detectNamedDevice(clause, devices);
+      if (named) {
+        return { name: "set_device_power", arguments: { target: named.did, state } };
+      }
+      const room = detectRoom(clause, devices);
+      if (room) {
+        return { name: "set_device_power", arguments: { room, state } };
+      }
+      if (recentTarget) {
+        return { name: "set_device_power", arguments: { target: recentTarget, state } };
+      }
+      const light = pickTargetLight(clause, devices, knownPower, recentTarget, state === "off");
+      if (light) {
+        return { name: "set_device_power", arguments: { target: light.did, state } };
+      }
+      return { name: "set_device_power", arguments: { category: "light", state } };
+    }
+    case "query_status": {
+      const named = detectNamedDevice(clause, devices);
+      if (named) {
+        return { name: "get_device_detail", arguments: { target: named.did } };
+      }
+      const room = detectRoom(clause, devices);
+      const sensor = devices.find(
+        (d) =>
+          (!room || d.room_name === room) &&
+          d.online &&
+          ((Array.isArray(d.metric_features) && d.metric_features.length > 0) ||
+            d.model.includes("sensor") ||
+            d.name.includes("温湿度")),
+      );
+      if (sensor && /(冷|热|干|闷|潮|湿|暖|温)/.test(clause)) {
+        return { name: "get_device_detail", arguments: { target: sensor.did } };
+      }
+      return { name: "list_devices", arguments: room ? { room } : {} };
+    }
+    case "needs_llm_agent":
+    default:
+      return null;
+  }
+}
+
 function planSingleClause(
   clause: string,
   devices: readonly DeviceInfo[],
   scenes: readonly SceneInfo[],
   recentTarget: string | null,
 ): PlannedCall | null {
-  const lower = clause.toLowerCase();
 
   // 1. 明确转发小爱指令
   const xiaoaiMatch = /^(?:让小爱|叫小爱|问小爱|对小爱说|小爱同学[,，:\s]*)(.+)$/.exec(clause);
@@ -473,59 +656,237 @@ function planSingleClause(
     }
   }
 
-  // 8. 兜底：若只是问候或能力询问，不调工具直接回复；否则查询设备列表帮助回答
-  if (/^(你好|您好|hi|hello|你是谁|你能做什么|帮助|help|在吗|小派)/i.test(lower)) {
-    return null;
-  }
-
-  return { name: "list_devices", arguments: {} };
+  // 8. 未命中确定性规则，交由上层判断问候/隐式意图分类/兜底
+  return null;
 }
 
-function summarizeToolResults(results: readonly ToolResultMessage[]): string {
+function summarizeSingleToolResult(res: ToolResultMessage, userText: string): string {
+  const raw = extractToolResultText(res);
+  const d =
+    res.details && typeof res.details === "object"
+      ? (res.details as Record<string, unknown>)
+      : null;
+
+  if (res.isError) {
+    return sanitizeForVoiceTts(raw) || "执行失败";
+  }
+
+  if (res.toolName === "list_devices" && d) {
+    const items = Array.isArray(d.devices) ? (d.devices as Array<Record<string, unknown>>) : null;
+    if (items) {
+      if (items.length === 0) return "未找到设备";
+      const names = items.map((it) => String(it.name ?? "").trim()).filter(Boolean);
+      if (names.length === 0) return `共 ${items.length} 台设备`;
+      return names.length <= 4
+        ? `共 ${items.length} 台：${names.join("、")}`
+        : `共 ${items.length} 台：${names.slice(0, 3).join("、")}等`;
+    }
+  }
+
+  if (res.toolName === "list_scenes" && d) {
+    const items = Array.isArray(d.scenes) ? (d.scenes as Array<Record<string, unknown>>) : null;
+    if (items) {
+      if (items.length === 0) return "暂无手动场景";
+      const names = items.map((it) => String(it.name ?? "").trim()).filter(Boolean);
+      if (names.length === 0) return `共 ${items.length} 个场景`;
+      return names.length <= 4
+        ? `共 ${items.length} 个场景：${names.join("、")}`
+        : `共 ${items.length} 个场景：${names.slice(0, 3).join("、")}等`;
+    }
+  }
+
+  if (res.toolName === "get_device_detail" && d) {
+    const name = typeof d.name === "string" && d.name.trim() ? d.name.trim() : "设备";
+    if (d.online === false) {
+      return joinDeviceLabel(name, "离线");
+    }
+    const vals = (d.values && typeof d.values === "object" ? d.values : {}) as Record<string, unknown>;
+    const props = Array.isArray(d.props) ? (d.props as PropInfo[]) : [];
+
+    // 1. 传感器温湿度摘要（仅当电量 < 20% 或用户明确询问电量时附带电量）
+    const temp = vals["temperature"];
+    const hum = vals["relative-humidity"] ?? vals["humidity"];
+    const bat = vals["battery-level"] ?? vals["battery"];
+    if (typeof temp === "number" || typeof hum === "number") {
+      const sensorParts: string[] = [];
+      if (typeof temp === "number") sensorParts.push(`${temp}°C`);
+      if (typeof hum === "number") sensorParts.push(`湿度 ${hum}%`);
+      const askedBattery = /(电量|电池|还有多少电|剩多少电)/.test(userText);
+      if (typeof bat === "number" && (bat < 20 || askedBattery)) {
+        sensorParts.push(`电量 ${bat}%`);
+      }
+      return `${name} ${sensorParts.join("，")}`;
+    }
+
+    // 2. 灯具状态摘要
+    const hasLightVals =
+      typeof vals["brightness"] === "number" || typeof vals["color-temperature"] === "number";
+    if (hasLightVals && typeof vals["on"] === "boolean") {
+      if (!vals["on"]) {
+        return joinDeviceLabel(name, "已关");
+      }
+      const lightParts: string[] = [];
+      if (typeof vals["brightness"] === "number") lightParts.push(`亮度 ${vals["brightness"]}%`);
+      if (typeof vals["color-temperature"] === "number") lightParts.push(`${vals["color-temperature"]}K`);
+      return lightParts.length > 0
+        ? joinDeviceLabel(name, `已开，${lightParts.join("，")}`)
+        : joinDeviceLabel(name, "已开");
+    }
+
+    // 3. 优先使用工具返回的干净 uiSummary（永不泄露 [did=...]）
+    if (typeof d.uiSummary === "string" && d.uiSummary.trim()) {
+      return sanitizeForVoiceTts(d.uiSummary);
+    }
+
+    // 4. 音箱 / 开关 / 其他非传感器设备摘要
+    const speakerParts: string[] = [];
+    if (typeof vals["volume"] === "number") speakerParts.push(`音量 ${vals["volume"]}%`);
+    if (vals["mute"] === true || vals["mute-2"] === true) speakerParts.push("已静音");
+    if (speakerParts.length > 0) {
+      return `${name} ${speakerParts.join("，")}`;
+    }
+    if (typeof vals["on"] === "boolean") {
+      return joinDeviceLabel(name, vals["on"] ? "已开" : "已关");
+    }
+    if (typeof bat === "number") {
+      return `${name} 电量 ${bat}%`;
+    }
+
+    const genericParts: string[] = [];
+    for (const p of props) {
+      const val = vals[p.name];
+      if (val === undefined || val === null) continue;
+      let formatted: string;
+      if (typeof val === "boolean") {
+        formatted = val ? "开" : "关";
+      } else if (p.value_list) {
+        const matchedOpt = p.value_list.find((o) => o.value === val);
+        formatted = matchedOpt?.desc_zh_cn ?? matchedOpt?.description ?? String(val);
+      } else {
+        formatted = `${String(val)}${formatPropUnit(p.unit)}`;
+      }
+      genericParts.push(`${p.desc || p.name} ${formatted}`);
+      if (genericParts.length >= 2) break;
+    }
+    if (genericParts.length > 0) {
+      return `${name} ${genericParts.join("，")}`;
+    }
+    return joinDeviceLabel(name, "在线");
+  }
+
+  if (d && typeof d.uiSummary === "string" && d.uiSummary.trim()) {
+    return sanitizeForVoiceTts(d.uiSummary);
+  }
+
+  if (!raw) return "";
+  const cleaned = sanitizeForVoiceTts(raw);
+  if (cleaned.length <= 160) return cleaned;
+  const firstClause = cleaned.split(/[。！？!?\n]/)[0]?.trim() ?? cleaned.slice(0, 140);
+  return firstClause.replace(/[:：]$/, "");
+}
+
+export function summarizeToolResults(
+  results: readonly ToolResultMessage[],
+  userText = "",
+  _mode: CavemanReplyMode = DEFAULT_CAVEMAN_MODE,
+): string {
   if (results.length === 0) {
-    return "已完成处理。";
+    return "已完成";
   }
   const parts: string[] = [];
   for (const res of results) {
-    const raw = extractToolResultText(res);
-    if (!raw) continue;
-    // 对传感器详情提取更口语化的温湿度摘要
-    if (res.toolName === "get_device_detail" && !res.isError && res.details && typeof res.details === "object") {
-      const d = res.details as Record<string, unknown>;
-      const vals = (d.values && typeof d.values === "object" ? d.values : {}) as Record<string, unknown>;
-      const name = typeof d.name === "string" ? d.name : "设备";
-      const metrics: string[] = [];
-      if (typeof vals["temperature"] === "number") metrics.push(`温度 ${vals["temperature"]}°C`);
-      const hum = vals["relative-humidity"] ?? vals["humidity"];
-      if (typeof hum === "number") metrics.push(`湿度 ${hum}%`);
-      if (typeof vals["battery-level"] === "number") metrics.push(`电量 ${vals["battery-level"]}%`);
-      if (typeof vals["on"] === "boolean") metrics.push(`开关${vals["on"] ? "已开启" : "已关闭"}`);
-      if (typeof vals["brightness"] === "number") metrics.push(`亮度 ${vals["brightness"]}%`);
-      if (typeof vals["color-temperature"] === "number") metrics.push(`色温 ${vals["color-temperature"]}K`);
-      if (metrics.length > 0) {
-        parts.push(`「${name}」当前${metrics.join("，")}。`);
-        continue;
-      }
+    const piece = summarizeSingleToolResult(res, userText).trim();
+    if (piece) {
+      parts.push(piece);
     }
-    const firstLine = raw.split(/\r?\n/)[0]?.trim() ?? raw;
-    parts.push(raw.length <= 160 ? raw : firstLine);
   }
-  return parts.join("\n") || "已执行完成。";
+  if (parts.length === 0) {
+    return "已完成";
+  }
+  if (parts.length === 1) {
+    return parts[0]!;
+  }
+
+  const trimmedParts = parts.map((p) => p.replace(/。+$/, ""));
+  if (
+    trimmedParts.length === 2 &&
+    trimmedParts[0]!.length <= 18 &&
+    trimmedParts[1]!.length <= 18 &&
+    !trimmedParts[0]!.includes("；") &&
+    !trimmedParts[1]!.includes("；") &&
+    !trimmedParts[0]!.includes("，") &&
+    !trimmedParts[1]!.includes("，")
+  ) {
+    return `${trimmedParts[0]}，${trimmedParts[1]}`;
+  }
+  return trimmedParts.join("；");
 }
 
-function buildFinalReplyWithoutTools(userText: string, devices: readonly DeviceInfo[]): string {
-  if (/^(你好|您好|hi|hello|在吗|小派)/i.test(userText.trim())) {
-    const onlineCount = devices.filter((d) => d.online).length;
-    return `你好！我是 MijiaDeck 内置 Pi Agent，当前共有 ${devices.length} 台设备（${onlineCount} 台在线）。你可以直接语音或输入指令，例如“打开客厅吸顶灯”、“把亮度调到80%”或“查看卧室温度”。`;
+function buildFinalReplyWithoutTools(
+  userText: string,
+  devices: readonly DeviceInfo[],
+  mode: CavemanReplyMode,
+  needsLlmHint = false,
+): string {
+  const effectiveMode = normalizeCavemanMode(mode, DEFAULT_CAVEMAN_MODE);
+  if (needsLlmHint) {
+    if (effectiveMode === "ultra" || effectiveMode === "full") {
+      return "本地引擎暂不支持，可切大模型处理";
+    }
+    return "本地引擎暂不支持该指令，可在设置中接入大模型处理。";
   }
-  return "我是 MijiaDeck 内置 Pi Agent，支持语音或文字控制米家设备：开关灯与插座、调节亮度/色温/颜色、查看温湿度、控制小爱音箱音量播放、给宠物喂食器出粮以及执行手动场景。若需要更复杂的自由对话推理，可在「设置 → 语音与 Pi Agent」中接入 DeepSeek、OpenAI、Claude、Gemini 或本地 Ollama 模型。";
+
+  const trimmed = userText.trim();
+  if (/^(你好|您好|hi|hello|在吗|小派)/i.test(trimmed)) {
+    const onlineCount = devices.filter((d) => d.online).length;
+    if (effectiveMode === "ultra" || effectiveMode === "full") {
+      return `在呢，${onlineCount}/${devices.length} 台设备在线，请说`;
+    }
+    if (effectiveMode === "lite") {
+      return `在呢，当前 ${onlineCount}/${devices.length} 台设备在线，请说指令。`;
+    }
+    return `你好！当前共 ${devices.length} 台设备（${onlineCount} 台在线），直接说指令即可控制。`;
+  }
+
+  if (effectiveMode === "ultra" || effectiveMode === "full") {
+    return "支持开关、调光、音箱、喂食、场景和温湿度查询，请说指令";
+  }
+  if (effectiveMode === "lite") {
+    return "支持控制开关、调光、音箱、喂食、场景和温湿度查询，请直接说指令。";
+  }
+  return "我是 MijiaDeck 助手，支持开关、调光调色、温湿度查询、小爱音箱、喂食和场景控制；复杂推理可在设置中接入大模型。";
+}
+
+function pushTextStreamReply(
+  stream: ReturnType<typeof createAssistantMessageEventStream>,
+  model: Model<Api>,
+  now: number,
+  replyText: string,
+): void {
+  const partial: AssistantMessage = {
+    role: "assistant",
+    content: [{ type: "text", text: "" }],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: ZERO_USAGE,
+    stopReason: "stop",
+    timestamp: now,
+  };
+  stream.push({ type: "start", partial });
+  stream.push({ type: "text_start", contentIndex: 0, partial });
+  partial.content = [{ type: "text", text: replyText }];
+  stream.push({ type: "text_delta", contentIndex: 0, delta: replyText, partial });
+  stream.push({ type: "text_end", contentIndex: 0, content: replyText, partial });
+  stream.push({ type: "done", reason: "stop", message: partial });
+  stream.end();
 }
 
 /**
  * 创建内置本地规划引擎的 Pi Agent StreamFn。
  */
 export function createLocalSmartHomeStreamFn(
-  ctxProvider: LocalPlannerContextProvider,
+  deps: LocalPlannerDeps,
 ): StreamFn {
   let callCounter = 0;
 
@@ -533,116 +894,141 @@ export function createLocalSmartHomeStreamFn(
     const stream = createAssistantMessageEventStream();
 
     queueMicrotask(() => {
-      const now = Date.now();
-      const messages = context.messages;
-      const lastMsg = messages[messages.length - 1];
+      void (async () => {
+        const now = Date.now();
+        const messages = context.messages;
+        const lastMsg = messages[messages.length - 1];
+        const cavemanMode = normalizeCavemanMode(deps.getCavemanMode?.(), DEFAULT_CAVEMAN_MODE);
 
-      // 情况 A：工具已执行完毕，根据本轮所有 toolResult 生成最终回复
-      if (lastMsg && lastMsg.role === "toolResult") {
-        const trailingResults: ToolResultMessage[] = [];
-        for (let i = messages.length - 1; i >= 0; i -= 1) {
-          const m = messages[i]!;
-          if (m.role === "toolResult") {
-            trailingResults.unshift(m);
-          } else {
-            break;
+        // 情况 A：工具已执行完毕，根据本轮所有 toolResult 生成最终回复
+        if (lastMsg && lastMsg.role === "toolResult") {
+          const trailingResults: ToolResultMessage[] = [];
+          for (let i = messages.length - 1; i >= 0; i -= 1) {
+            const m = messages[i]!;
+            if (m.role === "toolResult") {
+              trailingResults.unshift(m);
+            } else {
+              break;
+            }
+          }
+
+          const latestUserText = findLatestUserText(messages);
+          const replyText = summarizeToolResults(trailingResults, latestUserText, cavemanMode);
+          pushTextStreamReply(stream, model, now, replyText);
+          return;
+        }
+
+        // 情况 B：收到新的用户指令，规划工具调用
+        const userText = lastMsg ? extractUserText(lastMsg).trim() : "";
+        const devices = deps.getDevices();
+        const scenes = deps.getScenes();
+        const knownPower = deps.getKnownPower();
+        const recentTarget = findRecentDeviceFromTranscript(messages.slice(0, -1));
+
+        if (isGreetingOrHelp(userText)) {
+          const replyText = buildFinalReplyWithoutTools(userText, devices, cavemanMode, false);
+          pushTextStreamReply(stream, model, now, replyText);
+          return;
+        }
+
+        const clauses = splitCompoundClauses(userText);
+        const planned: PlannedCall[] = [];
+        let sawNeedsLlm = false;
+
+        for (const clause of clauses) {
+          const call = planSingleClause(clause, devices, scenes, recentTarget);
+          if (call) {
+            planned.push(call);
+            continue;
+          }
+          if (isGreetingOrHelp(clause)) {
+            continue;
+          }
+          if (deps.classifyImplicitAction) {
+            let label: ImplicitActionLabel | null = null;
+            try {
+              label = await deps.classifyImplicitAction(clause);
+            } catch {
+              label = null;
+            }
+            if (label === "needs_llm_agent") {
+              sawNeedsLlm = true;
+            } else if (label) {
+              const mapped = mapImplicitActionToToolCall(
+                label,
+                clause,
+                devices,
+                knownPower,
+                recentTarget,
+              );
+              if (mapped) {
+                planned.push(mapped);
+              }
+            }
           }
         }
 
-        const replyText = summarizeToolResults(trailingResults);
-        const partial: AssistantMessage = {
-          role: "assistant",
-          content: [{ type: "text", text: "" }],
-          api: model.api,
-          provider: model.provider,
-          model: model.id,
-          usage: ZERO_USAGE,
-          stopReason: "stop",
-          timestamp: now,
-        };
-        stream.push({ type: "start", partial });
-        stream.push({ type: "text_start", contentIndex: 0, partial });
-        partial.content = [{ type: "text", text: replyText }];
-        stream.push({ type: "text_delta", contentIndex: 0, delta: replyText, partial });
-        stream.push({ type: "text_end", contentIndex: 0, content: replyText, partial });
-        stream.push({ type: "done", reason: "stop", message: partial });
-        stream.end();
-        return;
-      }
-
-      // 情况 B：收到新的用户指令，规划工具调用
-      const userText = lastMsg ? extractUserText(lastMsg).trim() : "";
-      const devices = ctxProvider.getDevices();
-      const scenes = ctxProvider.getScenes();
-      const recentTarget = findRecentDeviceFromTranscript(messages.slice(0, -1));
-      const clauses = splitCompoundClauses(userText);
-
-      const planned: PlannedCall[] = [];
-      for (const clause of clauses) {
-        const call = planSingleClause(clause, devices, scenes, recentTarget);
-        if (call) {
-          planned.push(call);
+        if (planned.length === 0) {
+          if (sawNeedsLlm || isGreetingOrHelp(userText)) {
+            const replyText = buildFinalReplyWithoutTools(userText, devices, cavemanMode, sawNeedsLlm);
+            pushTextStreamReply(stream, model, now, replyText);
+            return;
+          }
+          planned.push({ name: "list_devices", arguments: {} });
         }
-      }
 
-      if (planned.length === 0) {
-        const replyText = buildFinalReplyWithoutTools(userText, devices);
+        const toolCalls: ToolCall[] = planned.map((p) => {
+          callCounter += 1;
+          return {
+            type: "toolCall",
+            id: `local_call_${now}_${callCounter}`,
+            name: p.name,
+            arguments: p.arguments,
+          };
+        });
+
         const partial: AssistantMessage = {
           role: "assistant",
-          content: [{ type: "text", text: "" }],
+          content: [],
           api: model.api,
           provider: model.provider,
           model: model.id,
           usage: ZERO_USAGE,
-          stopReason: "stop",
+          stopReason: "toolUse",
           timestamp: now,
         };
         stream.push({ type: "start", partial });
-        stream.push({ type: "text_start", contentIndex: 0, partial });
-        partial.content = [{ type: "text", text: replyText }];
-        stream.push({ type: "text_delta", contentIndex: 0, delta: replyText, partial });
-        stream.push({ type: "text_end", contentIndex: 0, content: replyText, partial });
-        stream.push({ type: "done", reason: "stop", message: partial });
-        stream.end();
-        return;
-      }
 
-      const toolCalls: ToolCall[] = planned.map((p) => {
-        callCounter += 1;
-        return {
-          type: "toolCall",
-          id: `local_call_${now}_${callCounter}`,
-          name: p.name,
-          arguments: p.arguments,
-        };
-      });
-
-      const partial: AssistantMessage = {
-        role: "assistant",
-        content: [],
-        api: model.api,
-        provider: model.provider,
-        model: model.id,
-        usage: ZERO_USAGE,
-        stopReason: "toolUse",
-        timestamp: now,
-      };
-      stream.push({ type: "start", partial });
-
-      toolCalls.forEach((tc, idx) => {
-        partial.content = [...partial.content, tc];
-        stream.push({ type: "toolcall_start", contentIndex: idx, partial });
-        stream.push({
-          type: "toolcall_delta",
-          contentIndex: idx,
-          delta: JSON.stringify(tc.arguments),
-          partial,
+        toolCalls.forEach((tc, idx) => {
+          partial.content = [...partial.content, tc];
+          stream.push({ type: "toolcall_start", contentIndex: idx, partial });
+          stream.push({
+            type: "toolcall_delta",
+            contentIndex: idx,
+            delta: JSON.stringify(tc.arguments),
+            partial,
+          });
+          stream.push({ type: "toolcall_end", contentIndex: idx, toolCall: tc, partial });
         });
-        stream.push({ type: "toolcall_end", contentIndex: idx, toolCall: tc, partial });
-      });
 
-      stream.push({ type: "done", reason: "toolUse", message: partial });
-      stream.end();
+        stream.push({ type: "done", reason: "toolUse", message: partial });
+        stream.end();
+      })().catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        const errMsg: AssistantMessage = {
+          role: "assistant",
+          content: [],
+          api: model.api,
+          provider: model.provider,
+          model: model.id,
+          usage: ZERO_USAGE,
+          stopReason: "error",
+          errorMessage: msg || "本地规划引擎执行异常",
+          timestamp: Date.now(),
+        };
+        stream.push({ type: "error", reason: "error", error: errMsg });
+        stream.end();
+      });
     });
 
     return stream;
