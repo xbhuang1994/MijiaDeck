@@ -143,7 +143,7 @@ function splitCompoundClauses(input: string): string[] {
     return [cleaned];
   }
   const parts = cleaned
-    .split(/(?:[，,;；]|(?:并且|而且|然后|同时|顺便|再把|再帮我|再|并(?=[把将打关开调设执切给让]))|\band\b|\bthen\b)/i)
+    .split(/(?:[，,;；]|(?:并且|而且|然后|同时|顺便|再把|再帮我|(?<!不要|别|不|没|无)再|并(?=[把将打关开调设执切给让停暂播继]))|\band\b|\bthen\b)/i)
     .map((p) => p.trim())
     .filter((p) => p.length > 0);
   return parts.length > 0 ? parts : [cleaned];
@@ -206,7 +206,7 @@ function detectNamedDevice(clause: string, devices: readonly DeviceInfo[]): Devi
     );
     if (sensors.length > 0) return sensors[0];
   }
-  if (/(音箱|小爱|音响|音量|声音|静音|上一首|下一首|暂停|播放|播报|朗读)/.test(clause)) {
+  if (/(音箱|小爱|音响|音量|声音|静音|上一首|上一曲|下一首|下一曲|切歌|换一首|换首歌|暂停|播放|播报|朗读|音乐|歌曲|放歌)/.test(clause)) {
     const speakers = devices.filter((d) => isSpeaker(d));
     if (speakers.length > 0) {
       return speakers.find((d) => (!room || d.room_name === room) && d.online) ?? speakers[0];
@@ -399,6 +399,43 @@ function mapImplicitActionToToolCall(
   }
 }
 
+function resolveSpeakerArg(clause: string, devices: readonly DeviceInfo[]): DeviceInfo | undefined {
+  const speakers = devices.filter((d) => isSpeaker(d));
+  if (speakers.length === 0) return undefined;
+  const normClause = normalize(clause);
+  const sorted = [...speakers].sort((a, b) => b.name.length - a.name.length);
+  for (const s of sorted) {
+    const normName = normalize(s.name);
+    if (normName.length >= 2 && normClause.includes(normName)) {
+      return s;
+    }
+  }
+  const room = detectRoom(clause, speakers);
+  if (room) {
+    return (
+      speakers.find((d) => d.room_name === room && d.online) ??
+      speakers.find((d) => d.room_name === room)
+    );
+  }
+  return undefined;
+}
+
+const RE_SPEAKER_CANCEL_PAUSE = /(?:取消暂停|解除暂停)/;
+
+const RE_SPEAKER_STOP_PLAYBACK =
+  /(?:(?:停止|终止|结束|停掉|停了|停一下|停下)(?:当前|正在)?(?:播放|放歌|放音乐|播歌|播音乐|听歌|听音乐|音乐|歌曲|唱歌|歌|(?:小爱|小米)?(?:音箱|音响)(?:播放)?|小爱播放)|(?:音乐|歌曲|播放|放歌|背景音乐|歌).{0,8}(?:停止|停掉|停了|停一下|停下|结束|终止|关掉|关闭|关了)|(?:关闭|关掉)(?:当前|正在播放的)?(?:音乐|歌曲|播放|放歌|背景音乐)|关了(?:当前|正在播放的)?(?:音乐|歌曲|背景音乐)|(?:不要|别|不再|不用|不想|不)(?:让(?:小爱|小米)?(?:音箱|音响)|让小爱)?(?:再)?(?:继续)?(?:播放|播歌|播音乐|放歌|放音乐|听歌|听音乐|(?:播|放)这首(?:歌)?|放了|播了)|(?:小爱|小米)?(?:音箱|音响)(?:停止|停掉|停了|停一下|停下)(?:播放)?|^(?:请|帮我|麻烦|先|现在|快)?(?:停止|停一下|停下|停了吧|停吧)(?:吧|呀|哦)?$|\b(?:stop\s+(?:the\s+)?(?:music|song|songs|playing|playback|audio|speaker)|turn\s+off\s+(?:the\s+)?music|shut\s+off\s+(?:the\s+)?music)\b|^(?:please\s+)?stop(?:\s+it|\s+now)?$)/i;
+
+const RE_SPEAKER_PAUSE_PLAYBACK =
+  /(?:暂停(?:当前|正在)?(?:播放|音乐|歌曲|放歌|放音乐|音箱|音响|小爱|一下)|(?:音乐|歌曲|播放|歌|音箱|音响).{0,6}暂停|^(?:请|帮我|麻烦|先|现在)?暂停(?:一下|吧|呀|哦)?$|\bpause\s+(?:the\s+)?(?:music|song|songs|playing|playback|audio|speaker)\b|^(?:please\s+)?pause(?:\s+it|\s+now)?$)/i;
+
+const RE_SPEAKER_RESUME_PLAYBACK =
+  /(?:取消暂停|解除暂停|继续播放|继续放歌|继续听歌|恢复播放|开始播放|播放音乐|播放歌曲|放歌|放音乐|播音乐|^(?:请|帮我|麻烦)?(?:继续|播放)(?:一下|吧|呀|哦)?$|^(?:please\s+)?(?:resume(?:\s+(?:the\s+)?(?:music|playback|playing))?|continue\s+playing|play(?:\s+(?:the\s+)?music)?)$)/i;
+
+const RE_GENERIC_MUSIC_TARGET = /^(?:音乐|歌曲|歌|一下)?(?:吧|呀|哦|啊)?$/;
+
+const RE_NEGATIVE_BEFORE_PLAY =
+  /(?:停止|暂停|终止|结束|停掉|停了|关闭|关掉|不要|别|不再|不用|不想|不).{0,8}(?:播放|放一首|点一首|放首|来一首|放歌|放音乐|播音乐)/;
+
 function planSingleClause(
   clause: string,
   devices: readonly DeviceInfo[],
@@ -406,8 +443,8 @@ function planSingleClause(
   recentTarget: string | null,
 ): PlannedCall | null {
 
-  // 1. 明确转发小爱指令
-  const xiaoaiMatch = /^(?:让小爱|叫小爱|问小爱|对小爱说|小爱同学[,，:\s]*)(.+)$/.exec(clause);
+  // 1. 明确转发小爱指令（排除“让小爱音箱/音响…”这类明确指定音箱设备的本地控制语句）
+  const xiaoaiMatch = /^(?:让小爱(?!音箱|音响)|叫小爱(?!音箱|音响)|问小爱|对小爱说|小爱同学[,，:\s]*)(.+)$/.exec(clause);
   if (xiaoaiMatch && xiaoaiMatch[1]?.trim()) {
     return {
       name: "send_xiaoai_command",
@@ -446,10 +483,10 @@ function planSingleClause(
     };
   }
 
-  // 4. 音箱播报 / 播放指定音乐 / 播放控制 / 音量与静音
+  // 4. 音箱播报 / 播放控制（切歌、停止、暂停优先于播放/点歌，避免“停止播放音乐”误命中“播放音乐”）/ 音量与静音
   const speakMatch = /(?:用音箱|用音响|让音箱|小爱)?(?:朗读|播报|念一下|说一句)[：:\s“"]*(.+?)[”"]*$/.exec(clause);
   if (speakMatch && speakMatch[1]?.trim()) {
-    const spk = detectNamedDevice(clause, devices);
+    const spk = resolveSpeakerArg(clause, devices);
     return {
       name: "control_speaker",
       arguments: {
@@ -458,9 +495,31 @@ function planSingleClause(
       },
     };
   }
+  if (/(?:上一首|上一曲|^(?:play\s+)?(?:previous|prev)(?:\s+(?:song|track|music))?$)/i.test(clause)) {
+    const spk = resolveSpeakerArg(clause, devices);
+    return { name: "control_speaker", arguments: { ...(spk ? { target: spk.did } : {}), playback: "previous" } };
+  }
+  if (/(?:下一首|下一曲|切歌|换一首|换首歌|^(?:play\s+)?next(?:\s+(?:song|track|music))?$)/i.test(clause)) {
+    const spk = resolveSpeakerArg(clause, devices);
+    return { name: "control_speaker", arguments: { ...(spk ? { target: spk.did } : {}), playback: "next" } };
+  }
+  const isCancelPause = RE_SPEAKER_CANCEL_PAUSE.test(clause);
+  if (!isCancelPause && RE_SPEAKER_STOP_PLAYBACK.test(clause)) {
+    const spk = resolveSpeakerArg(clause, devices);
+    return { name: "control_speaker", arguments: { ...(spk ? { target: spk.did } : {}), playback: "stop" } };
+  }
+  if (!isCancelPause && RE_SPEAKER_PAUSE_PLAYBACK.test(clause)) {
+    const spk = resolveSpeakerArg(clause, devices);
+    return { name: "control_speaker", arguments: { ...(spk ? { target: spk.did } : {}), playback: "pause" } };
+  }
   const musicMatch = /(?:用(?:小米|小爱)?(?:音箱|音响)|让(?:小米|小爱)?(?:音箱|音响))?(?:播放|放一首|点一首|放首|来一首)\s*(.+)$/.exec(clause);
-  if (musicMatch && musicMatch[1]?.trim() && !/^(音乐|一下)?$/.test(musicMatch[1].trim())) {
-    const spk = detectNamedDevice(clause, devices);
+  if (
+    musicMatch &&
+    musicMatch[1]?.trim() &&
+    !RE_NEGATIVE_BEFORE_PLAY.test(clause) &&
+    !RE_GENERIC_MUSIC_TARGET.test(musicMatch[1].trim())
+  ) {
+    const spk = resolveSpeakerArg(clause, devices);
     return {
       name: "control_speaker",
       arguments: {
@@ -469,38 +528,26 @@ function planSingleClause(
       },
     };
   }
-  if (/(上一首|上一曲|previous)/i.test(clause)) {
-    const spk = detectNamedDevice(clause, devices);
-    return { name: "control_speaker", arguments: { ...(spk ? { target: spk.did } : {}), playback: "previous" } };
-  }
-  if (/(下一首|下一曲|切歌|next)/i.test(clause)) {
-    const spk = detectNamedDevice(clause, devices);
-    return { name: "control_speaker", arguments: { ...(spk ? { target: spk.did } : {}), playback: "next" } };
-  }
-  if (/(暂停播放|暂停音乐|暂停音箱|暂停音响|暂停一下|pause)/i.test(clause)) {
-    const spk = detectNamedDevice(clause, devices);
-    return { name: "control_speaker", arguments: { ...(spk ? { target: spk.did } : {}), playback: "pause" } };
-  }
-  if (/(继续播放|开始播放|播放音乐|恢复播放)/.test(clause)) {
-    const spk = detectNamedDevice(clause, devices);
+  if (!RE_NEGATIVE_BEFORE_PLAY.test(clause) && RE_SPEAKER_RESUME_PLAYBACK.test(clause)) {
+    const spk = resolveSpeakerArg(clause, devices);
     return { name: "control_speaker", arguments: { ...(spk ? { target: spk.did } : {}), playback: "play" } };
   }
   if (/(取消静音|解除静音|恢复声音)/.test(clause)) {
-    const spk = detectNamedDevice(clause, devices);
+    const spk = resolveSpeakerArg(clause, devices);
     return {
       name: "control_speaker",
       arguments: { ...(spk ? { target: spk.did } : {}), mute: false },
     };
   }
   if (/(静音|闭嘴|mute)/i.test(clause)) {
-    const spk = detectNamedDevice(clause, devices);
+    const spk = resolveSpeakerArg(clause, devices);
     return {
       name: "control_speaker",
       arguments: { ...(spk ? { target: spk.did } : {}), mute: true },
     };
   }
   if (/(音量|声音)/.test(clause)) {
-    const spk = detectNamedDevice(clause, devices);
+    const spk = resolveSpeakerArg(clause, devices);
     const numMatch = /(\d{1,3})\s*%?/.exec(clause);
     if (numMatch) {
       return {

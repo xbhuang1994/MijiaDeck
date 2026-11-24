@@ -509,7 +509,7 @@ function tightenPoliteVerbPrefixes(input: string, mode: CavemanReplyMode): strin
   }
 
   // 去除“已打开了”中的冗余“了”
-  out = out.replace(/已(打开|关闭|开启|调[整节至到暗亮高低]|设[置定]|执行|切换|静音|暂停|播放|播报|出粮|发送)了/g, "已$1");
+  out = out.replace(/已(打开|关闭|开启|调[整节至到暗亮高低]|设[置定]|执行|切换|静音|暂停|停止|播放|播报|出粮|发送)了/g, "已$1");
   out = out.replace(/已已/g, "已");
 
   // 英文句首剥掉 “I've gone ahead and ” 后首字母大写

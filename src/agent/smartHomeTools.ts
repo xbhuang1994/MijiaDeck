@@ -23,6 +23,7 @@ import { JobExecutor } from "../core/jobs.ts";
 import {
   createSceneInfo,
   isSpeaker,
+  type ActionInfo,
   type DeviceInfo,
   type PropInfo,
   type SceneInfo,
@@ -449,6 +450,75 @@ function formatListUiSummary(names: readonly string[], unitLabel: string): strin
   return `共 ${names.length} ${unitLabel}：${names.slice(0, 3).join("、")}等`;
 }
 
+function findSpeakerPlaybackAction(
+  actions: readonly ActionInfo[],
+  target: "play" | "pause" | "stop" | "next" | "previous",
+): ActionInfo | null {
+  return (
+    actions.find((a) => a.name === target && (!a.service || a.service === "play-control")) ??
+    actions.find((a) => a.name === target) ??
+    actions.find(
+      (a) => a.service === "play-control" && a.name.replace(/-\d+$/, "") === target,
+    ) ??
+    null
+  );
+}
+
+async function executeSpeakerPlayback(
+  deps: SmartHomeToolDeps,
+  did: string,
+  actions: readonly ActionInfo[],
+  pb: "play" | "pause" | "stop" | "next" | "previous",
+): Promise<void> {
+  // 兼容极简 mock（detail.actions 为空时直接透传动作名）
+  if (actions.length === 0) {
+    await runJob(deps.jobs, () => deps.service.runAction(did, pb), 1);
+    return;
+  }
+
+  const primary = findSpeakerPlaybackAction(actions, pb);
+  const fallbackAction =
+    pb === "stop"
+      ? findSpeakerPlaybackAction(actions, "pause")
+      : pb === "pause"
+        ? findSpeakerPlaybackAction(actions, "stop")
+        : null;
+
+  if (primary) {
+    try {
+      await runJob(deps.jobs, () => deps.service.runAction(did, primary.name), 1);
+      return;
+    } catch (err) {
+      if (fallbackAction && fallbackAction.name !== primary.name) {
+        await runJob(deps.jobs, () => deps.service.runAction(did, fallbackAction.name), 1);
+        return;
+      }
+      throw err;
+    }
+  }
+
+  if (fallbackAction) {
+    await runJob(deps.jobs, () => deps.service.runAction(did, fallbackAction.name), 1);
+    return;
+  }
+
+  // 部分音箱型号规格未暴露 stop/pause 时，通过静默文本指令兜底
+  if (
+    (pb === "stop" || pb === "pause") &&
+    actions.some((a) => a.name === "execute-text-directive")
+  ) {
+    const directive = pb === "stop" ? "停止播放" : "暂停播放";
+    await runJob(
+      deps.jobs,
+      () => deps.service.runAction(did, "execute-text-directive", [directive, 1]),
+      1,
+    );
+    return;
+  }
+
+  await runJob(deps.jobs, () => deps.service.runAction(did, pb), 1);
+}
+
 async function applySpeakerPower(
   deps: SmartHomeToolDeps,
   device: DeviceInfo,
@@ -482,8 +552,8 @@ async function applySpeakerPower(
   if (!targetOn) {
     // 关闭小爱音箱：暂停/停止播放并开启扬声器静音（智能音箱无物理断电开关，采用暂停+静音待机）
     const pauseAction =
-      detail.actions.find((a) => a.name === "pause") ??
-      detail.actions.find((a) => a.name === "stop");
+      findSpeakerPlaybackAction(detail.actions, "pause") ??
+      findSpeakerPlaybackAction(detail.actions, "stop");
     if (pauseAction) {
       try {
         await runJob(deps.jobs, () => deps.service.runAction(device.did, pauseAction.name), 1);
@@ -1472,7 +1542,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
           next: "下一首",
           previous: "上一首",
         };
-        await runJob(deps.jobs, () => deps.service.runAction(speaker!.did, pb), 1);
+        await executeSpeakerPlayback(deps, speaker.did, detail.actions, pb);
         changes.push(labelMap[pb] ?? pb);
       }
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // MijiaDeck: 内置 Pi Agent 与智能家居工具集回归测试
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +12,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { fetchProviderModels } from "../src/agent/modelDiscovery.ts";
 import { PiAgentService } from "../src/agent/piAgentService.ts";
+import { evaluateVoiceAttention } from "../src/agent/voiceAttentionGate.ts";
 import {
   defaultAgentVoiceConfig,
   loadAgentVoiceConfig,
@@ -21,8 +22,10 @@ import {
 import { setDataPathOverrides } from "../src/core/jsonStore.ts";
 import { NetworkMonitor } from "../src/core/availability.ts";
 import { JobExecutor } from "../src/core/jobs.ts";
+import { MijiaService } from "../src/core/service.ts";
 import * as settingsStore from "../src/core/settingsStore.ts";
 import { VirtualDemoService } from "../src/core/virtualLightService.ts";
+import type { FlattenedSpec, MijiaApiClient } from "../src/mijia/index.ts";
 import { MainWindowController } from "../src/ui/controllers/mainWindowController.ts";
 import { ThemeController, applyTheme } from "../src/ui/theme.ts";
 
@@ -245,6 +248,286 @@ describe("PiAgentService with Local Smart-Home Stream Engine", () => {
       expect(await h.service.powerState("demo-light-living")).toBe(true);
     } finally {
       await h.cleanup();
+    }
+  });
+
+  test("routes '停止播放音乐' and stop/pause/play/track variations without misexecuting as resume play", async () => {
+    const h = createTestHarness();
+    try {
+      await h.ready();
+
+      const stopPhrases = [
+        "停止播放音乐",
+        "请停止播放音乐",
+        "停止播放音乐吧",
+        "让小爱音箱停止播放音乐",
+        "停止播放",
+        "停止音乐",
+        "停止放歌",
+        "停止播放周杰伦的晴天",
+        "结束播放",
+        "把音乐停了",
+        "把音乐关掉",
+        "关闭音乐",
+        "关掉音乐",
+        "不要播放音乐",
+        "不要再播放音乐",
+        "别再播放音乐",
+        "别让小爱音箱播放音乐",
+        "不要让音箱放歌了",
+        "别放歌了",
+        "别播了",
+        "不要再放这首歌了",
+        "停止",
+        "停一下",
+        "stop",
+        "stop playing music",
+        "turn off the music",
+      ];
+
+      for (const phrase of stopPhrases) {
+        await h.service.runAction("demo-speaker-xiaoai", "play");
+        expect(await h.service.readProp("demo-speaker-xiaoai", "playing-state")).toBe(1);
+
+        const res = await h.agent.prompt(phrase, { source: "voice" });
+        expect(res.ok).toBe(true);
+        expect(res.toolCalls.length).toBe(1);
+        expect(res.toolCalls[0]?.name).toBe("control_speaker");
+        expect(res.toolCalls[0]?.args.playback).toBe("stop");
+        expect(res.toolCalls[0]?.args.play_music).toBeUndefined();
+        expect(res.reply).not.toContain("继续播放");
+        expect(res.reply).toContain("已停止");
+        // VirtualDemoService speaker only exposes pause (no stop action), so stop falls back to pause
+        expect(await h.service.readProp("demo-speaker-xiaoai", "playing-state")).toBe(2);
+      }
+
+      // Pause variations
+      for (const phrase of [
+        "暂停播放音乐",
+        "暂停播放音乐吧",
+        "暂停播放周杰伦",
+        "暂停",
+        "暂停一下",
+        "把音乐暂停",
+        "pause",
+        "pause music",
+      ]) {
+        await h.service.runAction("demo-speaker-xiaoai", "play");
+        const res = await h.agent.prompt(phrase, { source: "voice" });
+        expect(res.ok).toBe(true);
+        expect(res.toolCalls[0]?.name).toBe("control_speaker");
+        expect(res.toolCalls[0]?.args.playback).toBe("pause");
+        expect(res.reply).toContain("已暂停");
+        expect(await h.service.readProp("demo-speaker-xiaoai", "playing-state")).toBe(2);
+      }
+
+      // Positive resume / generic play variations still trigger playback: "play"
+      for (const phrase of [
+        "继续播放",
+        "继续播放音乐",
+        "继续播放音乐吧",
+        "恢复播放",
+        "播放音乐",
+        "播放音乐吧",
+        "取消暂停",
+        "play music",
+        "resume",
+      ]) {
+        await h.service.runAction("demo-speaker-xiaoai", "pause");
+        const res = await h.agent.prompt(phrase, { source: "voice" });
+        expect(res.ok).toBe(true);
+        expect(res.toolCalls[0]?.name).toBe("control_speaker");
+        expect(res.toolCalls[0]?.args.playback).toBe("play");
+        expect(res.reply).toContain("继续播放");
+        expect(await h.service.readProp("demo-speaker-xiaoai", "playing-state")).toBe(1);
+      }
+
+      // Specific song titles containing negation/stop/next words still play the song
+      for (const [phrase, expectedSong] of [
+        ["播放不要说话", "不要说话"],
+        ["播放 Don't Stop Me Now", "Don't Stop Me Now"],
+        ["播放 Next Level", "Next Level"],
+      ] as const) {
+        const res = await h.agent.prompt(phrase);
+        expect(res.ok).toBe(true);
+        expect(res.toolCalls[0]?.name).toBe("control_speaker");
+        expect(res.toolCalls[0]?.args.play_music).toBe(expectedSong);
+      }
+
+      // Track navigation takes precedence over musicMatch ("播放下一首" != play_music:"下一首")
+      const rNext = await h.agent.prompt("播放下一首");
+      expect(rNext.ok).toBe(true);
+      expect(rNext.toolCalls[0]?.name).toBe("control_speaker");
+      expect(rNext.toolCalls[0]?.args.playback).toBe("next");
+      expect(rNext.toolCalls[0]?.args.play_music).toBeUndefined();
+
+      const rPrev = await h.agent.prompt("播放上一首");
+      expect(rPrev.ok).toBe(true);
+      expect(rPrev.toolCalls[0]?.name).toBe("control_speaker");
+      expect(rPrev.toolCalls[0]?.args.playback).toBe("previous");
+
+      // Volume down phrase mentioning 音乐 does NOT trigger stop
+      await h.service.writeProp("demo-speaker-xiaoai", "volume", 50);
+      const rVolDown = await h.agent.prompt("把音乐声音调小一点");
+      expect(rVolDown.ok).toBe(true);
+      expect(rVolDown.toolCalls[0]?.name).toBe("control_speaker");
+      expect(rVolDown.toolCalls[0]?.args.volume_delta).toBe(-15);
+      expect(rVolDown.toolCalls[0]?.args.playback).toBeUndefined();
+
+      // Compound clause: turn off light and stop playing music
+      await h.service.setPowerState("demo-light-living", true);
+      await h.service.runAction("demo-speaker-xiaoai", "play");
+      const rCompound = await h.agent.prompt("关闭客厅灯并停止播放音乐");
+      expect(rCompound.ok).toBe(true);
+      expect(rCompound.toolCalls.length).toBe(2);
+      expect(rCompound.toolCalls[0]?.name).toBe("set_device_power");
+      expect(rCompound.toolCalls[1]?.name).toBe("control_speaker");
+      expect(rCompound.toolCalls[1]?.args.playback).toBe("stop");
+      expect(await h.service.powerState("demo-light-living")).toBe(false);
+      expect(await h.service.readProp("demo-speaker-xiaoai", "playing-state")).toBe(2);
+
+      // Voice attention gate keeps stop/negation music commands intact
+      for (const [raw, expectedCmd] of [
+        ["小派，停止播放音乐", "停止播放音乐"],
+        ["小派，不要播放音乐", "不要播放音乐"],
+        ["小派，别放歌了", "别放歌了"],
+      ] as const) {
+        const attn = await evaluateVoiceAttention({
+          rawText: raw,
+          wakeWordEnabled: true,
+          wakeWords: ["小派"],
+          attentionMode: "smart",
+        });
+        expect(attn.accept).toBe(true);
+        expect(attn.command).toBe(expectedCmd);
+      }
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("stops playback on real xiaomi.wifispeaker.l05b spec (stop -> -704220008 -> pause fallback, never play)", async () => {
+    const l05bSpec: FlattenedSpec = {
+      name: "Speaker",
+      properties: [
+        {
+          name: "volume",
+          description: "Volume / 音量",
+          type: "uint",
+          rw: "rw",
+          unit: "percentage",
+          range: [0, 100, 1],
+          "value-list": null,
+          method: { siid: 2, piid: 1 },
+          service: "speaker",
+        },
+        {
+          name: "mute-2",
+          description: "Mute / 静音",
+          type: "bool",
+          rw: "rw",
+          range: null,
+          "value-list": null,
+          method: { siid: 2, piid: 2 },
+          service: "speaker",
+        },
+      ],
+      actions: [
+        { name: "play", description: "Play / 播放", method: { siid: 3, aiid: 2 }, service: "play-control" },
+        { name: "pause", description: "Pause / 暂停", method: { siid: 3, aiid: 3 }, service: "play-control" },
+        { name: "stop", description: "Stop / 结束播放", method: { siid: 3, aiid: 4 }, service: "play-control" },
+        { name: "previous", description: "Previous / 上一首", method: { siid: 3, aiid: 5 }, service: "play-control" },
+        { name: "next", description: "Next / 下一首", method: { siid: 3, aiid: 6 }, service: "play-control" },
+        { name: "stop-alarm", description: "Stop Alarm / 停止闹钟", method: { siid: 6, aiid: 1 }, service: "clock" },
+      ],
+    };
+
+    const actionPayloads: Array<Record<string, unknown>> = [];
+    const mockApi = {
+      authDataPath: path.join(tmpDir, "auth.json"),
+      apiBaseUrl: "https://api.io.mi.com/app",
+      available: true,
+      authData: { userId: "test-user" },
+      getHomesList: mock(async () => [
+        { name: "家", roomlist: [{ name: "房间", dids: ["504337266"] }] },
+      ]),
+      getDevicesList: mock(async () => [
+        {
+          did: "504337266",
+          name: "小爱音箱Play",
+          model: "xiaomi.wifispeaker.l05b",
+          spec_type: "urn:miot-spec-v2:device:speaker:0000A015:xiaomi-l05b:1",
+          isOnline: true,
+        },
+      ]),
+      getSharedDevicesList: mock(async () => []),
+      getDevicesProp: mock(async () => []),
+      setDevicesProp: mock(async () => []),
+      runAction: mock(async (payload: Record<string, unknown>) => {
+        actionPayloads.push(payload);
+        if (payload["siid"] === 3 && payload["aiid"] === 4) {
+          return { code: -704220008 };
+        }
+        return { code: 0 };
+      }),
+    };
+
+    const service = new MijiaService({
+      api: mockApi as unknown as MijiaApiClient,
+      specFetcher: async () => l05bSpec,
+    });
+    const jobs = new JobExecutor();
+    applyTheme("dark", "green");
+    const themeCtrl = new ThemeController("dark");
+    const networkMonitor = new NetworkMonitor({
+      initialReachability: "online",
+      autoStart: false,
+    });
+    const mainWindow = new MainWindowController({
+      service,
+      jobs,
+      themeCtrl,
+      networkMonitor,
+      autoStartTimers: false,
+      cacheLoader: () => null,
+      cacheSaver: () => {},
+    });
+    const agent = new PiAgentService({
+      deps: {
+        service,
+        jobs,
+        mainWindow,
+        settingsStore,
+        broadcastState: () => {},
+      },
+    });
+
+    try {
+      mainWindow.start();
+      const deadline = Date.now() + 2000;
+      while (Date.now() < deadline) {
+        if (!mainWindow.loadActive && !mainWindow.loadingDevices && mainWindow.allDevices.length > 0) {
+          break;
+        }
+        await Bun.sleep(15);
+      }
+
+      const res = await agent.prompt("停止播放音乐", { source: "voice" });
+      expect(res.ok).toBe(true);
+      expect(res.toolCalls[0]?.name).toBe("control_speaker");
+      expect(res.toolCalls[0]?.args.playback).toBe("stop");
+      expect(res.reply).toContain("已停止");
+      expect(res.reply).not.toContain("继续播放");
+      // Tried stop (s3a4) -> -704220008 -> transparently fell back to pause (s3a3); NEVER called play (s3a2) or stop-alarm (s6a1)
+      expect(actionPayloads).toEqual([
+        { did: "504337266", siid: 3, aiid: 4, in: [] },
+        { did: "504337266", siid: 3, aiid: 3, in: [] },
+      ]);
+    } finally {
+      agent.dispose();
+      networkMonitor.stop();
+      mainWindow.dispose();
+      await jobs.shutdown();
     }
   });
 
