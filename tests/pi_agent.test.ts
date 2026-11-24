@@ -357,7 +357,7 @@ describe("ModelDiscovery (Auto-fetch from Provider API)", () => {
         status: 401,
       });
     const failed = await fetchProviderModels({
-      provider: "openai-compatible",
+      provider: "deepseek",
       baseUrl: "https://gateway.example.test/v1",
       apiKey: "sk-magpie-secret-test-9999",
       fetcher: errFetch,
@@ -366,6 +366,22 @@ describe("ModelDiscovery (Auto-fetch from Provider API)", () => {
     expect(failed.source).toBe("fallback");
     expect(failed.models.length).toBeGreaterThan(0);
     expect(failed.error).not.toContain("sk-magpie-secret-test-9999");
+
+    // Custom provider with anthropic-messages protocol
+    let customAnthHeader = "";
+    const customAnth = await fetchProviderModels({
+      provider: "openai-compatible",
+      apiType: "anthropic-messages",
+      baseUrl: "https://custom-claude.example.test",
+      apiKey: "sk-ant-custom-0001",
+      fetcher: async (_url, init) => {
+        customAnthHeader = new Headers(init?.headers).get("x-api-key") ?? "";
+        return new Response(JSON.stringify({ data: [{ id: "claude-custom-1" }] }), { status: 200 });
+      },
+    });
+    expect(customAnth.ok).toBe(true);
+    expect(customAnthHeader).toBe("sk-ant-custom-0001");
+    expect(customAnth.models[0]?.id).toBe("claude-custom-1");
   });
 
   test("supports Google Gemini x-goog-api-key and Anthropic x-api-key model discovery", async () => {

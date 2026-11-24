@@ -583,9 +583,25 @@
           <div class="setting-card setting-card-wrap">
             <div class="setting-info">
               <div class="setting-label">模型引擎</div>
-              <div class="setting-desc" id="set-agent-provider-desc">内置本地引擎免 API Key 即可执行常见开关、调光、温湿度、喂食器与场景操作；也可接入主流云端大模型或本地 Ollama</div>
+              <div class="setting-desc" id="set-agent-provider-desc">内置本地引擎免 API Key 即可执行常见开关、调光、温湿度、喂食器与场景操作；也可接入主流云端大模型或自定义网关</div>
             </div>
             <select id="set-agent-provider" class="md-select agent-select" aria-label="Pi Agent 模型引擎"></select>
+          </div>
+
+          <div class="setting-card setting-card-wrap" id="setting-row-agent-custom-meta" hidden>
+            <div class="setting-info">
+              <div class="setting-label">自定义提供商名称与 API 协议</div>
+              <div class="setting-desc">可为自定义网关命名（如 magpie、ollama），并选择对应的接口协议</div>
+            </div>
+            <div class="agent-custom-meta-grid">
+              <input type="text" id="set-agent-custom-name" class="md-text-input" placeholder="自定义名称（如 magpie / ollama）" spellcheck="false" aria-label="自定义提供商名称">
+              <select id="set-agent-api-type" class="md-select agent-api-select" aria-label="自定义 API 协议">
+                <option value="openai-completions">OpenAI Completions</option>
+                <option value="openai-responses">OpenAI Responses</option>
+                <option value="anthropic-messages">Anthropic Messages</option>
+                <option value="google-generative-ai">Google Gemini</option>
+              </select>
+            </div>
           </div>
 
           <div class="setting-card setting-card-wrap" id="setting-row-agent-baseurl">

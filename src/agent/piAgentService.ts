@@ -188,11 +188,25 @@ function buildModelForConfig(config: AgentVoiceConfig): Model<Api> {
         contextWindow: 128_000,
         maxTokens: 4096,
       };
+    case "openai-compatible": {
+      const api = config.customApiType || "openai-completions";
+      return {
+        id: modelId,
+        name: modelId,
+        api,
+        provider: config.customProviderName || "openai-compatible",
+        baseUrl: baseUrl || "http://127.0.0.1:11434/v1",
+        input: ["text"],
+        cost: ZERO_COST,
+        reasoning: false,
+        contextWindow: 128_000,
+        maxTokens: 4096,
+      };
+    }
     case "deepseek":
     case "moonshot":
     case "xiaomi":
     case "openrouter":
-    case "openai-compatible":
     default:
       return {
         id: modelId,
@@ -522,6 +536,8 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   reconfigure(nextConfig: AgentVoiceConfig): void {
     const providerOrModelChanged =
       nextConfig.provider !== this._config.provider ||
+      nextConfig.customProviderName !== this._config.customProviderName ||
+      nextConfig.customApiType !== this._config.customApiType ||
       nextConfig.modelId !== this._config.modelId ||
       nextConfig.baseUrl !== this._config.baseUrl;
     this._config = nextConfig;
@@ -643,10 +659,14 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
 
   snapshot(): PiAgentSnapshot {
     const preset = getProviderPreset(this._config.provider);
+    const providerLabel =
+      this._config.provider === "openai-compatible" && this._config.customProviderName.trim()
+        ? this._config.customProviderName.trim()
+        : preset.label;
     return {
       running: this._running,
       provider: this._config.provider,
-      providerLabel: preset.label,
+      providerLabel,
       modelId: this._customModel?.id ?? (this._config.modelId || preset.defaultModel),
       tools: this._tools.map((t) => ({
         name: t.name,

@@ -24,6 +24,11 @@ export type AgentProviderMode =
   | "openai-compatible";
 
 export type VoiceEngineMode = "auto" | "browser" | "whisper";
+export type CustomApiType =
+  | "openai-completions"
+  | "openai-responses"
+  | "anthropic-messages"
+  | "google-generative-ai";
 
 export interface ProviderPreset {
   id: AgentProviderMode;
@@ -118,23 +123,31 @@ export const PROVIDER_PRESETS: ReadonlyArray<ProviderPreset> = [
   },
   {
     id: "openai-compatible",
-    label: "自定义 OpenAI 兼容（Ollama / 通义千问 / SiliconFlow 等）",
-    description: "支持本地 Ollama、vLLM、LM Studio 或任意兼容 OpenAI Chat Completions 的第三方接口",
-    defaultModel: "qwen2.5:7b",
-    suggestedModels: ["qwen2.5:7b", "qwen-plus", "deepseek-ai/DeepSeek-V3", "llama3.1:8b"],
-    defaultBaseUrl: "http://127.0.0.1:11434/v1",
+    label: "自定义配置（OpenAI / Anthropic / Gemini 兼容）",
+    description: "在界面中自定义提供商名称、API 协议、Base URL 与密钥，自动从接口拉取模型列表（支持代理网关、Ollama、通义千问、SiliconFlow 等）",
+    defaultModel: "",
+    suggestedModels: [],
+    defaultBaseUrl: "",
     requiresApiKey: false,
   },
 ];
 
 const VALID_PROVIDERS = new Set<string>(PROVIDER_PRESETS.map((p) => p.id));
 const VALID_VOICE_ENGINES = new Set<string>(["auto", "browser", "whisper"]);
+const VALID_CUSTOM_APIS = new Set<string>([
+  "openai-completions",
+  "openai-responses",
+  "anthropic-messages",
+  "google-generative-ai",
+]);
 
 export const DEFAULT_WAKE_WORDS = ["小派", "小湃", "小π", "派派", "pi", "米家助手"] as const;
 
 export interface AgentVoiceConfig {
   version: number;
   provider: AgentProviderMode;
+  customProviderName: string;
+  customApiType: CustomApiType;
   modelId: string;
   baseUrl: string;
   apiKey: string;
@@ -167,6 +180,8 @@ export interface PublicAgentVoiceConfig
 
 export interface AgentConfigPatch {
   provider?: unknown;
+  customProviderName?: unknown;
+  customApiType?: unknown;
   modelId?: unknown;
   baseUrl?: unknown;
   apiKey?: unknown;
@@ -193,6 +208,8 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
   return {
     version: AGENT_CONFIG_VERSION,
     provider: "local",
+    customProviderName: "",
+    customApiType: "openai-completions",
     modelId: "mijia-local-planner",
     baseUrl: "",
     apiKey: "",
@@ -298,9 +315,18 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
   const voiceLangRaw = typeof raw.voiceLang === "string" ? raw.voiceLang.trim() : "";
   const voiceLang = voiceLangRaw || defaults.voiceLang;
 
+  const customApiRaw =
+    typeof raw.customApiType === "string" ? raw.customApiType.trim() : defaults.customApiType;
+  const customApiType: CustomApiType = VALID_CUSTOM_APIS.has(customApiRaw)
+    ? (customApiRaw as CustomApiType)
+    : defaults.customApiType;
+
   return {
     version: AGENT_CONFIG_VERSION,
     provider,
+    customProviderName:
+      typeof raw.customProviderName === "string" ? raw.customProviderName.trim().slice(0, 64) : "",
+    customApiType,
     modelId,
     baseUrl: normalizeUrl(raw.baseUrl),
     apiKey: typeof raw.apiKey === "string" ? raw.apiKey.trim() : "",
@@ -437,6 +463,18 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
     if (providerChanged && patch.modelId === undefined) {
       nextRaw.modelId = getProviderPreset(p as AgentProviderMode).defaultModel;
     }
+  }
+
+  if (patch.customProviderName !== undefined) {
+    nextRaw.customProviderName = String(patch.customProviderName).trim();
+  }
+
+  if (patch.customApiType !== undefined) {
+    const apiType = String(patch.customApiType).trim();
+    if (!VALID_CUSTOM_APIS.has(apiType)) {
+      throw new Error(`不支持的自定义 API 协议: ${apiType}`);
+    }
+    nextRaw.customApiType = apiType;
   }
 
   if (patch.modelId !== undefined) {

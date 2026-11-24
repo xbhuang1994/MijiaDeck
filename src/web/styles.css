@@ -4973,6 +4973,18 @@ body.pi-drawer-open .voice-fab {
   min-width: 0;
 }
 
+.agent-custom-meta-grid {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.agent-api-select {
+  min-width: 185px;
+  flex-shrink: 0;
+}
+
 #set-agent-models-status.is-success {
   color: var(--c-theme-dim);
 }

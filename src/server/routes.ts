@@ -1801,9 +1801,26 @@ export function createRequestHandler(
               ? savedCfg.baseUrl
               : "";
         const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : undefined;
+        const rawApiType =
+          typeof body.customApiType === "string"
+            ? body.customApiType.trim()
+            : typeof body.apiType === "string"
+              ? body.apiType.trim()
+              : undefined;
+        const validApiTypes = new Set([
+          "openai-completions",
+          "openai-responses",
+          "anthropic-messages",
+          "google-generative-ai",
+        ]);
+        const apiType =
+          rawApiType && validApiTypes.has(rawApiType)
+            ? (rawApiType as agentConfigStoreModule.CustomApiType)
+            : undefined;
 
         const discovery = await fetchProviderModels({
           provider: knownProvider,
+          apiType,
           baseUrl,
           apiKey,
           savedConfig: savedCfg,

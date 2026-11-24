@@ -47,6 +47,8 @@ export interface UiProviderPreset {
 
 export interface UiPublicAgentConfig extends ClientVoiceConfig {
   provider: string;
+  customProviderName?: string;
+  customApiType?: string;
   modelId: string;
   baseUrl: string;
   systemPromptExtra: string;

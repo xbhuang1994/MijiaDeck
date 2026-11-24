@@ -17,6 +17,7 @@ import {
   resolveEnvApiKeyForProvider,
   type AgentProviderMode,
   type AgentVoiceConfig,
+  type CustomApiType,
 } from "../core/agentConfigStore.ts";
 import { createBoundedFetch, type FetchLike } from "../core/httpTimeout.ts";
 
@@ -28,6 +29,7 @@ export interface DiscoveredModel {
 
 export interface FetchProviderModelsOptions {
   provider: AgentProviderMode;
+  apiType?: CustomApiType;
   baseUrl?: string;
   apiKey?: string;
   savedConfig?: AgentVoiceConfig;
@@ -84,13 +86,19 @@ function resolveKeyForDiscovery(opts: FetchProviderModelsOptions): string | unde
   return resolveEnvApiKeyForProvider(opts.provider);
 }
 
-function buildModelsEndpoint(provider: AgentProviderMode, rawBaseUrl: string): string {
+function buildModelsEndpoint(
+  provider: AgentProviderMode,
+  rawBaseUrl: string,
+  apiType?: CustomApiType,
+): string {
   const preset = getProviderPreset(provider);
   const base = normalizeHttpUrl(rawBaseUrl) || preset.defaultBaseUrl;
   if (!base) return "";
   if (base.endsWith("/models")) return base;
 
-  if (provider === "anthropic") {
+  const isAnthropic =
+    provider === "anthropic" || (provider === "openai-compatible" && apiType === "anthropic-messages");
+  if (isAnthropic) {
     return base.endsWith("/v1") ? `${base}/models` : `${base}/v1/models`;
   }
   return `${base}/models`;
@@ -175,7 +183,8 @@ export async function fetchProviderModels(
     };
   }
 
-  const endpoint = buildModelsEndpoint(provider, options.baseUrl ?? "");
+  const effectiveApiType = options.apiType ?? options.savedConfig?.customApiType;
+  const endpoint = buildModelsEndpoint(provider, options.baseUrl ?? "", effectiveApiType);
   if (!endpoint) {
     return {
       ok: false,
@@ -202,10 +211,16 @@ export async function fetchProviderModels(
     Accept: "application/json",
   };
   if (apiKey) {
-    if (provider === "anthropic") {
+    const isAnthropic =
+      provider === "anthropic" ||
+      (provider === "openai-compatible" && effectiveApiType === "anthropic-messages");
+    const isGoogle =
+      provider === "google" ||
+      (provider === "openai-compatible" && effectiveApiType === "google-generative-ai");
+    if (isAnthropic) {
       headers["x-api-key"] = apiKey;
       headers["anthropic-version"] = "2023-06-01";
-    } else if (provider === "google") {
+    } else if (isGoogle) {
       headers["x-goog-api-key"] = apiKey;
     } else {
       headers["Authorization"] = `Bearer ${apiKey}`;

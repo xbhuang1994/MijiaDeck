@@ -3314,7 +3314,9 @@ export class MijiaDeckWebApp {
     const activeProvider = cfg?.provider || "local";
     provSelect.value = list.some((p) => p.id === activeProvider) ? activeProvider : "local";
 
-    el<HTMLInputElement>("set-agent-model").value = cfg?.modelId || "mijia-local-planner";
+    el<HTMLInputElement>("set-agent-custom-name").value = cfg?.customProviderName || "";
+    el<HTMLSelectElement>("set-agent-api-type").value = cfg?.customApiType || "openai-completions";
+    el<HTMLInputElement>("set-agent-model").value = cfg?.modelId || "";
     el<HTMLInputElement>("set-agent-base-url").value = cfg?.baseUrl || "";
     const keyInput = el<HTMLInputElement>("set-agent-api-key");
     keyInput.value = "";
@@ -3353,25 +3355,27 @@ export class MijiaDeckWebApp {
       this.agentProvidersCache.length > 0 ? this.agentProvidersCache : this.piAgentPanel.getProviders();
     const preset = providers.find((p) => p.id === provId);
     const isLocal = provId === "local";
+    const isCustom = provId === "openai-compatible";
 
+    el("setting-row-agent-custom-meta").hidden = !isCustom;
     el("setting-row-agent-model").hidden = isLocal;
     el("setting-row-agent-baseurl").hidden = isLocal;
     el("setting-row-agent-apikey").hidden = isLocal;
 
     if (preset) {
       el("set-agent-provider-desc").textContent = preset.description;
+      if (resetDefaultsOnSwitch) {
+        el<HTMLInputElement>("set-agent-model").value = preset.defaultModel;
+        if (isCustom && this.agentConfigCache?.provider !== "openai-compatible") {
+          el<HTMLInputElement>("set-agent-base-url").value = "";
+        }
+      }
       this.renderDiscoveredModels(
         preset.suggestedModels.map((id) => ({ id })),
         false,
       );
       el<HTMLInputElement>("set-agent-base-url").placeholder =
-        preset.defaultBaseUrl || "http://127.0.0.1:11434/v1";
-      if (resetDefaultsOnSwitch) {
-        el<HTMLInputElement>("set-agent-model").value = preset.defaultModel;
-        if (provId === "openai-compatible" && !el<HTMLInputElement>("set-agent-base-url").value) {
-          el<HTMLInputElement>("set-agent-base-url").value = preset.defaultBaseUrl;
-        }
-      }
+        preset.defaultBaseUrl || "https://your-gateway/v1 或 http://127.0.0.1:11434/v1";
     }
 
     if (!isLocal) {
@@ -3441,6 +3445,7 @@ export class MijiaDeckWebApp {
     const refreshBtn = el<HTMLButtonElement>("set-agent-refresh-models-btn");
     const baseUrl = el<HTMLInputElement>("set-agent-base-url").value.trim();
     const apiKey = el<HTMLInputElement>("set-agent-api-key").value.trim();
+    const customApiType = el<HTMLSelectElement>("set-agent-api-type").value;
 
     statusEl.classList.remove("is-success", "is-warn");
     statusEl.textContent = "正在从 API 自动获取可用模型列表…";
@@ -3448,6 +3453,7 @@ export class MijiaDeckWebApp {
 
     try {
       const payload: Record<string, unknown> = { provider };
+      if (provider === "openai-compatible") payload.customApiType = customApiType;
       if (baseUrl) payload.baseUrl = baseUrl;
       if (apiKey) payload.apiKey = apiKey;
 
@@ -3469,8 +3475,11 @@ export class MijiaDeckWebApp {
         statusEl.classList.add("is-success");
         statusEl.textContent = `✓ 已自动从 API 获取 ${list.length} 个可用模型，可直接下拉选择或手动输入`;
       } else {
+        if (list.length === 0) {
+          this.renderDiscoveredModels([], false);
+        }
         statusEl.classList.add("is-warn");
-        statusEl.textContent = res.error || "未能从接口拉取模型列表，已显示默认推荐列表";
+        statusEl.textContent = res.error || "未能从接口拉取模型列表，请检查 Base URL 与 API Key";
         if (showToastOnError && res.error) {
           this.showToast(res.error, 3200);
         }
@@ -3600,6 +3609,8 @@ export class MijiaDeckWebApp {
 
     const agentPayload: Record<string, unknown> = {
       provider: el<HTMLSelectElement>("set-agent-provider").value,
+      customProviderName: el<HTMLInputElement>("set-agent-custom-name").value.trim(),
+      customApiType: el<HTMLSelectElement>("set-agent-api-type").value,
       modelId: el<HTMLInputElement>("set-agent-model").value.trim(),
       baseUrl: el<HTMLInputElement>("set-agent-base-url").value.trim(),
       systemPromptExtra: el<HTMLTextAreaElement>("set-agent-system-prompt").value.trim(),
@@ -3626,26 +3637,24 @@ export class MijiaDeckWebApp {
     }
 
     try {
-      const [res, agentRes] = await Promise.all([
-        apiPost<unknown>("/api/settings", payload),
-        apiPost<{
-          config?: UiPublicAgentConfig;
-          agent?: unknown;
-          voice?: unknown;
-        }>("/api/agent/config", agentPayload),
-      ]);
+      const agentRes = await apiPost<{
+        config?: UiPublicAgentConfig;
+        agent?: unknown;
+        voice?: unknown;
+      }>("/api/agent/config", agentPayload);
+      const res = await apiPost<unknown>("/api/settings", payload);
       this.settingsOriginal = null;
       this.agentClearKeyPending = false;
       this.sttClearKeyPending = false;
-      if (agentRes?.config) this.agentConfigCache = agentRes.config;
-      if (agentRes?.agent) this.piAgentPanel.applyAgentSnapshot(agentRes.agent);
-      if (agentRes?.voice) this.piAgentPanel.applyVoiceSnapshot(agentRes.voice);
       if (asRecord(res)) {
         this.applyStatePatch(res);
       } else {
         this.applySettingsObject(payload);
         this.renderAll();
       }
+      if (agentRes?.config) this.agentConfigCache = agentRes.config;
+      if (agentRes?.agent) this.piAgentPanel.applyAgentSnapshot(agentRes.agent);
+      if (agentRes?.voice) this.piAgentPanel.applyVoiceSnapshot(agentRes.voice);
       this.reloadThemeStylesheet();
       this.closeModal();
       this.showToast("设置已保存", 2200);
@@ -4984,6 +4993,10 @@ export class MijiaDeckWebApp {
 
     el<HTMLSelectElement>("set-agent-provider").addEventListener("change", () => {
       this.syncAgentProviderFormHints(true);
+    });
+
+    el<HTMLSelectElement>("set-agent-api-type").addEventListener("change", () => {
+      void this.fetchAgentModelsFromApi(false);
     });
 
     el<HTMLSelectElement>("set-agent-model-select").addEventListener("change", (e) => {
