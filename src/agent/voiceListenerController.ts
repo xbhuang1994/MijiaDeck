@@ -110,6 +110,7 @@ export interface HandleTranscriptOptions {
   bypassWakeWord?: boolean;
   engine?: VoiceRuntimeEngine;
   now?: number;
+  segmentDurationMs?: number;
   acousticEvent?: string;
   voiceprint?: VoiceprintIdentifyResult | null;
   snrGainDb?: number;
@@ -249,11 +250,10 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     return this._localEngine;
   }
 
-  private _recordSpoken(text: string): void {
+  private _recordSpoken(text: string, now = Date.now()): void {
     const t = text.trim();
     if (!t) return;
-    const now = Date.now();
-    if (now - this._lastSpokenAt < 3500 && this._lastSpokenReply.length < 300) {
+    if (now >= this._lastSpokenAt && now - this._lastSpokenAt < 3500 && this._lastSpokenReply.length < 300) {
       this._lastSpokenReply = `${this._lastSpokenReply} ${t}`.trim();
     } else {
       this._lastSpokenReply = t;
@@ -355,7 +355,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     }
 
     const cfg = this.config;
-    const awakeActive = this._awakeUntil !== null && now < this._awakeUntil;
+    const speechStartedAt = Math.max(0, now - Math.min(8000, options.segmentDurationMs ?? 0));
+    const awakeActive =
+      this._awakeUntil !== null && (now < this._awakeUntil || speechStartedAt < this._awakeUntil);
     if (!awakeActive && this._awakeUntil !== null) {
       this._awakeUntil = null;
     }
@@ -363,7 +365,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       awakeActive ||
       (cfg.conversationWindowSec > 0 &&
         this._conversationUntil !== null &&
-        now < this._conversationUntil);
+        (now < this._conversationUntil || speechStartedAt < this._conversationUntil));
     if (!inConversation && this._conversationUntil !== null) {
       this._conversationUntil = null;
     }
@@ -434,11 +436,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       updatedAt: now,
     };
 
-    // 仅唤醒词：开启唤醒等待窗口与对话窗口
+    // 仅唤醒词：开启唤醒等待窗口与对话窗口（播报“我在，请说指令”期间额外预留 2.5s 语音播报宽限，避免短唤醒窗口被播报吃掉）
     if (decision.accept && decision.wokeOnly) {
-      this._awakeUntil = now + cfg.wakeWindowSec * 1000;
+      const ttsGraceMs = cfg.autoSpeakReply ? 2500 : 0;
+      this._awakeUntil = now + cfg.wakeWindowSec * 1000 + ttsGraceMs;
       if (cfg.conversationWindowSec > 0) {
-        this._conversationUntil = now + cfg.conversationWindowSec * 1000;
+        this._conversationUntil = now + cfg.conversationWindowSec * 1000 + ttsGraceMs;
       }
       this._mode = "awake";
       const wakeReply = options.voiceprint?.speakerName
@@ -448,7 +451,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       const snap = this.snapshot();
       this.emit("stateChanged", snap);
       if (cfg.autoSpeakReply) {
-        this._recordSpoken(wakeReply);
+        this._recordSpoken(wakeReply, now);
         this.emit("speakRequested", wakeReply);
       }
       return {
@@ -762,6 +765,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       isFinal: true,
       bypassWakeWord: options.bypassWakeWord,
       engine: runtimeEngine,
+      segmentDurationMs: Math.round((pcm16k.length / 16000) * 1000),
       acousticEvent,
       voiceprint: voiceprintResult,
       snrGainDb: denoised.snrGainDb,
@@ -892,6 +896,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       isFinal: true,
       bypassWakeWord: options.bypassWakeWord,
       engine: runtimeEngine,
+      segmentDurationMs: Math.round(segment.durationSec * 1000),
       acousticEvent,
       voiceprint: voiceprintResult,
       snrGainDb: segment.snrGainDb,

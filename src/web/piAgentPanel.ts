@@ -745,6 +745,11 @@ export class PiAgentPanelController {
       details.push(`降噪 +${m.snrGainDb.toFixed(1)}dB`);
     }
     if (m?.attention?.reason) {
+      if (!m.attention.accept && vs?.lastTranscript) {
+        const heard = vs.lastTranscript.trim();
+        const preview = heard.length > 26 ? `${heard.slice(0, 26)}…` : heard;
+        details.push(`听到：“${preview}”`);
+      }
       details.push(m.attention.accept ? `✓ ${m.attention.reason}` : `⊘ ${m.attention.reason}`);
     }
     if (typeof m?.timings?.totalMs === "number" && m.timings.totalMs > 0) {

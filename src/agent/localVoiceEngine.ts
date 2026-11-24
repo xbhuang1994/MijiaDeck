@@ -26,7 +26,13 @@ import {
   resampleLinear,
   spectralSubtractDenoise,
 } from "./audioPcm.ts";
-import { findWakeWordSpan, looksLikeDirectDeviceCommand } from "./voiceAttentionGate.ts";
+import {
+  findWakeWordSpan,
+  isWakeQueryText,
+  looksLikeDirectDeviceCommand,
+  matchEnglishHeadWakeWord,
+  stripLeadingVocativeOrFragment,
+} from "./voiceAttentionGate.ts";
 import { getPrimaryOwnerRefWavPath } from "./voiceprintStore.ts";
 
 export type { NoiseSuppressionMode, VadEngineMode };
@@ -846,10 +852,11 @@ export class LocalVoiceEngine {
   }
 
   /**
-   * 抗音乐/强噪双轨本地识别：
-   * - 高信噪比安静环境（SNR >= 22dB 且无强制双轨）：单轨极速解码（~140ms）
-   * - 嘈杂环境或存在音乐播放：同时解码「高通原始轨（零降噪伪影，保留爆破音与数字）」与「神经降噪轨」，
-   *   按唤醒词完整度 + 指令清晰度 + 声学事件融合择优！
+   * 抗音乐/强噪双轨本地识别 + 中英混说唤醒词句首英文探针恢复：
+   * - 高信噪比安静环境（SNR >= 24dB 且已命中唤醒词或无唤醒词要求）：单轨极速解码（~140ms）
+   * - 嘈杂环境/音乐播放，或降噪单轨未检出唤醒词：同时解码「高通原始轨」与「神经降噪轨」融合择优；
+   * - 若配置了英文唤醒词（如 Neo / Jarvis / Luna / Nova / pi）且中文 auto 模式下 SenseVoice 将句首英文吞掉或误判为日韩假名（如 "2お" / "ニ요"），
+   *   自动对句首 1.35 秒执行 ~55ms 英文语种提示探针（en），在不误触纯中文日常对话的前提下精准恢复中英混说唤醒词！
    */
   async transcribeDualTrack(
     rawPcm16k: Float32Array,
@@ -864,32 +871,153 @@ export class LocalVoiceEngine {
     const lang = options.voiceLang || "zh-CN";
     const wakeWords = options.wakeWords ?? [];
     const inputSnrDb = options.inputSnrDb ?? estimateSnrDb(rawPcm16k, 16000);
+    const hasAsciiWake = wakeWords.some((w) => /^[a-z][a-z0-9\s-]*$/i.test(w.trim()));
 
-    // 非常安静的环境直接单轨返回，保持最低延迟
+    let best: LocalAsrOutput;
+    const hpRaw = applyHighPassFilter(rawPcm16k, 16000, 85);
+
+    // 非常安静的环境：若无需唤醒词检查或降噪单轨已清晰命中唤醒词，直接单轨返回保持最低延迟
     if (!options.forceDual && inputSnrDb >= 24 && denoisedPcm16k.length > 0) {
       const single = await this.transcribeLocal(denoisedPcm16k, 16000, lang);
-      if (single.text.length > 0 && !single.event.toUpperCase().includes("BGM")) {
+      const singleMatchedWake =
+        wakeWords.length === 0 || Boolean(findWakeWordSpan(single.text, wakeWords));
+      if (
+        single.text.length > 0 &&
+        !single.event.toUpperCase().includes("BGM") &&
+        singleMatchedWake
+      ) {
         return single;
+      }
+      // 降噪轨未检出唤醒词时补跑一次高通原始轨（避免 GTCRN 轻度抑制句首短英文音节如 "嘿Neo"）
+      const rawRes = await this.transcribeLocal(hpRaw, 16000, lang);
+      best = chooseBestAsrCandidate(rawRes, single, { wakeWords, inputSnrDb });
+    } else {
+      const [rawRes, denRes] = await Promise.all([
+        this.transcribeLocal(hpRaw, 16000, lang),
+        denoisedPcm16k.length > 0
+          ? this.transcribeLocal(denoisedPcm16k, 16000, lang)
+          : Promise.resolve<LocalAsrOutput>({
+              text: "",
+              rawText: "",
+              lang: "",
+              emotion: "",
+              event: "",
+              engine: "sensevoice-local",
+              durationMs: 0,
+            }),
+      ]);
+      best = chooseBestAsrCandidate(rawRes, denRes, { wakeWords, inputSnrDb });
+    }
+
+    // 中英混说英文唤醒词句首恢复（仅在配置了英文唤醒词、中文/自动模式且主解码未命中唤醒词时触发）
+    const langLower = lang.toLowerCase();
+    const isBilingualZhMode = !langLower || langLower === "auto" || langLower.startsWith("zh");
+    if (hasAsciiWake && isBilingualZhMode && !findWakeWordSpan(best.text, wakeWords)) {
+      const recovered = await this._recoverBilingualEnglishWake(hpRaw, denoisedPcm16k, best, wakeWords);
+      if (recovered) {
+        return recovered;
       }
     }
 
-    const hpRaw = applyHighPassFilter(rawPcm16k, 16000, 85);
-    const [rawRes, denRes] = await Promise.all([
-      this.transcribeLocal(hpRaw, 16000, lang),
-      denoisedPcm16k.length > 0
-        ? this.transcribeLocal(denoisedPcm16k, 16000, lang)
-        : Promise.resolve<LocalAsrOutput>({
-            text: "",
-            rawText: "",
-            lang: "",
-            emotion: "",
-            event: "",
-            engine: "sensevoice-local",
-            durationMs: 0,
-          }),
-    ]);
+    return best;
+  }
 
-    return chooseBestAsrCandidate(rawRes, denRes, { wakeWords, inputSnrDb });
+  /**
+   * 针对 SenseVoice CTC 在中英混说时的单语种偏移问题（例如 "Neo" 单独说被识别成 "2お"/"ニ요"，
+   * 或 "Neo, 把小米音响音量调到30" 中句首英文 "Neo" 被 <|zh|> 吞掉只剩 "把小米音响音量调到30"）：
+   * 对句首 1.35s 音频做一次轻量 en 语种提示解码，并严格校验避免纯中文对话误唤醒。
+   */
+  private async _recoverBilingualEnglishWake(
+    hpRaw16k: Float32Array,
+    denoised16k: Float32Array,
+    best: LocalAsrOutput,
+    wakeWords: readonly string[],
+  ): Promise<LocalAsrOutput | null> {
+    const asciiWakes = wakeWords.filter((w) => /^[a-z][a-z0-9\s-]*$/i.test(w.trim()));
+    if (asciiWakes.length === 0) return null;
+
+    const primaryAudio = denoised16k.length >= 1600 ? denoised16k : hpRaw16k;
+    if (primaryAudio.length < 1600) return null;
+
+    const isShortClip = primaryAudio.length <= 16000 * 1.9;
+    const headPrimary = isShortClip
+      ? primaryAudio
+      : primaryAudio.subarray(0, Math.min(primaryAudio.length, Math.round(16000 * 1.35)));
+
+    const cleanBest = best.text.trim();
+    const meaningfulChars = cleanBest.replace(/[\s,，。．.、!！?？:：;；\-—~～"'“”‘’]/g, "");
+    const hasWeirdScript = /[\u3040-\u30ff\uac00-\ud7af]/.test(cleanBest);
+    const strippedBest = stripLeadingVocativeOrFragment(cleanBest);
+    const bestLooksLikeCmd =
+      strippedBest.length >= 2 &&
+      (looksLikeDirectDeviceCommand(strippedBest) || isWakeQueryText(strippedBest));
+    const bestIsShortOrGarbled = isShortClip || meaningfulChars.length <= 4 || hasWeirdScript;
+
+    // 既不是短/乱码句，也不像控制指令或唤醒询问 -> 直接跳过，零额外开销、零误触发
+    if (!bestIsShortOrGarbled && !bestLooksLikeCmd) {
+      return null;
+    }
+
+    let extraMs = 0;
+    const probeClip = async (
+      clip: Float32Array,
+      allowCommandGated: boolean,
+    ): Promise<{
+      enRes: LocalAsrOutput;
+      hit: { wakeWord: string; matchedSurface: string; fuzzy: boolean } | null;
+    }> => {
+      const enRes = await this.transcribeLocal(clip, 16000, "en-US");
+      extraMs += enRes.durationMs;
+      const hit = matchEnglishHeadWakeWord(enRes.text, asciiWakes, {
+        allowCommandGatedAliases: allowCommandGated,
+      });
+      return { enRes, hit };
+    };
+
+    let { enRes, hit } = await probeClip(headPrimary, bestLooksLikeCmd);
+
+    // 若降噪轨首段未命中且原始轨不同，再对高通原始轨句首 1.35s 补探一次（防止降噪器/VAD 削弱句首轻声英文唤醒词）
+    if (!hit && denoised16k.length >= 1600 && hpRaw16k.length >= 1600) {
+      const rawIsShort = hpRaw16k.length <= 16000 * 1.9;
+      const headRaw = rawIsShort
+        ? hpRaw16k
+        : hpRaw16k.subarray(0, Math.min(hpRaw16k.length, Math.round(16000 * 1.35)));
+      const second = await probeClip(headRaw, bestLooksLikeCmd);
+      if (second.hit) {
+        enRes = second.enRes;
+        hit = second.hit;
+      }
+    }
+
+    if (!hit) return null;
+
+    // 场景 1：双语“英文唤醒词 + 中文设备指令”（例如 auto 吞掉 Neo 只剩 "把小米音响音量调到30。"，而 headEn 明确听到 "Neo"/"Neil"/"Near"）
+    if (bestLooksLikeCmd) {
+      const cmdPart = isWakeQueryText(strippedBest) ? "" : strippedBest;
+      const recoveredText = cmdPart ? `${hit.wakeWord}，${cmdPart}` : hit.wakeWord;
+      return {
+        ...best,
+        text: recoveredText,
+        durationMs: best.durationMs + extraMs,
+        altText: `${best.text} [en-head:${enRes.text}]`,
+      };
+    }
+
+    // 场景 2：单独喊英文唤醒词（例如 "Neo" / "Hey Neo" 被 auto 误判成 "2お." / "ニ요." / "2." / "你有。"）
+    if (bestIsShortOrGarbled) {
+      const enSpan = findWakeWordSpan(enRes.text, asciiWakes);
+      const recoveredText =
+        enSpan && enSpan.afterText ? `${hit.wakeWord}，${enSpan.afterText}` : hit.wakeWord;
+      return {
+        ...enRes,
+        text: recoveredText,
+        engine: best.engine,
+        durationMs: best.durationMs + extraMs,
+        altText: best.text,
+      };
+    }
+
+    return null;
   }
 
   /**

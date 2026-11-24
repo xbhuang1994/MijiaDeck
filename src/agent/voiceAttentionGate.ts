@@ -88,18 +88,154 @@ export interface WakeSpanMatch {
 const LEADING_PUNCT_RE = /^[\s,，。．.、!！?？:：;；\-—~～"“”'‘’]+/;
 const TRAILING_PUNCT_RE = /[\s,，。．.、!！?？:：;；"“”'‘’]+$/;
 
-// 中文常见同音/噪声近音误识别映射（显著提高嘈杂环境与音乐播放下的唤醒召回率）
+// 中英文常见同音/音译/SenseVoice 跨语种误识别映射（显著提高自定义英文唤醒词与嘈杂环境下的唤醒召回率）
 const WAKE_HOMOPHONES: Readonly<Record<string, readonly string[]>> = {
   小派: ["小湃", "小π", "小拍", "小排", "小牌", "小佩", "肖派", "晓派", "校派", "小帕", "小怕"],
   派派: ["拍拍", "湃湃"],
   米家助手: ["米家主手", "迷家助手"],
+  小爱: ["小艾", "晓爱", "小矮"],
+  小度: ["小杜", "小肚"],
+  小智: ["小志", "小治"],
+  小艺: ["小易", "小意", "小翼"],
+  // 英文唤醒词常见近音/中文音译/SenseVoice auto 语种滑移（如 Neo -> 2お / ニ요 / Neil / 尼奥 / 你o）
+  neo: [
+    "neil",
+    "neal",
+    "nio",
+    "niyo",
+    "neio",
+    "neow",
+    "newo",
+    "niel",
+    "kneel",
+    "尼奥",
+    "尼欧",
+    "妮奥",
+    "妮欧",
+    "尼哦",
+    "妮哦",
+    "呢哦",
+    "你o",
+    "你0",
+    "2お",
+    "ニオ",
+    "ネオ",
+    "にお",
+    "ニ요",
+    "니오",
+    "네오",
+  ],
+  jarvis: ["贾维斯", "查维斯", "加维斯", "jarves", "jrvis"],
+  nova: ["诺瓦", "诺娃", "挪瓦", "nora"],
+  luna: ["露娜", "卢娜", "路娜", "lunna", "lunar"],
+  friday: ["星期五", "弗莱迪"],
+  echo: ["艾可", "爱科", "eko"],
 };
 
-// 仅在后面紧跟明确智能家居控制指令时才启用的强噪近音兜底（防止正常聊天误触）
+// 仅在后面紧跟明确智能家居控制指令（或唤醒询问“在吗”）时才启用的强噪/跨语种近音兜底（防止正常聊天误触）
 const NOISE_ONLY_WAKE_ALIASES: Readonly<Record<string, readonly string[]>> = {
   小派: ["小开", "小块", "小买", "小败", "小拜"],
   pi: ["heyp", "hey p", "api", "pai"],
+  neo: [
+    "new",
+    "near",
+    "leo",
+    "mio",
+    "nero",
+    "rio",
+    "hey ne",
+    "hei ne",
+    "妞",
+    "牛",
+    "纽",
+    "钮",
+    "你有",
+    "你又",
+    "里奥",
+    "利奥",
+    "米奥",
+  ],
 };
+
+// 常见英文高频停用词：禁止在动态模糊匹配中作为单独无指令的唤醒词触发（防误唤）
+const COMMON_EN_STOPWORDS = new Set<string>([
+  "no",
+  "not",
+  "now",
+  "new",
+  "near",
+  "one",
+  "two",
+  "the",
+  "and",
+  "you",
+  "he",
+  "she",
+  "it",
+  "we",
+  "me",
+  "my",
+  "hi",
+  "hey",
+  "ok",
+  "yes",
+  "are",
+  "is",
+  "do",
+  "go",
+  "so",
+  "to",
+  "on",
+  "off",
+  "in",
+  "out",
+  "up",
+  "for",
+  "how",
+  "who",
+  "why",
+  "all",
+  "can",
+  "get",
+  "let",
+  "see",
+  "say",
+  "set",
+  "put",
+  "run",
+  "our",
+  "his",
+  "her",
+  "has",
+  "had",
+  "was",
+  "did",
+  "big",
+  "bad",
+  "red",
+  "old",
+  "own",
+  "way",
+  "day",
+  "man",
+  "boy",
+  "top",
+  "low",
+  "end",
+  "car",
+  "cat",
+  "dog",
+  "need",
+  "next",
+  "nice",
+  "name",
+  "note",
+]);
+
+// 中文模糊前缀词中，容易与家庭日常问句混淆的词（如“你有打开窗户吗？”），需屏蔽句尾疑问助词“吗/嘛/么/呢”
+const AMBIGUOUS_ZH_NOISE_ALIASES = new Set<string>(["你有", "你又"]);
+
+const WAKE_QUERY_AFTER_RE = /^(?:在吗|你在吗|在不在|你好|您好)$/i;
 
 // 句首自然呼唤前缀（属于正向呼叫，不视为第三人称）
 const VOCATIVE_PREFIX_RE =
@@ -118,6 +254,171 @@ const DIRECT_COMMAND_START_RE =
 
 export function looksLikeDirectDeviceCommand(text: string): boolean {
   return DIRECT_COMMAND_START_RE.test(text.trim());
+}
+
+export function isWakeQueryText(text: string): boolean {
+  const cleaned = text.replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
+  return WAKE_QUERY_AFTER_RE.test(cleaned);
+}
+
+/**
+ * 剥离句首自然呼唤前缀或 SenseVoice 中英混说残留的极短碎片（如 "你好，关闭卧室灯" / "he打开卧室灯" / "vis打开客厅吸顶灯"），
+ * 便于与英文句首唤醒探针结果对齐重组。
+ */
+export function stripLeadingVocativeOrFragment(text: string): string {
+  let s = text.replace(LEADING_PUNCT_RE, "").trim();
+  // 先尝试剥离自然中文呼唤前缀（如 "你好，关闭卧室灯" -> "关闭卧室灯"）
+  const vocMatch =
+    /^(?:喂|嘿|嗨|哎|唉|哈喽|你好|您好|那个|hey|hi|ok|yo|hello)[\s,，、!！。:：]*(.+)$/i.exec(s);
+  if (vocMatch && vocMatch[1]) {
+    const rest = vocMatch[1].replace(LEADING_PUNCT_RE, "").trim();
+    if (rest) s = rest;
+  }
+  // 再剥离紧贴中文指令前的 1~4 字母残留碎片（如 "he打开卧室灯" / "vis打开客厅吸顶灯" / "n关闭卧室灯"）
+  const fragMatch = /^([a-z]{1,4})[\s,，。!！?？:：、]*(?=[\u4e00-\u9fff])/i.exec(s);
+  if (fragMatch) {
+    const rest = s.slice(fragMatch[0].length).replace(LEADING_PUNCT_RE, "").trim();
+    if (rest && (looksLikeDirectDeviceCommand(rest) || isWakeQueryText(rest))) {
+      s = rest;
+    }
+  }
+  return s.replace(TRAILING_PUNCT_RE, "").trim();
+}
+
+function phoneticSkeleton(word: string): string {
+  return word
+    .toLowerCase()
+    .replace(/[^a-z]/g, "")
+    .replace(/^kn/, "n")
+    .replace(/^wr/, "r")
+    .replace(/ph/g, "f")
+    .replace(/ck/g, "k")
+    .replace(/qu/g, "kw")
+    .replace(/x/g, "ks")
+    .replace(/gh/g, "")
+    .replace(/(?:ee|ea|ie|ei)/g, "i")
+    .replace(/(?:oo|ou|ew)/g, "u")
+    .replace(/(?:eo|io|iu|eu)/g, "io")
+    .replace(/(?:ae|ai|ay)/g, "e")
+    .replace(/(?:oa|ow)/g, "o")
+    .replace(/(.)\1+/g, "$1");
+}
+
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const prev = new Array<number>(b.length + 1);
+  const curr = new Array<number>(b.length + 1);
+  for (let j = 0; j <= b.length; j += 1) prev[j] = j;
+  for (let i = 1; i <= a.length; i += 1) {
+    curr[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j]! + 1, curr[j - 1]! + 1, prev[j - 1]! + cost);
+    }
+    for (let j = 0; j <= b.length; j += 1) prev[j] = curr[j]!;
+  }
+  return prev[b.length]!;
+}
+
+/**
+ * 判断英文单词 token 是否与配置的自定义英文唤醒词 wake 在拼写/发音上足够接近。
+ */
+function isPhoneticAsciiMatch(
+  tokenRaw: string,
+  wakeRaw: string,
+  options: { allowStopwords?: boolean } = {},
+): boolean {
+  const token = tokenRaw.toLowerCase().replace(/[^a-z]/g, "");
+  const wake = wakeRaw.toLowerCase().replace(/[^a-z]/g, "");
+  if (wake.length < 3 || token.length < 2) return false;
+  if (token === wake) return true;
+  if (!options.allowStopwords && COMMON_EN_STOPWORDS.has(token)) return false;
+  // 永远拒绝高频否定词 "no"（防止 "No, stop" 误触 "Neo"）
+  if (token === "no" || token === "not" || token === "now") return false;
+  if (Math.abs(token.length - wake.length) > 2) return false;
+
+  const skToken = phoneticSkeleton(token);
+  const skWake = phoneticSkeleton(wake);
+  if (skToken === skWake && skToken.length >= 2) return true;
+
+  const rawDist = levenshtein(token, wake);
+  const skDist = levenshtein(skToken, skWake);
+
+  if (wake.length <= 4) {
+    // 短英文唤醒词（如 Neo / Nova / Luna）：要求首字母一致且编辑距离或音素距离 <= 1
+    if (token[0] !== wake[0]) return false;
+    return rawDist <= 1 || skDist <= 1;
+  }
+  return rawDist <= 2 || skDist <= 1;
+}
+
+/**
+ * 供本地双轨 ASR 英文句首探针（headEn）复用：判断句首短英文转写是否命中了配置的英文唤醒词。
+ */
+export function matchEnglishHeadWakeWord(
+  headText: string,
+  wakeWords: readonly string[],
+  options: { allowCommandGatedAliases?: boolean } = {},
+): { wakeWord: string; matchedSurface: string; fuzzy: boolean } | null {
+  const cleaned = headText.trim();
+  if (!cleaned) return null;
+
+  const asciiWakes = wakeWords
+    .map((w) => w.trim())
+    .filter((w) => /^[a-z][a-z0-9\s-]*$/i.test(w))
+    .sort((a, b) => b.length - a.length);
+  if (asciiWakes.length === 0) return null;
+
+  // 1. 精确或内置同音表匹配
+  const direct = findWakeWordSpan(cleaned, asciiWakes);
+  if (direct && direct.index <= 6) {
+    return {
+      wakeWord: direct.wakeWord,
+      matchedSurface: direct.matchedSurface,
+      fuzzy: direct.fuzzy,
+    };
+  }
+
+  // 剥离句首常见英文呼唤词 Hey / Hi / OK
+  const stripped = cleaned
+    .replace(LEADING_PUNCT_RE, "")
+    .replace(/^(?:hey|hi|ok|yo|hello|嘿|喂|你好)[\s,，、!！。]*/i, "")
+    .trim();
+
+  // 2. 允许命令门控近音别名（用于中文完整命令已确认时的双语句首恢复，如 headEn="Near."/"New."/"Hey Ne."）
+  if (options.allowCommandGatedAliases) {
+    for (const w of asciiWakes) {
+      const aliases = NOISE_ONLY_WAKE_ALIASES[w] ?? NOISE_ONLY_WAKE_ALIASES[w.toLowerCase()];
+      if (!aliases) continue;
+      for (const alias of aliases) {
+        if (!/^[a-z0-9\s]+$/i.test(alias)) continue;
+        const re = new RegExp(`(?<![a-z])(${escapeRegExp(alias)})(?![a-z])`, "i");
+        const m = re.exec(cleaned);
+        if (m && m.index <= 6) {
+          return { wakeWord: w, matchedSurface: m[1] ?? m[0], fuzzy: true };
+        }
+      }
+    }
+  }
+
+  // 3. 通用自定义英文唤醒词动态音素/编辑距离匹配（支持任意用户自定义英文名，如 Neo / Jarvis / Luna / Milo）
+  const firstTokenMatch = /^([a-z]{2,16})(?![a-z])/i.exec(stripped);
+  if (firstTokenMatch && firstTokenMatch[1]) {
+    const token = firstTokenMatch[1];
+    for (const w of asciiWakes) {
+      if (
+        isPhoneticAsciiMatch(token, w, {
+          allowStopwords: Boolean(options.allowCommandGatedAliases),
+        })
+      ) {
+        return { wakeWord: w, matchedSurface: token, fuzzy: true };
+      }
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -185,7 +486,7 @@ export function computeEchoOverlap(transcript: string, lastSpoken: string): numb
 }
 
 /**
- * 在句子中查找唤醒词（支持中英文边界保护与中文常见同音 ASR 纠错）。
+ * 在句子中查找唤醒词（支持中英文边界保护、中英同音/音译纠错与任意自定义英文唤醒词音素模糊容错）。
  */
 export function findWakeWordSpan(
   rawText: string,
@@ -215,7 +516,7 @@ export function findWakeWordSpan(
     }
   }
   for (const w of sortedCanonical) {
-    const homophones = WAKE_HOMOPHONES[w];
+    const homophones = WAKE_HOMOPHONES[w] ?? WAKE_HOMOPHONES[w.toLowerCase()];
     if (!homophones) continue;
     for (const h of homophones) {
       const key = h.toLowerCase();
@@ -231,10 +532,12 @@ export function findWakeWordSpan(
     requireDirectCmdAfter: boolean,
   ): WakeSpanMatch | null => {
     for (const cand of list) {
-      const isAscii = /^[a-z0-9\s]+$/i.test(cand.surface);
+      const isAscii = /^[a-z0-9\s-]+$/i.test(cand.surface);
+      // 英文边界使用 (?<![a-z]) / (?![a-z])：既防止 "pi" 误匹配 "api/pizza"、"neo" 误匹配 "neon/pioneer"，
+      // 又允许中英无缝混说如 "嘿Neo，打开客厅吸顶灯"、"你好Neo关灯"、"Neo打开灯"、"Neo30"！
       const pattern = isAscii
         ? new RegExp(
-            `(?:^|[\\s,，。!！?？、])((?:hey\\s+|hi\\s+|ok\\s+)?${escapeRegExp(cand.surface)})(?=$|[\\s,，。!！?？:：、\\u4e00-\\u9fff])`,
+            `(?<![a-z])((?:hey\\s+|hi\\s+|ok\\s+)?${escapeRegExp(cand.surface)})(?![a-z])`,
             "i",
           )
         : new RegExp(`(${escapeRegExp(cand.surface)})`, "i");
@@ -248,15 +551,37 @@ export function findWakeWordSpan(
       const endIdx = startIdx + surfaceStr.length;
 
       const beforeText = cleaned.slice(0, startIdx).replace(TRAILING_PUNCT_RE, "").trim();
-      const afterText = cleaned
+      const rawAfter = cleaned
         .slice(endIdx)
         .replace(LEADING_PUNCT_RE, "")
-        .replace(/^(?:同学|你好|您好|在吗|请|帮我一下)?[\s,，。!！?？:：]*/i, "")
+        .replace(TRAILING_PUNCT_RE, "")
+        .trim();
+      const isWakeQuery = WAKE_QUERY_AFTER_RE.test(rawAfter);
+      const afterText = rawAfter
+        .replace(/^(?:同学|你好|您好|在吗|你在吗|在不在|请|帮我一下)?[\s,，。!！?？:：]*/i, "")
         .replace(TRAILING_PUNCT_RE, "")
         .trim();
 
-      if (requireDirectCmdAfter && (!afterText || !DIRECT_COMMAND_START_RE.test(afterText))) {
-        continue;
+      if (requireDirectCmdAfter) {
+        const surfaceLower = cand.surface.toLowerCase();
+        // 对容易与家庭日常问句混淆的中文别名（如 "你有打开窗户吗？"），屏蔽非“在吗”类的问句尾助词
+        if (
+          AMBIGUOUS_ZH_NOISE_ALIASES.has(cand.surface) &&
+          !isWakeQuery &&
+          /[吗嘛么呢]$/.test(rawAfter)
+        ) {
+          continue;
+        }
+        // 对常见英文词（如 "new" / "near"），仅允许后面紧跟中文直接设备控制指令或唤醒询问（防 "New York" / "Near the door"）
+        if (COMMON_EN_STOPWORDS.has(surfaceLower) && !isWakeQuery) {
+          const hasChineseAfter = /[\u4e00-\u9fff]/.test(afterText);
+          if (!hasChineseAfter || !DIRECT_COMMAND_START_RE.test(afterText)) {
+            continue;
+          }
+        }
+        if (!isWakeQuery && (!afterText || !DIRECT_COMMAND_START_RE.test(afterText))) {
+          continue;
+        }
       }
 
       return {
@@ -276,7 +601,7 @@ export function findWakeWordSpan(
   const primary = runCandidateList(candidates, false);
   if (primary) return primary;
 
-  // 强噪/音乐环境近音兜底：仅当后面紧跟明确的设备控制指令时才命中（如“小开把小米音量调到30” / “Api, turn off the light”）
+  // 强噪/跨语种近音兜底：仅当后面紧跟明确设备控制指令或唤醒询问时才命中
   const noiseCands: Candidate[] = [];
   for (const w of sortedCanonical) {
     const aliases = NOISE_ONLY_WAKE_ALIASES[w] ?? NOISE_ONLY_WAKE_ALIASES[w.toLowerCase()];
@@ -289,7 +614,74 @@ export function findWakeWordSpan(
       }
     }
   }
-  return runCandidateList(noiseCands, true);
+  const noiseMatch = runCandidateList(noiseCands, true);
+  if (noiseMatch) return noiseMatch;
+
+  // 通用自定义英文唤醒词动态音素/编辑距离兜底（支持任意未内置于映射表的自定义英文唤醒词，如 Jarvis / Luna / Milo / Kiro）
+  const asciiCanonical = sortedCanonical.filter((w) => /^[a-z][a-z0-9-]{2,}$/i.test(w));
+  if (asciiCanonical.length > 0) {
+    const leadMatch =
+      /^((?:(?:喂|嘿|嗨|哎|唉|哈喽|你好|您好|那个|hey|hi|ok|yo|hello)[\s,，、!！。]*)?)([a-z]{2,16})(?![a-z])/i.exec(
+        cleaned,
+      );
+    if (leadMatch && leadMatch[2]) {
+      const prefixStr = leadMatch[1] ?? "";
+      const token = leadMatch[2];
+      const startIdx = prefixStr.length;
+      const endIdx = startIdx + token.length;
+      const beforeText = prefixStr.replace(TRAILING_PUNCT_RE, "").trim();
+      const rawAfter = cleaned
+        .slice(endIdx)
+        .replace(LEADING_PUNCT_RE, "")
+        .replace(TRAILING_PUNCT_RE, "")
+        .trim();
+      const isWakeQuery = WAKE_QUERY_AFTER_RE.test(rawAfter);
+      const afterText = rawAfter
+        .replace(/^(?:同学|你好|您好|在吗|你在吗|在不在|请|帮我一下)?[\s,，。!！?？:：]*/i, "")
+        .replace(TRAILING_PUNCT_RE, "")
+        .trim();
+
+      const hasDirectCmd = afterText.length > 0 && DIRECT_COMMAND_START_RE.test(afterText);
+      const isStandaloneWake = rawAfter.length === 0 || isWakeQuery;
+
+      for (const w of asciiCanonical) {
+        if (
+          isStandaloneWake &&
+          isPhoneticAsciiMatch(token, w, { allowStopwords: false })
+        ) {
+          return {
+            matched: true,
+            wakeWord: w,
+            matchedSurface: token,
+            index: startIdx,
+            endIndex: endIdx,
+            beforeText,
+            afterText: "",
+            fuzzy: true,
+          };
+        }
+        if (
+          hasDirectCmd &&
+          isPhoneticAsciiMatch(token, w, {
+            allowStopwords: /[\u4e00-\u9fff]/.test(afterText),
+          })
+        ) {
+          return {
+            matched: true,
+            wakeWord: w,
+            matchedSurface: token,
+            index: startIdx,
+            endIndex: endIdx,
+            beforeText,
+            afterText,
+            fuzzy: true,
+          };
+        }
+      }
+    }
+  }
+
+  return null;
 }
 
 function buildAttentionPrompt(params: {
@@ -458,15 +850,21 @@ export async function evaluateVoiceAttention(
     });
   }
 
+  const wakeSpan = findWakeWordSpan(cleaned, input.wakeWords);
+
   // 0B. TTS 自回声防护（避免电脑扬声器朗读的回复被麦克风重新收进当成指令）
+  // 注意：若用户刚刚关闭了“客厅吸顶灯”（助手播报“已关闭客厅吸顶灯”），随后立刻说“打开客厅吸顶灯”，
+  // 设备名重叠率约 0.67，绝不能把明确反向控制指令或带唤醒词的语句误判为自回声！
   if (
     !input.bypassWakeWord &&
     input.lastSpokenReply &&
     input.lastSpokenAt &&
+    now >= input.lastSpokenAt &&
     now - input.lastSpokenAt <= 4500
   ) {
     const overlap = computeEchoOverlap(cleaned, input.lastSpokenReply);
-    if (overlap >= 0.6) {
+    const echoThreshold = wakeSpan || DIRECT_COMMAND_START_RE.test(cleaned) ? 0.88 : 0.6;
+    if (overlap >= echoThreshold) {
       return wrap({
         accept: false,
         wokeOnly: false,
@@ -481,8 +879,6 @@ export async function evaluateVoiceAttention(
       });
     }
   }
-
-  const wakeSpan = findWakeWordSpan(cleaned, input.wakeWords);
 
   // 0C. 声学非语音事件过滤（仅拦截无有效指令文本的纯背景音乐/掌声/笑声）
   if (!input.bypassWakeWord && !wakeSpan && isPureNonSpeechEvent(input.acousticEvent, cleaned)) {

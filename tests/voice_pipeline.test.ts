@@ -26,7 +26,9 @@ import {
   computeEchoOverlap,
   evaluateVoiceAttention,
   findWakeWordSpan,
+  matchEnglishHeadWakeWord,
   parseLlmAttentionJson,
+  stripLeadingVocativeOrFragment,
   trimTrailingMusicLyrics,
 } from "../src/agent/voiceAttentionGate.ts";
 import {
@@ -354,6 +356,19 @@ describe("Wake-Word Attention Mechanism (DDSD)", () => {
     expect(echo.accept).toBe(false);
     expect(echo.stage).toBe("echo");
 
+    // Opposite imperative command right after TTS confirmation MUST NOT be falsely suppressed as echo
+    const oppositeCmd = await evaluateVoiceAttention({
+      rawText: "打开客厅吸顶灯",
+      wakeWordEnabled: true,
+      wakeWords,
+      attentionMode: "smart",
+      awakeActive: true,
+      lastSpokenReply: "已关闭客厅吸顶灯",
+      lastSpokenAt: Date.now() - 1200,
+    });
+    expect(oppositeCmd.accept).toBe(true);
+    expect(oppositeCmd.command).toBe("打开客厅吸顶灯");
+
     const bgm = await evaluateVoiceAttention({
       rawText: "啦啦啦",
       wakeWordEnabled: true,
@@ -450,6 +465,97 @@ describe("Wake-Word Attention Mechanism (DDSD)", () => {
       parseLlmAttentionJson('```json\n{"addressed":false,"inConversation":false,"confidence":0.9,"reason":"旁白","command":""}\n```')
         ?.addressed,
     ).toBe(false);
+  });
+
+  test("recovers custom English wake words (Neo, Jarvis, Luna, Milo) in bilingual Chinese speech without false positives", async () => {
+    const neoWakes = ["Neo", "小派", "pi"];
+
+    // 1. Seamless Chinese-adjacent ASCII boundaries (no spaces needed!)
+    const heyZhNeo = await evaluateVoiceAttention({
+      rawText: "嘿Neo，打开客厅吸顶灯",
+      wakeWordEnabled: true,
+      wakeWords: neoWakes,
+      attentionMode: "smart",
+    });
+    expect(heyZhNeo.accept).toBe(true);
+    expect(heyZhNeo.wakeWord).toBe("Neo");
+    expect(heyZhNeo.command).toBe("打开客厅吸顶灯");
+
+    const helloZhNeo = await evaluateVoiceAttention({
+      rawText: "你好Neo关闭卧室灯",
+      wakeWordEnabled: true,
+      wakeWords: neoWakes,
+      attentionMode: "smart",
+    });
+    expect(helloZhNeo.accept).toBe(true);
+    expect(helloZhNeo.wakeWord).toBe("Neo");
+    expect(helloZhNeo.command).toBe("关闭卧室灯");
+
+    // 2. SenseVoice cross-lingual slips (Japanese/Korean auto drift + Chinese transliterations + phonetic homophones)
+    for (const wakeOnlySample of ["Neo", "Neil.", "2お.", "ニ요.", "尼奥", "你又在吗？"]) {
+      const dec = await evaluateVoiceAttention({
+        rawText: wakeOnlySample,
+        wakeWordEnabled: true,
+        wakeWords: neoWakes,
+        attentionMode: "smart",
+      });
+      expect(dec.accept).toBe(true);
+      expect(dec.wokeOnly).toBe(true);
+      expect(dec.wakeWord).toBe("Neo");
+    }
+
+    for (const [sample, expectedCmd] of [
+      ["new打开客厅吸顶灯。", "打开客厅吸顶灯"],
+      ["嘿妞打开客厅吸顶灯。", "打开客厅吸顶灯"],
+      ["你o关掉台灯。", "关掉台灯"],
+      ["你有播放音乐。", "播放音乐"],
+      ["尼欧，把小米音响音量调到30", "把小米音响音量调到30"],
+    ] as const) {
+      const dec = await evaluateVoiceAttention({
+        rawText: sample,
+        wakeWordEnabled: true,
+        wakeWords: neoWakes,
+        attentionMode: "smart",
+      });
+      expect(dec.accept).toBe(true);
+      expect(dec.wakeWord).toBe("Neo");
+      expect(dec.command).toBe(expectedCmd);
+    }
+
+    // 3. Dynamic phonetic tolerance for arbitrary user-defined English wake words
+    expect(findWakeWordSpan("Jrvis，打开客厅吸顶灯", ["Jarvis"])?.wakeWord).toBe("Jarvis");
+    expect(findWakeWordSpan("Lunna，关闭卧室灯", ["Luna"])?.wakeWord).toBe("Luna");
+    expect(findWakeWordSpan("Mylo，打开客厅吸顶灯", ["Milo"])?.wakeWord).toBe("Milo");
+
+    // 4. Bilingual headEn helper & fragment stripping
+    expect(matchEnglishHeadWakeWord("Neil.", neoWakes)?.wakeWord).toBe("Neo");
+    expect(
+      matchEnglishHeadWakeWord("Near.", neoWakes, { allowCommandGatedAliases: true })?.wakeWord,
+    ).toBe("Neo");
+    expect(matchEnglishHeadWakeWord("No, stop.", neoWakes, { allowCommandGatedAliases: true })).toBeNull();
+    expect(stripLeadingVocativeOrFragment("he打开卧室灯。")).toBe("打开卧室灯");
+    expect(stripLeadingVocativeOrFragment("你好，关闭卧室灯。")).toBe("关闭卧室灯");
+
+    // 5. Strict false-positive protection (ASCII word boundaries, stopwords, family chat, non-commands)
+    for (const negSample of [
+      "neon lights look bright",
+      "pioneer speaker review",
+      "No, stop that",
+      "Near the window",
+      "New York weather",
+      "你有打开窗户吗？",
+      "妞妞过来吃饭",
+      "打开客厅吸顶灯",
+      "今天天气真不错",
+    ]) {
+      const dec = await evaluateVoiceAttention({
+        rawText: negSample,
+        wakeWordEnabled: true,
+        wakeWords: neoWakes,
+        attentionMode: "smart",
+      });
+      expect(dec.accept).toBe(false);
+    }
   });
 
   test("enforces strict voiceprint policy to block unrecognized speakers", async () => {
@@ -577,7 +683,33 @@ describe("End-to-End Voice Pipeline HTTP API (Pipeline Status, Voiceprint CRUD, 
     expect(rejJson.matched).toBe(false);
     expect(await demoService.powerState("demo-light-living")).toBe(false);
 
-    // 6. Delete enrolled voiceprint
+    // 6. Custom English wake word "Neo" + two-turn wakeWindowSec grace (short 5s window survives 2.5s TTS reply + 3s spoken command)
+    await fetch(`${server.url}/api/agent/config`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        wakeWords: ["Neo", "小派", "pi"],
+        wakeWindowSec: 5,
+        autoSpeakReply: true,
+        conversationWindowSec: 0,
+      }),
+    });
+    const vl = server.runtime.voiceListener!;
+    const t0 = Date.now() + 10_000;
+    const woke = await vl.handleTranscript("Neo", { isFinal: true, now: t0 });
+    expect(woke.matched).toBe(true);
+    expect(woke.wokeOnly).toBe(true);
+    // User starts speaking at t0+5.2s (after TTS reply) and finishes 3.2s later at t0+8.4s -> speechStartedAt is inside wake window!
+    const follow = await vl.handleTranscript("打开客厅吸顶灯", {
+      isFinal: true,
+      now: t0 + 8400,
+      segmentDurationMs: 3200,
+    });
+    expect(follow.matched).toBe(true);
+    expect(follow.command).toBe("打开客厅吸顶灯");
+    expect(await demoService.powerState("demo-light-living")).toBe(true);
+
+    // 7. Delete enrolled voiceprint
     const delRes = await fetch(`${server.url}/api/voiceprints/${encodeURIComponent(profileId)}`, {
       method: "DELETE",
     });
@@ -585,5 +717,5 @@ describe("End-to-End Voice Pipeline HTTP API (Pipeline Status, Voiceprint CRUD, 
     const listRes = await fetch(`${server.url}/api/voiceprints`);
     const listJson = (await listRes.json()) as any;
     expect(listJson.profiles.length).toBe(0);
-  });
+  }, 15_000);
 });
