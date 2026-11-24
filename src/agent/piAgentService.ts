@@ -51,7 +51,11 @@ import {
   isSilentSentinel,
   type CavemanSpeakChunkState,
 } from "./cavemanReplyPolicy.ts";
-import { createLocalSmartHomeStreamFn } from "./localPlannerStream.ts";
+import {
+  createLocalSmartHomeStreamFn,
+  findRecentDeviceFromMessages,
+  planDeterministicLocalCalls,
+} from "./localPlannerStream.ts";
 import { createSmartHomeTools, type SmartHomeToolDeps } from "./smartHomeTools.ts";
 import {
   SystemOneClient,
@@ -279,6 +283,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   private _speakChunkState: CavemanSpeakChunkState = { emittedAny: false };
   private _suppressedSilent = false;
   private _emittedSpeakChunks = false;
+  private _turnUseLocalFastPath = false;
   private _lastError: string | null = null;
   private _running = false;
   private _entrySeq = 0;
@@ -420,6 +425,41 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           model,
           `尚未配置「${preset.label}」的 API Key，请在「设置 → 语音与 Pi Agent」中填写，或切换回「内置本地引擎（免 API Key）」。`,
         );
+      }
+
+      // 借鉴 Home Assistant assist_pipeline `prefer_local_intents` 架构：
+      // 即使配置了云端大模型，常规确定性智能家居指令（如“打开客厅灯”“停止播放音乐”“音量调到30”）
+      // 也由本地规划器 + 工具循环零延迟执行（省去两次云端 LLM 往返 ~1.5~4s），
+      // 复杂推理、口语隐式意图或开放问答无缝交由云端大模型处理。
+      if (this._config.preferLocalIntents !== false) {
+        const msgs = context.messages;
+        const lastMsg = msgs[msgs.length - 1];
+        if (lastMsg && lastMsg.role === "toolResult" && this._turnUseLocalFastPath) {
+          return this._localStreamFn(model, context, options);
+        }
+        if (lastMsg && lastMsg.role === "user") {
+          const userText =
+            typeof lastMsg.content === "string"
+              ? lastMsg.content
+              : lastMsg.content
+                  .filter((b): b is TextContent => b.type === "text")
+                  .map((b) => b.text)
+                  .join(" ");
+          const recentTarget = findRecentDeviceFromMessages(msgs.slice(0, -1));
+          const deterministicCalls = planDeterministicLocalCalls(
+            userText,
+            {
+              getDevices: () => this._deps.mainWindow.allDevices,
+              getScenes: () => this._deps.mainWindow.scenes ?? [],
+            },
+            recentTarget,
+          );
+          if (deterministicCalls) {
+            this._turnUseLocalFastPath = true;
+            return this._localStreamFn(model, context, options);
+          }
+          this._turnUseLocalFastPath = false;
+        }
       }
 
       const streamOpts = {
@@ -781,6 +821,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     this._speakChunkState = { emittedAny: false };
     this._suppressedSilent = false;
     this._emittedSpeakChunks = false;
+    this._turnUseLocalFastPath = false;
     this._running = true;
     this._lastError = null;
 
@@ -845,6 +886,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     } finally {
       const streamedChunks = this._emittedSpeakChunks;
       this._running = false;
+      this._turnUseLocalFastPath = false;
       this._activeAssistantEntry = null;
       this._activeVoiceMeta = null;
       this.emit("stateChanged", this.snapshot());

@@ -1191,7 +1191,8 @@ export async function evaluateVoiceAttention(
       });
     }
 
-    // A2. 精确非模糊句首呼唤 + 清晰控制指令（smart 模式且非 BGM 包裹、无第三人称语境）-> 0ms 快速通道
+    // A2. 精确非模糊句首呼唤 + 清晰控制指令（smart 模式、无第三人称语境）-> 0ms 快速通道
+    // 背景音乐下若后半句本身已命中明确智能家居域指令（如“Neo，停止播放音乐”），也 0ms 直通免等待云端往返
     if (
       !wakeSpan.fuzzy &&
       input.attentionMode === "smart" &&
@@ -1199,14 +1200,14 @@ export async function evaluateVoiceAttention(
       !hasReferentialAfter &&
       looksDirectCommand &&
       hasVocativeStart &&
-      !isBgmContext
+      (!isBgmContext || hasSmartHomeDomainIntent(trimmedCmd))
     ) {
       return wrap({
         accept: true,
         wokeOnly: false,
         addressed: true,
         inConversation: true,
-        confidence: 0.94,
+        confidence: isBgmContext ? 0.91 : 0.94,
         stage: "fast-wake",
         reason: `句首明确呼唤「${wakeSpan.wakeWord}」并下达操作指令`,
         wakeWord: wakeSpan.wakeWord,
@@ -1470,6 +1471,31 @@ export async function evaluateVoiceAttention(
         reason: "判定为非定向旁白/环境闲聊，未触发设备控制",
         wakeWord: null,
         command: "",
+        usedLlm: false,
+      });
+    }
+
+    // B2.5. 连续对话中的明确直接智能家居控制指令（smart 模式、非 BGM、短句、含明确控制动词与智能家居域意图）：
+    // 借鉴 Home Assistant 本地确定性意图优先原则，0ms 直通免等待云端 SystemOne 往返；
+    // 隐式/口语表达（如“有点刺眼”、“好冷啊”）与家庭闲聊仍交由 SystemOne 语义决策。
+    const isBgmConv = Boolean(input.acousticEvent?.toUpperCase().includes("BGM"));
+    if (
+      input.attentionMode === "smart" &&
+      !isBgmConv &&
+      cmd.length <= 18 &&
+      DIRECT_COMMAND_START_RE.test(cmd) &&
+      hasSmartHomeDomainIntent(cmd)
+    ) {
+      return wrap({
+        accept: true,
+        wokeOnly: false,
+        addressed: true,
+        inConversation: true,
+        confidence: 0.92,
+        stage: "fast-followup",
+        reason: input.awakeActive ? "唤醒窗口内明确设备控制指令" : "连续对话中明确设备控制指令（本地快速直通）",
+        wakeWord: null,
+        command: cmd,
         usedLlm: false,
       });
     }

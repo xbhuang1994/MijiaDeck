@@ -549,11 +549,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         this._error = null;
       }
       if (this._active) {
-        // 开启监听时预连接 SystemOne 网关，并异步预热本地 ONNX 模型、温柔女声 TTS 与 openWakeWord 零样本原型
+        // 开启监听时预连接 SystemOne 网关，并异步分片预热本地 ONNX 模型（含主声纹 VoxLock）、温柔女声 TTS 与 openWakeWord 零样本原型
         this._agent.systemOneClient?.preconnect();
-        void this._localEngine.warmup();
+        const hasAsciiWake = this.config.wakeWords.some((w) => /^[a-z][a-z0-9\s-]*$/i.test(w.trim()));
+        void this._localEngine.warmup({ preloadEnglish: hasAsciiWake });
         if (this.config.sourceSeparationMode !== "off") {
-          this._localEngine.sourceSeparator.warmup();
+          void this._localEngine.sourceSeparator.warmupAsync().catch(() => {});
         }
         if (this.config.owwEnabled) {
           void this._localEngine.openWakeWord
@@ -1027,9 +1028,13 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
 
       let voiceprintResult: VoiceprintIdentifyResult | null = null;
       let voiceprintMs = 0;
+      let preDenoisedForSep: Float32Array | undefined;
       const profiles = listPublicVoiceprints();
-      if (cfg.voiceprintMode !== "off" && profiles.length > 0 && pcm16k.length >= 4000) {
+      // strict 门禁需在注意力决策前识别声纹（并复用本次降噪轨给声源分离，避免二次 GTCRN）；
+      // tag 模式延后到分离完成后直接复用分离出的最优纯净人声做声纹打标，省去 500ms 重复降噪且抗音乐更准！
+      if (cfg.voiceprintMode === "strict" && profiles.length > 0 && pcm16k.length >= 4000) {
         const denForVp = this._localEngine.denoise(pcm16k, 16000, cfg.noiseSuppressionMode);
+        preDenoisedForSep = denForVp.samples;
         const emb = this._localEngine.extractSpeakerEmbedding(denForVp.samples, 16000);
         voiceprintMs = emb.durationMs;
         voiceprintResult = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
@@ -1063,7 +1068,24 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         voiceprintMode: cfg.voiceprintMode,
         systemOneClient: this._agent.systemOneClient,
         llmEvaluator,
+        preDenoisedGtcrn: preDenoisedForSep,
       });
+
+      // tag 模式在分离命中有效人声后直接复用 sep.bestSpeechPcm 执行 50ms 声纹打标
+      if (
+        cfg.voiceprintMode === "tag" &&
+        profiles.length > 0 &&
+        sep.speechDetected &&
+        (sep.attention.accept || !autoDispatch)
+      ) {
+        const vpAudio =
+          sep.bestSpeechPcm && sep.bestSpeechPcm.length >= 4000 ? sep.bestSpeechPcm : pcm16k;
+        if (vpAudio.length >= 4000) {
+          const emb = this._localEngine.extractSpeakerEmbedding(vpAudio, 16000);
+          voiceprintMs = emb.durationMs;
+          voiceprintResult = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
+        }
+      }
 
       if (sep.acousticWake?.matched) {
         this._lastWakeHit = { ...sep.acousticWake, timestamp: now };
@@ -1385,30 +1407,50 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const cfg = this.config;
     const lang = options.lang || cfg.voiceLang || "zh-CN";
 
-    // 1. 声纹识别（使用降噪后更干净的说话人语音段）
-    let voiceprintResult: VoiceprintIdentifyResult | null = null;
-    let voiceprintMs = 0;
     const profiles = listPublicVoiceprints();
     const vpAudio =
       segment.denoisedSamples.length >= 4000 ? segment.denoisedSamples : segment.rawSamples;
-    if (cfg.voiceprintMode !== "off" && profiles.length > 0 && vpAudio.length >= 4000) {
+
+    const sttAuth = resolveEffectiveSttAuth(cfg);
+    const hasCloudStt = Boolean(
+      sttAuth.baseUrl && (sttAuth.apiKey || isLocalEndpointUrl(sttAuth.baseUrl)),
+    );
+    const localReady = this._localEngine.getStatus().readyForLocalAsr;
+    const pref = options.preferredEngine ?? (cfg.voiceEngine === "whisper" ? "whisper" : "auto");
+    const useLocal =
+      pref === "local" ||
+      (pref === "auto" && localReady) ||
+      (pref === "whisper" && !hasCloudStt && localReady);
+
+    const sepReady =
+      useLocal &&
+      cfg.sourceSeparationMode !== "off" &&
+      this._localEngine.getStatus().readyForSourceSeparation &&
+      segment.rawSamples.length >= 3200;
+
+    // 1. 声纹识别：启用声源分离且为 tag 模式时，延后到分离命中后直接复用最优分离轨，省去噪声/拒识段上的 CAM++ 开销
+    let voiceprintResult: VoiceprintIdentifyResult | null = null;
+    let voiceprintMs = 0;
+    const deferTagVoiceprint = sepReady && cfg.voiceprintMode === "tag";
+    if (!deferTagVoiceprint && cfg.voiceprintMode !== "off" && profiles.length > 0 && vpAudio.length >= 4000) {
       const emb = this._localEngine.extractSpeakerEmbedding(vpAudio, 16000);
       voiceprintMs = emb.durationMs;
       voiceprintResult = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
     }
 
-    // 1.5 openWakeWord 声学命中（优先流式/降噪轨，未命中时补测原始轨句首，避免快速说 "Neo关灯" 时被 GTCRN 削弱句首）
+    // 1.5 openWakeWord 声学命中（启用声源分离时透传流式命中避免分离前重复扫 raw 轨）
     const owwEvaluated = Boolean(cfg.owwEnabled && this._localEngine.openWakeWord.isReady);
     let acousticWake =
       segment.acousticWake !== undefined
         ? segment.acousticWake
-        : owwEvaluated
+        : !sepReady && owwEvaluated
           ? this._localEngine.scoreWakeWordAudio(vpAudio, cfg.wakeWords, {
               threshold: cfg.owwThreshold,
               headOnlySec: 2.0,
             })
           : null;
     if (
+      !sepReady &&
       owwEvaluated &&
       (!acousticWake || !acousticWake.matched) &&
       (segment.acousticWake !== undefined || segment.rawSamples !== vpAudio)
@@ -1425,18 +1467,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       this._lastWakeHit = { ...acousticWake, timestamp: Date.now() };
     }
 
-    // 2. 双轨语音识别（优先本地 SenseVoice 双轨融合 + openWakeWord + SystemOne，降级云端 Whisper）
-    const sttAuth = resolveEffectiveSttAuth(cfg);
-    const hasCloudStt = Boolean(
-      sttAuth.baseUrl && (sttAuth.apiKey || isLocalEndpointUrl(sttAuth.baseUrl)),
-    );
-    const localReady = this._localEngine.getStatus().readyForLocalAsr;
-    const pref = options.preferredEngine ?? (cfg.voiceEngine === "whisper" ? "whisper" : "auto");
-    const useLocal =
-      pref === "local" ||
-      (pref === "auto" && localReady) ||
-      (pref === "whisper" && !hasCloudStt && localReady);
-
+    // 2. 双轨语音识别（优先本地声源分离 + SenseVoice，降级双轨 SenseVoice 或云端 Whisper）
     let transcript = "";
     let altText: string | undefined;
     let acousticEvent = "";
@@ -1445,11 +1476,6 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     let runtimeEngine: VoiceRuntimeEngine = "local";
 
     if (useLocal) {
-      const sepReady =
-        cfg.sourceSeparationMode !== "off" &&
-        this._localEngine.getStatus().readyForSourceSeparation &&
-        segment.rawSamples.length >= 3200;
-
       if (sepReady) {
         const now = Date.now();
         const segDurMs = Math.round(segment.durationSec * 1000);
@@ -1494,8 +1520,22 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
             voiceprintMode: cfg.voiceprintMode,
             systemOneClient: this._agent.systemOneClient,
             llmEvaluator,
+            // 复用流式会话已经算好的 GTCRN 降噪轨与 openWakeWord 声学命中，彻底消除重复推理！
+            preDenoisedGtcrn:
+              segment.denoiseEngine.startsWith("gtcrn") ? segment.denoisedSamples : undefined,
+            precomputedAcousticWake: acousticWake,
           },
         );
+
+        if (deferTagVoiceprint && profiles.length > 0 && sep.speechDetected && sep.attention.accept) {
+          const cleanVpAudio =
+            sep.bestSpeechPcm && sep.bestSpeechPcm.length >= 4000 ? sep.bestSpeechPcm : vpAudio;
+          if (cleanVpAudio.length >= 4000) {
+            const emb = this._localEngine.extractSpeakerEmbedding(cleanVpAudio, 16000);
+            voiceprintMs = emb.durationMs;
+            voiceprintResult = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
+          }
+        }
 
         const effectiveWake = sep.acousticWake ?? acousticWake;
         if (effectiveWake?.matched) {
