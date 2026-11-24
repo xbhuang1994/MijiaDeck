@@ -25,6 +25,7 @@ import {
 import {
   computeEchoOverlap,
   evaluateVoiceAttention,
+  extractCommandAfterAcousticWake,
   findWakeWordSpan,
   matchEnglishHeadWakeWord,
   parseLlmAttentionJson,
@@ -510,6 +511,15 @@ describe("Wake-Word Attention Mechanism (DDSD)", () => {
       ["你o关掉台灯。", "关掉台灯"],
       ["你有播放音乐。", "播放音乐"],
       ["尼欧，把小米音响音量调到30", "把小米音响音量调到30"],
+      // 快速说 "Neo关灯" / "Neo开灯" 常见误听回归保护（不能退化成只回复"在呢"或漏触发）
+      ["Neo关灯", "关灯"],
+      ["Neo开灯", "开灯"],
+      ["你好关灯", "关灯"],
+      ["你好开灯", "开灯"],
+      ["你有关灯。", "关灯"],
+      ["你给开灯。", "开灯"],
+      ["钮关灯。", "关灯"],
+      ["new关灯。", "关灯"],
     ] as const) {
       const dec = await evaluateVoiceAttention({
         rawText: sample,
@@ -518,8 +528,29 @@ describe("Wake-Word Attention Mechanism (DDSD)", () => {
         attentionMode: "smart",
       });
       expect(dec.accept).toBe(true);
+      expect(dec.wokeOnly).toBe(false);
       expect(dec.wakeWord).toBe("Neo");
       expect(dec.command).toBe(expectedCmd);
+    }
+
+    // 声学唤醒命中后的句首残片剥离（绝不把短指令“关灯/开灯”清空成纯唤醒）
+    expect(extractCommandAfterAcousticWake("你好关灯。", "Neo")).toBe("关灯");
+    expect(extractCommandAfterAcousticWake("你有关灯。", "Neo")).toBe("关灯");
+    expect(extractCommandAfterAcousticWake("你给开灯。", "Neo")).toBe("开灯");
+    expect(extractCommandAfterAcousticWake("钮关灯。", "Neo")).toBe("关灯");
+    expect(extractCommandAfterAcousticWake("关灯。", "Neo")).toBe("关灯");
+    expect(extractCommandAfterAcousticWake("2お.", "Neo")).toBe("");
+    expect(extractCommandAfterAcousticWake("在吗？", "Neo")).toBe("");
+
+    // “你好”单独问候或跟普通问句绝不可误触 Neo 唤醒
+    for (const helloNeg of ["你好", "你好，在吗", "你好，晚饭吃什么", "你好，打开窗户吗？"]) {
+      const dec = await evaluateVoiceAttention({
+        rawText: helloNeg,
+        wakeWordEnabled: true,
+        wakeWords: neoWakes,
+        attentionMode: "smart",
+      });
+      expect(dec.accept).toBe(false);
     }
 
     // 3. Dynamic phonetic tolerance for arbitrary user-defined English wake words

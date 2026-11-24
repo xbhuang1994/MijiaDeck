@@ -36,11 +36,11 @@ import {
 } from "./openWakeWordEngine.ts";
 import type { SystemOneClient } from "./systemOneClient.ts";
 import {
+  extractCommandAfterAcousticWake,
   findWakeWordSpan,
   isWakeQueryText,
   looksLikeDirectDeviceCommand,
   matchEnglishHeadWakeWord,
-  stripLeadingVocativeOrFragment,
 } from "./voiceAttentionGate.ts";
 import { getPrimaryOwnerRefWavPath } from "./voiceprintStore.ts";
 
@@ -276,7 +276,11 @@ function mapSenseVoiceLang(voiceLang?: string): string {
 export function chooseBestAsrCandidate(
   rawAsr: LocalAsrOutput,
   denoisedAsr: LocalAsrOutput,
-  options: { wakeWords: readonly string[]; inputSnrDb?: number },
+  options: {
+    wakeWords: readonly string[];
+    inputSnrDb?: number;
+    acousticWake?: WakeWordAcousticHit | null;
+  },
 ): LocalAsrOutput {
   const score = (cand: LocalAsrOutput, track: "raw" | "denoised"): number => {
     const text = cand.text.trim();
@@ -294,6 +298,11 @@ export function chooseBestAsrCandidate(
       }
     } else if (looksLikeDirectDeviceCommand(text)) {
       s += 28;
+    } else if (options.acousticWake?.matched) {
+      const postCmd = extractCommandAfterAcousticWake(text, options.acousticWake.wakeWord);
+      if (postCmd && looksLikeDirectDeviceCommand(postCmd)) {
+        s += 36;
+      }
     }
 
     const isBgm = rawAsr.event.toUpperCase().includes("BGM");
@@ -934,23 +943,24 @@ export class LocalVoiceEngine {
     let dualDenRes: LocalAsrOutput | null = null;
     const hpRaw = applyHighPassFilter(rawPcm16k, 16000, 85);
 
-    // 非常安静的环境：若无需唤醒词检查或降噪单轨已清晰命中唤醒词，直接单轨返回保持最低延迟
+    // 非常安静的环境：若无需唤醒词检查或降噪单轨已精确命中唤醒词且无模糊误听，直接单轨返回保持最低延迟
+    const acousticWake = options.acousticWake ?? null;
     if (!options.forceDual && inputSnrDb >= 24 && denoisedPcm16k.length > 0) {
       const single = await this.transcribeLocal(denoisedPcm16k, 16000, lang);
-      const singleMatchedWake =
-        wakeWords.length === 0 || Boolean(findWakeWordSpan(single.text, wakeWords));
+      const singleSpan = wakeWords.length > 0 ? findWakeWordSpan(single.text, wakeWords) : null;
+      const singleExactWake = wakeWords.length === 0 || Boolean(singleSpan && !singleSpan.fuzzy);
       if (
         single.text.length > 0 &&
         !single.event.toUpperCase().includes("BGM") &&
-        singleMatchedWake
+        singleExactWake
       ) {
         return single;
       }
-      // 降噪轨未检出唤醒词时补跑一次高通原始轨（避免 GTCRN 轻度抑制句首短英文音节如 "嘿Neo"）
+      // 降噪轨未精确检出唤醒词时补跑一次高通原始轨（避免 GTCRN 削弱句首短英文音节如快速说的 "Neo关灯" / "嘿Neo"）
       const rawRes = await this.transcribeLocal(hpRaw, 16000, lang);
       dualRawRes = rawRes;
       dualDenRes = single;
-      best = chooseBestAsrCandidate(rawRes, single, { wakeWords, inputSnrDb });
+      best = chooseBestAsrCandidate(rawRes, single, { wakeWords, inputSnrDb, acousticWake });
     } else {
       const [rawRes, denRes] = await Promise.all([
         this.transcribeLocal(hpRaw, 16000, lang),
@@ -968,11 +978,10 @@ export class LocalVoiceEngine {
       ]);
       dualRawRes = rawRes;
       dualDenRes = denRes;
-      best = chooseBestAsrCandidate(rawRes, denRes, { wakeWords, inputSnrDb });
+      best = chooseBestAsrCandidate(rawRes, denRes, { wakeWords, inputSnrDb, acousticWake });
     }
 
     // SystemOne 双轨 ASR 候选择优（双轨出现不同非空候选且分差较近或处于 BGM 场景）
-    const acousticWake = options.acousticWake ?? null;
     if (dualRawRes && dualDenRes && options.systemOneClient?.enabled) {
       const trackA = dualRawRes.text.trim();
       const trackB = dualDenRes.text.trim();
@@ -1018,36 +1027,35 @@ export class LocalVoiceEngine {
       }
     }
 
-    // openWakeWord 声学唤醒词直救：若本地声学引擎已确信命中唤醒词，但主 ASR 吞掉了句首唤醒词（如 "Neo"）
-    // 或将其误译为乱码（如 "2お"），直接补全规范唤醒词，免去额外 en-head ASR 探针延迟！
-    if (acousticWake?.matched && wakeWords.length > 0 && !findWakeWordSpan(best.text, wakeWords)) {
-      const cleanBest = best.text.trim();
-      const stripped = stripLeadingVocativeOrFragment(cleanBest);
-      const meaningfulChars = cleanBest.replace(/[\s,，。．.、!！?？:：;；\-—~～"'“”‘’]/g, "");
-      const hasWeirdScript = /[\u3040-\u30ff\uac00-\ud7af]/.test(cleanBest);
-      const primaryLen = denoisedPcm16k.length >= 1600 ? denoisedPcm16k.length : hpRaw.length;
-      const isShortClip = primaryLen <= 16000 * 1.9;
-      const looksLikeCmd =
-        stripped.length >= 2 &&
-        (looksLikeDirectDeviceCommand(stripped) || isWakeQueryText(stripped));
-
-      if (looksLikeCmd) {
-        const cmdPart = isWakeQueryText(stripped) ? "" : stripped;
+    // openWakeWord 声学唤醒词直救与规范化：
+    // 若本地声学引擎已确信命中唤醒词，但主 ASR 吞掉了句首唤醒词（如快速说的 "Neo关灯" -> "关灯"）
+    // 或将其误听为近音前缀（如 "你好关灯" / "你有关灯" / "你给开灯" / "钮关灯" / "new关灯"），
+    // 精准剥离句首误听残片并完整保留后面的设备指令，绝不把短指令误清空成纯唤醒 "在呢"！
+    const currentWakeSpan = wakeWords.length > 0 ? findWakeWordSpan(best.text, wakeWords) : null;
+    const trimmedBest = best.text.trim();
+    const isAmbiguousInterrogative =
+      /^(?:你有|你又|你好|你给)/.test(trimmedBest) &&
+      /[吗嘛么呢][。？！!?\s]*$/.test(trimmedBest) &&
+      !isWakeQueryText(extractCommandAfterAcousticWake(trimmedBest, acousticWake?.wakeWord ?? ""));
+    if (
+      acousticWake?.matched &&
+      wakeWords.length > 0 &&
+      !isAmbiguousInterrogative &&
+      (!currentWakeSpan || currentWakeSpan.fuzzy)
+    ) {
+      const extracted = extractCommandAfterAcousticWake(best.text, acousticWake.wakeWord);
+      if (extracted && !isWakeQueryText(extracted)) {
         return {
           ...best,
-          text: cmdPart ? `${acousticWake.wakeWord}，${cmdPart}` : acousticWake.wakeWord,
+          text: `${acousticWake.wakeWord}，${extracted}`,
+          altText: best.altText || best.text,
         };
       }
-      if (isShortClip || meaningfulChars.length <= 4 || hasWeirdScript || !cleanBest) {
+      if (!currentWakeSpan) {
         return {
           ...best,
           text: acousticWake.wakeWord,
-        };
-      }
-      if (stripped.length >= 2) {
-        return {
-          ...best,
-          text: `${acousticWake.wakeWord}，${stripped}`,
+          altText: best.altText || best.text,
         };
       }
     }
@@ -1067,8 +1075,8 @@ export class LocalVoiceEngine {
 
   /**
    * 针对 SenseVoice CTC 在中英混说时的单语种偏移问题（例如 "Neo" 单独说被识别成 "2お"/"ニ요"，
-   * 或 "Neo, 把小米音响音量调到30" 中句首英文 "Neo" 被 <|zh|> 吞掉只剩 "把小米音响音量调到30"）：
-   * 对句首 1.35s 音频做一次轻量 en 语种提示解码，并严格校验避免纯中文对话误唤醒。
+   * 或 "Neo关灯" / "Neo, 把小米音响音量调到30" 中句首英文 "Neo" 被 <|zh|> 吞掉或误听成 "你好关灯"）：
+   * 对句首 0.65s~1.35s 音频做轻量 en 语种提示解码，并严格校验避免纯中文对话误唤醒。
    */
   private async _recoverBilingualEnglishWake(
     hpRaw16k: Float32Array,
@@ -1090,10 +1098,10 @@ export class LocalVoiceEngine {
     const cleanBest = best.text.trim();
     const meaningfulChars = cleanBest.replace(/[\s,，。．.、!！?？:：;；\-—~～"'“”‘’]/g, "");
     const hasWeirdScript = /[\u3040-\u30ff\uac00-\ud7af]/.test(cleanBest);
-    const strippedBest = stripLeadingVocativeOrFragment(cleanBest);
+    const extractedFirst = extractCommandAfterAcousticWake(cleanBest, asciiWakes[0]!);
     const bestLooksLikeCmd =
-      strippedBest.length >= 2 &&
-      (looksLikeDirectDeviceCommand(strippedBest) || isWakeQueryText(strippedBest));
+      extractedFirst.length >= 2 &&
+      (looksLikeDirectDeviceCommand(extractedFirst) || isWakeQueryText(extractedFirst));
     const bestIsShortOrGarbled = isShortClip || meaningfulChars.length <= 4 || hasWeirdScript;
 
     // 既不是短/乱码句，也不像控制指令或唤醒询问 -> 直接跳过，零额外开销、零误触发
@@ -1132,15 +1140,24 @@ export class LocalVoiceEngine {
       }
     }
 
+    // 针对快速连读短句（如 0.7~1.8s 的 "Neo关灯"）：全段送 en-US 易受尾音中文干扰，补探前 0.65s 句首
+    if (!hit && isShortClip && bestLooksLikeCmd && hpRaw16k.length >= Math.round(16000 * 0.75)) {
+      const headFast = hpRaw16k.subarray(0, Math.round(16000 * 0.65));
+      const fastProbe = await probeClip(headFast, true);
+      if (fastProbe.hit) {
+        enRes = fastProbe.enRes;
+        hit = fastProbe.hit;
+      }
+    }
+
     if (!hit) return null;
 
-    // 场景 1：双语“英文唤醒词 + 中文设备指令”（例如 auto 吞掉 Neo 只剩 "把小米音响音量调到30。"，而 headEn 明确听到 "Neo"/"Neil"/"Near"）
-    if (bestLooksLikeCmd) {
-      const cmdPart = isWakeQueryText(strippedBest) ? "" : strippedBest;
-      const recoveredText = cmdPart ? `${hit.wakeWord}，${cmdPart}` : hit.wakeWord;
+    // 场景 1：双语“英文唤醒词 + 中文设备指令”（例如 "Neo关灯" / "Neo, 把小米音响音量调到30"）
+    const extracted = extractCommandAfterAcousticWake(cleanBest, hit.wakeWord);
+    if (extracted && !isWakeQueryText(extracted)) {
       return {
         ...best,
-        text: recoveredText,
+        text: `${hit.wakeWord}，${extracted}`,
         durationMs: best.durationMs + extraMs,
         altText: best.altText || best.text,
         enHeadText: enRes.text,

@@ -586,5 +586,5 @@ describe.if(hasRealModels)("OpenWakeWordEngine real ONNX integration", () => {
         }
       }
     }
-  });
+  }, 20_000);
 });

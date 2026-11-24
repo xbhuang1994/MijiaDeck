@@ -159,6 +159,10 @@ const NOISE_ONLY_WAKE_ALIASES: Readonly<Record<string, readonly string[]>> = {
     "rio",
     "hey ne",
     "hei ne",
+    "你好",
+    "你给",
+    "你欧",
+    "你哦",
     "妞",
     "牛",
     "纽",
@@ -247,7 +251,10 @@ const COMMON_EN_STOPWORDS = new Set<string>([
 ]);
 
 // 中文模糊前缀词中，容易与家庭日常问句混淆的词（如“你有打开窗户吗？”），需屏蔽句尾疑问助词“吗/嘛/么/呢”
-const AMBIGUOUS_ZH_NOISE_ALIASES = new Set<string>(["你有", "你又"]);
+const AMBIGUOUS_ZH_NOISE_ALIASES = new Set<string>(["你有", "你又", "你好", "你给"]);
+
+// 严禁单独作为纯唤醒询问触发的中文问候词（如“你好”“你好在吗”绝不能误唤醒，仅在“你好关灯”这类句首直连设备指令时兜底）
+const COMMAND_ONLY_NOISE_ALIASES = new Set<string>(["你好", "你给"]);
 
 const WAKE_QUERY_AFTER_RE = /^(?:在吗|你在吗|在不在|你好|您好)$/i;
 
@@ -264,7 +271,7 @@ const REFERENTIAL_AFTER_RE =
 
 // 明确面向智能家居/助手的祈使或询问动词（搭配句首唤醒词可安全走 0ms 快速通道）
 const DIRECT_COMMAND_START_RE =
-  /^(?:请|帮我|给我|麻烦|快|赶紧|顺便|现在|把|将|打开|开启|关掉|关闭|关上|开一下|关一下|调|设置|设定|设为|改成|换成|切换|播放|放一首|来一首|暂停|继续|停止|静音|取消静音|声音|音量|大一点|小一点|亮一点|暗一点|暖一点|冷一点|查|查看|查询|看看|告诉我|现在|卧室|客厅|餐厅|书房|厨房|阳台|主卧|次卧|玄关|卫生间|全屋|所有|全部|小爱|小米|灯|吸顶灯|台灯|空调|风扇|插座|开关|窗帘|喂食器|出粮|喂|场景|模式|温度|湿度|空气|turn|open|close|set|play|pause|stop|mute|check|what)/i;
+  /^(?:请|帮我|给我|麻烦|快|赶紧|顺便|现在|把|将|打开|开启|开灯|关灯|熄灯|灭灯|亮灯|开机|关机|开空调|关空调|开风扇|关风扇|开窗|关窗|开电视|关电视|开音箱|关音箱|开音响|关音响|开插座|关插座|开开关|关开关|全开|全关|关掉|关闭|关上|开一下|关一下|调|设置|设定|设为|改成|换成|切换|播放|放一首|来一首|放歌|放音乐|播音乐|听歌|切歌|换歌|下一首|上一首|暂停|继续|停止|静音|取消静音|闭麦|开麦|声音|音量|大一点|小一点|亮一点|暗一点|暖一点|冷一点|查|查看|查询|看看|告诉我|卧室|客厅|餐厅|书房|厨房|阳台|主卧|次卧|玄关|卫生间|全屋|所有|全部|小爱|小米|灯|吸顶灯|台灯|空调|风扇|插座|开关|窗帘|喂食器|出粮|喂食|喂猫|喂狗|喂|场景|模式|回家|离家|睡眠|观影|温度|湿度|空气|turn|open|close|set|play|pause|stop|mute|check|what)/i;
 
 export function looksLikeDirectDeviceCommand(text: string): boolean {
   return DIRECT_COMMAND_START_RE.test(text.trim());
@@ -297,6 +304,61 @@ export function stripLeadingVocativeOrFragment(text: string): string {
     }
   }
   return s.replace(TRAILING_PUNCT_RE, "").trim();
+}
+
+const PURE_WAKE_FILLER_RE = /^(?:[你呢啊嗯哦喔哈嘿喂哟20oO]+|ok|hi|hey|yo)$/i;
+
+/**
+ * 当 openWakeWord 声学引擎或 en-head 英文句首探针已确认本段语音开头包含唤醒词（如快速说的 "Neo关灯"）时，
+ * 从 SenseVoice 中文轨中精准剥离被误听的句首唤醒词残片（如 "你好关灯" / "你有关灯" / "你给开灯" / "钮关灯" / "new关灯"），
+ * 完整保留后面的短指令（如 "关灯" / "开灯"），绝不把短指令误清空成纯唤醒！
+ */
+export function extractCommandAfterAcousticWake(rawText: string, wakeWord: string): string {
+  const cleaned = rawText.replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
+  if (!cleaned) return "";
+
+  // 1. 若本身已直接是清晰设备指令（例如 SenseVoice 吞掉 Neo 只剩 "关灯" / "开灯" / "打开客厅吸顶灯"）
+  if (looksLikeDirectDeviceCommand(cleaned)) {
+    return cleaned;
+  }
+  if (isWakeQueryText(cleaned)) {
+    return "";
+  }
+
+  // 2. 先尝试常规/同音/别名唤醒词切分（如 "你有关灯" / "new关灯" / "钮关灯" / "你好关灯"）
+  const span = findWakeWordSpan(cleaned, [wakeWord]);
+  if (span) {
+    return span.afterText.replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
+  }
+
+  // 3. 声学已确认唤醒词存在：尝试剥离常见误识别前缀（你好/你有/你又/你给/你欧/你哦/尼/妮/牛/妞/钮/你 + 1~4 字母残片）
+  const strippedVoc = stripLeadingVocativeOrFragment(cleaned);
+  if (strippedVoc !== cleaned) {
+    if (isWakeQueryText(strippedVoc)) return "";
+    if (looksLikeDirectDeviceCommand(strippedVoc)) return strippedVoc;
+  }
+
+  const mangledPrefixRe =
+    /^(?:你好|您好|你有|你又|你给|你欧|你哦|你奥|你o|你0|尼奥|尼欧|妮奥|妮欧|尼哦|呢哦|里奥|利奥|米奥|尼|妮|牛|妞|钮|纽|你|new|near|neil|neal|nio|no|ne|he|hey)[\s,，。!！?？:：、]*/i;
+  const m = mangledPrefixRe.exec(cleaned);
+  if (m) {
+    const rest = cleaned.slice(m[0].length).replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
+    if (!rest || isWakeQueryText(rest) || PURE_WAKE_FILLER_RE.test(rest)) {
+      return "";
+    }
+    if (looksLikeDirectDeviceCommand(rest) || (rest.length >= 2 && !/[\u3040-\u30ff\uac00-\ud7af]/.test(rest))) {
+      return rest;
+    }
+  }
+
+  // 4. 若整句仅是日韩假名乱码（"2お" / "ニ요" / "を"）或 1 字拟声残片 -> 判定为纯唤醒
+  if (/[\u3040-\u30ff\uac00-\ud7af]/.test(cleaned) || PURE_WAKE_FILLER_RE.test(cleaned)) {
+    return "";
+  }
+  if (strippedVoc && !isWakeQueryText(strippedVoc) && !PURE_WAKE_FILLER_RE.test(strippedVoc)) {
+    return strippedVoc;
+  }
+  return "";
 }
 
 function phoneticSkeleton(word: string): string {
@@ -586,6 +648,12 @@ export function findWakeWordSpan(
 
       if (requireDirectCmdAfter) {
         const surfaceLower = cand.surface.toLowerCase();
+        // 问候类别名（如 "你好" / "你给"）绝不可作为纯唤醒询问触发，且必须位于句首并紧跟明确设备控制指令（如 "你好关灯"）
+        if (COMMAND_ONLY_NOISE_ALIASES.has(cand.surface)) {
+          if (beforeText.length > 0 || isWakeQuery || afterText.length < 2 || !DIRECT_COMMAND_START_RE.test(afterText)) {
+            continue;
+          }
+        }
         // 对容易与家庭日常问句混淆的中文别名（如 "你有打开窗户吗？"），屏蔽非“在吗”类的问句尾助词
         if (
           AMBIGUOUS_ZH_NOISE_ALIASES.has(cand.surface) &&
@@ -1017,11 +1085,12 @@ export async function evaluateVoiceAttention(
 
   // ==================== 情况 A：句子中提到了唤醒词 ====================
   if (wakeSpan) {
-    // 混合 openWakeWord 声学否决：仅由模糊同音/噪声别名命中，且该唤醒词已启用本地声学原型但声学分 < 0.42（或缺失）时直接拦截
+    // 混合 openWakeWord 声学否决：仅由模糊同音/噪声别名命中，且该唤醒词已启用本地声学原型但声学分低于门槛（用户实录原型 0.42 / TTS 零样本原型 0.32）时拦截
+    const vetoFloor = input.acousticWake?.source === "tts-bootstrap" ? 0.32 : 0.42;
     if (
       wakeSpan.fuzzy &&
       input.owwActiveForWord === true &&
-      (!input.acousticWake || input.acousticWake.score < 0.42)
+      (!input.acousticWake || input.acousticWake.score < vetoFloor)
     ) {
       return wrap({
         accept: false,
@@ -1032,7 +1101,7 @@ export async function evaluateVoiceAttention(
         stage: "acoustic-veto",
         reason: `模糊唤醒词「${wakeSpan.matchedSurface}」未通过本地声学唤醒校验${
           input.acousticWake
-            ? `（得分 ${(input.acousticWake.score * 100).toFixed(0)}% < 42%）`
+            ? `（得分 ${(input.acousticWake.score * 100).toFixed(0)}% < ${Math.round(vetoFloor * 100)}%）`
             : "（无声学命中）"
         }，已拦截误触发`,
         wakeWord: wakeSpan.wakeWord,

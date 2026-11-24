@@ -1007,14 +1007,23 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       voiceprintResult = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
     }
 
-    // ---- Stage 4.5: 本地 openWakeWord 离线句首声学唤醒打分 ----
+    // ---- Stage 4.5: 本地 openWakeWord 离线句首声学唤醒打分（降噪轨未命中时自动补查原始轨，防 GTCRN 削弱快速句首） ----
     const owwEvaluated = Boolean(cfg.owwEnabled && this._localEngine.openWakeWord.isReady);
-    const acousticWake = owwEvaluated
+    let acousticWake = owwEvaluated
       ? this._localEngine.scoreWakeWordAudio(vad.speechSamples, cfg.wakeWords, {
           threshold: cfg.owwThreshold,
           headOnlySec: 2.0,
         })
       : null;
+    if (owwEvaluated && (!acousticWake || !acousticWake.matched)) {
+      const rawHit = this._localEngine.scoreWakeWordAudio(pcm16k, cfg.wakeWords, {
+        threshold: cfg.owwThreshold,
+        headOnlySec: 2.0,
+      });
+      if (rawHit && (!acousticWake || rawHit.score > acousticWake.score)) {
+        acousticWake = rawHit;
+      }
+    }
     if (acousticWake?.matched) {
       this._lastWakeHit = { ...acousticWake, timestamp: Date.now() };
     }
@@ -1164,9 +1173,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       voiceprintResult = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
     }
 
-    // 1.5 openWakeWord 声学命中（优先使用流式实时峰值，否则对当前音频段句首补打分）
+    // 1.5 openWakeWord 声学命中（优先流式/降噪轨，未命中时补测原始轨句首，避免快速说 "Neo关灯" 时被 GTCRN 削弱句首）
     const owwEvaluated = Boolean(cfg.owwEnabled && this._localEngine.openWakeWord.isReady);
-    const acousticWake =
+    let acousticWake =
       segment.acousticWake !== undefined
         ? segment.acousticWake
         : owwEvaluated
@@ -1175,6 +1184,19 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
               headOnlySec: 2.0,
             })
           : null;
+    if (
+      owwEvaluated &&
+      (!acousticWake || !acousticWake.matched) &&
+      (segment.acousticWake !== undefined || segment.rawSamples !== vpAudio)
+    ) {
+      const rawHit = this._localEngine.scoreWakeWordAudio(segment.rawSamples, cfg.wakeWords, {
+        threshold: cfg.owwThreshold,
+        headOnlySec: 2.0,
+      });
+      if (rawHit && (!acousticWake || rawHit.score > acousticWake.score)) {
+        acousticWake = rawHit;
+      }
+    }
     if (acousticWake?.matched) {
       this._lastWakeHit = { ...acousticWake, timestamp: Date.now() };
     }
