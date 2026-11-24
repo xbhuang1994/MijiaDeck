@@ -263,67 +263,93 @@ function planSingleClause(
     };
   }
 
-  // 4. 音箱播报 / 播放控制 / 音量与静音
-  const speakMatch = /(?:用音箱|让音箱|小爱)?(?:朗读|播报|念一下|说一句)[：:\s“"]*(.+?)[”"]*$/.exec(clause);
+  // 4. 音箱播报 / 播放指定音乐 / 播放控制 / 音量与静音
+  const speakMatch = /(?:用音箱|用音响|让音箱|小爱)?(?:朗读|播报|念一下|说一句)[：:\s“"]*(.+?)[”"]*$/.exec(clause);
   if (speakMatch && speakMatch[1]?.trim()) {
     const spk = detectNamedDevice(clause, devices);
     return {
-      name: "run_device_action",
+      name: "control_speaker",
       arguments: {
-        target: spk?.did ?? "小爱音箱",
-        action: "play-text",
-        params: [speakMatch[1].trim()],
+        ...(spk ? { target: spk.did } : {}),
+        speak_text: speakMatch[1].trim(),
+      },
+    };
+  }
+  const musicMatch = /(?:用(?:小米|小爱)?(?:音箱|音响)|让(?:小米|小爱)?(?:音箱|音响))?(?:播放|放一首|点一首|放首|来一首)\s*(.+)$/.exec(clause);
+  if (musicMatch && musicMatch[1]?.trim() && !/^(音乐|一下)?$/.test(musicMatch[1].trim())) {
+    const spk = detectNamedDevice(clause, devices);
+    return {
+      name: "control_speaker",
+      arguments: {
+        ...(spk ? { target: spk.did } : {}),
+        play_music: musicMatch[1].trim(),
       },
     };
   }
   if (/(上一首|上一曲|previous)/i.test(clause)) {
     const spk = detectNamedDevice(clause, devices);
-    return { name: "run_device_action", arguments: { target: spk?.did ?? "小爱音箱", action: "previous" } };
+    return { name: "control_speaker", arguments: { ...(spk ? { target: spk.did } : {}), playback: "previous" } };
   }
   if (/(下一首|下一曲|切歌|next)/i.test(clause)) {
     const spk = detectNamedDevice(clause, devices);
-    return { name: "run_device_action", arguments: { target: spk?.did ?? "小爱音箱", action: "next" } };
+    return { name: "control_speaker", arguments: { ...(spk ? { target: spk.did } : {}), playback: "next" } };
   }
-  if (/(暂停播放|暂停音乐|暂停音箱|暂停一下|pause)/i.test(clause)) {
+  if (/(暂停播放|暂停音乐|暂停音箱|暂停音响|暂停一下|pause)/i.test(clause)) {
     const spk = detectNamedDevice(clause, devices);
-    return { name: "run_device_action", arguments: { target: spk?.did ?? "小爱音箱", action: "pause" } };
+    return { name: "control_speaker", arguments: { ...(spk ? { target: spk.did } : {}), playback: "pause" } };
   }
   if (/(继续播放|开始播放|播放音乐|恢复播放)/.test(clause)) {
     const spk = detectNamedDevice(clause, devices);
-    return { name: "run_device_action", arguments: { target: spk?.did ?? "小爱音箱", action: "play" } };
+    return { name: "control_speaker", arguments: { ...(spk ? { target: spk.did } : {}), playback: "play" } };
   }
   if (/(取消静音|解除静音|恢复声音)/.test(clause)) {
     const spk = detectNamedDevice(clause, devices);
     return {
-      name: "set_device_property",
-      arguments: { target: spk?.did ?? "小爱音箱", property: "mute", value: false },
+      name: "control_speaker",
+      arguments: { ...(spk ? { target: spk.did } : {}), mute: false },
     };
   }
   if (/(静音|闭嘴|mute)/i.test(clause)) {
     const spk = detectNamedDevice(clause, devices);
     return {
-      name: "set_device_property",
-      arguments: { target: spk?.did ?? "小爱音箱", property: "mute", value: true },
+      name: "control_speaker",
+      arguments: { ...(spk ? { target: spk.did } : {}), mute: true },
     };
   }
   if (/(音量|声音)/.test(clause)) {
     const spk = detectNamedDevice(clause, devices);
     const numMatch = /(\d{1,3})\s*%?/.exec(clause);
-    let volume: number | null = numMatch ? Number(numMatch[1]) : null;
-    if (volume === null) {
-      if (/(大一点|调大|调高|提高|升高)/.test(clause)) volume = 70;
-      else if (/(小一点|调小|调低|降低)/.test(clause)) volume = 25;
-      else if (/(最大|满)/.test(clause)) volume = 100;
-      else if (/(最小|最低)/.test(clause)) volume = 10;
-    }
-    if (volume !== null) {
+    if (numMatch) {
       return {
-        name: "set_device_property",
+        name: "control_speaker",
         arguments: {
-          target: spk?.did ?? "小爱音箱",
-          property: "volume",
-          value: Math.max(0, Math.min(100, volume)),
+          ...(spk ? { target: spk.did } : {}),
+          volume: Math.max(0, Math.min(100, Number(numMatch[1]))),
         },
+      };
+    }
+    if (/(大一点|调大|调高|提高|升高)/.test(clause)) {
+      return {
+        name: "control_speaker",
+        arguments: { ...(spk ? { target: spk.did } : {}), volume_delta: 15 },
+      };
+    }
+    if (/(小一点|调小|调低|降低)/.test(clause)) {
+      return {
+        name: "control_speaker",
+        arguments: { ...(spk ? { target: spk.did } : {}), volume_delta: -15 },
+      };
+    }
+    if (/(最大|满)/.test(clause)) {
+      return {
+        name: "control_speaker",
+        arguments: { ...(spk ? { target: spk.did } : {}), volume: 100 },
+      };
+    }
+    if (/(最小|最低)/.test(clause)) {
+      return {
+        name: "control_speaker",
+        arguments: { ...(spk ? { target: spk.did } : {}), volume: 10 },
       };
     }
   }

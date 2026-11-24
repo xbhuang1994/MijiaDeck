@@ -1100,6 +1100,8 @@ export class MijiaDeckWebApp {
   private agentProvidersCache: UiProviderPreset[] = [];
   private agentClearKeyPending = false;
   private sttClearKeyPending = false;
+  private agentModelsFetchGen = 0;
+  private agentModelsDebounceTimer: number | null = null;
 
   // Tray manager draft
   private trayMgrTab: "devices" | "scenes" = "devices";
@@ -3358,13 +3360,10 @@ export class MijiaDeckWebApp {
 
     if (preset) {
       el("set-agent-provider-desc").textContent = preset.description;
-      const datalist = el("set-agent-model-list");
-      datalist.replaceChildren();
-      for (const m of preset.suggestedModels) {
-        const opt = document.createElement("option");
-        opt.value = m;
-        datalist.appendChild(opt);
-      }
+      this.renderDiscoveredModels(
+        preset.suggestedModels.map((id) => ({ id })),
+        false,
+      );
       el<HTMLInputElement>("set-agent-base-url").placeholder =
         preset.defaultBaseUrl || "http://127.0.0.1:11434/v1";
       if (resetDefaultsOnSwitch) {
@@ -3372,6 +3371,121 @@ export class MijiaDeckWebApp {
         if (provId === "openai-compatible" && !el<HTMLInputElement>("set-agent-base-url").value) {
           el<HTMLInputElement>("set-agent-base-url").value = preset.defaultBaseUrl;
         }
+      }
+    }
+
+    if (!isLocal) {
+      void this.fetchAgentModelsFromApi(false);
+    }
+  }
+
+  private renderDiscoveredModels(
+    models: Array<{ id: string; name?: string }>,
+    autoSelectIfEmpty: boolean,
+  ): void {
+    const modelInput = el<HTMLInputElement>("set-agent-model");
+    const select = el<HTMLSelectElement>("set-agent-model-select");
+    const datalist = el("set-agent-model-list");
+    const currentVal = modelInput.value.trim();
+
+    datalist.replaceChildren();
+    select.replaceChildren();
+
+    const ids = new Set<string>();
+    for (const m of models) {
+      const id = String(m.id ?? "").trim();
+      if (!id || ids.has(id)) continue;
+      ids.add(id);
+
+      const dOpt = document.createElement("option");
+      dOpt.value = id;
+      datalist.appendChild(dOpt);
+
+      const sOpt = document.createElement("option");
+      sOpt.value = id;
+      sOpt.textContent = m.name && m.name !== id ? `${id} (${m.name})` : id;
+      select.appendChild(sOpt);
+    }
+
+    if (currentVal && !ids.has(currentVal)) {
+      const customOpt = document.createElement("option");
+      customOpt.value = currentVal;
+      customOpt.textContent = `${currentVal}（当前自定义）`;
+      select.prepend(customOpt);
+    }
+
+    if (currentVal) {
+      select.value = currentVal;
+    } else if (autoSelectIfEmpty && models.length > 0 && models[0]?.id) {
+      select.value = models[0].id;
+      modelInput.value = models[0].id;
+    }
+  }
+
+  private scheduleFetchAgentModels(): void {
+    if (this.agentModelsDebounceTimer !== null) {
+      window.clearTimeout(this.agentModelsDebounceTimer);
+    }
+    this.agentModelsDebounceTimer = window.setTimeout(() => {
+      this.agentModelsDebounceTimer = null;
+      void this.fetchAgentModelsFromApi(false);
+    }, 450);
+  }
+
+  private async fetchAgentModelsFromApi(showToastOnError: boolean): Promise<void> {
+    const provider = el<HTMLSelectElement>("set-agent-provider").value;
+    if (!provider || provider === "local") return;
+
+    const gen = ++this.agentModelsFetchGen;
+    const statusEl = el("set-agent-models-status");
+    const refreshBtn = el<HTMLButtonElement>("set-agent-refresh-models-btn");
+    const baseUrl = el<HTMLInputElement>("set-agent-base-url").value.trim();
+    const apiKey = el<HTMLInputElement>("set-agent-api-key").value.trim();
+
+    statusEl.classList.remove("is-success", "is-warn");
+    statusEl.textContent = "正在从 API 自动获取可用模型列表…";
+    refreshBtn.disabled = true;
+
+    try {
+      const payload: Record<string, unknown> = { provider };
+      if (baseUrl) payload.baseUrl = baseUrl;
+      if (apiKey) payload.apiKey = apiKey;
+
+      const res = await apiPost<{
+        fetched?: boolean;
+        source?: string;
+        models?: Array<{ id: string; name?: string }>;
+        error?: string;
+      }>("/api/agent/models", payload);
+
+      if (gen !== this.agentModelsFetchGen) return;
+
+      const list = Array.isArray(res.models) ? res.models : [];
+      if (list.length > 0) {
+        this.renderDiscoveredModels(list, !el<HTMLInputElement>("set-agent-model").value.trim());
+      }
+
+      if (res.fetched && res.source === "api") {
+        statusEl.classList.add("is-success");
+        statusEl.textContent = `✓ 已自动从 API 获取 ${list.length} 个可用模型，可直接下拉选择或手动输入`;
+      } else {
+        statusEl.classList.add("is-warn");
+        statusEl.textContent = res.error || "未能从接口拉取模型列表，已显示默认推荐列表";
+        if (showToastOnError && res.error) {
+          this.showToast(res.error, 3200);
+        }
+      }
+    } catch (err) {
+      if (gen !== this.agentModelsFetchGen) return;
+      const msg = err instanceof Error ? err.message : String(err);
+      statusEl.classList.add("is-warn");
+      statusEl.textContent = `获取模型列表失败：${msg}`;
+      if (showToastOnError) {
+        this.showToast(`获取模型列表失败：${msg}`, 3200);
+      }
+    } finally {
+      if (gen === this.agentModelsFetchGen) {
+        refreshBtn.disabled = false;
       }
     }
   }
@@ -4870,6 +4984,39 @@ export class MijiaDeckWebApp {
 
     el<HTMLSelectElement>("set-agent-provider").addEventListener("change", () => {
       this.syncAgentProviderFormHints(true);
+    });
+
+    el<HTMLSelectElement>("set-agent-model-select").addEventListener("change", (e) => {
+      const val = (e.target as HTMLSelectElement).value.trim();
+      if (val) {
+        el<HTMLInputElement>("set-agent-model").value = val;
+      }
+    });
+
+    el<HTMLInputElement>("set-agent-model").addEventListener("input", (e) => {
+      const val = (e.target as HTMLInputElement).value.trim();
+      const sel = el<HTMLSelectElement>("set-agent-model-select");
+      if ([...sel.options].some((o) => o.value === val)) {
+        sel.value = val;
+      }
+    });
+
+    el("set-agent-refresh-models-btn").addEventListener("click", () => {
+      void this.fetchAgentModelsFromApi(true);
+    });
+
+    el<HTMLInputElement>("set-agent-base-url").addEventListener("input", () => {
+      this.scheduleFetchAgentModels();
+    });
+    el<HTMLInputElement>("set-agent-base-url").addEventListener("change", () => {
+      void this.fetchAgentModelsFromApi(false);
+    });
+
+    el<HTMLInputElement>("set-agent-api-key").addEventListener("input", () => {
+      this.scheduleFetchAgentModels();
+    });
+    el<HTMLInputElement>("set-agent-api-key").addEventListener("change", () => {
+      void this.fetchAgentModelsFromApi(false);
     });
 
     el<HTMLInputElement>("set-voice-wake-enabled").addEventListener("change", (e) => {

@@ -41,6 +41,7 @@ export interface StartServerOptions {
   rootDir?: string;
   updateFetcher?: typeof fetch;
   sttFetcher?: typeof fetch;
+  modelFetcher?: typeof fetch;
   agentStreamFn?: StreamFn;
   agentModel?: Model<Api>;
   autoStart?: boolean;
@@ -332,6 +333,7 @@ export async function startMijiaDeckServer(
   const requestHandler = createRequestHandler(runtime, {
     rootDir: options.rootDir,
     updateFetcher: options.updateFetcher,
+    modelFetcher: options.modelFetcher,
   });
 
   const server = Bun.serve<WsData>({

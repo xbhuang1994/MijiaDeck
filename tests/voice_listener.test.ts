@@ -220,4 +220,53 @@ describe("Voice Listener -> Pi Agent End-to-End Server & WebSocket Integration",
     expect(capturedAuth).toBe("Bearer sk-test-stt-secret-key-0001");
     expect(demoService.lastDispensedPortions).toBe(3);
   });
+
+  test("POST /api/agent/models auto-fetches live model list using saved server-side API key", async () => {
+    let seenUrl = "";
+    let seenAuth = "";
+    server = await startMijiaDeckServer({
+      mode: "demo",
+      port: 0,
+      modelFetcher: (async (input: string | URL | Request, init?: RequestInit) => {
+        seenUrl = String(input);
+        seenAuth = new Headers(init?.headers).get("authorization") ?? "";
+        return new Response(
+          JSON.stringify({
+            data: [{ id: "group/qwen3.8-flash-next" }, { id: "auto/claude-sonnet-5-5" }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }) as typeof fetch,
+    });
+
+    await fetch(`${server.url}/api/agent/config`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider: "openai-compatible",
+        baseUrl: "https://magpie.example.test/v1",
+        apiKey: "sk-saved-secret-key-5555",
+        modelId: "group/qwen3.8-flash-next",
+      }),
+    });
+
+    // Request models list WITHOUT resending apiKey — backend resolves saved key securely
+    const res = await fetch(`${server.url}/api/agent/models`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider: "openai-compatible", baseUrl: "https://magpie.example.test/v1" }),
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as any;
+    expect(json.ok).toBe(true);
+    expect(json.fetched).toBe(true);
+    expect(json.source).toBe("api");
+    expect(json.models.map((m: any) => m.id)).toEqual([
+      "group/qwen3.8-flash-next",
+      "auto/claude-sonnet-5-5",
+    ]);
+    expect(seenUrl).toBe("https://magpie.example.test/v1/models");
+    expect(seenAuth).toBe("Bearer sk-saved-secret-key-5555");
+    expect(JSON.stringify(json)).not.toContain("sk-saved-secret-key-5555");
+  });
 });

@@ -588,17 +588,6 @@
             <select id="set-agent-provider" class="md-select agent-select" aria-label="Pi Agent 模型引擎"></select>
           </div>
 
-          <div class="setting-card setting-card-wrap" id="setting-row-agent-model">
-            <div class="setting-info">
-              <div class="setting-label">模型 ID</div>
-              <div class="setting-desc">选择推荐模型或输入任意目标模型名称</div>
-            </div>
-            <div class="agent-field-control">
-              <input type="text" id="set-agent-model" class="md-text-input" list="set-agent-model-list" placeholder="mijia-local-planner" aria-label="Pi Agent 模型 ID">
-              <datalist id="set-agent-model-list"></datalist>
-            </div>
-          </div>
-
           <div class="setting-card setting-card-wrap" id="setting-row-agent-baseurl">
             <div class="setting-info">
               <div class="setting-label">API Base URL（可选）</div>
@@ -617,6 +606,23 @@
             <div class="agent-key-row">
               <input type="password" id="set-agent-api-key" class="md-text-input" placeholder="输入新的 API Key（留空保持不变）" autocomplete="off" aria-label="Pi Agent API Key">
               <button type="button" id="set-agent-clear-key-btn" class="secondary-button btn-compact" hidden>清除密钥</button>
+            </div>
+          </div>
+
+          <div class="setting-card setting-card-wrap" id="setting-row-agent-model">
+            <div class="setting-info">
+              <div class="setting-label">模型列表与模型 ID</div>
+              <div class="setting-desc" id="set-agent-models-status">配置 API 地址与密钥后将自动从接口拉取可用模型列表，也可手动输入自定义模型 ID</div>
+            </div>
+            <div class="agent-model-stack">
+              <div class="agent-model-select-row">
+                <select id="set-agent-model-select" class="md-select agent-model-select" aria-label="从 API 获取的可用模型列表"></select>
+                <button type="button" id="set-agent-refresh-models-btn" class="secondary-button btn-compact" title="立即从接口重新获取模型列表">刷新列表</button>
+              </div>
+              <div class="agent-field-control">
+                <input type="text" id="set-agent-model" class="md-text-input" list="set-agent-model-list" placeholder="自动拉取后选择，或直接输入模型 ID" spellcheck="false" aria-label="Pi Agent 模型 ID">
+                <datalist id="set-agent-model-list"></datalist>
+              </div>
             </div>
           </div>
 

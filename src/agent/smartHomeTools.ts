@@ -95,7 +95,7 @@ function deviceMatchesCategory(device: DeviceInfo, category: string): boolean {
       device.spec_type.includes("sensor")
     );
   }
-  if (cat === "speaker" || cat === "音箱" || cat === "小爱") {
+  if (cat === "speaker" || cat === "音箱" || cat === "音响" || cat === "小爱") {
     return isSpeaker(device);
   }
   if (cat === "camera" || cat === "摄像头" || cat === "摄像机") {
@@ -332,6 +332,118 @@ function ensureAccessReady(deps: SmartHomeToolDeps): string | null {
   return null;
 }
 
+function findSpeakerAudioProps(props: readonly PropInfo[]): {
+  volumeProp: PropInfo | null;
+  speakerMuteProp: PropInfo | null;
+  micMuteProp: PropInfo | null;
+} {
+  const volumeProp =
+    props.find((p) => p.name === "volume" && p.writable) ??
+    props.find((p) => p.name.startsWith("volume") && p.writable) ??
+    null;
+
+  const speakerMuteProp =
+    props.find((p) => p.service === "speaker" && p.name.startsWith("mute") && p.writable) ??
+    props.find((p) => p.name === "mute-2" && p.writable) ??
+    props.find((p) => p.name === "mute" && p.writable) ??
+    props.find((p) => p.name.startsWith("mute") && p.writable && p.name !== "mute-4") ??
+    null;
+
+  const micMuteProp =
+    props.find((p) => p.service === "microphone" && p.name.startsWith("mute") && p.writable) ??
+    props.find((p) => p.name === "mute-4" && p.writable) ??
+    null;
+
+  return { volumeProp, speakerMuteProp, micMuteProp };
+}
+
+async function applySpeakerPower(
+  deps: SmartHomeToolDeps,
+  device: DeviceInfo,
+  state: "on" | "off" | "toggle",
+): Promise<{ on: boolean; note: string; values: Record<string, unknown> }> {
+  const detail = await runJob(deps.jobs, () => deps.service.deviceDetail(device.did), 2);
+  const { speakerMuteProp } = findSpeakerAudioProps(detail.props);
+
+  let targetOn: boolean;
+  if (state === "toggle") {
+    let currentlyMuted = false;
+    if (speakerMuteProp?.readable) {
+      try {
+        const vals = await runJob(
+          deps.jobs,
+          () => deps.service.readProps(device.did, [speakerMuteProp.name]),
+          2,
+        );
+        currentlyMuted = vals[speakerMuteProp.name] === true;
+      } catch {
+        currentlyMuted = false;
+      }
+    }
+    targetOn = currentlyMuted;
+  } else {
+    targetOn = state === "on";
+  }
+
+  const steps: string[] = [];
+  if (!targetOn) {
+    // 关闭小爱音箱：暂停/停止播放并开启扬声器静音（智能音箱无物理断电开关，采用暂停+静音待机）
+    const pauseAction =
+      detail.actions.find((a) => a.name === "pause") ??
+      detail.actions.find((a) => a.name === "stop");
+    if (pauseAction) {
+      try {
+        await runJob(deps.jobs, () => deps.service.runAction(device.did, pauseAction.name), 1);
+        steps.push("已暂停播放");
+      } catch {
+        // 未在播放时暂停可能报错，不阻断静音
+      }
+    }
+    if (speakerMuteProp) {
+      await runJob(deps.jobs, () => deps.service.writeProp(device.did, speakerMuteProp.name, true), 1);
+      steps.push("已开启静音待机");
+    }
+  } else {
+    // 打开小爱音箱：解除扬声器静音，并唤醒/恢复
+    if (speakerMuteProp) {
+      await runJob(deps.jobs, () => deps.service.writeProp(device.did, speakerMuteProp.name, false), 1);
+      steps.push("已取消静音");
+    }
+    const wakeAction =
+      detail.actions.find((a) => a.name === "wake-up") ??
+      detail.actions.find((a) => a.name === "play");
+    if (wakeAction) {
+      try {
+        await runJob(deps.jobs, () => deps.service.runAction(device.did, wakeAction.name), 1);
+        steps.push(wakeAction.name === "wake-up" ? "已唤醒" : "已恢复播放");
+      } catch {
+        // 唤醒或播放失败不影响取消静音成功
+      }
+    }
+  }
+
+  let values: Record<string, unknown> = {};
+  const toRead = ["volume", speakerMuteProp?.name, "playing-state"].filter((n): n is string => Boolean(n));
+  if (toRead.length > 0) {
+    try {
+      values = await runJob(deps.jobs, () => deps.service.readProps(device.did, toRead), 2);
+    } catch {
+      values = {};
+    }
+  }
+
+  if (deps.mainWindow.tray) {
+    deps.mainWindow.tray.refreshAudioAfterCommand(device.did);
+  }
+  const note =
+    steps.length > 0
+      ? `${targetOn ? "打开" : "关闭"}（${steps.join("，")}）`
+      : targetOn
+        ? "已打开"
+        : "已关闭";
+  return { on: targetOn, note, values };
+}
+
 /**
  * 构建完整智能家居 Pi Agent 工具列表。
  */
@@ -491,19 +603,19 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
     },
   };
 
-  const setDevicePowerTool: AgentTool<any> = {
+    const setDevicePowerTool: AgentTool<any> = {
     name: "set_device_power",
     label: "开关设备",
     description:
-      "打开、关闭或切换一个或多个智能设备的电源开关。支持按设备名、did、房间或设备类别（如关闭餐厅所有灯）批量操作。",
+      "打开、关闭或切换一个或多个智能设备的电源开关。支持按设备名、did、房间或设备类别（如关闭餐厅所有灯）批量操作；若目标为小爱/小米音箱，会自动切换音箱播放与静音待机状态。",
     parameters: obj({
       state: oneOf(["on", "off", "toggle"] as const, {
         description: "目标开关状态：on 打开、off 关闭、toggle 切换",
       }),
-      target: opt(str({ description: "目标设备名称、did 或关键词，例如：客厅吸顶灯、餐厅主灯、全部灯" })),
+      target: opt(str({ description: "目标设备名称、did 或关键词，例如：客厅吸顶灯、餐厅主灯、小米音箱、全部灯" })),
       room: opt(str({ description: "可选房间名，例如：客厅、餐厅、卧室" })),
       category: opt(
-        oneOf(["all", "light", "switch", "appliance", "camera"] as const, {
+        oneOf(["all", "light", "switch", "appliance", "camera", "speaker"] as const, {
           description: "可选类别过滤，批量开关时推荐使用",
         }),
       ),
@@ -512,19 +624,31 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       const blocked = ensureAccessReady(deps);
       if (blocked) return textResult(blocked, { ok: false, error: blocked }, true);
 
-      const candidates = resolveDevices(deps.mainWindow.allDevices, {
+      let candidates = resolveDevices(deps.mainWindow.allDevices, {
         target: params.target,
         room: params.room,
         category: params.category,
         controllableOnly: true,
       });
 
+      // 若用户明确点名了音箱/音响（如“关闭小米音响”、“打开小爱音箱”），允许通过软开关控制音箱（关闭=暂停+静音，打开=取消静音+播放/唤醒）
+      if (candidates.length === 0 && (params.target || params.category === "speaker")) {
+        const speakerCandidates = resolveDevices(deps.mainWindow.allDevices, {
+          target: params.target,
+          room: params.room,
+          category: "speaker",
+        }).filter((d) => isSpeaker(d));
+        if (speakerCandidates.length > 0) {
+          candidates = speakerCandidates;
+        }
+      }
+
       if (candidates.length === 0) {
         const desc = [params.room, params.target, params.category].filter(Boolean).join(" ") || "指定条件";
         return textResult(`未找到可控制开关的设备（${desc}）。`, { ok: false }, true);
       }
 
-      const succeeded: Array<{ did: string; name: string; state: boolean }> = [];
+      const succeeded: Array<{ did: string; name: string; state: boolean; note?: string }> = [];
       const failed: Array<{ did: string; name: string; reason: string }> = [];
 
       for (const dev of candidates) {
@@ -533,6 +657,11 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
           continue;
         }
         try {
+          if (isSpeaker(dev)) {
+            const spRes = await applySpeakerPower(deps, dev, params.state);
+            succeeded.push({ did: dev.did, name: dev.name, state: spRes.on, note: spRes.note });
+            continue;
+          }
           let newState: boolean;
           if (params.state === "toggle") {
             newState = await runJob(deps.jobs, () => deps.service.togglePower(dev.did), 1);
@@ -557,7 +686,9 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         deps.broadcastState();
       }
 
-      const okParts = succeeded.map((s) => `${s.state ? "打开" : "关闭"}「${s.name}」`);
+      const okParts = succeeded.map((s) =>
+        s.note ? `「${s.name}」${s.note}` : `${s.state ? "打开" : "关闭"}「${s.name}」`,
+      );
       const errParts = failed.map((f) => `「${f.name}」失败(${f.reason})`);
       const summary = [
         okParts.length > 0 ? `已${okParts.join("、")}` : "",
@@ -751,10 +882,18 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       const detail = await runJob(deps.jobs, () => deps.service.deviceDetail(device.did), 2);
       const rawKey = params.property.trim();
       const normKey = normalizeQuery(rawKey);
-      const prop =
-        detail.props.find((p) => p.name === rawKey || p.name === rawKey.replaceAll("_", "-")) ??
-        detail.props.find((p) => p.writable && (normalizeQuery(p.name) === normKey || normalizeQuery(p.desc) === normKey)) ??
-        detail.props.find((p) => p.writable && (normalizeQuery(p.desc).includes(normKey) || normalizeQuery(p.name).includes(normKey)));
+      let prop: PropInfo | undefined;
+      if (isSpeaker(device) && (normKey === "mute" || normKey === "静音" || normKey === "扬声器静音")) {
+        prop = findSpeakerAudioProps(detail.props).speakerMuteProp ?? undefined;
+      } else if (isSpeaker(device) && (normKey === "micmute" || normKey === "麦克风静音" || normKey === "闭麦")) {
+        prop = findSpeakerAudioProps(detail.props).micMuteProp ?? undefined;
+      }
+      if (!prop) {
+        prop =
+          detail.props.find((p) => p.name === rawKey || p.name === rawKey.replaceAll("_", "-")) ??
+          detail.props.find((p) => p.writable && (normalizeQuery(p.name) === normKey || normalizeQuery(p.desc) === normKey)) ??
+          detail.props.find((p) => p.writable && (normalizeQuery(p.desc).includes(normKey) || normalizeQuery(p.name).includes(normKey)));
+      }
 
       if (!prop) {
         return textResult(`「${device.name}」未找到可写属性「${rawKey}」。`, { ok: false }, true);
@@ -992,11 +1131,189 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
     },
   };
 
+  const controlSpeakerTool: AgentTool<any> = {
+    name: "control_speaker",
+    label: "控制小米/小爱音箱",
+    description:
+      "专用小米/小爱音箱综合控制工具：支持开关音箱（打开=取消静音并唤醒，关闭=暂停播放并静音待机）、播放指定音乐/歌曲/歌手、播放控制（播放/暂停/停止/上一首/下一首）、设置绝对音量（0-100）或相对增减音量（volume_delta）、扬声器静音/取消静音、麦克风静音以及朗读文本。",
+    parameters: obj({
+      target: opt(str({ description: "目标音箱名称或 did；留空自动选择默认在线小爱/小米音箱" })),
+      power: opt(
+        oneOf(["on", "off", "toggle"] as const, {
+          description: "开关音箱：on 打开（取消静音并唤醒），off 关闭（暂停并静音待机），toggle 切换",
+        }),
+      ),
+      play_music: opt(str({ description: "播放指定音乐、歌曲、歌手或歌单，例如：周杰伦的晴天、轻音乐、林俊杰的江南" })),
+      playback: opt(
+        oneOf(["play", "pause", "stop", "next", "previous"] as const, {
+          description: "播放控制：play 继续播放、pause 暂停、stop 停止、next 下一首、previous 上一首",
+        }),
+      ),
+      volume: opt(num({ description: "设置目标绝对音量（0-100）", minimum: 0, maximum: 100 })),
+      volume_delta: opt(
+        num({
+          description: "相对调整音量增减值，例如 +10 表示调大 10%，-15 表示调小 15%",
+          minimum: -100,
+          maximum: 100,
+        }),
+      ),
+      mute: opt(bool({ description: "扬声器静音（true）或取消静音（false）" })),
+      mic_mute: opt(bool({ description: "麦克风静音（true）或开启麦克风（false）" })),
+      speak_text: opt(str({ description: "让音箱直接朗读指定文本内容" })),
+    }),
+    execute: async (_toolCallId, params) => {
+      const blocked = ensureAccessReady(deps);
+      if (blocked) return textResult(blocked, { ok: false, error: blocked }, true);
+
+      const devices = deps.mainWindow.allDevices;
+      const onlineSpeakers = devices.filter((d) => isSpeaker(d) && d.online);
+      let speaker: DeviceInfo | null = null;
+      if (params.target) {
+        speaker = resolveSingleDevice(onlineSpeakers, params.target);
+      }
+      if (!speaker) {
+        const prefDid = deps.settingsStore.getDefaultSpeakerDid();
+        if (prefDid) {
+          speaker = onlineSpeakers.find((d) => d.did === prefDid) ?? null;
+        }
+      }
+      if (!speaker) {
+        speaker = onlineSpeakers[0] ?? null;
+      }
+      if (!speaker) {
+        return textResult(speakerHint(devices) || "当前没有可用的在线小米/小爱音箱。", { ok: false }, true);
+      }
+
+      const detail = await runJob(deps.jobs, () => deps.service.deviceDetail(speaker!.did), 2);
+      const { volumeProp, speakerMuteProp, micMuteProp } = findSpeakerAudioProps(detail.props);
+      const changes: string[] = [];
+
+      if (params.power) {
+        const pwRes = await applySpeakerPower(deps, speaker, params.power);
+        changes.push(pwRes.note);
+      }
+
+      if (typeof params.mute === "boolean") {
+        if (!speakerMuteProp) {
+          return textResult(`「${speaker.name}」不支持扬声器静音属性控制。`, { ok: false }, true);
+        }
+        await runJob(deps.jobs, () => deps.service.writeProp(speaker!.did, speakerMuteProp.name, params.mute), 1);
+        changes.push(params.mute ? "已静音" : "已取消静音");
+      }
+
+      if (typeof params.mic_mute === "boolean") {
+        if (!micMuteProp) {
+          return textResult(`「${speaker.name}」不支持麦克风静音属性控制。`, { ok: false }, true);
+        }
+        await runJob(deps.jobs, () => deps.service.writeProp(speaker!.did, micMuteProp.name, params.mic_mute), 1);
+        changes.push(params.mic_mute ? "已关闭麦克风" : "已开启麦克风");
+      }
+
+      if (params.volume !== undefined || params.volume_delta !== undefined) {
+        if (!volumeProp) {
+          return textResult(`「${speaker.name}」不支持音量属性调节。`, { ok: false }, true);
+        }
+        let targetVol: number;
+        if (params.volume !== undefined) {
+          targetVol = params.volume;
+        } else {
+          let curVol = 50;
+          try {
+            const cur = await runJob(deps.jobs, () => deps.service.readProp(speaker!.did, volumeProp.name), 2);
+            if (typeof cur === "number" && Number.isFinite(cur)) {
+              curVol = cur;
+            }
+          } catch {
+            // fallback 50
+          }
+          targetVol = curVol + Number(params.volume_delta ?? 0);
+        }
+        const clamped = clampToPropRange(volumeProp, targetVol);
+        await runJob(deps.jobs, () => deps.service.writeProp(speaker!.did, volumeProp.name, clamped), 1);
+        changes.push(`音量调至 ${clamped}%`);
+      }
+
+      if (params.play_music && params.play_music.trim()) {
+        const song = params.play_music.trim();
+        // 播放音乐前如处于静音，自动取消静音确保能听见
+        if (speakerMuteProp && params.mute === undefined && params.power !== "off") {
+          try {
+            const mVal = await runJob(deps.jobs, () => deps.service.readProp(speaker!.did, speakerMuteProp.name), 2);
+            if (mVal === true) {
+              await runJob(deps.jobs, () => deps.service.writeProp(speaker!.did, speakerMuteProp.name, false), 1);
+              changes.push("已取消静音");
+            }
+          } catch {
+            // ignore
+          }
+        }
+        const directive = /^播放/.test(song) ? song : `播放${song}`;
+        await runJob(
+          deps.jobs,
+          () => deps.service.runAction(speaker!.did, "execute-text-directive", [directive, 0]),
+          1,
+        );
+        changes.push(`开始${directive}`);
+      }
+
+      if (params.playback) {
+        const pb = params.playback;
+        const labelMap: Record<string, string> = {
+          play: "继续播放",
+          pause: "暂停播放",
+          stop: "停止播放",
+          next: "切换下一首",
+          previous: "切换上一首",
+        };
+        await runJob(deps.jobs, () => deps.service.runAction(speaker!.did, pb), 1);
+        changes.push(labelMap[pb] ?? pb);
+      }
+
+      if (params.speak_text && params.speak_text.trim()) {
+        const txt = params.speak_text.trim();
+        await runJob(deps.jobs, () => deps.service.runAction(speaker!.did, "play-text", [txt]), 1);
+        changes.push(`已朗读“${txt}”`);
+      }
+
+      // 回读音箱实时音量与静音状态
+      const toRead = [volumeProp?.name, speakerMuteProp?.name, micMuteProp?.name, "playing-state"].filter(
+        (n): n is string => Boolean(n),
+      );
+      let readback: Record<string, unknown> = {};
+      if (toRead.length > 0) {
+        try {
+          readback = await runJob(deps.jobs, () => deps.service.readProps(speaker!.did, toRead), 2);
+        } catch {
+          readback = {};
+        }
+      }
+
+      if (deps.mainWindow.tray) {
+        deps.mainWindow.tray.refreshAudioAfterCommand(speaker.did);
+      }
+      deps.broadcastState();
+
+      const summary =
+        changes.length > 0
+          ? `已对「${speaker.name}」执行：${changes.join("，")}。`
+          : `未对「${speaker.name}」指定需要执行的操作。`;
+
+      return textResult(summary, {
+        ok: true,
+        did: speaker.did,
+        name: speaker.name,
+        changes,
+        values: readback,
+      });
+    },
+  };
+
   return [
     listDevicesTool,
     getDeviceDetailTool,
     setDevicePowerTool,
     controlLightTool,
+    controlSpeakerTool,
     setDevicePropertyTool,
     runDeviceActionTool,
     listScenesTool,

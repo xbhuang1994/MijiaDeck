@@ -10,6 +10,7 @@ import {
   fauxProvider,
   fauxToolCall,
 } from "@earendil-works/pi-ai";
+import { fetchProviderModels } from "../src/agent/modelDiscovery.ts";
 import { PiAgentService } from "../src/agent/piAgentService.ts";
 import {
   defaultAgentVoiceConfig,
@@ -203,10 +204,26 @@ describe("PiAgentService with Local Smart-Home Stream Engine", () => {
       expect(rFeed.ok).toBe(true);
       expect(h.service.lastDispensedPortions).toBe(2);
 
-      // 5. Speaker volume & XiaoAI directive
+      // 5. Speaker control: volume, relative volume, music playback, and soft power off/on
       const rVol = await h.agent.prompt("小爱音箱音量调到65");
       expect(rVol.ok).toBe(true);
       expect(await h.service.readProp("demo-speaker-xiaoai", "volume")).toBe(65);
+
+      const rVolUp = await h.agent.prompt("把小米音响声音调大一点");
+      expect(rVolUp.ok).toBe(true);
+      expect(await h.service.readProp("demo-speaker-xiaoai", "volume")).toBe(80);
+
+      const rMusic = await h.agent.prompt("用小米音响播放周杰伦的晴天");
+      expect(rMusic.ok).toBe(true);
+      expect(h.service.lastDirective).toBe("播放周杰伦的晴天");
+
+      const rSpkOff = await h.agent.prompt("关闭小米音响");
+      expect(rSpkOff.ok).toBe(true);
+      expect(await h.service.readProp("demo-speaker-xiaoai", "mute")).toBe(true);
+
+      const rSpkOn = await h.agent.prompt("打开小米音响");
+      expect(rSpkOn.ok).toBe(true);
+      expect(await h.service.readProp("demo-speaker-xiaoai", "mute")).toBe(false);
 
       const rXiaoAi = await h.agent.prompt("让小爱播放轻音乐");
       expect(rXiaoAi.ok).toBe(true);
@@ -297,5 +314,96 @@ describe("PiAgentService with Local Smart-Home Stream Engine", () => {
       if (prevKey !== undefined) process.env.DEEPSEEK_API_KEY = prevKey;
       await h.cleanup();
     }
+  });
+});
+
+describe("ModelDiscovery (Auto-fetch from Provider API)", () => {
+  test("fetches OpenAI-compatible /models list using saved or transient API key and redacts errors", async () => {
+    let seenUrl = "";
+    let seenAuth = "";
+    const mockFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      seenUrl = String(input);
+      const headers = new Headers(init?.headers);
+      seenAuth = headers.get("authorization") ?? "";
+      return new Response(
+        JSON.stringify({
+          data: [
+            { id: "group/qwen3.8-flash-next", owned_by: "magpie" },
+            { id: "auto/claude-sonnet-5-5", owned_by: "magpie" },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const result = await fetchProviderModels({
+      provider: "openai-compatible",
+      baseUrl: "https://gateway.example.test/v1/",
+      apiKey: "sk-magpie-secret-test-9999",
+      fetcher: mockFetch,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.source).toBe("api");
+    expect(seenUrl).toBe("https://gateway.example.test/v1/models");
+    expect(seenAuth).toBe("Bearer sk-magpie-secret-test-9999");
+    expect(result.models.map((m) => m.id)).toEqual([
+      "group/qwen3.8-flash-next",
+      "auto/claude-sonnet-5-5",
+    ]);
+
+    // Fallback with redacted error on HTTP 401
+    const errFetch = async () =>
+      new Response(JSON.stringify({ error: { message: "Invalid key sk-magpie-secret-test-9999" } }), {
+        status: 401,
+      });
+    const failed = await fetchProviderModels({
+      provider: "openai-compatible",
+      baseUrl: "https://gateway.example.test/v1",
+      apiKey: "sk-magpie-secret-test-9999",
+      fetcher: errFetch,
+    });
+    expect(failed.ok).toBe(false);
+    expect(failed.source).toBe("fallback");
+    expect(failed.models.length).toBeGreaterThan(0);
+    expect(failed.error).not.toContain("sk-magpie-secret-test-9999");
+  });
+
+  test("supports Google Gemini x-goog-api-key and Anthropic x-api-key model discovery", async () => {
+    let googleHeader = "";
+    const gRes = await fetchProviderModels({
+      provider: "google",
+      apiKey: "AIzaTestKey123",
+      fetcher: (async (_url, init) => {
+        googleHeader = new Headers(init?.headers).get("x-goog-api-key") ?? "";
+        return new Response(
+          JSON.stringify({
+            models: [
+              { name: "models/gemini-2.5-flash", displayName: "Gemini 2.5 Flash", supportedGenerationMethods: ["generateContent"] },
+              { name: "models/embedding-001", supportedGenerationMethods: ["embedContent"] },
+            ],
+          }),
+          { status: 200 },
+        );
+      }) as typeof fetch,
+    });
+    expect(gRes.ok).toBe(true);
+    expect(googleHeader).toBe("AIzaTestKey123");
+    expect(gRes.models.map((m) => m.id)).toEqual(["gemini-2.5-flash"]);
+
+    let anthHeader = "";
+    const aRes = await fetchProviderModels({
+      provider: "anthropic",
+      apiKey: "sk-ant-test-key",
+      fetcher: (async (_url, init) => {
+        anthHeader = new Headers(init?.headers).get("x-api-key") ?? "";
+        return new Response(
+          JSON.stringify({ data: [{ id: "claude-sonnet-4-5", display_name: "Claude Sonnet 4.5" }] }),
+          { status: 200 },
+        );
+      }) as typeof fetch,
+    });
+    expect(aRes.ok).toBe(true);
+    expect(anthHeader).toBe("sk-ant-test-key");
+    expect(aRes.models[0]?.id).toBe("claude-sonnet-4-5");
   });
 });

@@ -4954,6 +4954,33 @@ body.pi-drawer-open .voice-fab {
   align-items: stretch;
 }
 
+.agent-model-stack {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.agent-model-select-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.agent-model-select {
+  flex: 1;
+  min-width: 0;
+}
+
+#set-agent-models-status.is-success {
+  color: var(--c-theme-dim);
+}
+
+#set-agent-models-status.is-warn {
+  color: var(--c-warn-text);
+}
+
 .md-text-input,
 .md-num-input,
 .agent-textarea {

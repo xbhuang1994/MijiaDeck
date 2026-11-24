@@ -8,6 +8,7 @@
 
 import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
+import { fetchProviderModels } from "../agent/modelDiscovery.ts";
 import type { PiAgentService } from "../agent/piAgentService.ts";
 import type { VoiceListenerController, VoiceListenMode } from "../agent/voiceListenerController.ts";
 import type { AppMode } from "../cli/startup.ts";
@@ -118,6 +119,7 @@ export interface AppRuntime {
 export interface RequestHandlerOptions {
   rootDir?: string;
   updateFetcher?: typeof fetch;
+  modelFetcher?: typeof fetch;
 }
 
 export class HttpError extends Error {
@@ -1777,6 +1779,43 @@ export function createRequestHandler(
           ok: true,
           config: cfgStore.toPublicAgentVoiceConfig(cfg),
           providers: cfgStore.PROVIDER_PRESETS,
+        });
+      }
+
+      if ((method === "GET" || method === "POST") && pathname === "/api/agent/models") {
+        const cfgStore = runtime.agentConfigStore ?? agentConfigStoreModule;
+        const savedCfg = runtime.piAgent ? runtime.piAgent.config : cfgStore.loadAgentVoiceConfig();
+        const body = method === "POST" ? await readJsonBody(req) : {};
+        const rawProvider =
+          typeof body.provider === "string" && body.provider.trim()
+            ? body.provider.trim()
+            : savedCfg.provider;
+        const knownProvider = cfgStore.PROVIDER_PRESETS.find((p) => p.id === rawProvider)?.id;
+        if (!knownProvider) {
+          throw new HttpError(400, `不支持的模型引擎类型: ${rawProvider}`);
+        }
+        const baseUrl =
+          typeof body.baseUrl === "string"
+            ? body.baseUrl.trim()
+            : knownProvider === savedCfg.provider
+              ? savedCfg.baseUrl
+              : "";
+        const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : undefined;
+
+        const discovery = await fetchProviderModels({
+          provider: knownProvider,
+          baseUrl,
+          apiKey,
+          savedConfig: savedCfg,
+          fetcher: options.modelFetcher,
+        });
+        return jsonResponse({
+          ok: true,
+          fetched: discovery.ok,
+          provider: discovery.provider,
+          source: discovery.source,
+          models: discovery.models,
+          ...(discovery.error ? { error: discovery.error } : {}),
         });
       }
 
