@@ -27,6 +27,10 @@ import {
   spectralSubtractDenoise,
 } from "./audioPcm.ts";
 import {
+  LocalTtsEngine,
+  type LocalTtsStatus,
+} from "./localTtsEngine.ts";
+import {
   OPEN_WAKEWORD_MODEL_URLS,
   OpenWakeWordEngine,
   type OpenWakeWordScoreClipOptions,
@@ -89,6 +93,7 @@ export interface LocalVoiceEngineStatus {
     cedAudioTagging?: boolean;
     pyannoteDiarization?: boolean;
     spleeterSeparation?: boolean;
+    localTts?: boolean;
   };
   readyForDenoise: boolean;
   readyForDpdfnet: boolean;
@@ -98,6 +103,8 @@ export interface LocalVoiceEngineStatus {
   readyForLocalAsr: boolean;
   readyForWakeWord: boolean;
   readyForSourceSeparation?: boolean;
+  readyForLocalTts?: boolean;
+  tts?: LocalTtsStatus;
   downloading: boolean;
   lastError: string | null;
 }
@@ -377,6 +384,7 @@ export function chooseBestAsrCandidate(
 export class LocalVoiceEngine {
   private readonly _modelsDirOverride?: string;
   private readonly _oww: OpenWakeWordEngine;
+  private readonly _tts: LocalTtsEngine;
   private _sourceSeparator: AudioSourceSeparator | null = null;
   private _gtcrnDenoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
   private _dpdfnetDenoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
@@ -397,6 +405,7 @@ export class LocalVoiceEngine {
     this._modelsDirOverride = options.modelsDir;
     const p = resolveVoiceModelPaths(options.modelsDir);
     this._oww = new OpenWakeWordEngine({ modelsDir: p.modelsDir });
+    this._tts = new LocalTtsEngine({ modelsDir: p.modelsDir });
   }
 
   get paths(): LocalVoiceModelPaths {
@@ -405,6 +414,10 @@ export class LocalVoiceEngine {
 
   get openWakeWord(): OpenWakeWordEngine {
     return this._oww;
+  }
+
+  get tts(): LocalTtsEngine {
+    return this._tts;
   }
 
   get sourceSeparator(): AudioSourceSeparator {
@@ -448,6 +461,7 @@ export class LocalVoiceEngine {
     const cedAudioTagging = existsSync(p.cedModel) && existsSync(p.cedLabels);
     const pyannoteDiarization = existsSync(p.pyannoteSegmentation) && speakerCampp;
     const spleeterSeparation = existsSync(p.spleeterVocals) && existsSync(p.spleeterAccompaniment);
+    const ttsStatus = this._tts.getStatus();
     const addonAvailable = sherpa !== null;
     return {
       addonAvailable,
@@ -464,6 +478,7 @@ export class LocalVoiceEngine {
         cedAudioTagging,
         pyannoteDiarization,
         spleeterSeparation,
+        localTts: ttsStatus.ready,
       },
       readyForDenoise: addonAvailable && gtcrn,
       readyForDpdfnet: addonAvailable && dpdfnet4,
@@ -474,8 +489,10 @@ export class LocalVoiceEngine {
       readyForWakeWord: this._oww.getStatus().ready,
       readyForSourceSeparation:
         addonAvailable && senseVoice && (cedAudioTagging || pyannoteDiarization || spleeterSeparation),
-      downloading: this._downloading,
-      lastError: this._lastError,
+      readyForLocalTts: ttsStatus.ready,
+      tts: ttsStatus,
+      downloading: this._downloading || ttsStatus.downloading,
+      lastError: this._lastError ?? ttsStatus.lastError,
     };
   }
 
@@ -1317,6 +1334,11 @@ export class LocalVoiceEngine {
       await fetchAndExtractOptionalTar(MODEL_URLS.cedTinyTar, p.cedModel, "ced-tiny.tar.bz2");
       await fetchAndExtractOptionalTar(MODEL_URLS.pyannoteSegTar, p.pyannoteSegmentation, "pyannote-seg.tar.bz2");
       await fetchAndExtractOptionalTar(MODEL_URLS.spleeterFp16Tar, p.spleeterVocals, "spleeter-fp16.tar.bz2");
+      try {
+        await this._tts.downloadMissingModels();
+      } catch {
+        // 可选本地温柔女声模型下载失败时自动回退浏览器女声，不阻断核心 ASR
+      }
     } catch (err) {
       this._lastError = err instanceof Error ? err.message : String(err);
       throw err;
@@ -1331,6 +1353,7 @@ export class LocalVoiceEngine {
     this._sourceSeparator?.dispose();
     this._sourceSeparator = null;
     this._oww.dispose();
+    this._tts.dispose();
     this._gtcrnDenoiser = null;
     this._dpdfnetDenoiser = null;
     this._voxlockDenoiser = null;

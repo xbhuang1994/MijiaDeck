@@ -128,6 +128,19 @@ export interface UiLocalVoiceStatus {
   readyForVoiceprint: boolean;
   readyForLocalAsr: boolean;
   readyForWakeWord?: boolean;
+  readyForLocalTts?: boolean;
+  tts?: {
+    addonAvailable: boolean;
+    ready: boolean;
+    readyVoices: Array<"gentle-zh-en" | "warm-zh-baker">;
+    activeVoice: "gentle-zh-en" | "warm-zh-baker" | null;
+    models?: {
+      matchaZhEn: boolean;
+      vocos16k: boolean;
+      matchaZhBaker: boolean;
+      vocos22k: boolean;
+    };
+  };
   downloading?: boolean;
   models?: {
     gtcrn: boolean;
@@ -137,6 +150,7 @@ export interface UiLocalVoiceStatus {
     speakerCampp: boolean;
     senseVoice: boolean;
     openWakeWord?: boolean;
+    localTts?: boolean;
   };
 }
 
@@ -175,7 +189,11 @@ export interface UiVoiceSnapshot {
   error: string | null;
   wakeWordEnabled: boolean;
   wakeWords: string[];
+  wakeAckPhrase?: string;
   autoSpeakReply: boolean;
+  ttsEngine?: "auto" | "local" | "browser";
+  ttsVoice?: "gentle-zh-en" | "warm-zh-baker";
+  ttsSpeed?: number;
   attentionMode?: "smart" | "strict" | "off";
   noiseSuppressionMode?: "auto" | "neural" | "dpdfnet" | "voxlock" | "dsp" | "off";
   voiceprintMode?: "off" | "tag" | "strict";
@@ -332,7 +350,10 @@ export class PiAgentPanelController {
           if (res.agent) this.applyAgentSnapshot(res.agent);
           if (res.voiceState) this.applyVoiceSnapshot(res.voiceState);
           if (res.matched && res.wokeOnly) {
-            this.flashLivePill("已唤醒，请说…", 4000);
+            this.flashLivePill(
+              res.reply ? `已唤醒「${res.reply}」` : "已唤醒，静默持续监听中…",
+              4000,
+            );
           } else if (res.matched && res.reply) {
             this.flashLivePill(`π ${res.reply}`, 4200);
           }
@@ -369,7 +390,10 @@ export class PiAgentPanelController {
         if (data.agent) this.applyAgentSnapshot(data.agent);
         if (data.voiceState) this.applyVoiceSnapshot(data.voiceState);
         if (data.matched && data.wokeOnly) {
-          this.flashLivePill("已唤醒，请说…", 4000);
+          this.flashLivePill(
+            data.reply ? `已唤醒「${data.reply}」` : "已唤醒，静默持续监听中…",
+            4000,
+          );
         } else if (data.matched && data.reply) {
           this.flashLivePill(`π ${data.reply}`, 4200);
         } else if (
@@ -452,7 +476,10 @@ export class PiAgentPanelController {
       if (ev.agent) this.applyAgentSnapshot(ev.agent);
       if (ev.voiceState) this.applyVoiceSnapshot(ev.voiceState);
       if (matched && wokeOnly) {
-        this.flashLivePill("已唤醒，请说…", 4000);
+        this.flashLivePill(
+          reply ? `已唤醒「${reply}」` : "已唤醒，静默持续监听中…",
+          4000,
+        );
       } else if (matched && reply) {
         this.flashLivePill(`π ${reply}`, 4200);
       } else if (
@@ -725,6 +752,7 @@ export class PiAgentPanelController {
       this.voiceClient.updateConfig({
         ...this.agentState.config,
         localAsrReady: Boolean(this.voiceState?.localEngine?.readyForLocalAsr),
+        localTtsReady: this.voiceState?.localEngine?.readyForLocalTts,
       });
     }
     this.renderAll();
@@ -757,12 +785,24 @@ export class PiAgentPanelController {
     if (this.voiceState.localEngine) {
       this.voiceClient.updateConfig({
         localAsrReady: Boolean(this.voiceState.localEngine.readyForLocalAsr),
+        localTtsReady: Boolean(this.voiceState.localEngine.readyForLocalTts),
       });
     }
     this.syncDialogTimer();
     this.renderTitleButtons();
     this.renderVoiceStrip();
     this.renderLivePill();
+  }
+
+  previewVoice(
+    text: string,
+    overrides?: {
+      ttsEngine?: "auto" | "local" | "browser";
+      ttsVoice?: "gentle-zh-en" | "warm-zh-baker";
+      ttsSpeed?: number;
+    },
+  ): void {
+    this.voiceClient.previewVoice(text, overrides);
   }
 
   getVoiceSnapshot(): UiVoiceSnapshot | null {

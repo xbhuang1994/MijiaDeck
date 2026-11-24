@@ -3432,6 +3432,8 @@ export class MijiaDeckWebApp {
     el("setting-row-wake-words").classList.toggle("is-disabled", !wakeEnabled);
     const wakeList = cfg?.wakeWords && cfg.wakeWords.length > 0 ? cfg.wakeWords : ["小派", "pi"];
     el<HTMLInputElement>("set-voice-wake-words").value = wakeList.join(", ");
+    el<HTMLInputElement>("set-voice-wake-ack-phrase").value =
+      cfg?.wakeAckPhrase !== undefined ? cfg.wakeAckPhrase : "嗯?";
     el<HTMLInputElement>("set-voice-conv-window").value = String(cfg?.conversationWindowSec ?? 25);
 
     el<HTMLInputElement>("set-oww-enabled").checked = cfg?.owwEnabled ?? true;
@@ -3452,6 +3454,9 @@ export class MijiaDeckWebApp {
     el<HTMLInputElement>("set-voiceprint-threshold").value = String(cfg?.voiceprintThreshold ?? 0.42);
     el<HTMLInputElement>("set-voice-barge-in").checked = cfg?.bargeInEnabled ?? true;
     el<HTMLInputElement>("set-voice-auto-speak").checked = cfg?.autoSpeakReply ?? true;
+    el<HTMLSelectElement>("set-voice-tts-engine").value = cfg?.ttsEngine || "auto";
+    el<HTMLSelectElement>("set-voice-tts-voice").value = cfg?.ttsVoice || "gentle-zh-en";
+    el<HTMLInputElement>("set-voice-tts-speed").value = (cfg?.ttsSpeed ?? 0.98).toFixed(2);
 
     el<HTMLInputElement>("set-stt-base-url").value = cfg?.sttBaseUrl || "";
     el<HTMLInputElement>("set-stt-model").value = cfg?.sttModel || "whisper-1";
@@ -3486,6 +3491,7 @@ export class MijiaDeckWebApp {
     const vpOk = Boolean(status?.readyForVoiceprint);
     const asrOk = Boolean(status?.readyForLocalAsr);
     const owwOk = Boolean(status?.readyForWakeWord ?? status?.models?.openWakeWord);
+    const ttsOk = Boolean(status?.readyForLocalTts ?? status?.models?.localTts);
 
     setBadge("badge-model-gtcrn", "GTCRN 降噪", gtcrnOk);
     setBadge("badge-model-dpdfnet", "DPDFNet4 强噪", dpdfOk);
@@ -3494,9 +3500,10 @@ export class MijiaDeckWebApp {
     setBadge("badge-model-vp", "3D-Speaker 声纹", vpOk);
     setBadge("badge-model-asr", "SenseVoice 识别", asrOk);
     setBadge("badge-model-oww", "openWakeWord 唤醒", owwOk);
+    setBadge("badge-model-tts", "Matcha 温柔女声", ttsOk);
 
     const coreReady = gtcrnOk && vadOk && vpOk && asrOk;
-    const allReady = coreReady && owwOk;
+    const allReady = coreReady && owwOk && ttsOk;
     const dlBtn = document.getElementById("voice-download-models-btn") as HTMLButtonElement | null;
     if (dlBtn) {
       dlBtn.hidden = allReady || !status?.addonAvailable;
@@ -4288,6 +4295,10 @@ export class MijiaDeckWebApp {
     const owwThreshold = Number.isFinite(owwThreshRaw)
       ? Number(Math.min(0.95, Math.max(0.25, owwThreshRaw)).toFixed(2))
       : 0.6;
+    const ttsSpeedRaw = Number(el<HTMLInputElement>("set-voice-tts-speed").value);
+    const ttsSpeed = Number.isFinite(ttsSpeedRaw)
+      ? Number(Math.min(1.4, Math.max(0.7, ttsSpeedRaw)).toFixed(2))
+      : 0.98;
 
     const agentPayload: Record<string, unknown> = {
       provider: el<HTMLSelectElement>("set-agent-provider").value,
@@ -4304,6 +4315,7 @@ export class MijiaDeckWebApp {
       vadSilenceMs: Number(el<HTMLInputElement>("set-voice-vad-silence").value) || 750,
       wakeWordEnabled: el<HTMLInputElement>("set-voice-wake-enabled").checked,
       wakeWords: el<HTMLInputElement>("set-voice-wake-words").value,
+      wakeAckPhrase: el<HTMLInputElement>("set-voice-wake-ack-phrase").value.trim(),
       conversationWindowSec,
       maxConsecutiveSidetalk,
       owwEnabled: el<HTMLInputElement>("set-oww-enabled").checked,
@@ -4316,6 +4328,9 @@ export class MijiaDeckWebApp {
       voiceprintThreshold: Number(el<HTMLInputElement>("set-voiceprint-threshold").value) || 0.42,
       bargeInEnabled: el<HTMLInputElement>("set-voice-barge-in").checked,
       autoSpeakReply: el<HTMLInputElement>("set-voice-auto-speak").checked,
+      ttsEngine: el<HTMLSelectElement>("set-voice-tts-engine").value,
+      ttsVoice: el<HTMLSelectElement>("set-voice-tts-voice").value,
+      ttsSpeed,
       sttBaseUrl: el<HTMLInputElement>("set-stt-base-url").value.trim(),
       sttModel: el<HTMLInputElement>("set-stt-model").value.trim(),
     };
@@ -5764,6 +5779,39 @@ export class MijiaDeckWebApp {
 
     el("voice-download-models-btn").addEventListener("click", () => {
       void this.downloadMissingVoiceModels();
+    });
+
+    const readDraftTtsOptions = () => {
+      const eng = el<HTMLSelectElement>("set-voice-tts-engine").value;
+      const voice = el<HTMLSelectElement>("set-voice-tts-voice").value;
+      const speedRaw = Number(el<HTMLInputElement>("set-voice-tts-speed").value);
+      return {
+        ttsEngine: (eng === "local" || eng === "browser" ? eng : "auto") as
+          | "auto"
+          | "local"
+          | "browser",
+        ttsVoice: (voice === "warm-zh-baker" ? "warm-zh-baker" : "gentle-zh-en") as
+          | "gentle-zh-en"
+          | "warm-zh-baker",
+        ttsSpeed: Number.isFinite(speedRaw) ? Math.min(1.4, Math.max(0.7, speedRaw)) : 0.98,
+      };
+    };
+
+    el("set-voice-wake-ack-preview-btn").addEventListener("click", () => {
+      const phrase = el<HTMLInputElement>("set-voice-wake-ack-phrase").value.trim();
+      if (!phrase) {
+        this.showToast("当前回复短语为空：触发唤醒词将静默进入持续监听，不播报语音", 2800);
+        return;
+      }
+      this.piAgentPanel.previewVoice(phrase, readDraftTtsOptions());
+    });
+
+    el("set-voice-tts-preview-btn").addEventListener("click", () => {
+      const phrase = el<HTMLInputElement>("set-voice-wake-ack-phrase").value.trim();
+      const sample = phrase
+        ? `${phrase} 客厅吸顶灯已开，亮度调至80%。`
+        : "嗯？客厅吸顶灯已开，亮度调至80%。";
+      this.piAgentPanel.previewVoice(sample, readDraftTtsOptions());
     });
 
     el("vp-record-enroll-btn").addEventListener("click", () => {

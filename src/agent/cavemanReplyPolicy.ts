@@ -417,6 +417,20 @@ export function compressCavemanSpeakChunk(
   return compressed;
 }
 
+export const DEFAULT_WAKE_ACK_PHRASE = "嗯?";
+
+/**
+ * 解析自定义唤醒词回复短语：
+ * - 未传（undefined / null）时回退默认“嗯?”
+ * - 显式传空字符串或纯空白时返回空字符串，表示唤醒后不语音回复、静默持续监听
+ */
+export function resolveWakeAckReply(customPhrase?: string | null): string {
+  if (customPhrase === undefined || customPhrase === null) {
+    return DEFAULT_WAKE_ACK_PHRASE;
+  }
+  return customPhrase.trim().slice(0, 64);
+}
+
 /**
  * 生成唤醒应答语（绝不使用 1 字“在”，避免蓝牙/USB 音频起播 100ms 截断）。
  */

@@ -8,6 +8,11 @@
 
 import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
+import {
+  normalizeTtsSpeed,
+  normalizeTtsVoice,
+  TTS_VOICE_PRESETS,
+} from "../agent/localTtsEngine.ts";
 import { fetchProviderModels } from "../agent/modelDiscovery.ts";
 import type { PiAgentService } from "../agent/piAgentService.ts";
 import type {
@@ -1860,6 +1865,9 @@ export function createRequestHandler(
           if (updated.owwEnabled) {
             void runtime.voiceListener.bootstrapWakeWords(updated.wakeWords).catch(() => {});
           }
+          if (updated.ttsEngine !== "browser" && updated.autoSpeakReply) {
+            void runtime.voiceListener.prewarmLocalTts().catch(() => {});
+          }
         }
         runtime.reloadVoiceStreams?.(updated.wakeWords, updated.owwThreshold);
         emitBroadcast(runtime);
@@ -1869,6 +1877,64 @@ export function createRequestHandler(
           agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
           voice: runtime.voiceListener ? runtime.voiceListener.snapshot() : null,
         });
+      }
+
+      if (method === "GET" && pathname === "/api/voice/tts/status") {
+        const ttsStatus = runtime.voiceListener
+          ? runtime.voiceListener.localEngine.tts.getStatus()
+          : null;
+        return jsonResponse({
+          ok: true,
+          tts: ttsStatus,
+          presets: TTS_VOICE_PRESETS,
+        });
+      }
+
+      if (method === "POST" && pathname === "/api/voice/tts") {
+        if (!runtime.voiceListener) {
+          throw new HttpError(503, "语音播报服务未初始化");
+        }
+        const body = await readJsonBody(req);
+        const text = typeof body.text === "string" ? body.text.trim() : "";
+        if (!text) {
+          throw new HttpError(400, "缺少要播报的文本内容 text");
+        }
+        const cfg = runtime.voiceListener.config;
+        const voice = normalizeTtsVoice(body.voice, cfg.ttsVoice);
+        const speed = normalizeTtsSpeed(body.speed, cfg.ttsSpeed);
+        const tts = runtime.voiceListener.localEngine.tts;
+        if (!tts.getStatus().ready) {
+          return jsonResponse(
+            {
+              ok: false,
+              fallback: "browser",
+              error: "本地离线温柔女声模型尚未就绪，将自动使用浏览器女声",
+            },
+            503,
+          );
+        }
+        try {
+          const result = await tts.synthesizeWav(text, { voice, speed });
+          return new Response(new Blob([result.wav as unknown as BlobPart], { type: "audio/wav" }), {
+            status: 200,
+            headers: {
+              "Content-Type": "audio/wav",
+              "Cache-Control": "no-store",
+              "X-Tts-Voice": result.voice,
+              "X-Tts-Latency-Ms": String(result.latencyMs),
+              "X-Tts-Cache": result.cached ? "hit" : "miss",
+            },
+          });
+        } catch (err) {
+          return jsonResponse(
+            {
+              ok: false,
+              fallback: "browser",
+              error: sanitizeErrorMessage(err),
+            },
+            503,
+          );
+        }
       }
 
       if (method === "POST" && pathname === "/api/voice-listen/dialog") {

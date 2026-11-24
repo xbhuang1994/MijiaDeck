@@ -17,7 +17,10 @@ import { TypedEmitter } from "../core/contracts.ts";
 import { createBoundedFetch, type FetchLike } from "../core/httpTimeout.ts";
 import { decodeWavPcm, encodeWavPcm16, isWavBuffer, resampleLinear } from "./audioPcm.ts";
 import type { SeparatedAudioStreamInfo, SoundTypeTag } from "./audioSourceSeparator.ts";
-import { formatExitConversationAck, formatWakeAck } from "./cavemanReplyPolicy.ts";
+import {
+  formatExitConversationAck,
+  resolveWakeAckReply,
+} from "./cavemanReplyPolicy.ts";
 import { LocalVoiceEngine, type LocalVoiceEngineStatus } from "./localVoiceEngine.ts";
 import type {
   OpenWakeWordBootstrapResult,
@@ -126,7 +129,11 @@ export interface VoiceListenerSnapshot {
   error: string | null;
   wakeWordEnabled: boolean;
   wakeWords: string[];
+  wakeAckPhrase: string;
   autoSpeakReply: boolean;
+  ttsEngine: AgentVoiceConfig["ttsEngine"];
+  ttsVoice: AgentVoiceConfig["ttsVoice"];
+  ttsSpeed: number;
   attentionMode: AgentVoiceConfig["attentionMode"];
   noiseSuppressionMode: AgentVoiceConfig["noiseSuppressionMode"];
   voiceprintMode: AgentVoiceConfig["voiceprintMode"];
@@ -363,7 +370,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   ): VoiceListenerSnapshot {
     const now = options.now ?? Date.now();
     const cfg = this.config;
-    const ttsGraceMs = options.speakAck && cfg.autoSpeakReply ? 1200 : 0;
+    const ack = resolveWakeAckReply(cfg.wakeAckPhrase);
+    const willSpeakAck = Boolean(options.speakAck && cfg.autoSpeakReply && ack.length > 0);
+    const ttsGraceMs = willSpeakAck ? 1200 : 0;
     this._dialogEpoch += 1;
     const epoch = this._dialogEpoch;
     this._dialogState = "conversation";
@@ -385,8 +394,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
 
     const snap = this.snapshot();
     this.emit("stateChanged", snap);
-    if (options.speakAck && cfg.autoSpeakReply) {
-      const ack = formatWakeAck(cfg.cavemanMode, options.speakerName);
+    if (willSpeakAck) {
       this._recordSpoken(ack, now);
       this.emit("speakRequested", ack);
     }
@@ -499,6 +507,21 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._lastSpokenAt = now;
   }
 
+  /**
+   * 后台预热本地温柔女声神经 TTS 并缓存当前唤醒词回复短语（让“嗯?”几乎零延迟播放）。
+   */
+  async prewarmLocalTts(): Promise<void> {
+    const cfg = this.config;
+    if (cfg.ttsEngine === "browser" || !cfg.autoSpeakReply) return;
+    const ack = resolveWakeAckReply(cfg.wakeAckPhrase);
+    const prewarmTexts = ack ? [ack, "已待机"] : ["已待机"];
+    await this._localEngine.tts.warmup({
+      voice: cfg.ttsVoice,
+      speed: cfg.ttsSpeed,
+      prewarmTexts,
+    });
+  }
+
   updateRuntimeState(patch: {
     active?: boolean;
     mode?: VoiceListenMode;
@@ -526,7 +549,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         this._error = null;
       }
       if (this._active) {
-        // 开启监听时预连接 SystemOne 网关，并异步预热本地 ONNX 模型与 openWakeWord 零样本原型
+        // 开启监听时预连接 SystemOne 网关，并异步预热本地 ONNX 模型、温柔女声 TTS 与 openWakeWord 零样本原型
         this._agent.systemOneClient?.preconnect();
         void this._localEngine.warmup();
         if (this.config.sourceSeparationMode !== "off") {
@@ -536,6 +559,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           void this._localEngine.openWakeWord
             .bootstrapWakeWords(this.config.wakeWords)
             .catch(() => {});
+        }
+        if (this.config.ttsEngine !== "browser" && this.config.autoSpeakReply) {
+          void this.prewarmLocalTts().catch(() => {});
         }
       }
     }
@@ -727,12 +753,14 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       updatedAt: now,
     };
 
-    // 仅唤醒词：切入连续对话状态并播报 Caveman 唤醒确认（“在呢” / “${name}，在呢”）
+    // 仅唤醒词：切入连续对话状态；回复自定义短语（默认“嗯?”），若配置为空则静默不回复并持续监听
     if (decision.accept && decision.wokeOnly) {
-      const wakeReply = formatWakeAck(cfg.cavemanMode, options.voiceprint?.speakerName);
-      entry.reply = wakeReply;
+      const wakeReply = resolveWakeAckReply(cfg.wakeAckPhrase);
+      if (wakeReply) {
+        entry.reply = wakeReply;
+      }
       const snap = this.enterConversation("wake_only", {
-        speakAck: true,
+        speakAck: wakeReply.length > 0,
         now,
         speakerName: options.voiceprint?.speakerName,
       });
@@ -1956,7 +1984,11 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       error: this._error,
       wakeWordEnabled: cfg.wakeWordEnabled,
       wakeWords: [...cfg.wakeWords],
+      wakeAckPhrase: cfg.wakeAckPhrase,
       autoSpeakReply: cfg.autoSpeakReply,
+      ttsEngine: cfg.ttsEngine,
+      ttsVoice: cfg.ttsVoice,
+      ttsSpeed: cfg.ttsSpeed,
       attentionMode: cfg.attentionMode,
       noiseSuppressionMode: cfg.noiseSuppressionMode,
       voiceprintMode: cfg.voiceprintMode,

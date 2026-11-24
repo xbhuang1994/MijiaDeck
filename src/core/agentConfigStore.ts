@@ -24,6 +24,8 @@ export type AgentProviderMode =
   | "openai-compatible";
 
 export type VoiceEngineMode = "auto" | "local" | "browser" | "whisper";
+export type TtsEngineMode = "auto" | "local" | "browser";
+export type TtsVoicePreset = "gentle-zh-en" | "warm-zh-baker";
 export type NoiseSuppressionMode = "auto" | "neural" | "dpdfnet" | "voxlock" | "dsp" | "off";
 export type SourceSeparationMode = "auto" | "fast" | "full" | "off";
 export type VadEngineMode = "silero" | "adaptive";
@@ -141,6 +143,8 @@ export const PROVIDER_PRESETS: ReadonlyArray<ProviderPreset> = [
 
 const VALID_PROVIDERS = new Set<string>(PROVIDER_PRESETS.map((p) => p.id));
 const VALID_VOICE_ENGINES = new Set<string>(["auto", "local", "browser", "whisper"]);
+const VALID_TTS_ENGINES = new Set<string>(["auto", "local", "browser"]);
+const VALID_TTS_VOICES = new Set<string>(["gentle-zh-en", "warm-zh-baker"]);
 const VALID_NOISE_MODES = new Set<string>(["auto", "neural", "dpdfnet", "voxlock", "dsp", "off"]);
 const VALID_SOURCE_SEP_MODES = new Set<string>(["auto", "fast", "full", "off"]);
 const VALID_VAD_MODES = new Set<string>(["silero", "adaptive"]);
@@ -169,6 +173,10 @@ const VALID_CUSTOM_APIS = new Set<string>([
 ]);
 
 export const DEFAULT_WAKE_WORDS = ["小派", "小湃", "小π", "派派", "pi", "米家助手"] as const;
+export const DEFAULT_WAKE_ACK_PHRASE = "嗯?";
+export const DEFAULT_TTS_ENGINE: TtsEngineMode = "auto";
+export const DEFAULT_TTS_VOICE: TtsVoicePreset = "gentle-zh-en";
+export const DEFAULT_TTS_SPEED = 0.98;
 
 export interface AgentVoiceConfig {
   version: number;
@@ -185,8 +193,13 @@ export interface AgentVoiceConfig {
   voiceLang: string;
   wakeWordEnabled: boolean;
   wakeWords: string[];
+  /** 命中唤醒词时的回复短语；默认为“嗯?”，显式设为空字符串则不回复并持续监听 */
+  wakeAckPhrase: string;
   wakeWindowSec: number;
   autoSpeakReply: boolean;
+  ttsEngine: TtsEngineMode;
+  ttsVoice: TtsVoicePreset;
+  ttsSpeed: number;
   continuousListen: boolean;
   vadThreshold: number;
   vadSilenceMs: number;
@@ -245,8 +258,12 @@ export interface AgentConfigPatch {
   voiceLang?: unknown;
   wakeWordEnabled?: unknown;
   wakeWords?: unknown;
+  wakeAckPhrase?: unknown;
   wakeWindowSec?: unknown;
   autoSpeakReply?: unknown;
+  ttsEngine?: unknown;
+  ttsVoice?: unknown;
+  ttsSpeed?: unknown;
   continuousListen?: unknown;
   vadThreshold?: unknown;
   vadSilenceMs?: unknown;
@@ -291,8 +308,12 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     voiceLang: "zh-CN",
     wakeWordEnabled: true,
     wakeWords: [...DEFAULT_WAKE_WORDS],
+    wakeAckPhrase: DEFAULT_WAKE_ACK_PHRASE,
     wakeWindowSec: 12,
     autoSpeakReply: true,
+    ttsEngine: DEFAULT_TTS_ENGINE,
+    ttsVoice: DEFAULT_TTS_VOICE,
+    ttsSpeed: DEFAULT_TTS_SPEED,
     continuousListen: true,
     vadThreshold: 0.018,
     vadSilenceMs: 750,
@@ -482,6 +503,25 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
   const sysOneModelRaw =
     typeof raw.systemOneModel === "string" ? raw.systemOneModel.trim().slice(0, 128) : "";
 
+  const wakeAckPhrase =
+    typeof raw.wakeAckPhrase === "string"
+      ? raw.wakeAckPhrase.trim().slice(0, 64)
+      : defaults.wakeAckPhrase;
+
+  const ttsEngineRaw =
+    typeof raw.ttsEngine === "string" ? raw.ttsEngine.trim().toLowerCase() : defaults.ttsEngine;
+  const ttsEngine: TtsEngineMode = VALID_TTS_ENGINES.has(ttsEngineRaw)
+    ? (ttsEngineRaw as TtsEngineMode)
+    : defaults.ttsEngine;
+
+  const ttsVoiceRaw =
+    typeof raw.ttsVoice === "string" ? raw.ttsVoice.trim().toLowerCase() : defaults.ttsVoice;
+  const ttsVoice: TtsVoicePreset = VALID_TTS_VOICES.has(ttsVoiceRaw)
+    ? (ttsVoiceRaw as TtsVoicePreset)
+    : defaults.ttsVoice;
+
+  const ttsSpeed = Number(clampNumber(raw.ttsSpeed, 0.7, 1.4, defaults.ttsSpeed).toFixed(2));
+
   return {
     version: AGENT_CONFIG_VERSION,
     provider,
@@ -500,9 +540,13 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     wakeWordEnabled:
       typeof raw.wakeWordEnabled === "boolean" ? raw.wakeWordEnabled : defaults.wakeWordEnabled,
     wakeWords: raw.wakeWords !== undefined ? normalizeWakeWords(raw.wakeWords) : defaults.wakeWords,
+    wakeAckPhrase,
     wakeWindowSec: Math.round(clampNumber(raw.wakeWindowSec, 3, 60, defaults.wakeWindowSec)),
     autoSpeakReply:
       typeof raw.autoSpeakReply === "boolean" ? raw.autoSpeakReply : defaults.autoSpeakReply,
+    ttsEngine,
+    ttsVoice,
+    ttsSpeed,
     continuousListen:
       typeof raw.continuousListen === "boolean" ? raw.continuousListen : defaults.continuousListen,
     vadThreshold: Number(clampNumber(raw.vadThreshold, 0.004, 0.3, defaults.vadThreshold).toFixed(4)),
@@ -780,11 +824,32 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
   if (patch.wakeWords !== undefined) {
     nextRaw.wakeWords = normalizeWakeWords(patch.wakeWords);
   }
+  if (patch.wakeAckPhrase !== undefined) {
+    nextRaw.wakeAckPhrase =
+      patch.wakeAckPhrase === null ? "" : String(patch.wakeAckPhrase).trim().slice(0, 64);
+  }
   if (patch.wakeWindowSec !== undefined) {
     nextRaw.wakeWindowSec = patch.wakeWindowSec;
   }
   if (patch.autoSpeakReply !== undefined) {
     nextRaw.autoSpeakReply = Boolean(patch.autoSpeakReply);
+  }
+  if (patch.ttsEngine !== undefined) {
+    const te = String(patch.ttsEngine).trim().toLowerCase();
+    if (!VALID_TTS_ENGINES.has(te)) {
+      throw new Error(`不支持的语音播报引擎: ${te}`);
+    }
+    nextRaw.ttsEngine = te;
+  }
+  if (patch.ttsVoice !== undefined) {
+    const tv = String(patch.ttsVoice).trim().toLowerCase();
+    if (!VALID_TTS_VOICES.has(tv)) {
+      throw new Error(`不支持的语音播报音色: ${tv}`);
+    }
+    nextRaw.ttsVoice = tv;
+  }
+  if (patch.ttsSpeed !== undefined) {
+    nextRaw.ttsSpeed = patch.ttsSpeed;
   }
   if (patch.continuousListen !== undefined) {
     nextRaw.continuousListen = Boolean(patch.continuousListen);

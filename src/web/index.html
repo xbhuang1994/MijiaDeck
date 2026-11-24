@@ -694,6 +694,7 @@
                 <span class="voice-badge-pill" id="badge-model-vp">3D-Speaker 声纹</span>
                 <span class="voice-badge-pill" id="badge-model-asr">SenseVoice 识别</span>
                 <span class="voice-badge-pill" id="badge-model-oww">openWakeWord 唤醒</span>
+                <span class="voice-badge-pill" id="badge-model-tts">Matcha 温柔女声</span>
               </div>
               <button type="button" id="voice-download-models-btn" class="secondary-button btn-compact" hidden>一键补齐模型</button>
             </div>
@@ -771,6 +772,13 @@
                 <input type="number" id="set-voice-conv-window" class="md-num-input" min="5" max="120" value="25" aria-label="持续对话超时秒数">
                 <span class="agent-unit">秒对话</span>
               </div>
+            </div>
+            <div class="wake-ack-row">
+              <div class="wake-ack-input-row">
+                <input type="text" id="set-voice-wake-ack-phrase" class="md-text-input" maxlength="64" placeholder="唤醒词回复短语（默认：嗯?；留空则不回复、持续监听）" aria-label="触发唤醒词的回复短语">
+                <button type="button" id="set-voice-wake-ack-preview-btn" class="secondary-button btn-compact" title="试听当前唤醒词回复短语">试听</button>
+              </div>
+              <div class="wake-ack-hint">触发唤醒词后的语音应答短语，默认为「嗯?」；清空并留空则不语音回复，直接静默持续监听。</div>
             </div>
             <div class="oww-enroll-box">
               <div class="oww-enroll-head">
@@ -856,20 +864,40 @@
             </div>
           </div>
 
-          <div class="setting-card">
-            <div class="setting-info">
-              <div class="setting-label">流式语音播报与语音打断（Barge-in）</div>
-              <div class="setting-desc">边生成边播报首句结果以降低等待感；右侧可同时控制是否允许说话打断当前播报</div>
-            </div>
-            <div class="voice-toggle-pair">
-              <label class="voice-mini-check">
-                <input type="checkbox" id="set-voice-barge-in" checked>
-                <span>支持打断</span>
-              </label>
-              <label class="md-switch">
-                <input type="checkbox" id="set-voice-auto-speak">
-                <span class="md-switch-track"></span>
-              </label>
+          <div class="setting-card setting-card-wrap">
+            <div class="tts-settings-stack">
+              <div class="tts-settings-head">
+                <div class="setting-info">
+                  <div class="setting-label">温柔女声语音播报与语音打断（Barge-in）</div>
+                  <div class="setting-desc">默认使用本地离线 Matcha 神经温柔女声流式播报，零卡顿、自然悦耳；右侧可控制是否允许说话打断</div>
+                </div>
+                <div class="voice-toggle-pair">
+                  <label class="voice-mini-check">
+                    <input type="checkbox" id="set-voice-barge-in" checked>
+                    <span>支持打断</span>
+                  </label>
+                  <label class="md-switch">
+                    <input type="checkbox" id="set-voice-auto-speak">
+                    <span class="md-switch-track"></span>
+                  </label>
+                </div>
+              </div>
+              <div class="tts-voice-grid">
+                <select id="set-voice-tts-engine" class="md-select" aria-label="语音播报引擎">
+                  <option value="auto">引擎：自动（本地女声）</option>
+                  <option value="local">引擎：本地神经女声</option>
+                  <option value="browser">引擎：浏览器原生女声</option>
+                </select>
+                <select id="set-voice-tts-voice" class="md-select" aria-label="播报女声音色">
+                  <option value="gentle-zh-en">柔美轻柔女声（中英）</option>
+                  <option value="warm-zh-baker">知性温暖女声（22kHz）</option>
+                </select>
+                <div class="agent-window-box" title="播报语速（0.70 ~ 1.40，默认 0.98 柔和自然）">
+                  <span class="agent-unit">语速</span>
+                  <input type="number" id="set-voice-tts-speed" class="md-num-input" min="0.70" max="1.40" step="0.02" value="0.98" aria-label="语音播报语速">
+                </div>
+                <button type="button" id="set-voice-tts-preview-btn" class="secondary-button btn-compact" title="用当前选择的女声音色试听播报效果">试听女声</button>
+              </div>
             </div>
           </div>
 

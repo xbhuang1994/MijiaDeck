@@ -183,11 +183,11 @@ describe("Swarm Integrated E2E: SystemOne + Caveman + openWakeWord + Dual-State 
     expect(mention.attention?.stage).toBe("systemone-attention");
     expect(vl.snapshot().dialogState).toBe("standby");
 
-    // 2. Wake-only "Neo" -> enters conversation mode with crisp 2-char Caveman ack "在呢"
+    // 2. Wake-only "Neo" -> enters conversation mode with default gentle wake ack "嗯?"
     const wakeOnly = await vl.handleTranscript("Neo", { isFinal: true });
     expect(wakeOnly.matched).toBe(true);
     expect(wakeOnly.wokeOnly).toBe(true);
-    expect(wakeOnly.reply).toBe("在呢");
+    expect(wakeOnly.reply).toBe("嗯?");
     expect(vl.snapshot().dialogState).toBe("conversation");
 
     // 3. In conversation mode: implicit colloquial command ("有点刺眼") -> SystemOne conv_action=followup + implicit light_dimmer!

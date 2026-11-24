@@ -20,8 +20,12 @@ export interface ClientVoiceConfig {
   voiceLang: string;
   wakeWordEnabled: boolean;
   wakeWords: string[];
+  wakeAckPhrase?: string;
   wakeWindowSec: number;
   autoSpeakReply: boolean;
+  ttsEngine?: "auto" | "local" | "browser";
+  ttsVoice?: "gentle-zh-en" | "warm-zh-baker";
+  ttsSpeed?: number;
   continuousListen: boolean;
   vadThreshold: number;
   vadSilenceMs: number;
@@ -43,6 +47,7 @@ export interface ClientVoiceConfig {
   owwThreshold?: number;
   effectiveSttConfigured: boolean;
   localAsrReady?: boolean;
+  localTtsReady?: boolean;
 }
 
 export interface VoiceListenerClientCallbacks {
@@ -166,6 +171,49 @@ export function sanitizeBrowserTts(text: string): string {
   }
   base = base.replace(/[。！？；，,.!?;、\s]+$/g, "").trim();
   return base ? `${base}${TTS_TRUNCATE_SUFFIX}` : cleaned.slice(0, TTS_MAX_CHARS);
+}
+
+/**
+ * 从浏览器 SpeechSynthesis 音色列表中优先挑选温柔女声（兜底引擎使用，避开生硬男声与默认机械音）。
+ */
+export function pickGentleBrowserVoice(
+  voices: ReadonlyArray<SpeechSynthesisVoice>,
+  lang = "zh-CN",
+): SpeechSynthesisVoice | null {
+  if (!voices || voices.length === 0) return null;
+  const targetLang = (lang || "zh-CN").toLowerCase();
+  const langPrefix = targetLang.split("-")[0] || "zh";
+
+  let best: SpeechSynthesisVoice | null = null;
+  let bestScore = -Infinity;
+
+  for (const v of voices) {
+    const name = `${v.name || ""} ${v.voiceURI || ""}`.toLowerCase();
+    const vLang = (v.lang || "").toLowerCase();
+    let score = 0;
+
+    if (vLang === targetLang) score += 40;
+    else if (vLang.startsWith(langPrefix)) score += 28;
+    else if (langPrefix === "zh" && vLang.startsWith("zh")) score += 22;
+    else score -= 30;
+
+    if (/xiaoxiao|晓晓/.test(name)) score += 120;
+    else if (/xiaoyi|晓伊|xiaohan|晓涵|xiaorou|晓柔|xiaochen|晓辰/.test(name)) score += 115;
+    else if (/hsiaochen|hsiaoyu|hiumaan|hiugaai|晓臻|晓雨/.test(name)) score += 108;
+    else if (/google.*普通话|google.*chinese|tingting|meijia|sinji|yaoyao|瑶瑶/.test(name)) score += 92;
+    else if (/natural|neural|online/.test(name)) score += 75;
+    else if (/huihui|慧慧|female|woman|女/.test(name)) score += 45;
+
+    if (/kangkang|康康|yunxi|云希|yunjian|云健|yunyang|云扬|yunze|云泽|yunjie|david|mark|george|\bmale\b|男/.test(name)) {
+      score -= 120;
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = v;
+    }
+  }
+  return bestScore > -10 ? best : null;
 }
 
 /**
@@ -545,6 +593,15 @@ export async function recordShortWavSample(
   return encodeFloat32ToWavBlob(pcm16, targetRate);
 }
 
+interface TtsQueueItem {
+  text: string;
+  engine: "auto" | "local" | "browser";
+  voice: "gentle-zh-en" | "warm-zh-baker";
+  speed: number;
+  abort?: AbortController;
+  audioPromise?: Promise<Blob | null>;
+}
+
 export class VoiceListenerClient {
   private config: ClientVoiceConfig = {
     voiceEnabled: true,
@@ -552,8 +609,12 @@ export class VoiceListenerClient {
     voiceLang: "zh-CN",
     wakeWordEnabled: true,
     wakeWords: ["小派", "pi"],
+    wakeAckPhrase: "嗯?",
     wakeWindowSec: 12,
     autoSpeakReply: true,
+    ttsEngine: "auto",
+    ttsVoice: "gentle-zh-en",
+    ttsSpeed: 0.98,
     continuousListen: true,
     vadThreshold: 0.018,
     vadSilenceMs: 750,
@@ -567,6 +628,7 @@ export class VoiceListenerClient {
     bargeInEnabled: true,
     effectiveSttConfigured: false,
     localAsrReady: false,
+    localTtsReady: undefined,
   };
 
   private active = false;
@@ -577,10 +639,14 @@ export class VoiceListenerClient {
   private lastError: string | null = null;
   private speakingMuted = false;
 
-  // Streaming TTS Queue + Watchdog（解决 Chrome/Edge speechSynthesis 偶发卡死）
-  private ttsQueue: string[] = [];
+  // Streaming Neural TTS Queue + Prefetch + Watchdog（优先本地温柔女声，自动平滑降级浏览器女声）
+  private ttsQueue: TtsQueueItem[] = [];
   private ttsSpeaking = false;
   private ttsNotifiedSpeaking = false;
+  private ttsSessionGen = 0;
+  private activeAudioEl: HTMLAudioElement | null = null;
+  private activeAudioUrl: string | null = null;
+  private activeTtsAbort: AbortController | null = null;
   private ttsWatchdogTimer: number | null = null;
   private ttsReleaseTimer: number | null = null;
 
@@ -732,10 +798,48 @@ export class VoiceListenerClient {
     }
   }
 
+  private cleanupActiveAudio(): void {
+    if (this.activeTtsAbort) {
+      try {
+        this.activeTtsAbort.abort();
+      } catch {
+        // ignore
+      }
+      this.activeTtsAbort = null;
+    }
+    if (this.activeAudioEl) {
+      try {
+        this.activeAudioEl.onended = null;
+        this.activeAudioEl.onerror = null;
+        this.activeAudioEl.pause();
+        this.activeAudioEl.src = "";
+      } catch {
+        // ignore
+      }
+      this.activeAudioEl = null;
+    }
+    if (this.activeAudioUrl) {
+      try {
+        URL.revokeObjectURL(this.activeAudioUrl);
+      } catch {
+        // ignore
+      }
+      this.activeAudioUrl = null;
+    }
+  }
+
   /**
    * 立即打断当前语音播报（Barge-in），让用户随时插话下达新指令。
    */
   cancelSpeaking(): void {
+    this.ttsSessionGen += 1;
+    for (const item of this.ttsQueue) {
+      try {
+        item.abort?.abort();
+      } catch {
+        // ignore
+      }
+    }
     this.ttsQueue = [];
     this.ttsSpeaking = false;
     this.speakingMuted = false;
@@ -747,6 +851,7 @@ export class VoiceListenerClient {
       window.clearTimeout(this.ttsReleaseTimer);
       this.ttsReleaseTimer = null;
     }
+    this.cleanupActiveAudio();
     try {
       if (typeof window !== "undefined" && "speechSynthesis" in window) {
         window.speechSynthesis.cancel();
@@ -765,36 +870,118 @@ export class VoiceListenerClient {
     }
   }
 
+  private buildTtsQueueItem(
+    cleaned: string,
+    overrides?: {
+      ttsEngine?: "auto" | "local" | "browser";
+      ttsVoice?: "gentle-zh-en" | "warm-zh-baker";
+      ttsSpeed?: number;
+    },
+  ): TtsQueueItem {
+    const engine = overrides?.ttsEngine ?? this.config.ttsEngine ?? "auto";
+    const voice = overrides?.ttsVoice ?? this.config.ttsVoice ?? "gentle-zh-en";
+    const speedRaw = overrides?.ttsSpeed ?? this.config.ttsSpeed ?? 0.98;
+    const speed = Number.isFinite(speedRaw) ? Math.min(1.4, Math.max(0.7, speedRaw)) : 0.98;
+
+    const item: TtsQueueItem = { text: cleaned, engine, voice, speed };
+    const shouldTryLocal =
+      engine === "local" || (engine === "auto" && this.config.localTtsReady !== false);
+
+    if (shouldTryLocal && typeof fetch === "function") {
+      const abort = new AbortController();
+      item.abort = abort;
+      item.audioPromise = this.fetchLocalTtsWav(cleaned, voice, speed, abort.signal);
+    }
+    return item;
+  }
+
+  private async fetchLocalTtsWav(
+    text: string,
+    voice: "gentle-zh-en" | "warm-zh-baker",
+    speed: number,
+    signal: AbortSignal,
+  ): Promise<Blob | null> {
+    const timeoutId = window.setTimeout(() => {
+      try {
+        // 超时保护避免极端情况下卡住播报管线
+        if (!signal.aborted && this.activeTtsAbort?.signal === signal) {
+          this.activeTtsAbort.abort();
+        }
+      } catch {
+        // ignore
+      }
+    }, 6000);
+    try {
+      const res = await fetch("/api/voice/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, voice, speed }),
+        signal,
+      });
+      if (!res.ok) {
+        if (res.status === 503) {
+          this.config.localTtsReady = false;
+        }
+        return null;
+      }
+      this.config.localTtsReady = true;
+      const blob = await res.blob();
+      return blob.size > 44 ? blob : null;
+    } catch {
+      return null;
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+  }
+
   /**
    * 整句播报（兼容旧事件）。
    */
   speak(text: string): void {
     const cleaned = sanitizeBrowserTts(text);
     if (!cleaned || !this.config.autoSpeakReply) return;
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    if (typeof window === "undefined") return;
     this.cancelSpeaking();
-    this.ttsQueue.push(cleaned);
-    this.pumpTtsQueue();
+    this.ttsQueue.push(this.buildTtsQueueItem(cleaned));
+    void this.pumpTtsQueue();
   }
 
   /**
-   * 流式分句播报：收到 Pi Agent 首句即刻朗读，大幅降低首字语音延迟（TTFA）。
+   * 试听当前选择的温柔女声配置（忽略 autoSpeakReply 开关，供设置弹窗即时试听）。
+   */
+  previewVoice(
+    text: string,
+    overrides?: {
+      ttsEngine?: "auto" | "local" | "browser";
+      ttsVoice?: "gentle-zh-en" | "warm-zh-baker";
+      ttsSpeed?: number;
+    },
+  ): void {
+    const cleaned = sanitizeBrowserTts(text) || "嗯？客厅吸顶灯已开，亮度调至百分之八十。";
+    if (typeof window === "undefined") return;
+    this.cancelSpeaking();
+    this.ttsQueue.push(this.buildTtsQueueItem(cleaned, overrides));
+    void this.pumpTtsQueue();
+  }
+
+  /**
+   * 流式分句播报：收到 Pi Agent 首句即刻预取并朗读，大幅降低首字语音延迟（TTFA）。
    */
   enqueueSpeakChunk(text: string): void {
     const cleaned = sanitizeBrowserTts(text);
     if (!cleaned || !this.config.autoSpeakReply) return;
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    if (typeof window === "undefined") return;
     if (this.ttsReleaseTimer !== null) {
       window.clearTimeout(this.ttsReleaseTimer);
       this.ttsReleaseTimer = null;
     }
-    this.ttsQueue.push(cleaned);
+    this.ttsQueue.push(this.buildTtsQueueItem(cleaned));
     if (!this.ttsSpeaking) {
-      this.pumpTtsQueue();
+      void this.pumpTtsQueue();
     }
   }
 
-  private pumpTtsQueue(): void {
+  private async pumpTtsQueue(): Promise<void> {
     if (this.ttsSpeaking) return;
     const next = this.ttsQueue.shift();
     if (!next) {
@@ -815,54 +1002,129 @@ export class VoiceListenerClient {
       return;
     }
 
-    try {
-      this.ttsSpeaking = true;
-      this.speakingMuted = true;
-      this.workletNode?.port.postMessage({ type: "pause", paused: true });
-      if (!this.ttsNotifiedSpeaking) {
-        this.ttsNotifiedSpeaking = true;
-        this.cb.sendVoiceStreamControl?.({ type: "voice_tts_state", speaking: true });
-      }
-      if (this.active && this.mode !== "speaking") {
-        this.mode = "speaking";
-        this.emitState(false);
-      }
-
-      const utter = new SpeechSynthesisUtterance(next);
-      utter.lang = this.config.voiceLang || "zh-CN";
-      utter.rate = 1.12;
-
-      let settled = false;
-      const finishChunk = () => {
-        if (settled) return;
-        settled = true;
-        if (this.ttsWatchdogTimer !== null) {
-          window.clearTimeout(this.ttsWatchdogTimer);
-          this.ttsWatchdogTimer = null;
-        }
-        this.ttsSpeaking = false;
-        this.pumpTtsQueue();
-      };
-
-      // Watchdog 防止 Chrome/Edge 偶发丢失 onend 导致麦克风永久静音卡死
-      const estMs = Math.max(4500, Math.min(18_000, next.length * 260 + 2500));
-      this.ttsWatchdogTimer = window.setTimeout(finishChunk, estMs);
-      utter.onend = finishChunk;
-      utter.onerror = finishChunk;
-      window.speechSynthesis.speak(utter);
-    } catch {
-      this.ttsSpeaking = false;
-      this.speakingMuted = false;
-      this.workletNode?.port.postMessage({ type: "pause", paused: false });
-      if (this.ttsNotifiedSpeaking) {
-        this.ttsNotifiedSpeaking = false;
-        this.cb.sendVoiceStreamControl?.({ type: "voice_tts_state", speaking: false });
-      }
-      if (this.active && this.mode === "speaking") {
-        this.mode = "listening";
-        this.emitState(false);
-      }
+    const gen = this.ttsSessionGen;
+    this.ttsSpeaking = true;
+    this.speakingMuted = true;
+    this.workletNode?.port.postMessage({ type: "pause", paused: true });
+    if (!this.ttsNotifiedSpeaking) {
+      this.ttsNotifiedSpeaking = true;
+      this.cb.sendVoiceStreamControl?.({ type: "voice_tts_state", speaking: true });
     }
+    if (this.active && this.mode !== "speaking") {
+      this.mode = "speaking";
+      this.emitState(false);
+    }
+
+    let settled = false;
+    const finishChunk = () => {
+      if (settled || gen !== this.ttsSessionGen) return;
+      settled = true;
+      if (this.ttsWatchdogTimer !== null) {
+        window.clearTimeout(this.ttsWatchdogTimer);
+        this.ttsWatchdogTimer = null;
+      }
+      this.cleanupActiveAudio();
+      this.ttsSpeaking = false;
+      void this.pumpTtsQueue();
+    };
+
+    try {
+      // 1. 优先播放服务端本地 Matcha 温柔女声 WAV（已预取，流式多句近乎零停顿）
+      if (next.audioPromise) {
+        this.activeTtsAbort = next.abort ?? null;
+        const wavBlob = await next.audioPromise;
+        if (gen !== this.ttsSessionGen) return;
+        if (wavBlob) {
+          const played = await this.playWavBlob(wavBlob, next.text.length, gen, finishChunk);
+          if (played) {
+            return;
+          }
+          if (gen !== this.ttsSessionGen) return;
+        }
+      }
+
+      // 2. 自动兜底：使用浏览器 SpeechSynthesis 并优先选择温柔女声（如 Xiaoxiao / Xiaoyi / Tingting）
+      if ("speechSynthesis" in window) {
+        this.speakWithBrowserVoice(next.text, next.speed, finishChunk);
+        return;
+      }
+
+      finishChunk();
+    } catch {
+      finishChunk();
+    }
+  }
+
+  private playWavBlob(
+    wavBlob: Blob,
+    textLen: number,
+    gen: number,
+    finishChunk: () => void,
+  ): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      if (gen !== this.ttsSessionGen || typeof Audio === "undefined") {
+        resolve(false);
+        return;
+      }
+      try {
+        const url = URL.createObjectURL(wavBlob);
+        const audio = new Audio(url);
+        audio.preload = "auto";
+        this.activeAudioUrl = url;
+        this.activeAudioEl = audio;
+
+        const estMs = Math.max(5000, Math.min(25_000, textLen * 320 + 3500));
+        this.ttsWatchdogTimer = window.setTimeout(finishChunk, estMs);
+
+        audio.onended = finishChunk;
+        audio.onerror = finishChunk;
+
+        const playPromise = audio.play();
+        if (playPromise && typeof playPromise.then === "function") {
+          playPromise
+            .then(() => {
+              resolve(true);
+            })
+            .catch(() => {
+              if (this.ttsWatchdogTimer !== null) {
+                window.clearTimeout(this.ttsWatchdogTimer);
+                this.ttsWatchdogTimer = null;
+              }
+              this.cleanupActiveAudio();
+              resolve(false);
+            });
+        } else {
+          resolve(true);
+        }
+      } catch {
+        this.cleanupActiveAudio();
+        resolve(false);
+      }
+    });
+  }
+
+  private speakWithBrowserVoice(text: string, speed: number, finishChunk: () => void): void {
+    const utter = new SpeechSynthesisUtterance(text);
+    const lang = this.config.voiceLang || "zh-CN";
+    utter.lang = lang;
+    utter.rate = Math.min(1.18, Math.max(0.82, speed));
+    utter.pitch = 1.04;
+    try {
+      const voices = window.speechSynthesis.getVoices();
+      const gentle = pickGentleBrowserVoice(voices, lang);
+      if (gentle) {
+        utter.voice = gentle;
+      }
+    } catch {
+      // ignore
+    }
+
+    // Watchdog 防止 Chrome/Edge 偶发丢失 onend 导致麦克风永久静音卡死
+    const estMs = Math.max(4500, Math.min(18_000, text.length * 280 + 2800));
+    this.ttsWatchdogTimer = window.setTimeout(finishChunk, estMs);
+    utter.onend = finishChunk;
+    utter.onerror = finishChunk;
+    window.speechSynthesis.speak(utter);
   }
 
   private pickEngine(forced?: ClientVoiceEngine): ClientVoiceEngine | null {
