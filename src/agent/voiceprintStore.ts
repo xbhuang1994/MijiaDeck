@@ -7,7 +7,7 @@
  * 仅在本地保存 L2 归一化说话人嵌入向量，绝不上传至任何外部服务。
  */
 
-import { existsSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dataFile, readJson, writeJson } from "../core/jsonStore.ts";
 import { cosineSimilarity, encodeWavPcm16, l2Normalize } from "./audioPcm.ts";
 
@@ -192,20 +192,64 @@ export function listVoiceprintRefWavPaths(): Array<{
   return out;
 }
 
+interface VoiceprintCache {
+  filePath: string;
+  mtimeMs: number;
+  size: number;
+  profiles: VoiceprintProfileRecord[];
+}
+
+let cachedVoiceprints: VoiceprintCache | null = null;
+
+function statVoiceprintFile(filePath: string): { mtimeMs: number; size: number } | null {
+  try {
+    const st = statSync(filePath);
+    return { mtimeMs: st.mtimeMs, size: st.size };
+  } catch {
+    return null;
+  }
+}
+
 export function loadVoiceprints(): VoiceprintProfileRecord[] {
+  const filePath = dataFile(FILENAME);
+  const st = statVoiceprintFile(filePath);
+  if (!st) {
+    cachedVoiceprints = null;
+    return [];
+  }
+  if (
+    cachedVoiceprints &&
+    cachedVoiceprints.filePath === filePath &&
+    cachedVoiceprints.mtimeMs === st.mtimeMs &&
+    cachedVoiceprints.size === st.size
+  ) {
+    return cachedVoiceprints.profiles.map((p) => ({ ...p, samples: [...p.samples] }));
+  }
   const raw = readJson<Record<string, unknown>>(
-    dataFile(FILENAME),
+    filePath,
     emptyStore() as unknown as Record<string, unknown>,
   );
-  return normalizeStore(raw).profiles;
+  const profiles = normalizeStore(raw).profiles;
+  cachedVoiceprints = { filePath, mtimeMs: st.mtimeMs, size: st.size, profiles };
+  return profiles.map((p) => ({ ...p, samples: [...p.samples] }));
 }
 
 function saveVoiceprints(profiles: VoiceprintProfileRecord[]): void {
+  const filePath = dataFile(FILENAME);
   const payload: VoiceprintFileSchema = {
     version: 1,
     profiles,
   };
-  writeJson(dataFile(FILENAME), payload as unknown as Record<string, unknown>);
+  writeJson(filePath, payload as unknown as Record<string, unknown>);
+  const st = statVoiceprintFile(filePath);
+  cachedVoiceprints = st
+    ? {
+        filePath,
+        mtimeMs: st.mtimeMs,
+        size: st.size,
+        profiles: profiles.map((p) => ({ ...p, samples: [...p.samples] })),
+      }
+    : null;
 }
 
 export function listPublicVoiceprints(): PublicVoiceprintProfile[] {

@@ -25,6 +25,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { projectRoot } from "../core/appMeta.ts";
+import { dataFile } from "../core/jsonStore.ts";
 import {
   applyHighPassFilter,
   computeRms,
@@ -1500,6 +1501,13 @@ export class OpenWakeWordEngine {
   private _bootstrapping = false;
   private _bootstrapQueue: Promise<unknown> = Promise.resolve();
   private _disposed = false;
+  private _compiledCtxCache: {
+    cacheKey: string;
+    storeUpdatedAt: number;
+    protoCount: number;
+    hardNegCount: number;
+    context: CompiledScoringContext;
+  } | null = null;
 
   constructor(options: OpenWakeWordEngineOptions = {}) {
     this.paths = resolveOpenWakeWordModelPaths(options.modelsDir);
@@ -1590,6 +1598,7 @@ export class OpenWakeWordEngine {
 
   dispose(): void {
     this._disposed = true;
+    this._compiledCtxCache = null;
     this.releaseSessions();
   }
 
@@ -1767,10 +1776,27 @@ export class OpenWakeWordEngine {
   }
 
   /**
-   * 编译当前唤醒词集合与硬负样本的均值中心化打分上下文。
+   * 编译当前唤醒词集合与硬负样本的均值中心化打分上下文（带路径+updatedAt 缓存，零重复归一化开销）。
    */
   compileScoringContext(wakeWords: readonly string[]): CompiledScoringContext {
     const store = loadWakeWordStore();
+    const storePath = dataFile("wakeword_prototypes.json");
+    const normKeys = wakeWords
+      .map((w) => normalizeWakeWordKey(w))
+      .filter(Boolean)
+      .sort()
+      .join("|");
+    const cacheKey = `${storePath}::${normKeys}`;
+    if (
+      this._compiledCtxCache &&
+      this._compiledCtxCache.cacheKey === cacheKey &&
+      this._compiledCtxCache.storeUpdatedAt === store.updatedAt &&
+      this._compiledCtxCache.protoCount === store.prototypes.length &&
+      this._compiledCtxCache.hardNegCount === store.hardNegatives.length
+    ) {
+      return this._compiledCtxCache.context;
+    }
+
     const bgMean =
       store.bgMean.length === WAKEWORD_EMBEDDING_DIM ? Float32Array.from(store.bgMean) : null;
 
@@ -1813,7 +1839,7 @@ export class OpenWakeWordEngine {
       });
     }
 
-    return {
+    const context: CompiledScoringContext = {
       storeUpdatedAt: store.updatedAt,
       bgMean,
       prototypes,
@@ -1821,6 +1847,14 @@ export class OpenWakeWordEngine {
       displayWordByKey,
       patienceByKey,
     };
+    this._compiledCtxCache = {
+      cacheKey,
+      storeUpdatedAt: store.updatedAt,
+      protoCount: store.prototypes.length,
+      hardNegCount: store.hardNegatives.length,
+      context,
+    };
+    return context;
   }
 
   /**

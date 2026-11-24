@@ -236,16 +236,16 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
     this.preRollWrite = 0;
     this.preRollFilled = 0;
 
-    // 连续实时流模式：直接每 128ms (2048 samples) 将 16kHz Int16 PCM 推给服务端在线降噪 + Silero VAD
-    // 彻底避免强噪/背景音乐下浏览器 RMS 门限失效或 15 秒卡死！
+    // 连续实时流模式：每 64ms (1024 samples = 2x512 Silero VAD 窗口) 将 16kHz Int16 PCM 推给服务端在线降噪 + Silero VAD
+    // 相比 128ms 帧减半首包等待，同时彻底避免强噪/背景音乐下浏览器 RMS 门限失效或长时卡顿！
     this.streamMode = Boolean(opts.streamMode);
-    this.streamFrameSize = 2048;
+    this.streamFrameSize = 1024;
     this.streamBuf = new Int16Array(this.streamFrameSize);
     this.streamPos = 0;
 
     // 兜底 HTTP 模式下的自适应噪声底噪 + VAD 状态
     this.vadThreshold = Number(opts.vadThreshold) || 0.018;
-    this.vadSilenceMs = Number(opts.vadSilenceMs) || 750;
+    this.vadSilenceMs = Number(opts.vadSilenceMs) || 600;
     this.noiseFloor = 0.006;
     this.speaking = false;
     this.speechChunks = [];

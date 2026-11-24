@@ -18,7 +18,7 @@
  * - 优雅降级：任意可选分离/分类模型缺失时自动平滑回退，绝不中断主语音链路。
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -27,6 +27,7 @@ import {
   applyHighPassFilter,
   computeRms,
   cosineSimilarity,
+  decodeWavPcm,
   estimateSnrDb,
   l2Normalize,
   resampleLinear,
@@ -114,6 +115,10 @@ export interface SourceSeparationRunOptions {
   systemOneClient?: SystemOneClient | null;
   llmEvaluator?: AttentionLlmEvaluator;
   speakerRefWavPaths?: ReadonlyArray<{ id: string; wavPath: string }>;
+  /** 可选：复用流式会话已完成的 GTCRN 降噪轨（长度匹配时跳过重复离线 GTCRN 推理） */
+  preDenoisedGtcrn?: Float32Array;
+  /** 可选：复用流式 openWakeWord 预计算声学唤醒命中 */
+  precomputedAcousticWake?: WakeWordAcousticHit | null;
 }
 
 export interface SourceSeparationPipelineResult {
@@ -134,6 +139,8 @@ export interface SourceSeparationPipelineResult {
   attention: AttentionDecision;
   stageTimingsMs: Record<string, number>;
   totalMs: number;
+  /** 最优分离/降噪人声段（16kHz），可供上层声纹打标直接复用 */
+  bestSpeechPcm?: Float32Array;
 }
 
 export interface SourceSeparatorModelPaths {
@@ -367,6 +374,13 @@ function cleanPunct(text: string): string {
   return text.replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
 }
 
+const THIRD_PERSON_ASR_ALIAS_RE =
+  /(?:觉得|认为|听说|提到|聊到|说到|问|叫).{0,6}(?:neo|no|new|nio|尼奥|尼欧|尼奥尔).{0,8}(?:语音助手|助手|小助手|ai|好用|怎么样|反应|挺快|不错)/i;
+
+function isThirdPersonMentionExtended(text: string): boolean {
+  return isThirdPersonNeoMention(text) || THIRD_PERSON_ASR_ALIAS_RE.test(text);
+}
+
 function isAmbiguousZhQuestion(text: string): boolean {
   const c = cleanPunct(text);
   return /^(?:你有|你又|你好|你给|你是)/.test(c) && /[吗嘛么呢]$/.test(c) && !isWakeQueryText(c.slice(2));
@@ -385,7 +399,12 @@ function extractEmbeddedSmartHomeCommand(text: string): string {
   const cleaned = cleanPunct(text);
   if (!cleaned || isAmbiguousZhQuestion(cleaned)) return "";
 
-  if (DESCRIPTIVE_NON_COMMAND_RE.test(cleaned) || HOUSEHOLD_SIDETALK_RE.test(cleaned)) {
+  // 描述性非指令句（如“打开客厅吸顶灯，那个开关好像有点松了”/“把客厅灯修好之后亮多了”）整体属于陈述评价，绝不拆出前半句误当控制指令
+  if (DESCRIPTIVE_NON_COMMAND_RE.test(cleaned)) {
+    return "";
+  }
+
+  if (HOUSEHOLD_SIDETALK_RE.test(cleaned)) {
     const clauses = cleaned.split(/[，,。！？!?;；]+/).map((s) => cleanPunct(s)).filter(Boolean);
     for (const c of clauses) {
       if (
@@ -508,6 +527,7 @@ export class AudioSourceSeparator {
     string,
     InstanceType<NonNullable<SherpaExtraModule["OfflineSpeechDenoiser"]>>
   >();
+  private _refEmbeddingCache = new Map<string, number[]>();
 
   constructor(engine: LocalVoiceEngine) {
     this._engine = engine;
@@ -555,6 +575,190 @@ export class AudioSourceSeparator {
     } catch {
       // 预热异常绝不影响正常语音降级链路
     }
+  }
+
+  /**
+   * 异步分片预热（不阻塞事件循环）：依次初始化 CED、Pyannote、Spleeter，
+   * 并预加载首位主人参考声纹的 CAM++ 向量与 VoxLock 实例，彻底消除首次背景音乐/多人重叠分离的冷启动卡顿。
+   */
+  async warmupAsync(
+    speakerRefWavPaths?: ReadonlyArray<{ id: string; wavPath: string }>,
+  ): Promise<void> {
+    const yieldTick = () => new Promise<void>((r) => setTimeout(r, 0));
+    try {
+      this._ensureCedTagger();
+      await yieldTick();
+      this._ensureDiarizer();
+      await yieldTick();
+      this._ensureSpleeter();
+      await yieldTick();
+
+      const refs =
+        speakerRefWavPaths && speakerRefWavPaths.length > 0
+          ? speakerRefWavPaths
+          : listVoiceprintRefWavPaths().map((r) => ({
+              id: r.role === "owner" ? "owner" : r.id,
+              wavPath: r.wavPath,
+            }));
+      const primaryRef = refs[0];
+      if (primaryRef && primaryRef.wavPath && existsSync(primaryRef.wavPath)) {
+        this._getRefSpeakerEmbedding(primaryRef.wavPath);
+        await yieldTick();
+        this._ensureVoxLockInstance(primaryRef.wavPath);
+      }
+    } catch {
+      // 预热异常绝不影响正常语音降级链路
+    }
+  }
+
+  private _getRefSpeakerEmbedding(wavPath: string): number[] | null {
+    if (!wavPath) return null;
+    const cached = this._refEmbeddingCache.get(wavPath);
+    if (cached) return cached;
+    if (!existsSync(wavPath)) return null;
+    try {
+      const raw = new Uint8Array(readFileSync(wavPath));
+      const decoded = decodeWavPcm(raw);
+      const pcm16k =
+        decoded.sampleRate === SR
+          ? decoded.samples
+          : resampleLinear(decoded.samples, decoded.sampleRate, SR);
+      if (pcm16k.length < 3200) return null;
+      const emb = l2Normalize(this._engine.extractSpeakerEmbedding(pcm16k, SR).embedding);
+      if (emb.length > 0) {
+        this._refEmbeddingCache.set(wavPath, emb);
+        return emb;
+      }
+    } catch {
+      // ignore invalid reference wav
+    }
+    return null;
+  }
+
+  private _ensureVoxLockInstance(
+    refWavPath: string,
+  ): InstanceType<NonNullable<SherpaExtraModule["OfflineSpeechDenoiser"]>> | null {
+    const existing = this._voxlockCache.get(refWavPath);
+    if (existing) return existing;
+    const sherpa = loadExtraSherpa();
+    const p = this._engine.paths;
+    if (
+      !sherpa?.OfflineSpeechDenoiser ||
+      !refWavPath ||
+      !existsSync(refWavPath) ||
+      !existsSync(p.voxlockEnroll) ||
+      !existsSync(p.voxlockChunk)
+    ) {
+      return null;
+    }
+    try {
+      const instance = new sherpa.OfflineSpeechDenoiser({
+        model: {
+          voxlock: {
+            enrollModel: p.voxlockEnroll,
+            chunkModel: p.voxlockChunk,
+            voiceSample: refWavPath,
+          },
+          numThreads: this._numThreads(),
+          debug: false,
+          provider: "cpu",
+        },
+      });
+      this._voxlockCache.set(refWavPath, instance);
+      return instance;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 极速 3D-Speaker CAM++ 目标说话人存在性检测（~50ms）：
+   * 用于强歌声/负信噪比场景下判断是否包含已注册用户人声，既能拯救被流行歌曲盖过的用户指令，
+   * 又能避免对纯背景歌曲误触发耗时 VoxLock 提取。
+   */
+  checkRegisteredSpeakerPresence(
+    pcm16k: Float32Array,
+    speakerRefs: ReadonlyArray<{ id: string; wavPath: string }>,
+    threshold = 0.32,
+  ): {
+    present: boolean;
+    bestRefId: string | null;
+    bestScore: number;
+    scoresById: Map<string, number>;
+    durationMs: number;
+  } {
+    const t0 = performance.now();
+    const scoresById = new Map<string, number>();
+    if (speakerRefs.length === 0 || pcm16k.length < 4800) {
+      return {
+        present: false,
+        bestRefId: null,
+        bestScore: 0,
+        scoresById,
+        durationMs: Math.round(performance.now() - t0),
+      };
+    }
+
+    const refEmbs: Array<{ id: string; emb: number[] }> = [];
+    for (const ref of speakerRefs.slice(0, 3)) {
+      const emb = this._getRefSpeakerEmbedding(ref.wavPath);
+      if (emb) refEmbs.push({ id: ref.id, emb });
+    }
+    if (refEmbs.length === 0) {
+      return {
+        present: false,
+        bestRefId: null,
+        bestScore: 0,
+        scoresById,
+        durationMs: Math.round(performance.now() - t0),
+      };
+    }
+
+    // 选取全段或最多 2 个最高能量 1.4s 窗口提取 CAM++ 向量
+    const probeSlices: Float32Array[] = [];
+    if (pcm16k.length <= Math.round(SR * 2.4)) {
+      probeSlices.push(pcm16k);
+    } else {
+      const winLen = Math.round(SR * 1.4);
+      const step = Math.round(SR * 0.9);
+      const candidates: Array<{ off: number; rms: number }> = [];
+      for (let off = 0; off + winLen <= pcm16k.length; off += step) {
+        candidates.push({ off, rms: computeRms(pcm16k.subarray(off, off + winLen)) });
+      }
+      candidates.sort((a, b) => b.rms - a.rms);
+      for (const c of candidates.slice(0, 2)) {
+        if (c.rms >= 0.01) {
+          probeSlices.push(pcm16k.subarray(c.off, c.off + winLen));
+        }
+      }
+      if (probeSlices.length === 0) {
+        probeSlices.push(pcm16k.subarray(0, Math.min(pcm16k.length, winLen)));
+      }
+    }
+
+    let bestRefId: string | null = null;
+    let bestScore = -1;
+    for (const sl of probeSlices) {
+      const emb = l2Normalize(this._engine.extractSpeakerEmbedding(sl, SR).embedding);
+      if (emb.length === 0) continue;
+      for (const ref of refEmbs) {
+        const sim = cosineSimilarity(emb, ref.emb);
+        const prev = scoresById.get(ref.id) ?? -1;
+        if (sim > prev) scoresById.set(ref.id, sim);
+        if (sim > bestScore) {
+          bestScore = sim;
+          bestRefId = ref.id;
+        }
+      }
+    }
+
+    return {
+      present: bestScore >= threshold,
+      bestRefId,
+      bestScore: bestScore < 0 ? 0 : Number(bestScore.toFixed(4)),
+      scoresById,
+      durationMs: Math.round(performance.now() - t0),
+    };
   }
 
   private _ensureCedTagger() {
@@ -830,35 +1034,10 @@ export class AudioSourceSeparator {
     refWavPath: string,
   ): { samples: Float32Array; durationMs: number } | null {
     const t0 = performance.now();
-    const sherpa = loadExtraSherpa();
-    const p = this._engine.paths;
-    if (
-      !sherpa?.OfflineSpeechDenoiser ||
-      !refWavPath ||
-      !existsSync(refWavPath) ||
-      !existsSync(p.voxlockEnroll) ||
-      !existsSync(p.voxlockChunk)
-    ) {
-      return null;
-    }
+    const instance = this._ensureVoxLockInstance(refWavPath);
+    if (!instance) return null;
 
     try {
-      let instance = this._voxlockCache.get(refWavPath);
-      if (!instance) {
-        instance = new sherpa.OfflineSpeechDenoiser({
-          model: {
-            voxlock: {
-              enrollModel: p.voxlockEnroll,
-              chunkModel: p.voxlockChunk,
-              voiceSample: refWavPath,
-            },
-            numThreads: this._numThreads(),
-            debug: false,
-            provider: "cpu",
-          },
-        });
-        this._voxlockCache.set(refWavPath, instance);
-      }
       const out = instance.run({ samples: pcm16k, sampleRate: SR });
       const samples =
         out.sampleRate === SR
@@ -1066,6 +1245,8 @@ export class AudioSourceSeparator {
     globalTextContext: string;
     isTseOrMusicSeparated: boolean;
     speakerId?: string;
+    precomputedWake?: WakeWordAcousticHit | null;
+    isNoisyOrMusic?: boolean;
   }): Promise<TurnCandidate> {
     const {
       branch,
@@ -1081,6 +1262,8 @@ export class AudioSourceSeparator {
       globalTextContext,
       isTseOrMusicSeparated,
       speakerId,
+      precomputedWake,
+      isNoisyOrMusic,
     } = params;
     const wakeWords = opts.wakeWords ?? ["Neo"];
     const wakeWordEnabled = opts.wakeWordEnabled !== false;
@@ -1130,10 +1313,10 @@ export class AudioSourceSeparator {
     if (
       !opts.bypassWakeWord &&
       wakeWordEnabled &&
-      (isThirdPersonNeoMention(primaryText) ||
-        (altText && isThirdPersonNeoMention(altText)) ||
+      (isThirdPersonMentionExtended(primaryText) ||
+        (altText && isThirdPersonMentionExtended(altText)) ||
         (globalTextContext &&
-          isThirdPersonNeoMention(globalTextContext) &&
+          isThirdPersonMentionExtended(globalTextContext) &&
           !STRICT_IMPERATIVE_ACTION_RE.test(primaryText)))
     ) {
       return makeRejected("pragmatic-reject", "检测到第三人称提及或否定呼唤语境，拒绝触发");
@@ -1178,20 +1361,6 @@ export class AudioSourceSeparator {
       return makeRejected("acoustic", "连续对话窗口内识别为纯歌曲演唱歌词，已拦截");
     }
 
-    let acousticWake = this._engine.scoreWakeWordAudio(effectiveProbePcm, wakeWords, {
-      threshold: 0.6,
-      headOnlySec: Math.min(3.0, Math.max(1.8, effectiveProbePcm.length / SR)),
-    });
-    if (altSegPcm && altSegPcm.length >= 1600 && (!acousticWake || !acousticWake.matched)) {
-      const altHit = this._engine.scoreWakeWordAudio(altSegPcm, wakeWords, {
-        threshold: 0.6,
-        headOnlySec: Math.min(3.0, Math.max(1.8, altSegPcm.length / SR)),
-      });
-      if (altHit && (!acousticWake || altHit.score > acousticWake.score)) {
-        acousticWake = altHit;
-      }
-    }
-
     let workingText = bestText;
     let wakeSpan = wakeWordEnabled ? findWakeWordSpan(workingText, wakeWords) : null;
     let enHeadMatched = false;
@@ -1212,6 +1381,49 @@ export class AudioSourceSeparator {
       }
     }
 
+    // 延迟按需 openWakeWord 声学打分：
+    // 若中文转写已精确命中唤醒词+有效指令、或处于连续对话/免唤醒模式，或已传入高置信流式命中，直接免去 130~260ms 重复推理！
+    const hasExactClearWake = Boolean(
+      wakeSpan &&
+        !wakeSpan.fuzzy &&
+        !isThirdPersonNeoMention(workingText) &&
+        (wakeSpan.afterText.length === 0 ||
+          isValidSmartHomeActionCommand(wakeSpan.afterText) ||
+          looksLikeDirectDeviceCommand(wakeSpan.afterText)),
+    );
+    let acousticWake: WakeWordAcousticHit | null = precomputedWake ?? null;
+    const needOwwCheck =
+      !opts.bypassWakeWord &&
+      wakeWordEnabled &&
+      !inConv &&
+      !hasExactClearWake &&
+      !(acousticWake && acousticWake.matched);
+
+    if (needOwwCheck) {
+      const primaryHit = this._engine.scoreWakeWordAudio(effectiveProbePcm, wakeWords, {
+        threshold: 0.6,
+        headOnlySec: Math.min(3.0, Math.max(1.8, effectiveProbePcm.length / SR)),
+      });
+      if (primaryHit && (!acousticWake || primaryHit.score > acousticWake.score)) {
+        acousticWake = primaryHit;
+      }
+      if (
+        altSegPcm &&
+        altSegPcm.length >= 1600 &&
+        altSegPcm !== effectiveProbePcm &&
+        (!acousticWake || !acousticWake.matched) &&
+        (isNoisyOrMusic || (acousticWake?.score ?? 0) >= 0.28)
+      ) {
+        const altHit = this._engine.scoreWakeWordAudio(altSegPcm, wakeWords, {
+          threshold: 0.6,
+          headOnlySec: Math.min(3.0, Math.max(1.8, altSegPcm.length / SR)),
+        });
+        if (altHit && (!acousticWake || altHit.score > acousticWake.score)) {
+          acousticWake = altHit;
+        }
+      }
+    }
+
     const embeddedCmd = extractEmbeddedSmartHomeCommand(workingText);
     const meaningfulChars = workingText.replace(/[\s,，。．.、!！?？:：;；\-—~～"'“”‘’]/g, "");
     const hasWeirdScript = /[\u3040-\u30ff\uac00-\ud7af]/.test(workingText);
@@ -1220,6 +1432,9 @@ export class AudioSourceSeparator {
       embeddedCmd.length >= 2 ||
       isValidSmartHomeActionCommand(extractCommandAfterAcousticWake(workingText, wakeWords[0] ?? "Neo"));
     const hasAsciiWake = wakeWords.some((w) => /^[a-z][a-z0-9\s-]*$/i.test(w.trim()));
+    const isClearNonCommandChat =
+      !looksLikeCmdForWake &&
+      (HOUSEHOLD_SIDETALK_RE.test(workingText) || DESCRIPTIVE_NON_COMMAND_RE.test(workingText));
 
     if (
       !opts.bypassWakeWord &&
@@ -1227,12 +1442,21 @@ export class AudioSourceSeparator {
       hasAsciiWake &&
       !inConv &&
       (!wakeSpan || wakeSpan.fuzzy) &&
+      !isClearNonCommandChat &&
       (isShortOrGarbled || looksLikeCmdForWake)
     ) {
+      // 精简并按命中概率排序 en-US 唤醒探针窗口（始终保留 0..0.68s 紧致句首窗，隔离紧接中文指令前的快速 “Neo”）
       const probeWindows: Float32Array[] = [];
       probeWindows.push(effectiveProbePcm.subarray(0, Math.min(effectiveProbePcm.length, Math.round(SR * 1.25))));
       if (effectiveProbePcm.length >= Math.round(SR * 0.72)) {
         probeWindows.push(effectiveProbePcm.subarray(0, Math.round(SR * 0.68)));
+      }
+      if (acousticWake && acousticWake.sampleOffset > Math.round(SR * 0.85)) {
+        const peakStart = Math.max(0, acousticWake.sampleOffset - Math.round(SR * 0.85));
+        const peakEnd = Math.min(effectiveProbePcm.length, acousticWake.sampleOffset + Math.round(SR * 0.2));
+        if (peakEnd - peakStart >= Math.round(SR * 0.4)) {
+          probeWindows.push(effectiveProbePcm.subarray(peakStart, peakEnd));
+        }
       }
       if (embeddedCmd.length >= 2 && effectiveProbePcm.length >= Math.round(SR * 1.35)) {
         probeWindows.push(
@@ -1241,24 +1465,12 @@ export class AudioSourceSeparator {
             Math.min(effectiveProbePcm.length, Math.round(SR * 1.35)),
           ),
         );
-        if (effectiveProbePcm.length >= Math.round(SR * 1.6)) {
-          probeWindows.push(
-            effectiveProbePcm.subarray(
-              Math.round(SR * 0.65),
-              Math.min(effectiveProbePcm.length, Math.round(SR * 1.6)),
-            ),
-          );
-        }
       }
-      if (acousticWake && acousticWake.sampleOffset > Math.round(SR * 0.9)) {
-        const peakStart = Math.max(0, acousticWake.sampleOffset - Math.round(SR * 0.9));
-        const peakEnd = Math.min(effectiveProbePcm.length, acousticWake.sampleOffset + Math.round(SR * 0.2));
-        if (peakEnd - peakStart >= Math.round(SR * 0.4)) {
-          probeWindows.push(effectiveProbePcm.subarray(peakStart, peakEnd));
-        }
-      }
-      if (altSegPcm && altSegPcm.length >= 1600) {
+      if (altSegPcm && altSegPcm.length >= 1600 && altSegPcm !== effectiveProbePcm && (isNoisyOrMusic || embeddedCmd.length >= 2)) {
         probeWindows.push(altSegPcm.subarray(0, Math.min(altSegPcm.length, Math.round(SR * 1.25))));
+        if (altSegPcm.length >= Math.round(SR * 0.72) && embeddedCmd.length >= 2) {
+          probeWindows.push(altSegPcm.subarray(0, Math.round(SR * 0.68)));
+        }
       }
 
       for (const win of probeWindows) {
@@ -1302,6 +1514,7 @@ export class AudioSourceSeparator {
         } else if (
           highOwwOk &&
           isShortOrGarbled &&
+          meaningfulChars.length >= 1 &&
           !/^(?:你好|您好)/.test(workingText) &&
           !/^(?:没有|嗯|哦)$/.test(cleanPunct(workingText))
         ) {
@@ -1512,6 +1725,7 @@ export class AudioSourceSeparator {
       detectedSpeakerCount: number;
       acousticWake: WakeWordAcousticHit | null;
       attention: AttentionDecision;
+      bestSpeechPcm?: Float32Array;
     }): SourceSeparationPipelineResult => ({
       ...p,
       inputSnrDb,
@@ -1536,7 +1750,7 @@ export class AudioSourceSeparator {
       latencyMs: 0,
     });
 
-    // Stage 0.5: 极速静音与纯歌曲早退
+    // Stage 0.5: 极速静音早退
     if (pcm16k.length < 1600 || computeRms(pcm16k) < 0.004) {
       return buildReturn({
         speechDetected: false,
@@ -1552,602 +1766,189 @@ export class AudioSourceSeparator {
       });
     }
 
+    const speakerRefs: Array<{ id: string; wavPath: string }> =
+      opts.speakerRefWavPaths && opts.speakerRefWavPaths.length > 0
+        ? [...opts.speakerRefWavPaths]
+        : listVoiceprintRefWavPaths().map((r) => ({
+            id: r.role === "owner" ? "owner" : r.id,
+            wavPath: r.wavPath,
+          }));
+
+    // 抗负信噪比纯歌曲早退门控：
+    // 在纯歌曲直接拒识前，检查流式唤醒命中或极速 CAM++ 目标说话人存在性（~50ms），
+    // 既保证纯音乐/纯流行歌曲极速跳过，又防止用户在强流行歌声下（-3dB/-5dB）说出的指令被误杀！
     if (
       !opts.bypassWakeWord &&
       scene.musicProb >= 0.62 &&
       scene.speechProb < 0.12 &&
       scene.singingProb >= 0.06
     ) {
-      soundSet.add("song");
-      soundSet.add("bgm");
-      return buildReturn({
-        speechDetected: false,
-        text: "",
-        acousticEvent: "<|BGM|>",
-        denoiseEngine: "ced-gate",
-        vadEngine: "ced-gate",
-        asrEngine: "skipped-pure-song",
-        outputSnrDb: inputSnrDb,
-        detectedSpeakerCount: 0,
-        acousticWake: null,
-        attention: rejectDecision("acoustic", "并行场景分类判定为纯歌曲演唱（无用户语音指令）"),
-      });
-    }
+      let rescuedByOwnerOrWake = Boolean(
+        opts.precomputedAcousticWake && opts.precomputedAcousticWake.score >= 0.40,
+      );
+      if (!rescuedByOwnerOrWake && speakerRefs.length > 0) {
+        const presence = this.checkRegisteredSpeakerPresence(pcm16k, speakerRefs, 0.36);
+        stageTimingsMs.ownerPresenceGateMs = presence.durationMs;
+        if (presence.present) {
+          rescuedByOwnerOrWake = true;
+        }
+      } else if (!rescuedByOwnerOrWake && speakerRefs.length === 0 && !inConv && opts.wakeWordEnabled !== false) {
+        const quickOww = this._engine.scoreWakeWordAudio(pcm16k, wakeWords, {
+          threshold: 0.6,
+          headOnlySec: Math.min(3.5, pcm16k.length / SR),
+        });
+        if (quickOww && quickOww.score >= 0.44) {
+          rescuedByOwnerOrWake = true;
+        }
+      }
 
-    const gtcrn = this._engine.denoise(pcm16k, SR, "auto");
-    stageTimingsMs.gtcrnMs = gtcrn.durationMs;
-    const gtcrnVadSegs = this._extractTimedVadSegments(gtcrn.samples, {
-      threshold: 0.38,
-      minSilenceDuration: 0.24,
-      padSec: 0.12,
-      mergeGapSec: 0.14,
-    });
-
-    const isClearlyNonSpeech =
-      scene.speechProb < 0.12 &&
-      (scene.musicProb >= 0.35 || scene.noiseProb >= 0.24 || spectralFlatness >= 0.65);
-
-    if (gtcrnVadSegs.length === 0 && (isClearlyNonSpeech || inputSnrDb < 10)) {
-      if (soundSet.size === 0) soundSet.add("noise");
-      return buildReturn({
-        speechDetected: false,
-        text: "",
-        acousticEvent: hasStrongMusic ? "<|BGM|>" : "",
-        denoiseEngine: gtcrn.engine,
-        vadEngine: "silero",
-        asrEngine: "skipped-no-speech",
-        outputSnrDb: gtcrn.outputSnrDb,
-        detectedSpeakerCount: 0,
-        acousticWake: null,
-        attention: rejectDecision("acoustic", "并行场景分类与神经 VAD 判定为纯非语音背景音/纯音乐"),
-      });
-    }
-
-    const preRollBg = this._detectBackgroundSongFromPreRoll(
-      pcm16k,
-      scene,
-      gtcrnVadSegs[0]?.startSec ?? 0,
-    );
-    if (preRollBg.isSong) {
-      soundSet.add("song");
-      soundSet.add("bgm");
-    }
-    if (preRollBg.isNoise && !hasStrongMusic) {
-      soundSet.add("noise");
+      if (!rescuedByOwnerOrWake) {
+        soundSet.add("song");
+        soundSet.add("bgm");
+        return buildReturn({
+          speechDetected: false,
+          text: "",
+          acousticEvent: "<|BGM|>",
+          denoiseEngine: "ced-gate",
+          vadEngine: "ced-gate",
+          asrEngine: "skipped-pure-song",
+          outputSnrDb: inputSnrDb,
+          detectedSpeakerCount: 0,
+          acousticWake: null,
+          attention: rejectDecision("acoustic", "并行场景分类判定为纯歌曲演唱（无用户语音指令）"),
+        });
+      }
     }
 
     const rawHp = applyHighPassFilter(pcm16k, SR, 85);
+    const hasReusableStreamGtcrn = Boolean(
+      opts.preDenoisedGtcrn &&
+        opts.preDenoisedGtcrn.length >= 1600 &&
+        Math.abs(opts.preDenoisedGtcrn.length - pcm16k.length) <= 512,
+    );
+
+    let cachedGtcrn: { samples: Float32Array; engine: string; outputSnrDb: number; durationMs: number } | null =
+      null;
+    const obtainGtcrn = () => {
+      if (cachedGtcrn) return cachedGtcrn;
+      if (hasReusableStreamGtcrn && opts.preDenoisedGtcrn) {
+        const outSnr = estimateSnrDb(opts.preDenoisedGtcrn, SR);
+        cachedGtcrn = {
+          samples: opts.preDenoisedGtcrn,
+          engine: "gtcrn-stream",
+          outputSnrDb: outSnr,
+          durationMs: 0,
+        };
+        stageTimingsMs.gtcrnMs = 0;
+        return cachedGtcrn;
+      }
+      const res = this._engine.denoise(pcm16k, SR, "auto");
+      stageTimingsMs.gtcrnMs = res.durationMs;
+      cachedGtcrn = {
+        samples: res.samples,
+        engine: res.engine,
+        outputSnrDb: res.outputSnrDb,
+        durationMs: res.durationMs,
+      };
+      return cachedGtcrn;
+    };
+
     const allCandidates: TurnCandidate[] = [];
-    let detectedSpeakerCount = gtcrnVadSegs.length > 0 ? 1 : 0;
     const globalTranscriptParts: string[] = [];
+    let detectedSpeakerCount = 0;
 
-    // Stage 1A: 干净单说话人极速通道
-    const isCleanLikelySingle =
-      inputSnrDb >= 18 &&
-      !hasStrongMusic &&
-      !hasNoiseHint &&
-      scene.crowdTvProb < 0.12 &&
-      gtcrnVadSegs.length === 1 &&
-      gtcrnVadSegs[0]!.samples.length < SR * 2.7;
+    const buildTurnsForTrack = (
+      track: Float32Array,
+      vadSegs: TimedSpeechSegment[],
+      isNoisyTrack: boolean,
+    ): { turns: Array<TimedSpeechSegment & { speakerId: string }>; totalVadDurSec: number } => {
+      const turns: Array<TimedSpeechSegment & { speakerId: string }> = [];
+      const totalVadDurSec = vadSegs.reduce((acc, s) => acc + (s.endSec - s.startSec), 0);
+      const shouldDiarize =
+        vadSegs.length >= 2 || totalVadDurSec >= 2.3 || scene.crowdTvProb >= 0.14;
 
-    if (isCleanLikelySingle) {
-      const seg = gtcrnVadSegs[0]!;
-      soundSet.add("speech");
-      const rawSeg = slicePcmBySec(rawHp, seg.startSec, seg.endSec, 0.08);
-      const zhGtcrn = await this._engine.transcribeLocal(seg.samples, SR, voiceLang);
-      globalTranscriptParts.push(zhGtcrn.text);
+      if (shouldDiarize && track.length >= SR * 1.0) {
+        const diar = this.diarizeSpeakers(track, 0.52);
+        stageTimingsMs.diarizationMs = (stageTimingsMs.diarizationMs ?? 0) + diar.durationMs;
 
-      const quickSpan = findWakeWordSpan(zhGtcrn.text, wakeWords);
-      let zhRaw: LocalAsrOutput | null = null;
-      if (!quickSpan || quickSpan.fuzzy) {
-        zhRaw = await this._engine.transcribeLocal(rawSeg, SR, voiceLang);
-      }
-
-      const evalRes = await this._evaluateTurnCandidate({
-        branch: "clean_fast_gtcrn",
-        startSec: seg.startSec,
-        endSec: seg.endSec,
-        segPcm: seg.samples,
-        probePcm: slicePcmBySec(gtcrn.samples, Math.max(0, seg.startSec - 0.18), seg.endSec, 0),
-        altSegPcm: rawSeg,
-        zhRes: zhGtcrn,
-        altZhRes: zhRaw,
-        opts,
-        scene,
-        globalTextContext: zhGtcrn.text,
-        isTseOrMusicSeparated: false,
-        speakerId: "speaker_0",
-      });
-      separatedStreams.push({
-        streamId: "speaker_0",
-        kind: "speaker",
-        speakerId: "speaker_0",
-        startSec: seg.startSec,
-        endSec: seg.endSec,
-        transcript: evalRes.rawText,
-      });
-
-      return buildReturn({
-        speechDetected: true,
-        text: evalRes.rawText,
-        altText: evalRes.altText,
-        acousticEvent: evalRes.acousticEvent,
-        denoiseEngine: gtcrn.engine,
-        vadEngine: "silero",
-        asrEngine: "sensevoice-sep-fast",
-        outputSnrDb: gtcrn.outputSnrDb,
-        detectedSpeakerCount: 1,
-        acousticWake: evalRes.acousticWake,
-        attention: evalRes.decision,
-      });
-    }
-
-    // Stage 1B: 轻量增强 + VAD 边界保护型 Pyannote/CAM++ 说话人隔离与逐轮解码
-    let dpdfSamples: Float32Array | null = null;
-    let denoiseOutSnr = gtcrn.outputSnrDb;
-    let denoiseEngineName: string = gtcrn.engine;
-    if (hasNoiseHint || hasStrongMusic || inputSnrDb < 18) {
-      const dpdf = this._engine.denoise(pcm16k, SR, "dpdfnet");
-      stageTimingsMs.dpdfnetMs = dpdf.durationMs;
-      dpdfSamples = dpdf.samples;
-      denoiseOutSnr = dpdf.outputSnrDb;
-      denoiseEngineName = dpdf.engine;
-    }
-
-    const primaryCleanTrack = dpdfSamples ?? gtcrn.samples;
-    let vadSegs = this._extractTimedVadSegments(primaryCleanTrack, {
-      threshold: 0.36,
-      minSilenceDuration: 0.22,
-      padSec: 0.12,
-      mergeGapSec: 0.10,
-    });
-    if (vadSegs.length === 0 && gtcrnVadSegs.length > 0) {
-      vadSegs = gtcrnVadSegs;
-    }
-
-    if (vadSegs.length === 0 && !hasStrongMusic) {
-      if (soundSet.size === 0) soundSet.add("noise");
-      return buildReturn({
-        speechDetected: false,
-        text: "",
-        acousticEvent: "",
-        denoiseEngine: denoiseEngineName,
-        vadEngine: "silero",
-        asrEngine: "skipped-no-speech",
-        outputSnrDb: denoiseOutSnr,
-        detectedSpeakerCount: 0,
-        acousticWake: null,
-        attention: rejectDecision("no-wake", "降噪后未检测到有效人声"),
-      });
-    }
-
-    let turnSegments: Array<TimedSpeechSegment & { speakerId: string }> = [];
-    const totalVadDurSec = vadSegs.reduce((acc, s) => acc + (s.endSec - s.startSec), 0);
-    const shouldDiarize =
-      vadSegs.length >= 2 || totalVadDurSec >= 2.3 || scene.crowdTvProb >= 0.14;
-
-    if (shouldDiarize && primaryCleanTrack.length >= SR * 1.0) {
-      const diar = this.diarizeSpeakers(primaryCleanTrack, 0.52);
-      stageTimingsMs.diarizationMs = diar.durationMs;
-
-      if (diar.segments.length >= 1) {
-        const mergedDiar: SpeakerDiarizationSpan[] = [];
-        for (const seg of diar.segments) {
-          const prev = mergedDiar[mergedDiar.length - 1];
-          if (prev && prev.speaker === seg.speaker && seg.start - prev.end <= 0.45) {
-            prev.end = Math.max(prev.end, seg.end);
-          } else {
-            mergedDiar.push({ ...seg });
-          }
-        }
-        const filteredDiar = mergedDiar.filter((ds) => ds.end - ds.start >= 0.42);
-        if (filteredDiar.length >= 2 && diar.speakerCount >= 2) {
-          for (const ds of filteredDiar) {
-            const sSample = Math.max(0, Math.floor((ds.start - 0.14) * SR));
-            const eSample = Math.min(primaryCleanTrack.length, Math.ceil((ds.end + 0.14) * SR));
-            turnSegments.push({
-              startSample: sSample,
-              endSample: eSample,
-              startSec: Number((sSample / SR).toFixed(3)),
-              endSec: Number((eSample / SR).toFixed(3)),
-              samples: primaryCleanTrack.slice(sSample, eSample),
-              speakerId: `speaker_${ds.speaker}`,
-            });
-          }
-        }
-      }
-    }
-
-    if (turnSegments.length === 0 && vadSegs.length > 0) {
-      const expanded: TimedSpeechSegment[] = [];
-      for (const vs of vadSegs) {
-        expanded.push(...this._splitLongSegmentBySpeakerChange(vs, hasStrongMusic ? 0.36 : 0.42));
-      }
-      const centroids: number[][] = [];
-      const simTh = hasStrongMusic || hasNoiseHint ? 0.44 : 0.50;
-      for (const seg of expanded) {
-        let spkId = "speaker_0";
-        if (seg.samples.length >= 6400 && computeRms(seg.samples) >= 0.015) {
-          const emb = l2Normalize(this._engine.extractSpeakerEmbedding(seg.samples, SR).embedding);
-          let bestIdx = -1;
-          let bestSim = -1;
-          for (let c = 0; c < centroids.length; c += 1) {
-            const sim = cosineSimilarity(emb, centroids[c]!);
-            if (sim > bestSim) {
-              bestSim = sim;
-              bestIdx = c;
+        if (diar.segments.length >= 1) {
+          const mergedDiar: SpeakerDiarizationSpan[] = [];
+          for (const seg of diar.segments) {
+            const prev = mergedDiar[mergedDiar.length - 1];
+            if (prev && prev.speaker === seg.speaker && seg.start - prev.end <= 0.45) {
+              prev.end = Math.max(prev.end, seg.end);
+            } else {
+              mergedDiar.push({ ...seg });
             }
           }
-          if (bestIdx >= 0 && bestSim >= simTh) {
-            spkId = `speaker_${bestIdx}`;
-          } else {
-            spkId = `speaker_${centroids.length}`;
-            centroids.push(emb);
+          const filteredDiar = mergedDiar.filter((ds) => ds.end - ds.start >= 0.42);
+          if (filteredDiar.length >= 2 && diar.speakerCount >= 2) {
+            for (const ds of filteredDiar) {
+              const sSample = Math.max(0, Math.floor((ds.start - 0.14) * SR));
+              const eSample = Math.min(track.length, Math.ceil((ds.end + 0.14) * SR));
+              turns.push({
+                startSample: sSample,
+                endSample: eSample,
+                startSec: Number((sSample / SR).toFixed(3)),
+                endSec: Number((eSample / SR).toFixed(3)),
+                samples: track.slice(sSample, eSample),
+                speakerId: `speaker_${ds.speaker}`,
+              });
+            }
           }
         }
-        turnSegments.push({ ...seg, speakerId: spkId });
-      }
-    }
-
-    detectedSpeakerCount = this._verifyDistinctSpeakerCount(
-      primaryCleanTrack,
-      turnSegments,
-      hasStrongMusic || hasNoiseHint ? 0.45 : 0.50,
-    );
-    if (detectedSpeakerCount >= 2 && !(hasStrongMusic && scene.speechProb < 0.25)) {
-      soundSet.add("multi_speaker");
-    }
-
-    const stage1Candidates: TurnCandidate[] = [];
-    for (let idx = 0; idx < Math.min(turnSegments.length, 6); idx += 1) {
-      const turn = turnSegments[idx]!;
-      const probeStartSec = Math.max(0, turn.startSec - 0.35);
-      const probeClean = slicePcmBySec(primaryCleanTrack, probeStartSec, turn.endSec, 0.06);
-      const rawTurn = slicePcmBySec(rawHp, probeStartSec, turn.endSec, 0.06);
-      const gtcrnTurn = slicePcmBySec(gtcrn.samples, probeStartSec, turn.endSec, 0.06);
-
-      const zhClean = await this._engine.transcribeLocal(turn.samples, SR, voiceLang);
-      if (zhClean.text.trim()) {
-        if (scene.speechProb >= 0.14 || !hasStrongMusic || zhClean.text.trim().length >= 3) {
-          soundSet.add("speech");
-        }
-        globalTranscriptParts.push(zhClean.text.trim());
       }
 
-      const quickSpan = findWakeWordSpan(zhClean.text, wakeWords);
-      let zhAlt: LocalAsrOutput | null = null;
-      if (!quickSpan || quickSpan.fuzzy || hasStrongMusic) {
-        zhAlt = await this._engine.transcribeLocal(
-          hasStrongMusic ? rawTurn : gtcrnTurn,
-          SR,
-          voiceLang,
-        );
-        if (zhAlt.text.trim() && (scene.speechProb >= 0.14 || !hasStrongMusic)) {
-          soundSet.add("speech");
+      if (turns.length === 0 && vadSegs.length > 0) {
+        const expanded: TimedSpeechSegment[] = [];
+        for (const vs of vadSegs) {
+          expanded.push(...this._splitLongSegmentBySpeakerChange(vs, isNoisyTrack ? 0.36 : 0.42));
+        }
+        const centroids: number[][] = [];
+        const simTh = isNoisyTrack ? 0.44 : 0.50;
+        for (const seg of expanded) {
+          let spkId = "speaker_0";
+          if (seg.samples.length >= 6400 && computeRms(seg.samples) >= 0.015) {
+            const emb = l2Normalize(this._engine.extractSpeakerEmbedding(seg.samples, SR).embedding);
+            let bestIdx = -1;
+            let bestSim = -1;
+            for (let c = 0; c < centroids.length; c += 1) {
+              const sim = cosineSimilarity(emb, centroids[c]!);
+              if (sim > bestSim) {
+                bestSim = sim;
+                bestIdx = c;
+              }
+            }
+            if (bestIdx >= 0 && bestSim >= simTh) {
+              spkId = `speaker_${bestIdx}`;
+            } else {
+              spkId = `speaker_${centroids.length}`;
+              centroids.push(emb);
+            }
+          }
+          turns.push({ ...seg, speakerId: spkId });
         }
       }
+      return { turns, totalVadDurSec };
+    };
 
-      const cand = await this._evaluateTurnCandidate({
-        branch: "stage1_diarized",
-        startSec: turn.startSec,
-        endSec: turn.endSec,
-        segPcm: turn.samples,
-        probePcm: probeClean,
-        altSegPcm: hasStrongMusic ? rawTurn : gtcrnTurn,
-        zhRes: zhClean,
-        altZhRes: zhAlt,
-        opts,
-        scene,
-        globalTextContext: globalTranscriptParts.join(" "),
-        isTseOrMusicSeparated: false,
-        speakerId: turn.speakerId,
-      });
-      stage1Candidates.push(cand);
-      allCandidates.push(cand);
-      separatedStreams.push({
-        streamId: `stage1_${turn.speakerId}_${turn.startSec.toFixed(1)}`,
-        kind: "speaker",
-        speakerId: turn.speakerId,
-        startSec: turn.startSec,
-        endSec: turn.endSec,
-        transcript: cand.rawText,
-      });
-    }
-
-    const hasOnlyWokeInMulti =
-      turnSegments.length >= 2 &&
-      stage1Candidates.some((c) => c.decision.accept && c.decision.wokeOnly) &&
-      !stage1Candidates.some((c) => c.decision.accept && !c.decision.wokeOnly);
-
-    if (hasOnlyWokeInMulti && vadSegs.length > 0) {
-      for (const vs of vadSegs.slice(0, 2)) {
-        const zhFull = await this._engine.transcribeLocal(vs.samples, SR, voiceLang);
-        const rawFull = slicePcmBySec(rawHp, vs.startSec, vs.endSec, 0.08);
-        const zhRawFull = await this._engine.transcribeLocal(rawFull, SR, voiceLang);
-        const fullCand = await this._evaluateTurnCandidate({
-          branch: "stage1_vad_intact",
-          startSec: vs.startSec,
-          endSec: vs.endSec,
-          segPcm: vs.samples,
-          probePcm: vs.samples,
-          altSegPcm: rawFull,
-          zhRes: zhFull,
-          altZhRes: zhRawFull,
-          opts,
-          scene,
-          globalTextContext: globalTranscriptParts.join(" "),
-          isTseOrMusicSeparated: false,
-          speakerId: "speaker_0",
-        });
-        stage1Candidates.push(fullCand);
-        allCandidates.push(fullCand);
-      }
-    }
-
-    const bridged1 = this._bridgeAdjacentWakeAndCommand(stage1Candidates, wakeWords);
-    if (bridged1) allCandidates.push(bridged1);
-
-    const globalText = globalTranscriptParts.join(" ");
-    const stage1Accepted = allCandidates
-      .filter((c) => c.decision.accept)
-      .sort((a, b) => b.priority - a.priority);
-
-    if (stage1Accepted.length > 0) {
-      const best = stage1Accepted[0]!;
-      const isHighConfAccept =
-        opts.bypassWakeWord ||
-        (!best.decision.wokeOnly && best.hasSmartHome && best.hasActionVerb) ||
-        (best.decision.wokeOnly && turnSegments.length === 1);
-      if (isHighConfAccept || mode === "fast") {
-        return buildReturn({
-          speechDetected: true,
-          text: best.rawText,
-          altText: best.altText,
-          acousticEvent: best.acousticEvent,
-          denoiseEngine: denoiseEngineName,
-          vadEngine: "silero-diar",
-          asrEngine: "sensevoice-sep-stage1",
-          outputSnrDb: denoiseOutSnr,
-          detectedSpeakerCount: Math.max(1, detectedSpeakerCount),
-          acousticWake: best.acousticWake,
-          attention: best.decision,
-        });
-      }
-    }
-
-    // fast 模式不升级重型分离，直接结束
-    if (mode === "fast") {
-      const bestRej = allCandidates[0];
-      return buildReturn({
-        speechDetected: globalText.length > 0,
-        text: globalText || bestRej?.rawText || "",
-        altText: bestRej?.altText,
-        acousticEvent: bestRej?.acousticEvent ?? "",
-        denoiseEngine: denoiseEngineName,
-        vadEngine: "silero-diar",
-        asrEngine: "sensevoice-sep-fast",
-        outputSnrDb: denoiseOutSnr,
-        detectedSpeakerCount: soundSet.has("speech") ? Math.max(1, detectedSpeakerCount) : 0,
-        acousticWake: bestRej?.acousticWake ?? null,
-        attention: bestRej?.decision ?? rejectDecision("no-wake", "未检测到指向助手的有效指令"),
-      });
-    }
-
-    // Stage 1.5: 智能早退门控
-    const maxStage1Oww = allCandidates.reduce((mx, c) => Math.max(mx, c.acousticWake?.score ?? 0), 0);
-    const anyStage1EmbeddedCmd = allCandidates.some(
-      (c) =>
-        extractEmbeddedSmartHomeCommand(c.rawText).length >= 2 ||
-        (c.altText ? extractEmbeddedSmartHomeCommand(c.altText).length >= 2 : false),
-    );
-    const anyStage1Garbled = allCandidates.some(
-      (c) => /[\u3040-\u30ff\uac00-\ud7af]/.test(c.rawText) || c.rawText.length <= 2,
-    );
-
-    if (!opts.bypassWakeWord && isThirdPersonNeoMention(globalText)) {
-      return buildReturn({
-        speechDetected: true,
-        text: globalText,
-        acousticEvent: allCandidates[0]?.acousticEvent ?? "",
-        denoiseEngine: denoiseEngineName,
-        vadEngine: "silero-diar",
-        asrEngine: "sensevoice-sep-stage1",
-        outputSnrDb: denoiseOutSnr,
-        detectedSpeakerCount: Math.max(1, detectedSpeakerCount),
-        acousticWake: allCandidates[0]?.acousticWake ?? null,
-        attention: rejectDecision("pragmatic-reject", "判定为第三人称提及或否定呼唤，跳过重型分离"),
-      });
-    }
-
-    const isFluentCasualNegative =
-      mode !== "full" &&
-      !opts.bypassWakeWord &&
-      !anyStage1EmbeddedCmd &&
-      !anyStage1Garbled &&
-      maxStage1Oww < 0.48 &&
-      scene.crowdTvProb < 0.18 &&
-      globalText.length >= 6 &&
-      (HOUSEHOLD_SIDETALK_RE.test(globalText) ||
-        DESCRIPTIVE_NON_COMMAND_RE.test(globalText) ||
-        isAmbiguousZhQuestion(globalText) ||
-        (!hasStrongMusic && !hasNoiseHint && turnSegments.length >= 2 && inputSnrDb >= 14));
-
-    if (isFluentCasualNegative) {
-      return buildReturn({
-        speechDetected: true,
-        text: globalText,
-        acousticEvent: allCandidates[0]?.acousticEvent ?? "",
-        denoiseEngine: denoiseEngineName,
-        vadEngine: "silero-diar",
-        asrEngine: "sensevoice-sep-stage1",
-        outputSnrDb: denoiseOutSnr,
-        detectedSpeakerCount: Math.max(1, detectedSpeakerCount),
-        acousticWake: allCandidates[0]?.acousticWake ?? null,
-        attention: rejectDecision("no-wake", "清晰非指令日常对话，无唤醒与设备控制意图"),
-      });
-    }
-
-    // Stage 2A: 按需边沿安全 Spleeter 2-Stem 音乐/歌声分离
-    let spleeterRes: MusicStemSeparationOutput | null = null;
-    let vocScene: AudioSceneAnalysis | null = null;
-    const shouldRunSpleeter =
-      hasStrongMusic &&
-      (mode === "full" ||
-        anyStage1EmbeddedCmd ||
-        anyStage1Garbled ||
-        maxStage1Oww >= 0.44 ||
-        globalText.length <= 5);
-
-    if (shouldRunSpleeter) {
-      spleeterRes = this.separateMusicStems(pcm16k);
-      if (spleeterRes) {
-        stageTimingsMs.spleeterMs = spleeterRes.durationMs;
-        vocScene = this.analyzeAudioScene(spleeterRes.vocals16k, 15);
-        if (spleeterRes.vocalToAccompDb < 14) soundSet.add("bgm");
-        if (vocScene.singingProb >= 0.045 || scene.singingProb >= 0.045) {
-          soundSet.add("song");
-          soundSet.add("bgm");
-        }
-        if (vocScene.speechProb >= 0.16) soundSet.add("speech");
-
-        separatedStreams.push({
-          streamId: "spleeter_accompaniment",
-          kind: "bgm_accompaniment",
-          energyRatio: Number(computeRms(spleeterRes.accompaniment16k).toFixed(4)),
-        });
-
-        const vocRms = computeRms(spleeterRes.vocals16k);
-        if (vocRms < 0.008 && spleeterRes.vocalToAccompDb < -12) {
-          return buildReturn({
-            speechDetected: false,
-            text: "",
-            acousticEvent: "<|BGM|>",
-            denoiseEngine: "spleeter",
-            vadEngine: "silero",
-            asrEngine: "skipped-pure-bgm",
-            outputSnrDb: denoiseOutSnr,
-            detectedSpeakerCount: 0,
-            acousticWake: null,
-            attention: rejectDecision("acoustic", "Spleeter 分离确认仅含纯器乐伴奏无有效人声"),
-          });
-        }
-
-        if (
-          !opts.bypassWakeWord &&
-          vocScene.singingProb >= 0.14 &&
-          vocScene.speechProb < 0.22 &&
-          !anyStage1EmbeddedCmd &&
-          maxStage1Oww < 0.45
-        ) {
-          soundSet.add("song");
-          return buildReturn({
-            speechDetected: false,
-            text: globalText,
-            acousticEvent: "<|BGM|>",
-            denoiseEngine: "spleeter",
-            vadEngine: "silero",
-            asrEngine: "skipped-pure-singing",
-            outputSnrDb: denoiseOutSnr,
-            detectedSpeakerCount: 0,
-            acousticWake: null,
-            attention: rejectDecision("acoustic", "Spleeter 人声轨判定为纯歌声演唱（无用户语音指令）"),
-          });
-        }
-
-        const splDpdf = this._engine.denoise(spleeterRes.vocals16k, SR, "dpdfnet");
-        const splSegs = this._extractTimedVadSegments(splDpdf.samples, {
-          threshold: 0.34,
-          minSilenceDuration: 0.22,
-          padSec: 0.12,
-          mergeGapSec: 0.12,
-        });
-        const rawVocHp = applyHighPassFilter(spleeterRes.vocals16k, SR, 85);
-
-        for (const seg of splSegs.slice(0, 3)) {
-          const rawVocSlice = slicePcmBySec(rawVocHp, seg.startSec, seg.endSec, 0.08);
-          const zhSpl = await this._engine.transcribeLocal(seg.samples, SR, voiceLang);
-          const zhVocRaw = await this._engine.transcribeLocal(rawVocSlice, SR, voiceLang);
-          const cand = await this._evaluateTurnCandidate({
-            branch: "stage2_spleeter_dpdf",
-            startSec: seg.startSec,
-            endSec: seg.endSec,
-            segPcm: seg.samples,
-            probePcm: slicePcmBySec(splDpdf.samples, Math.max(0, seg.startSec - 0.22), seg.endSec, 0.06),
-            altSegPcm: rawVocSlice,
-            zhRes: zhSpl,
-            altZhRes: zhVocRaw,
-            opts,
-            scene: {
-              ...scene,
-              singingProb: Math.max(scene.singingProb, vocScene.singingProb),
-              speechProb: Math.max(scene.speechProb, vocScene.speechProb),
-            },
-            globalTextContext: globalText,
-            isTseOrMusicSeparated: true,
-            speakerId: "vocal_sep",
-          });
-          allCandidates.push(cand);
-        }
-      }
-    }
-
-    const postSplAccepted = allCandidates
-      .filter((c) => c.decision.accept)
-      .sort((a, b) => b.priority - a.priority);
-    if (postSplAccepted.length > 0 && postSplAccepted[0]!.priority >= 170) {
-      const best = postSplAccepted[0]!;
-      return buildReturn({
-        speechDetected: true,
-        text: best.rawText,
-        altText: best.altText,
-        acousticEvent: best.acousticEvent,
-        denoiseEngine: "spleeter+dpdfnet4",
-        vadEngine: "silero",
-        asrEngine: "sensevoice-sep-spleeter",
-        outputSnrDb: denoiseOutSnr,
-        detectedSpeakerCount: Math.max(1, detectedSpeakerCount),
-        acousticWake: best.acousticWake,
-        attention: best.decision,
-      });
-    }
-
-    // Stage 2B: 按需 VoxLock TSE 与「Spleeter -> VoxLock」歌声级联分离
-    const speakerRefs =
-      opts.speakerRefWavPaths && opts.speakerRefWavPaths.length > 0
-        ? opts.speakerRefWavPaths
-        : listVoiceprintRefWavPaths().map((r) => ({ id: r.role === "owner" ? "owner" : r.id, wavPath: r.wavPath }));
-
-    const maxOwwSoFar = allCandidates.reduce((mx, c) => Math.max(mx, c.acousticWake?.score ?? 0), 0);
-    const anyEmbeddedCmdNow = allCandidates.some(
-      (c) =>
-        extractEmbeddedSmartHomeCommand(c.rawText).length >= 2 ||
-        (c.altText ? extractEmbeddedSmartHomeCommand(c.altText).length >= 2 : false),
-    );
-    const suspectedHiddenOverlap =
-      scene.crowdTvProb >= 0.18 ||
-      anyStage1Garbled ||
-      maxOwwSoFar >= 0.49 ||
-      (turnSegments.length === 1 && totalVadDurSec >= 2.3 && maxOwwSoFar >= 0.42 && !hasStrongMusic);
-
-    const shouldRunVoxLock =
-      speakerRefs.length > 0 &&
-      !isThirdPersonNeoMention(globalText) &&
-      (mode === "full" || anyEmbeddedCmdNow || suspectedHiddenOverlap);
-
-    if (shouldRunVoxLock) {
-      const voxSource =
-        spleeterRes && (scene.musicProb >= 0.28 || scene.singingProb >= 0.05)
-          ? spleeterRes.vocals16k
-          : pcm16k;
-      const branchPrefix = voxSource === pcm16k ? "voxlock" : "spl_voxlock";
+    const runVoxLockCascade = async (params: {
+      voxSource: Float32Array;
+      branchPrefix: string;
+      globalText: string;
+      orderedRefs: ReadonlyArray<{ id: string; wavPath: string }>;
+      anyEmbeddedCmdNow: boolean;
+      allowDualSpeakerTag: boolean;
+    }): Promise<void> => {
+      const { voxSource, branchPrefix, globalText, orderedRefs, anyEmbeddedCmdNow, allowDualSpeakerTag } = params;
       const voxCache = new Map<string, Float32Array>();
-
       let anyVoxHit = false;
-      for (let rIdx = 0; rIdx < Math.min(speakerRefs.length, 2); rIdx += 1) {
-        const ref = speakerRefs[rIdx]!;
+
+      for (let rIdx = 0; rIdx < Math.min(orderedRefs.length, 2); rIdx += 1) {
+        const ref = orderedRefs[rIdx]!;
         if (rIdx > 0 && anyVoxHit) break;
         if (rIdx > 0) {
-          const firstRefSamples = voxCache.get(speakerRefs[0]!.id);
+          const firstRefSamples = voxCache.get(orderedRefs[0]!.id);
           const firstRms = firstRefSamples ? computeRms(firstRefSamples) : 0;
           if (!(scene.crowdTvProb >= 0.18 || anyEmbeddedCmdNow || firstRms < 0.035 || mode === "full")) {
             break;
@@ -2159,14 +1960,17 @@ export class AudioSourceSeparator {
         stageTimingsMs[`${branchPrefix}_${ref.id}Ms`] = vox.durationMs;
 
         const voxSegs = this._extractTimedVadSegments(vox.samples, {
-          threshold: 0.32,
+          threshold: 0.30,
           minSilenceDuration: 0.20,
           padSec: 0.14,
           mergeGapSec: 0.14,
         });
         for (const seg of voxSegs.slice(0, 3)) {
-          if (computeRms(seg.samples) < 0.010) continue;
+          if (computeRms(seg.samples) < 0.009) continue;
           const zhVox = await this._engine.transcribeLocal(seg.samples, SR, voiceLang);
+          if (zhVox.text.trim()) {
+            soundSet.add("speech");
+          }
           const cand = await this._evaluateTurnCandidate({
             branch: `${branchPrefix}_${ref.id}`,
             startSec: seg.startSec,
@@ -2181,6 +1985,7 @@ export class AudioSourceSeparator {
             globalTextContext: globalText,
             isTseOrMusicSeparated: true,
             speakerId: ref.id,
+            isNoisyOrMusic: true,
           });
           allCandidates.push(cand);
           separatedStreams.push({
@@ -2197,10 +2002,9 @@ export class AudioSourceSeparator {
         }
       }
 
-      // 双 VoxLock 分支确认独立重叠双说话人
-      if (speakerRefs.length >= 2) {
-        const s0 = speakerRefs[0]!.id;
-        const s1 = speakerRefs[1]!.id;
+      if (allowDualSpeakerTag && orderedRefs.length >= 2) {
+        const s0 = orderedRefs[0]!.id;
+        const s1 = orderedRefs[1]!.id;
         const tx0 = separatedStreams.find((s) => s.speakerId === s0)?.transcript ?? "";
         const tx1 = separatedStreams.find((s) => s.speakerId === s1)?.transcript ?? "";
         const rms0 = voxCache.get(s0) ? computeRms(voxCache.get(s0)!) : 0;
@@ -2211,28 +2015,30 @@ export class AudioSourceSeparator {
         }
       }
 
-      // 局部滑动窗口 en-US 唤醒探针（复用 voxCache 零重复 VoxLock 推理）
+      // 精简局部滑动窗口 en-US 唤醒探针（向前预留 0.35s 防止裁掉句首 Neo，复用 voxCache 零重复 VoxLock 推理）
       if (!anyVoxHit && !opts.bypassWakeWord && opts.wakeWordEnabled !== false) {
         const tseCmdCands = allCandidates.filter(
           (c) =>
             (c.branch.startsWith("voxlock") ||
               c.branch.startsWith("spl_voxlock") ||
+              c.branch.startsWith("stage1_spleeter") ||
               c.branch.startsWith("stage2_spleeter")) &&
             extractEmbeddedSmartHomeCommand(c.rawText).length >= 2,
         );
         for (const tc of tseCmdCands.slice(0, 2)) {
           const cleanCmd = extractEmbeddedSmartHomeCommand(tc.rawText);
           const cachedVox = tc.speakerId ? voxCache.get(tc.speakerId) : undefined;
+          const probeStart = Math.max(0, tc.startSec - 0.35);
           const scanAudio = cachedVox
-            ? slicePcmBySec(cachedVox, tc.startSec, tc.endSec, 0.05)
-            : tc.segPcm;
-          const rawSlice = slicePcmBySec(rawHp, tc.startSec, tc.endSec, 0.05);
+            ? slicePcmBySec(cachedVox, probeStart, tc.endSec, 0.05)
+            : slicePcmBySec(voxSource, probeStart, tc.endSec, 0.05);
+          const rawSlice = slicePcmBySec(rawHp, probeStart, tc.endSec, 0.05);
 
           let recoveredWake: string | null = null;
           for (const srcAudio of [scanAudio, rawSlice]) {
-            const maxScanEnd = Math.min(srcAudio.length, Math.round(SR * 2.1));
-            for (let off = 0; off + Math.round(SR * 0.65) <= maxScanEnd; off += Math.round(SR * 0.35)) {
-              const win = srcAudio.subarray(off, Math.min(srcAudio.length, off + Math.round(SR * 0.85)));
+            const maxScanEnd = Math.min(srcAudio.length, Math.round(SR * 2.0));
+            for (let off = 0; off + Math.round(SR * 0.62) <= maxScanEnd; off += Math.round(SR * 0.35)) {
+              const win = srcAudio.subarray(off, Math.min(srcAudio.length, off + Math.round(SR * 0.80)));
               const enRes = await this._engine.transcribeLocal(win, SR, "en-US");
               const hit = matchSafeEnWake(enRes.text, wakeWords, true);
               if (hit) {
@@ -2277,6 +2083,902 @@ export class AudioSourceSeparator {
           }
         }
       }
+    };
+
+    // =========================================================================
+    // 路由 1：干净高信噪比人声极速通道（~320~550ms，较原管线提速 6~10 倍）
+    // =========================================================================
+    const isCleanEnvironment =
+      !hasStrongMusic && !hasNoiseHint && inputSnrDb >= 15 && scene.crowdTvProb < 0.14;
+    let preComputedCleanBase: { samples: Float32Array; engine: string; outputSnrDb: number } | null = null;
+    let preComputedCleanVad: TimedSpeechSegment[] | null = null;
+
+    if (isCleanEnvironment) {
+      const skipGtcrnForUltraClean =
+        !hasReusableStreamGtcrn && inputSnrDb >= 21 && scene.noiseProb < 0.06 && scene.musicProb < 0.10;
+      const cleanBase = skipGtcrnForUltraClean
+        ? { samples: rawHp, engine: "highpass-fast", outputSnrDb: inputSnrDb }
+        : obtainGtcrn();
+      preComputedCleanBase = cleanBase;
+
+      const cleanVad = this._extractTimedVadSegments(cleanBase.samples, {
+        threshold: 0.36,
+        minSilenceDuration: 0.24,
+        padSec: 0.12,
+        mergeGapSec: 0.14,
+      });
+      preComputedCleanVad = cleanVad;
+
+      if (cleanVad.length === 0) {
+        return buildReturn({
+          speechDetected: false,
+          text: "",
+          acousticEvent: "",
+          denoiseEngine: cleanBase.engine,
+          vadEngine: "silero",
+          asrEngine: "skipped-no-speech",
+          outputSnrDb: cleanBase.outputSnrDb,
+          detectedSpeakerCount: 0,
+          acousticWake: null,
+          attention: rejectDecision("no-wake", "未检测到有效人声"),
+        });
+      }
+
+      if (cleanVad.length === 1 && cleanVad[0]!.samples.length < SR * 6.5) {
+        const seg = cleanVad[0]!;
+        const segDurSec = seg.samples.length / SR;
+        soundSet.add("speech");
+        const rawSeg = cleanBase.samples === rawHp ? seg.samples : slicePcmBySec(rawHp, seg.startSec, seg.endSec, 0.08);
+        const zhPrimary = await this._engine.transcribeLocal(seg.samples, SR, voiceLang);
+        globalTranscriptParts.push(zhPrimary.text);
+
+        const quickSpan = findWakeWordSpan(zhPrimary.text, wakeWords);
+        let zhAlt: LocalAsrOutput | null = null;
+        if (cleanBase.samples !== rawHp && (!quickSpan || quickSpan.fuzzy)) {
+          zhAlt = await this._engine.transcribeLocal(rawSeg, SR, voiceLang);
+        }
+
+        const evalRes = await this._evaluateTurnCandidate({
+          branch: "clean_fast",
+          startSec: seg.startSec,
+          endSec: seg.endSec,
+          segPcm: seg.samples,
+          probePcm: slicePcmBySec(cleanBase.samples, Math.max(0, seg.startSec - 0.18), seg.endSec, 0),
+          altSegPcm: rawSeg,
+          zhRes: zhPrimary,
+          altZhRes: zhAlt,
+          opts,
+          scene,
+          globalTextContext: zhPrimary.text,
+          isTseOrMusicSeparated: false,
+          speakerId: "speaker_0",
+          precomputedWake: opts.precomputedAcousticWake,
+          isNoisyOrMusic: false,
+        });
+
+        const fastReturn =
+          (evalRes.decision.accept && !evalRes.decision.wokeOnly) ||
+          (!opts.bypassWakeWord && isThirdPersonMentionExtended(evalRes.rawText)) ||
+          segDurSec < 2.8;
+
+        let confirmedSingleSpeaker = fastReturn;
+        if (!confirmedSingleSpeaker) {
+          // >= 2.8s 未命中的高信噪比干净长句：用 ~60ms Pyannote 快速确认是否藏有第二说话人；
+          // 只要确认仅单说话人且无异语种乱码，直接返回（绝不对 50dB 干净单人负样本升级 VoxLock！）
+          const hasWeird = /[\u3040-\u30ff\uac00-\ud7af]/.test(evalRes.rawText);
+          if (!hasWeird) {
+            const quickDiar = this.diarizeSpeakers(cleanBase.samples, 0.52);
+            stageTimingsMs.diarizationMs = (stageTimingsMs.diarizationMs ?? 0) + quickDiar.durationMs;
+            if (quickDiar.speakerCount <= 1) {
+              confirmedSingleSpeaker = true;
+            }
+          }
+        }
+
+        if (confirmedSingleSpeaker) {
+          separatedStreams.push({
+            streamId: "speaker_0",
+            kind: "speaker",
+            speakerId: "speaker_0",
+            startSec: seg.startSec,
+            endSec: seg.endSec,
+            transcript: evalRes.rawText,
+          });
+          return buildReturn({
+            speechDetected: true,
+            text: evalRes.rawText,
+            altText: evalRes.altText,
+            acousticEvent: evalRes.acousticEvent,
+            denoiseEngine: cleanBase.engine,
+            vadEngine: "silero",
+            asrEngine: "sensevoice-sep-fast",
+            outputSnrDb: cleanBase.outputSnrDb,
+            detectedSpeakerCount: 1,
+            acousticWake: evalRes.acousticWake,
+            attention: evalRes.decision,
+            bestSpeechPcm: seg.samples,
+          });
+        }
+        // 若长句中检测到多说话人或隐藏重叠指令，继续流转至多说话人隔离分支
+        allCandidates.push(evalRes);
+      }
+    }
+
+    // =========================================================================
+    // 路由 2：音乐/歌声优先直通 Spleeter 2-Stem 管线（彻底跳过低效 2x DPDFNet4，
+    // 节省 2.1~4.5 秒，同时结合 CAM++ 目标说话人检测精准触发 Spleeter->VoxLock 攻克强歌声）
+    // =========================================================================
+    if (hasStrongMusic && mode !== "fast") {
+      const spleeterRes = this.separateMusicStems(pcm16k);
+      if (spleeterRes) {
+        stageTimingsMs.spleeterMs = spleeterRes.durationMs;
+        const vocScene = this.analyzeAudioScene(spleeterRes.vocals16k, 15);
+        if (spleeterRes.vocalToAccompDb < 14) soundSet.add("bgm");
+        if (vocScene.singingProb >= 0.045 || scene.singingProb >= 0.045) {
+          soundSet.add("song");
+          soundSet.add("bgm");
+        }
+        if (vocScene.speechProb >= 0.16) soundSet.add("speech");
+
+        separatedStreams.push({
+          streamId: "spleeter_accompaniment",
+          kind: "bgm_accompaniment",
+          energyRatio: Number(computeRms(spleeterRes.accompaniment16k).toFixed(4)),
+        });
+
+        const vocRms = computeRms(spleeterRes.vocals16k);
+        const vocOutSnr = estimateSnrDb(spleeterRes.vocals16k, SR);
+        if (vocRms < 0.008 && spleeterRes.vocalToAccompDb < -12) {
+          return buildReturn({
+            speechDetected: false,
+            text: "",
+            acousticEvent: "<|BGM|>",
+            denoiseEngine: "spleeter",
+            vadEngine: "silero",
+            asrEngine: "skipped-pure-bgm",
+            outputSnrDb: vocOutSnr,
+            detectedSpeakerCount: 0,
+            acousticWake: null,
+            attention: rejectDecision("acoustic", "Spleeter 分离确认仅含纯器乐伴奏无有效人声"),
+          });
+        }
+
+        const vocHp = applyHighPassFilter(spleeterRes.vocals16k, SR, 85);
+        let splVadSegs = this._extractTimedVadSegments(vocHp, {
+          threshold: 0.34,
+          minSilenceDuration: 0.22,
+          padSec: 0.12,
+          mergeGapSec: 0.12,
+        });
+
+        const preRollBg = this._detectBackgroundSongFromPreRoll(
+          pcm16k,
+          scene,
+          splVadSegs[0]?.startSec ?? 0,
+        );
+        if (preRollBg.isSong) {
+          soundSet.add("song");
+          soundSet.add("bgm");
+        }
+
+        let cachedOwnerPresence: ReturnType<AudioSourceSeparator["checkRegisteredSpeakerPresence"]> | null = null;
+        const getOwnerPresence = () => {
+          if (cachedOwnerPresence) return cachedOwnerPresence;
+          cachedOwnerPresence = this.checkRegisteredSpeakerPresence(vocHp, speakerRefs, 0.32);
+          stageTimingsMs.ownerPresenceMs = cachedOwnerPresence.durationMs;
+          return cachedOwnerPresence;
+        };
+
+        if (splVadSegs.length === 0) {
+          const ownerCheck = speakerRefs.length > 0 ? getOwnerPresence() : null;
+          if (!opts.bypassWakeWord && !ownerCheck?.present && vocScene.singingProb >= 0.12 && vocScene.speechProb < 0.22) {
+            soundSet.add("song");
+            return buildReturn({
+              speechDetected: false,
+              text: "",
+              acousticEvent: "<|BGM|>",
+              denoiseEngine: "spleeter",
+              vadEngine: "silero",
+              asrEngine: "skipped-pure-singing",
+              outputSnrDb: vocOutSnr,
+              detectedSpeakerCount: 0,
+              acousticWake: null,
+              attention: rejectDecision("acoustic", "Spleeter 人声轨判定为纯歌声演唱（无用户语音指令）"),
+            });
+          }
+          if (vocRms >= 0.015) {
+            splVadSegs = [
+              {
+                startSample: 0,
+                endSample: vocHp.length,
+                startSec: 0,
+                endSec: Number((vocHp.length / SR).toFixed(3)),
+                samples: vocHp,
+              },
+            ];
+          } else {
+            return buildReturn({
+              speechDetected: false,
+              text: "",
+              acousticEvent: "<|BGM|>",
+              denoiseEngine: "spleeter",
+              vadEngine: "silero",
+              asrEngine: "skipped-no-speech",
+              outputSnrDb: vocOutSnr,
+              detectedSpeakerCount: 0,
+              acousticWake: null,
+              attention: rejectDecision("acoustic", "Spleeter 分离后未检测到有效人声"),
+            });
+          }
+        }
+
+        const { turns: splTurns } = buildTurnsForTrack(vocHp, splVadSegs, true);
+        detectedSpeakerCount = this._verifyDistinctSpeakerCount(vocHp, splTurns, 0.45);
+        if (detectedSpeakerCount >= 2 && !(vocScene.speechProb < 0.25 && scene.speechProb < 0.25)) {
+          soundSet.add("multi_speaker");
+        }
+
+        const mergedScene: AudioSceneAnalysis = {
+          ...scene,
+          singingProb: Math.max(scene.singingProb, vocScene.singingProb),
+          speechProb: Math.max(scene.speechProb, vocScene.speechProb),
+        };
+        const streamGtcrnTrack = hasReusableStreamGtcrn ? opts.preDenoisedGtcrn! : null;
+        const splCandidates: TurnCandidate[] = [];
+
+        for (let idx = 0; idx < Math.min(splTurns.length, 4); idx += 1) {
+          const turn = splTurns[idx]!;
+          const probeStartSec = Math.max(0, turn.startSec - 0.30);
+          const probeVoc = slicePcmBySec(vocHp, probeStartSec, turn.endSec, 0.06);
+          const altTrack = streamGtcrnTrack ?? rawHp;
+          const altSlice = slicePcmBySec(altTrack, probeStartSec, turn.endSec, 0.06);
+
+          const zhVoc = await this._engine.transcribeLocal(turn.samples, SR, voiceLang);
+          if (zhVoc.text.trim()) {
+            if (mergedScene.speechProb >= 0.14 || zhVoc.text.trim().length >= 3) {
+              soundSet.add("speech");
+            }
+            globalTranscriptParts.push(zhVoc.text.trim());
+          }
+
+          const quickSpan = findWakeWordSpan(zhVoc.text, wakeWords);
+          const zhVocIsFluentNonCmd =
+            !quickSpan &&
+            extractEmbeddedSmartHomeCommand(zhVoc.text).length < 2 &&
+            (HOUSEHOLD_SIDETALK_RE.test(zhVoc.text) || DESCRIPTIVE_NON_COMMAND_RE.test(zhVoc.text));
+          let zhAlt: LocalAsrOutput | null = null;
+          if ((!quickSpan || quickSpan.fuzzy) && !zhVocIsFluentNonCmd) {
+            zhAlt = await this._engine.transcribeLocal(altSlice, SR, voiceLang);
+            if (zhAlt.text.trim() && mergedScene.speechProb >= 0.14) {
+              soundSet.add("speech");
+            }
+          }
+
+          const cand = await this._evaluateTurnCandidate({
+            branch: "stage1_spleeter",
+            startSec: turn.startSec,
+            endSec: turn.endSec,
+            segPcm: turn.samples,
+            probePcm: probeVoc,
+            altSegPcm: altSlice,
+            zhRes: zhVoc,
+            altZhRes: zhAlt,
+            opts,
+            scene: mergedScene,
+            globalTextContext: globalTranscriptParts.join(" "),
+            isTseOrMusicSeparated: true,
+            speakerId: turn.speakerId,
+            precomputedWake: splTurns.length === 1 ? opts.precomputedAcousticWake : null,
+            isNoisyOrMusic: true,
+          });
+          splCandidates.push(cand);
+          allCandidates.push(cand);
+          separatedStreams.push({
+            streamId: `spleeter_${turn.speakerId}_${turn.startSec.toFixed(1)}`,
+            kind: "speaker",
+            speakerId: turn.speakerId,
+            startSec: turn.startSec,
+            endSec: turn.endSec,
+            transcript: cand.rawText,
+          });
+        }
+
+        const bridgedMusic = this._bridgeAdjacentWakeAndCommand(splCandidates, wakeWords);
+        if (bridgedMusic) allCandidates.push(bridgedMusic);
+
+        const globalMusicText = globalTranscriptParts.join(" ");
+        const musicAccepted = allCandidates
+          .filter((c) => c.decision.accept)
+          .sort((a, b) => b.priority - a.priority);
+        if (musicAccepted.length > 0) {
+          const best = musicAccepted[0]!;
+          const isHighConf =
+            opts.bypassWakeWord ||
+            (!best.decision.wokeOnly && best.hasSmartHome && best.hasActionVerb) ||
+            (best.decision.wokeOnly && splTurns.length === 1);
+          if (isHighConf) {
+            return buildReturn({
+              speechDetected: true,
+              text: best.rawText,
+              altText: best.altText,
+              acousticEvent: best.acousticEvent,
+              denoiseEngine: "spleeter",
+              vadEngine: "silero",
+              asrEngine: `sensevoice-sep-${best.branch}`,
+              outputSnrDb: vocOutSnr,
+              detectedSpeakerCount: Math.max(1, detectedSpeakerCount),
+              acousticWake: best.acousticWake,
+              attention: best.decision,
+              bestSpeechPcm: best.segPcm,
+            });
+          }
+        }
+
+        if (!opts.bypassWakeWord && isThirdPersonMentionExtended(globalMusicText)) {
+          return buildReturn({
+            speechDetected: true,
+            text: globalMusicText,
+            acousticEvent: allCandidates[0]?.acousticEvent ?? "",
+            denoiseEngine: "spleeter",
+            vadEngine: "silero",
+            asrEngine: "sensevoice-sep-spleeter",
+            outputSnrDb: vocOutSnr,
+            detectedSpeakerCount: Math.max(1, detectedSpeakerCount),
+            acousticWake: allCandidates[0]?.acousticWake ?? null,
+            attention: rejectDecision("pragmatic-reject", "判定为第三人称提及或否定呼唤，跳过重型分离"),
+          });
+        }
+
+        const maxMusicOww = allCandidates.reduce((mx, c) => Math.max(mx, c.acousticWake?.score ?? 0), 0);
+        const anyMusicEmbeddedCmd = allCandidates.some(
+          (c) =>
+            extractEmbeddedSmartHomeCommand(c.rawText).length >= 2 ||
+            (c.altText ? extractEmbeddedSmartHomeCommand(c.altText).length >= 2 : false),
+        );
+        const isFluentMusicChat =
+          globalMusicText.length >= 6 &&
+          (HOUSEHOLD_SIDETALK_RE.test(globalMusicText) ||
+            DESCRIPTIVE_NON_COMMAND_RE.test(globalMusicText) ||
+            isAmbiguousZhQuestion(globalMusicText));
+        const cleanMusicChars = globalMusicText.replace(/[^\u4e00-\u9fffA-Za-z0-9]/g, "");
+        const anyMusicGarbled =
+          !isFluentMusicChat &&
+          (cleanMusicChars.length <= 3 ||
+            allCandidates.some(
+              (c) =>
+                /[\u3040-\u30ff\uac00-\ud7af]/.test(c.rawText) &&
+                c.endSec - c.startSec >= 0.7,
+            ));
+        const ownerPresence = speakerRefs.length > 0 ? getOwnerPresence() : null;
+
+        if (
+          !opts.bypassWakeWord &&
+          vocScene.singingProb >= 0.14 &&
+          vocScene.speechProb < 0.22 &&
+          !anyMusicEmbeddedCmd &&
+          maxMusicOww < 0.42 &&
+          !(ownerPresence?.present)
+        ) {
+          soundSet.add("song");
+          return buildReturn({
+            speechDetected: false,
+            text: globalMusicText,
+            acousticEvent: "<|BGM|>",
+            denoiseEngine: "spleeter",
+            vadEngine: "silero",
+            asrEngine: "skipped-pure-singing",
+            outputSnrDb: vocOutSnr,
+            detectedSpeakerCount: 0,
+            acousticWake: null,
+            attention: rejectDecision("acoustic", "Spleeter 人声轨判定为纯歌声演唱（无用户语音指令）"),
+          });
+        }
+
+        const isClearUnmaskedMusicChat =
+          mode !== "full" &&
+          !opts.bypassWakeWord &&
+          !anyMusicEmbeddedCmd &&
+          !anyMusicGarbled &&
+          maxMusicOww < 0.59 &&
+          isFluentMusicChat &&
+          (scene.speechProb >= 0.42 || vocScene.singingProb < 0.15);
+
+        if (isClearUnmaskedMusicChat) {
+          return buildReturn({
+            speechDetected: true,
+            text: globalMusicText,
+            acousticEvent: allCandidates[0]?.acousticEvent ?? "",
+            denoiseEngine: "spleeter",
+            vadEngine: "silero",
+            asrEngine: "sensevoice-sep-spleeter",
+            outputSnrDb: vocOutSnr,
+            detectedSpeakerCount: Math.max(1, detectedSpeakerCount),
+            acousticWake: allCandidates[0]?.acousticWake ?? null,
+            attention: rejectDecision("no-wake", "清晰非指令日常对话，无唤醒与设备控制意图"),
+          });
+        }
+
+        // 强歌声/负信噪比盖过用户语音时，执行 Spleeter -> VoxLock 级联剥离背景歌手！
+        // 若高信噪比(>=8dB)下已清晰转写长段日常中文(>13字)且无指令/无唤醒，说明人声未被歌声遮蔽，免去无谓 VoxLock
+        const clearlyUnmaskedLongSpeech =
+          inputSnrDb >= 8 && scene.speechProb >= 0.42 && cleanMusicChars.length >= 14;
+        const ownerMaskedBySinging = Boolean(
+          ownerPresence?.present &&
+            !isFluentMusicChat &&
+            !clearlyUnmaskedLongSpeech &&
+            (vocScene.singingProb >= 0.12 ||
+              scene.singingProb >= 0.08 ||
+              (vocScene.speechProb < 0.32 && cleanMusicChars.length <= 6) ||
+              inputSnrDb < 4),
+        );
+        const shouldRunMusicVoxLock =
+          speakerRefs.length > 0 &&
+          !isThirdPersonMentionExtended(globalMusicText) &&
+          (mode === "full" ||
+            anyMusicEmbeddedCmd ||
+            anyMusicGarbled ||
+            maxMusicOww >= (clearlyUnmaskedLongSpeech ? 0.58 : 0.48) ||
+            scene.crowdTvProb >= 0.18 ||
+            ownerMaskedBySinging);
+
+        if (shouldRunMusicVoxLock) {
+          // 优先保留首位主用户（owner），仅当次位成员相似度显著高于主用户且主用户未明显发声时才换序
+          let orderedRefs = speakerRefs;
+          if (speakerRefs.length >= 2 && ownerPresence && ownerPresence.scoresById.size > 0) {
+            const s0 = ownerPresence.scoresById.get(speakerRefs[0]!.id) ?? -1;
+            const s1 = ownerPresence.scoresById.get(speakerRefs[1]!.id) ?? -1;
+            if (s0 < 0.35 && s1 > s0 + 0.12) {
+              orderedRefs = [speakerRefs[1]!, speakerRefs[0]!, ...speakerRefs.slice(2)];
+            }
+          }
+          await runVoxLockCascade({
+            voxSource: spleeterRes.vocals16k,
+            branchPrefix: "spl_voxlock",
+            globalText: globalMusicText,
+            orderedRefs,
+            anyEmbeddedCmdNow: anyMusicEmbeddedCmd,
+            allowDualSpeakerTag: false,
+          });
+        }
+
+        const finalMusicAccepted = allCandidates
+          .filter((c) => c.decision.accept)
+          .sort((a, b) => b.priority - a.priority);
+        if (finalMusicAccepted.length > 0) {
+          const winner = finalMusicAccepted[0]!;
+          return buildReturn({
+            speechDetected: true,
+            text: winner.rawText,
+            altText: winner.altText,
+            acousticEvent: winner.acousticEvent,
+            denoiseEngine: winner.branch.startsWith("spl_voxlock") ? "spleeter+voxlock" : "spleeter",
+            vadEngine: "silero-sep",
+            asrEngine: `sensevoice-sep-${winner.branch}`,
+            outputSnrDb: vocOutSnr,
+            detectedSpeakerCount: Math.max(1, detectedSpeakerCount),
+            acousticWake: winner.acousticWake,
+            attention: winner.decision,
+            bestSpeechPcm: winner.segPcm,
+          });
+        }
+
+        const bestMusicRej = allCandidates[0];
+        return buildReturn({
+          speechDetected: globalMusicText.length > 0,
+          text: globalMusicText || bestMusicRej?.rawText || "",
+          altText: bestMusicRej?.altText,
+          acousticEvent: bestMusicRej?.acousticEvent ?? "<|BGM|>",
+          denoiseEngine: "spleeter",
+          vadEngine: "silero-sep",
+          asrEngine: "sensevoice-sep-spleeter",
+          outputSnrDb: vocOutSnr,
+          detectedSpeakerCount: soundSet.has("speech") ? Math.max(1, detectedSpeakerCount) : 0,
+          acousticWake: bestMusicRej?.acousticWake ?? null,
+          attention: bestMusicRej?.decision ?? rejectDecision("no-wake", "音乐人声分离后未检测到有效助手指令"),
+        });
+      }
+    }
+
+    // =========================================================================
+    // 路由 3：环境噪声 / 多人交替与重叠 / 音乐降级路径
+    // 策略：GTCRN 优先（~373ms），仅在 GTCRN 失败且音频明显退化时惰性升级 DPDFNet4（~1.7s）与 VoxLock
+    // =========================================================================
+    const baseClean = preComputedCleanBase ?? obtainGtcrn();
+    let denoiseOutSnr = baseClean.outputSnrDb;
+    let denoiseEngineName = baseClean.engine;
+    const primaryCleanTrack = baseClean.samples;
+
+    let vadSegs =
+      preComputedCleanVad ??
+      this._extractTimedVadSegments(primaryCleanTrack, {
+        threshold: 0.36,
+        minSilenceDuration: 0.22,
+        padSec: 0.12,
+        mergeGapSec: 0.12,
+      });
+
+    const isClearlyNonSpeech =
+      scene.speechProb < 0.12 &&
+      (scene.musicProb >= 0.35 || scene.noiseProb >= 0.24 || spectralFlatness >= 0.65);
+
+    if (vadSegs.length === 0 && (isClearlyNonSpeech || inputSnrDb < 10 || !hasStrongMusic)) {
+      if (soundSet.size === 0) soundSet.add("noise");
+      return buildReturn({
+        speechDetected: false,
+        text: "",
+        acousticEvent: hasStrongMusic ? "<|BGM|>" : "",
+        denoiseEngine: denoiseEngineName,
+        vadEngine: "silero",
+        asrEngine: "skipped-no-speech",
+        outputSnrDb: denoiseOutSnr,
+        detectedSpeakerCount: 0,
+        acousticWake: null,
+        attention: rejectDecision("acoustic", "并行场景分类与神经 VAD 判定为纯非语音背景音"),
+      });
+    }
+
+    const preRollBg = this._detectBackgroundSongFromPreRoll(
+      pcm16k,
+      scene,
+      vadSegs[0]?.startSec ?? 0,
+    );
+    if (preRollBg.isSong) {
+      soundSet.add("song");
+      soundSet.add("bgm");
+    }
+    if (preRollBg.isNoise && !hasStrongMusic) {
+      soundSet.add("noise");
+    }
+
+    const { turns: turnSegments, totalVadDurSec } = buildTurnsForTrack(
+      primaryCleanTrack,
+      vadSegs,
+      hasStrongMusic || hasNoiseHint,
+    );
+
+    detectedSpeakerCount = this._verifyDistinctSpeakerCount(
+      primaryCleanTrack,
+      turnSegments,
+      hasStrongMusic || hasNoiseHint ? 0.45 : 0.50,
+    );
+    if (detectedSpeakerCount >= 2 && !(hasStrongMusic && scene.speechProb < 0.25)) {
+      soundSet.add("multi_speaker");
+    }
+
+    const stage1Candidates: TurnCandidate[] = [];
+    for (let idx = 0; idx < Math.min(turnSegments.length, 6); idx += 1) {
+      const turn = turnSegments[idx]!;
+      const probeStartSec = Math.max(0, turn.startSec - 0.35);
+      const probeClean = slicePcmBySec(primaryCleanTrack, probeStartSec, turn.endSec, 0.06);
+      const rawTurn = slicePcmBySec(rawHp, probeStartSec, turn.endSec, 0.06);
+
+      const zhClean = await this._engine.transcribeLocal(turn.samples, SR, voiceLang);
+      if (zhClean.text.trim()) {
+        if (scene.speechProb >= 0.14 || !hasStrongMusic || zhClean.text.trim().length >= 3) {
+          soundSet.add("speech");
+        }
+        globalTranscriptParts.push(zhClean.text.trim());
+      }
+
+      const quickSpan = findWakeWordSpan(zhClean.text, wakeWords);
+      const zhCleanIsFluentNonCmd =
+        !quickSpan &&
+        extractEmbeddedSmartHomeCommand(zhClean.text).length < 2 &&
+        (HOUSEHOLD_SIDETALK_RE.test(zhClean.text) || DESCRIPTIVE_NON_COMMAND_RE.test(zhClean.text));
+      let zhAlt: LocalAsrOutput | null = null;
+      if (primaryCleanTrack !== rawHp && (!quickSpan || quickSpan.fuzzy || hasStrongMusic) && !zhCleanIsFluentNonCmd) {
+        zhAlt = await this._engine.transcribeLocal(rawTurn, SR, voiceLang);
+        if (zhAlt.text.trim() && (scene.speechProb >= 0.14 || !hasStrongMusic)) {
+          soundSet.add("speech");
+        }
+      }
+
+      const cand = await this._evaluateTurnCandidate({
+        branch: "stage1_diarized",
+        startSec: turn.startSec,
+        endSec: turn.endSec,
+        segPcm: turn.samples,
+        probePcm: probeClean,
+        altSegPcm: primaryCleanTrack === rawHp ? undefined : rawTurn,
+        zhRes: zhClean,
+        altZhRes: zhAlt,
+        opts,
+        scene,
+        globalTextContext: globalTranscriptParts.join(" "),
+        isTseOrMusicSeparated: false,
+        speakerId: turn.speakerId,
+        precomputedWake: turnSegments.length === 1 ? opts.precomputedAcousticWake : null,
+        isNoisyOrMusic: hasStrongMusic || hasNoiseHint || inputSnrDb < 15,
+      });
+      stage1Candidates.push(cand);
+      allCandidates.push(cand);
+      separatedStreams.push({
+        streamId: `stage1_${turn.speakerId}_${turn.startSec.toFixed(1)}`,
+        kind: "speaker",
+        speakerId: turn.speakerId,
+        startSec: turn.startSec,
+        endSec: turn.endSec,
+        transcript: cand.rawText,
+      });
+    }
+
+    const hasOnlyWokeInMulti =
+      turnSegments.length >= 2 &&
+      stage1Candidates.some((c) => c.decision.accept && c.decision.wokeOnly) &&
+      !stage1Candidates.some((c) => c.decision.accept && !c.decision.wokeOnly);
+
+    if (hasOnlyWokeInMulti && vadSegs.length > 0) {
+      for (const vs of vadSegs.slice(0, 2)) {
+        const zhFull = await this._engine.transcribeLocal(vs.samples, SR, voiceLang);
+        const rawFull = slicePcmBySec(rawHp, vs.startSec, vs.endSec, 0.08);
+        const zhRawFull =
+          primaryCleanTrack === rawHp ? null : await this._engine.transcribeLocal(rawFull, SR, voiceLang);
+        const fullCand = await this._evaluateTurnCandidate({
+          branch: "stage1_vad_intact",
+          startSec: vs.startSec,
+          endSec: vs.endSec,
+          segPcm: vs.samples,
+          probePcm: vs.samples,
+          altSegPcm: primaryCleanTrack === rawHp ? undefined : rawFull,
+          zhRes: zhFull,
+          altZhRes: zhRawFull,
+          opts,
+          scene,
+          globalTextContext: globalTranscriptParts.join(" "),
+          isTseOrMusicSeparated: false,
+          speakerId: "speaker_0",
+          isNoisyOrMusic: hasStrongMusic || hasNoiseHint,
+        });
+        stage1Candidates.push(fullCand);
+        allCandidates.push(fullCand);
+      }
+    }
+
+    const bridged1 = this._bridgeAdjacentWakeAndCommand(stage1Candidates, wakeWords);
+    if (bridged1) allCandidates.push(bridged1);
+
+    const globalText = globalTranscriptParts.join(" ");
+    const stage1Accepted = allCandidates
+      .filter((c) => c.decision.accept)
+      .sort((a, b) => b.priority - a.priority);
+
+    if (stage1Accepted.length > 0) {
+      const best = stage1Accepted[0]!;
+      const isHighConfAccept =
+        opts.bypassWakeWord ||
+        (!best.decision.wokeOnly && best.hasSmartHome && best.hasActionVerb) ||
+        (best.decision.wokeOnly && turnSegments.length === 1);
+      if (isHighConfAccept || mode === "fast") {
+        return buildReturn({
+          speechDetected: true,
+          text: best.rawText,
+          altText: best.altText,
+          acousticEvent: best.acousticEvent,
+          denoiseEngine: denoiseEngineName,
+          vadEngine: "silero-diar",
+          asrEngine: "sensevoice-sep-stage1",
+          outputSnrDb: denoiseOutSnr,
+          detectedSpeakerCount: Math.max(1, detectedSpeakerCount),
+          acousticWake: best.acousticWake,
+          attention: best.decision,
+          bestSpeechPcm: best.segPcm,
+        });
+      }
+    }
+
+    if (mode === "fast") {
+      const bestRej = allCandidates[0];
+      return buildReturn({
+        speechDetected: globalText.length > 0,
+        text: globalText || bestRej?.rawText || "",
+        altText: bestRej?.altText,
+        acousticEvent: bestRej?.acousticEvent ?? "",
+        denoiseEngine: denoiseEngineName,
+        vadEngine: "silero-diar",
+        asrEngine: "sensevoice-sep-fast",
+        outputSnrDb: denoiseOutSnr,
+        detectedSpeakerCount: soundSet.has("speech") ? Math.max(1, detectedSpeakerCount) : 0,
+        acousticWake: bestRej?.acousticWake ?? null,
+        attention: bestRej?.decision ?? rejectDecision("no-wake", "未检测到指向助手的有效指令"),
+      });
+    }
+
+    // Stage 1.5: 智能早退门控
+    const maxStage1Oww = allCandidates.reduce((mx, c) => Math.max(mx, c.acousticWake?.score ?? 0), 0);
+    const anyStage1EmbeddedCmd = allCandidates.some(
+      (c) =>
+        extractEmbeddedSmartHomeCommand(c.rawText).length >= 2 ||
+        (c.altText ? extractEmbeddedSmartHomeCommand(c.altText).length >= 2 : false),
+    );
+    const cleanGlobalChars = globalText.replace(/[^\u4e00-\u9fffA-Za-z0-9]/g, "");
+    const isFluentStage1Chat =
+      globalText.length >= 6 &&
+      (HOUSEHOLD_SIDETALK_RE.test(globalText) ||
+        DESCRIPTIVE_NON_COMMAND_RE.test(globalText) ||
+        isAmbiguousZhQuestion(globalText));
+    const anyStage1Garbled =
+      !isFluentStage1Chat &&
+      (cleanGlobalChars.length <= 3 ||
+        allCandidates.some(
+          (c) => /[\u3040-\u30ff\uac00-\ud7af]/.test(c.rawText) && c.endSec - c.startSec >= 0.55,
+        ));
+
+    if (!opts.bypassWakeWord && isThirdPersonMentionExtended(globalText)) {
+      return buildReturn({
+        speechDetected: true,
+        text: globalText,
+        acousticEvent: allCandidates[0]?.acousticEvent ?? "",
+        denoiseEngine: denoiseEngineName,
+        vadEngine: "silero-diar",
+        asrEngine: "sensevoice-sep-stage1",
+        outputSnrDb: denoiseOutSnr,
+        detectedSpeakerCount: Math.max(1, detectedSpeakerCount),
+        acousticWake: allCandidates[0]?.acousticWake ?? null,
+        attention: rejectDecision("pragmatic-reject", "判定为第三人称提及或否定呼唤，跳过重型分离"),
+      });
+    }
+
+    // 纯环境噪声（雨声/风扇/空调白噪等，speechProb < 0.06 且仅有极短 ASR 幻觉）在 GTCRN 后即刻早退，避免无谓 DPDFNet4 + 双 VoxLock！
+    if (
+      mode !== "full" &&
+      !opts.bypassWakeWord &&
+      !hasStrongMusic &&
+      scene.speechProb < 0.06 &&
+      !anyStage1EmbeddedCmd &&
+      maxStage1Oww < 0.54 &&
+      cleanGlobalChars.length <= 5
+    ) {
+      if (soundSet.size === 0) soundSet.add("noise");
+      return buildReturn({
+        speechDetected: false,
+        text: "",
+        acousticEvent: "",
+        denoiseEngine: denoiseEngineName,
+        vadEngine: "silero",
+        asrEngine: "skipped-no-speech",
+        outputSnrDb: denoiseOutSnr,
+        detectedSpeakerCount: 0,
+        acousticWake: allCandidates[0]?.acousticWake ?? null,
+        attention: rejectDecision("acoustic", "低语音概率纯环境噪声，跳过重型分离"),
+      });
+    }
+
+    const isFluentCasualNegative =
+      mode !== "full" &&
+      !opts.bypassWakeWord &&
+      !anyStage1EmbeddedCmd &&
+      !anyStage1Garbled &&
+      maxStage1Oww < 0.59 &&
+      scene.crowdTvProb < 0.18 &&
+      globalText.length >= 6 &&
+      (isFluentStage1Chat ||
+        (!hasStrongMusic && !hasNoiseHint && turnSegments.length >= 2 && inputSnrDb >= 14));
+
+    if (isFluentCasualNegative) {
+      return buildReturn({
+        speechDetected: true,
+        text: globalText,
+        acousticEvent: allCandidates[0]?.acousticEvent ?? "",
+        denoiseEngine: denoiseEngineName,
+        vadEngine: "silero-diar",
+        asrEngine: "sensevoice-sep-stage1",
+        outputSnrDb: denoiseOutSnr,
+        detectedSpeakerCount: Math.max(1, detectedSpeakerCount),
+        acousticWake: allCandidates[0]?.acousticWake ?? null,
+        attention: rejectDecision("no-wake", "清晰非指令日常对话，无唤醒与设备控制意图"),
+      });
+    }
+
+    // Stage 2A（按需惰性升级 DPDFNet4）：仅当存在明显非音乐强噪（低 SNR 或噪声标签显著）且 GTCRN 未能恢复指令时运行
+    const hasRealAmbientNoise =
+      (scene.noiseProb >= 0.10 || inputSnrDb < 14 || (spectralFlatness >= 0.62 && inputSnrDb < 16)) &&
+      !(inputSnrDb >= 20 && scene.noiseProb < 0.08);
+    const shouldEscalateDpdfNet =
+      !hasStrongMusic &&
+      hasRealAmbientNoise &&
+      (mode === "full" ||
+        anyStage1Garbled ||
+        anyStage1EmbeddedCmd ||
+        maxStage1Oww >= 0.42 ||
+        inputSnrDb < 8);
+
+    if (shouldEscalateDpdfNet) {
+      const dpdf = this._engine.denoise(pcm16k, SR, "dpdfnet");
+      stageTimingsMs.dpdfnetMs = dpdf.durationMs;
+      denoiseOutSnr = dpdf.outputSnrDb;
+      denoiseEngineName = dpdf.engine;
+
+      const dpdfVad = this._extractTimedVadSegments(dpdf.samples, {
+        threshold: 0.34,
+        minSilenceDuration: 0.22,
+        padSec: 0.12,
+        mergeGapSec: 0.12,
+      });
+      for (const seg of dpdfVad.slice(0, 3)) {
+        const probeStartSec = Math.max(0, seg.startSec - 0.35);
+        const gtcrnSlice = slicePcmBySec(primaryCleanTrack, probeStartSec, seg.endSec, 0.06);
+        const zhDpdf = await this._engine.transcribeLocal(seg.samples, SR, voiceLang);
+        const cand = await this._evaluateTurnCandidate({
+          branch: "stage2_dpdfnet",
+          startSec: seg.startSec,
+          endSec: seg.endSec,
+          segPcm: seg.samples,
+          probePcm: slicePcmBySec(dpdf.samples, probeStartSec, seg.endSec, 0.06),
+          altSegPcm: gtcrnSlice,
+          zhRes: zhDpdf,
+          altZhRes: null,
+          opts,
+          scene,
+          globalTextContext: globalText,
+          isTseOrMusicSeparated: false,
+          speakerId: "speaker_0",
+          isNoisyOrMusic: true,
+        });
+        allCandidates.push(cand);
+      }
+
+      const postDpdfAccepted = allCandidates
+        .filter((c) => c.decision.accept)
+        .sort((a, b) => b.priority - a.priority);
+      if (postDpdfAccepted.length > 0 && postDpdfAccepted[0]!.priority >= 170) {
+        const best = postDpdfAccepted[0]!;
+        return buildReturn({
+          speechDetected: true,
+          text: best.rawText,
+          altText: best.altText,
+          acousticEvent: best.acousticEvent,
+          denoiseEngine: denoiseEngineName,
+          vadEngine: "silero",
+          asrEngine: `sensevoice-sep-${best.branch}`,
+          outputSnrDb: denoiseOutSnr,
+          detectedSpeakerCount: Math.max(1, detectedSpeakerCount),
+          acousticWake: best.acousticWake,
+          attention: best.decision,
+          bestSpeechPcm: best.segPcm,
+        });
+      }
+    }
+
+    // Stage 2B: 按需 VoxLock TSE 目标说话人提取（攻克多人重叠与电视/群聊人声掩蔽）
+    const maxOwwSoFar = allCandidates.reduce((mx, c) => Math.max(mx, c.acousticWake?.score ?? 0), 0);
+    const anyEmbeddedCmdNow = allCandidates.some(
+      (c) =>
+        extractEmbeddedSmartHomeCommand(c.rawText).length >= 2 ||
+        (c.altText ? extractEmbeddedSmartHomeCommand(c.altText).length >= 2 : false),
+    );
+    const suspectedHiddenOverlap =
+      scene.crowdTvProb >= 0.18 ||
+      anyStage1Garbled ||
+      maxOwwSoFar >= 0.49 ||
+      (turnSegments.length === 1 && totalVadDurSec >= 2.3 && maxOwwSoFar >= 0.44 && !hasStrongMusic);
+
+    const shouldRunVoxLock =
+      speakerRefs.length > 0 &&
+      !isThirdPersonMentionExtended(globalText) &&
+      (mode === "full" || anyEmbeddedCmdNow || suspectedHiddenOverlap);
+
+    if (shouldRunVoxLock) {
+      let orderedStage3Refs = speakerRefs;
+      if (speakerRefs.length >= 2) {
+        const spkPresence = this.checkRegisteredSpeakerPresence(primaryCleanTrack, speakerRefs, 0.30);
+        stageTimingsMs.ownerPresenceMs = (stageTimingsMs.ownerPresenceMs ?? 0) + spkPresence.durationMs;
+        if (spkPresence.scoresById.size > 0) {
+          const s0 = spkPresence.scoresById.get(speakerRefs[0]!.id) ?? -1;
+          const s1 = spkPresence.scoresById.get(speakerRefs[1]!.id) ?? -1;
+          // 优先保持主用户（owner）在第一位，仅当主用户明显未发声且次位成员占主导时换序
+          if (s0 < 0.35 && s1 > s0 + 0.12) {
+            orderedStage3Refs = [speakerRefs[1]!, speakerRefs[0]!, ...speakerRefs.slice(2)];
+          }
+        }
+      }
+      await runVoxLockCascade({
+        voxSource: pcm16k,
+        branchPrefix: "voxlock",
+        globalText,
+        orderedRefs: orderedStage3Refs,
+        anyEmbeddedCmdNow,
+        allowDualSpeakerTag: true,
+      });
     }
 
     // Stage 3: 最终择优输出
@@ -2302,6 +3004,7 @@ export class AudioSourceSeparator {
         detectedSpeakerCount: Math.max(1, detectedSpeakerCount),
         acousticWake: winner.acousticWake,
         attention: winner.decision,
+        bestSpeechPcm: winner.segPcm,
       });
     }
 
@@ -2326,5 +3029,6 @@ export class AudioSourceSeparator {
     this._diarizer = null;
     this._spleeter = null;
     this._voxlockCache.clear();
+    this._refEmbeddingCache.clear();
   }
 }

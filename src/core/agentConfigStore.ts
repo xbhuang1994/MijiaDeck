@@ -27,6 +27,7 @@ export type VoiceEngineMode = "auto" | "local" | "browser" | "whisper";
 export type NoiseSuppressionMode = "auto" | "neural" | "dpdfnet" | "voxlock" | "dsp" | "off";
 export type SourceSeparationMode = "auto" | "fast" | "full" | "off";
 export type VadEngineMode = "silero" | "adaptive";
+export type VadSensitivityMode = "aggressive" | "default" | "relaxed";
 export type VoiceprintPolicyMode = "off" | "tag" | "strict";
 export type AttentionMode = "smart" | "strict" | "off";
 export type SystemOneMode = "auto" | "on" | "off";
@@ -144,6 +145,7 @@ const VALID_VOICE_ENGINES = new Set<string>(["auto", "local", "browser", "whispe
 const VALID_NOISE_MODES = new Set<string>(["auto", "neural", "dpdfnet", "voxlock", "dsp", "off"]);
 const VALID_SOURCE_SEP_MODES = new Set<string>(["auto", "fast", "full", "off"]);
 const VALID_VAD_MODES = new Set<string>(["silero", "adaptive"]);
+const VALID_VAD_SENSITIVITIES = new Set<string>(["aggressive", "default", "relaxed"]);
 const VALID_VOICEPRINT_MODES = new Set<string>(["off", "tag", "strict"]);
 const VALID_ATTENTION_MODES = new Set<string>(["smart", "strict", "off"]);
 const VALID_SYSTEMONE_MODES = new Set<string>(["auto", "on", "off"]);
@@ -190,9 +192,12 @@ export interface AgentVoiceConfig {
   continuousListen: boolean;
   vadThreshold: number;
   vadSilenceMs: number;
+  vadSensitivity: VadSensitivityMode;
   noiseSuppressionMode: NoiseSuppressionMode;
   sourceSeparationMode: SourceSeparationMode;
   vadMode: VadEngineMode;
+  // 借鉴 Home Assistant prefer_local_intents：常规智能家居控制指令优先走零延迟本地规划引擎，免去云端大模型往返
+  preferLocalIntents: boolean;
   voiceprintMode: VoiceprintPolicyMode;
   voiceprintThreshold: number;
   attentionMode: AttentionMode;
@@ -250,9 +255,11 @@ export interface AgentConfigPatch {
   continuousListen?: unknown;
   vadThreshold?: unknown;
   vadSilenceMs?: unknown;
+  vadSensitivity?: unknown;
   noiseSuppressionMode?: unknown;
   sourceSeparationMode?: unknown;
   vadMode?: unknown;
+  preferLocalIntents?: unknown;
   voiceprintMode?: unknown;
   voiceprintThreshold?: unknown;
   attentionMode?: unknown;
@@ -295,10 +302,12 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     autoSpeakReply: true,
     continuousListen: true,
     vadThreshold: 0.018,
-    vadSilenceMs: 750,
+    vadSilenceMs: 600,
+    vadSensitivity: "default",
     noiseSuppressionMode: "auto",
     sourceSeparationMode: "auto",
     vadMode: "silero",
+    preferLocalIntents: true,
     voiceprintMode: "tag",
     voiceprintThreshold: 0.42,
     attentionMode: "smart",
@@ -454,6 +463,14 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     ? (vadModeRaw as VadEngineMode)
     : defaults.vadMode;
 
+  const vadSensRaw =
+    typeof raw.vadSensitivity === "string"
+      ? raw.vadSensitivity.trim().toLowerCase()
+      : defaults.vadSensitivity;
+  const vadSensitivity: VadSensitivityMode = VALID_VAD_SENSITIVITIES.has(vadSensRaw)
+    ? (vadSensRaw as VadSensitivityMode)
+    : defaults.vadSensitivity;
+
   const vpModeRaw =
     typeof raw.voiceprintMode === "string"
       ? raw.voiceprintMode.trim()
@@ -506,10 +523,15 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     continuousListen:
       typeof raw.continuousListen === "boolean" ? raw.continuousListen : defaults.continuousListen,
     vadThreshold: Number(clampNumber(raw.vadThreshold, 0.004, 0.3, defaults.vadThreshold).toFixed(4)),
-    vadSilenceMs: Math.round(clampNumber(raw.vadSilenceMs, 350, 5000, defaults.vadSilenceMs)),
+    vadSilenceMs: Math.round(clampNumber(raw.vadSilenceMs, 300, 5000, defaults.vadSilenceMs)),
+    vadSensitivity,
     noiseSuppressionMode,
     sourceSeparationMode,
     vadMode,
+    preferLocalIntents:
+      typeof raw.preferLocalIntents === "boolean"
+        ? raw.preferLocalIntents
+        : defaults.preferLocalIntents,
     voiceprintMode,
     voiceprintThreshold: Number(
       clampNumber(raw.voiceprintThreshold, 0.2, 0.85, defaults.voiceprintThreshold).toFixed(2),
@@ -794,6 +816,16 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
   }
   if (patch.vadSilenceMs !== undefined) {
     nextRaw.vadSilenceMs = patch.vadSilenceMs;
+  }
+  if (patch.vadSensitivity !== undefined) {
+    const vs = String(patch.vadSensitivity).trim().toLowerCase();
+    if (!VALID_VAD_SENSITIVITIES.has(vs)) {
+      throw new Error(`不支持的 VAD 灵敏度档位: ${vs}`);
+    }
+    nextRaw.vadSensitivity = vs;
+  }
+  if (patch.preferLocalIntents !== undefined) {
+    nextRaw.preferLocalIntents = Boolean(patch.preferLocalIntents);
   }
   if (patch.noiseSuppressionMode !== undefined) {
     const nm = String(patch.noiseSuppressionMode).trim();

@@ -55,9 +55,67 @@ export interface LocalPlannerDeps {
 
 export type LocalPlannerContextProvider = LocalPlannerDeps;
 
-interface PlannedCall {
+export interface PlannedCall {
   name: string;
   arguments: JsonObject;
+}
+
+const SMART_HOME_FAST_ENTITY_RE =
+  /(?:设备|吸顶灯|吊灯|主灯|射灯|灯带|台灯|照明|电灯|灯光|灯|空调|风扇|窗帘|插座|开关|音箱|音响|小爱|电视|净化器|加湿器|除湿|扫地|摄像头|摄像机|监控|温湿度|温度|湿度|传感|喂食|出粮|场景|模式|房间|客厅|卧室|主卧|次卧|餐厅|书房|厨房|阳台|走廊|玄关|卫生间|浴室|家里|全屋|全部|所有|音量|声音|亮度|色温|音乐|歌曲|light|lamp|speaker|music|volume|device|room)/i;
+
+/**
+ * 借鉴 Home Assistant `assist_pipeline` `prefer_local_intents` 设计：
+ * 在调用云端大模型前先以零延迟判断该指令是否可由确定性本地智能家居规则完整覆盖。
+ * - 若所有子句均可确定性执行（开关、调光、音箱控制、喂食、场景、设备查询等），直接返回工具调用列表；
+ * - 若包含任何非确定性/口语隐式/开放式问答子句，返回 null 交由云端大模型处理。
+ */
+export function planDeterministicLocalCalls(
+  userText: string,
+  deps: Pick<LocalPlannerDeps, "getDevices" | "getScenes">,
+  recentTarget: string | null = null,
+): PlannedCall[] | null {
+  const trimmed = userText.trim();
+  if (!trimmed || trimmed.length > 48 || isGreetingOrHelp(trimmed)) {
+    return null;
+  }
+
+  const devices = deps.getDevices();
+  const scenes = deps.getScenes();
+  const clauses = splitCompoundClauses(trimmed);
+  if (clauses.length === 0 || clauses.length > 3) {
+    return null;
+  }
+
+  const planned: PlannedCall[] = [];
+  for (const clause of clauses) {
+    const call = planSingleClause(clause, devices, scenes, recentTarget);
+    if (!call) {
+      return null;
+    }
+    // 防止开放式中文问句（如“今天天气怎么样”）误落入 list_devices 或未知 target 的 set_device_power
+    if (call.name === "list_devices" && !SMART_HOME_FAST_ENTITY_RE.test(clause)) {
+      return null;
+    }
+    if (call.name === "set_device_power") {
+      const hasKnownRoom = Boolean(call.arguments.room);
+      const hasKnownCategory = Boolean(call.arguments.category);
+      const targetStr = typeof call.arguments.target === "string" ? call.arguments.target : "";
+      const matchedKnownDevice =
+        Boolean(targetStr) &&
+        (targetStr === recentTarget ||
+          devices.some((d) => d.did === targetStr || d.name === targetStr));
+      if (!matchedKnownDevice && !hasKnownRoom && !hasKnownCategory && !SMART_HOME_FAST_ENTITY_RE.test(clause)) {
+        return null;
+      }
+    }
+    planned.push(call);
+  }
+
+  return planned.length > 0 ? planned : null;
+}
+
+export function findRecentDeviceFromMessages(messages: readonly Message[]): string | null {
+  return findRecentDeviceFromTranscript(messages);
 }
 
 const ZERO_USAGE: Usage = {

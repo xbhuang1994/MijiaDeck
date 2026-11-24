@@ -8,6 +8,7 @@
  * 以确保 bgMean 背景均值更新后全部原型保持一致）、通用语音背景均值与硬负样本。
  */
 
+import { statSync } from "node:fs";
 import { dataFile, readJson, writeJson } from "../core/jsonStore.ts";
 
 const FILENAME = "wakeword_prototypes.json";
@@ -203,28 +204,82 @@ function enforceWordSourceCap(
   );
 }
 
+interface WakeWordStoreCache {
+  filePath: string;
+  mtimeMs: number;
+  size: number;
+  data: WakeWordPrototypeStoreData;
+}
+
+let cachedWakeWordStore: WakeWordStoreCache | null = null;
+
+function statFileKey(filePath: string): { mtimeMs: number; size: number } | null {
+  try {
+    const st = statSync(filePath);
+    return { mtimeMs: st.mtimeMs, size: st.size };
+  } catch {
+    return null;
+  }
+}
+
 /**
- * 读取本地唤醒词原型库。文件缺失或损坏时安全返回空库。
+ * 读取本地唤醒词原型库（带路径+mtime+size 内存缓存，避免高频 scoreClip 重复读取 500KB+ JSON）。
+ * 文件缺失或损坏时安全返回空库。
  */
 export function loadWakeWordStore(): WakeWordPrototypeStoreData {
+  const filePath = dataFile(FILENAME);
+  const st = statFileKey(filePath);
+  if (!st) {
+    cachedWakeWordStore = null;
+    return emptyStore();
+  }
+  if (
+    cachedWakeWordStore &&
+    cachedWakeWordStore.filePath === filePath &&
+    cachedWakeWordStore.mtimeMs === st.mtimeMs &&
+    cachedWakeWordStore.size === st.size
+  ) {
+    const d = cachedWakeWordStore.data;
+    return {
+      ...d,
+      bgMean: d.bgMean,
+      hardNegatives: d.hardNegatives,
+      prototypes: [...d.prototypes],
+    };
+  }
   const raw = readJson<Record<string, unknown>>(
-    dataFile(FILENAME),
+    filePath,
     emptyStore() as unknown as Record<string, unknown>,
   );
-  return normalizeStore(raw);
+  const normalized = normalizeStore(raw);
+  cachedWakeWordStore = {
+    filePath,
+    mtimeMs: st.mtimeMs,
+    size: st.size,
+    data: normalized,
+  };
+  return {
+    ...normalized,
+    prototypes: [...normalized.prototypes],
+  };
 }
 
 /**
  * 原子保存本地唤醒词原型库。
  */
 export function saveWakeWordStore(store: WakeWordPrototypeStoreData): void {
+  const filePath = dataFile(FILENAME);
   const normalized = normalizeStore({
     ...store,
     version: 1,
     embeddingDim: WAKEWORD_EMBEDDING_DIM,
     updatedAt: Date.now(),
   });
-  writeJson(dataFile(FILENAME), normalized as unknown as Record<string, unknown>);
+  writeJson(filePath, normalized as unknown as Record<string, unknown>);
+  const st = statFileKey(filePath);
+  cachedWakeWordStore = st
+    ? { filePath, mtimeMs: st.mtimeMs, size: st.size, data: normalized }
+    : null;
 }
 
 /**
