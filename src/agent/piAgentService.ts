@@ -19,6 +19,7 @@ import {
 } from "@earendil-works/pi-agent-core";
 import {
   createAssistantMessageEventStream,
+  normalizeContext,
   type Api,
   type AssistantMessage,
   type Model,
@@ -80,17 +81,27 @@ export interface PiAgentSnapshot {
   lastError: string | null;
 }
 
+export interface VoicePromptMeta {
+  speakerName?: string | null;
+  speakerRole?: "owner" | "member" | null;
+  speakerScore?: number;
+  wakeWord?: string | null;
+  attentionReason?: string;
+}
+
 export interface PiAgentRunResult {
   ok: boolean;
   entryId: string;
   reply: string;
   toolCalls: AgentToolCallRecord[];
+  streamedSpeakChunks?: boolean;
   error?: string;
 }
 
 export type PiAgentEvents = {
   stateChanged: [PiAgentSnapshot];
   streamEvent: [Record<string, unknown>];
+  speakChunk: [{ entryId: string; text: string; final: boolean }];
   replyFinished: [{ entryId: string; text: string; source: "text" | "voice"; ok: boolean }];
 };
 
@@ -244,6 +255,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   private _timeline: AgentTimelineEntry[] = [];
   private _activeAssistantEntry: AgentTimelineEntry | null = null;
   private _activeSource: "text" | "voice" = "text";
+  private _activeVoiceMeta: VoicePromptMeta | null = null;
+  private _speakCursor = 0;
+  private _emittedSpeakChunks = false;
   private _lastError: string | null = null;
   private _running = false;
   private _entrySeq = 0;
@@ -313,6 +327,20 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             .join("\n");
 
     const extra = this._config.systemPromptExtra.trim();
+    const vm = this._activeVoiceMeta;
+    const voiceContextLine =
+      this._activeSource === "voice"
+        ? [
+            "当前为实时语音对话模式：",
+            vm?.speakerName
+              ? `说话人声纹已识别为「${vm.speakerName}」${vm.speakerRole === "owner" ? "（主人）" : ""}。`
+              : "",
+            "回复务必极简口语化（1 句优先，避免 Markdown、符号列表和长段落），以获得最低语音播报延迟。",
+            "如果发现语句其实是环境旁白或未指向你，不要调用任何设备工具，简短忽略即可。",
+          ]
+            .filter(Boolean)
+            .join("")
+        : "";
     return [
       "你是 MijiaDeck 内置的智能家居控制助手（Pi Agent），专门负责响应用户的语音或文字指令，并通过工具真实地查询和控制用户的米家智能设备与手动场景。",
       "执行原则：",
@@ -321,6 +349,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       "3. 支持一次响应中包含多个工具调用（例如同时调节客厅灯亮度并关闭餐厅主灯）。",
       "4. 完成工具调用后，用简短、自然、适合语音播报的中文回复（通常 1~2 句话），直接告知执行结果或读取到的数据，不要输出冗长代码块或表格。",
       "5. 若设备离线、未登录或找不到匹配设备，诚实告知原因。",
+      voiceContextLine ? `\n${voiceContextLine}` : "",
       "",
       `当前家庭：${mw.currentHome || "全部"} | 房间列表：${mw.tabNames.join("、") || "全屋"}`,
       "当前设备清单：",
@@ -443,6 +472,10 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             delta: ev.delta,
             text: entry.text,
           });
+          // 流式分句语音播报：遇到句末标点立即派发，大幅降低首字播报延迟（TTFA）
+          if (this._activeSource === "voice" && this._config.autoSpeakReply) {
+            this._flushReadySpeakSentences(entry, false);
+          }
         }
         break;
       }
@@ -533,6 +566,112 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     }
   }
 
+  private _flushReadySpeakSentences(entry: AgentTimelineEntry, final: boolean): void {
+    const remaining = entry.text.slice(this._speakCursor);
+    if (!remaining.trim()) return;
+
+    if (!final) {
+      const m = /^([\s\S]*?[。！？!?\n])/.exec(remaining);
+      if (!m) return;
+      const chunk = m[1]!.trim();
+      this._speakCursor += m[1]!.length;
+      if (chunk.length >= 2) {
+        this._emittedSpeakChunks = true;
+        this.emit("speakChunk", { entryId: entry.id, text: chunk, final: false });
+      }
+      return;
+    }
+
+    const tail = remaining.trim();
+    this._speakCursor = entry.text.length;
+    if (tail) {
+      this._emittedSpeakChunks = true;
+      this.emit("speakChunk", { entryId: entry.id, text: tail, final: true });
+    }
+  }
+
+  /**
+   * 返回近期对话轮次，供唤醒词注意力门控判断当前是否处于与助手的连续对话中。
+   */
+  recentConversationTurns(limit = 6): Array<{ role: "user" | "assistant"; text: string; timestamp: number }> {
+    return this._timeline
+      .filter((e) => e.status === "done" && e.text.trim().length > 0)
+      .slice(-limit)
+      .map((e) => ({
+        role: e.role,
+        text: e.text,
+        timestamp: e.timestamp,
+      }));
+  }
+
+  /**
+   * 轻量零工具 LLM 注意力思考调用（不污染主对话历史），供唤醒词注意力门控调用。
+   */
+  async evaluateAttention(promptText: string, timeoutMs = 7000): Promise<string | null> {
+    if (this._config.provider === "local" && !this._customStreamFn) {
+      return null;
+    }
+    const model = this._customModel ?? buildModelForConfig(this._config);
+    const apiKey = resolveEffectiveApiKey(this._config);
+    const localUrl = isLocalEndpointUrl(model.baseUrl);
+    const effectiveKey = apiKey || (localUrl ? "ollama" : undefined);
+    if (!effectiveKey && !this._customStreamFn) {
+      return null;
+    }
+
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    (timer as { unref?: () => void }).unref?.();
+
+    try {
+      const context = normalizeContext({
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: promptText }],
+            timestamp: Date.now(),
+          },
+        ],
+      });
+      const streamOpts = {
+        apiKey: effectiveKey,
+        signal: ac.signal,
+        maxTokens: 600,
+        temperature: 0,
+      };
+      const stream = this._customStreamFn
+        ? await this._customStreamFn(model, context, streamOpts)
+        : model.api === "anthropic-messages"
+          ? this._anthropicApi.streamSimple(model, context, streamOpts)
+          : model.api === "google-generative-ai"
+            ? this._googleApi.streamSimple(model, context, streamOpts)
+            : model.api === "openai-responses"
+              ? this._openaiResponses.streamSimple(model, context, streamOpts)
+              : this._openaiCompletions.streamSimple(model, context, streamOpts);
+
+      let outText = "";
+      for await (const ev of stream) {
+        if (ev.type === "text_delta" && ev.delta) {
+          outText += ev.delta;
+        } else if (ev.type === "done" && ev.message) {
+          const blocks = ev.message.content
+            .filter((b): b is TextContent => b.type === "text")
+            .map((b) => b.text)
+            .join("")
+            .trim();
+          if (blocks) outText = blocks;
+        } else if (ev.type === "error") {
+          return null;
+        }
+      }
+      return outText.trim() || null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   reconfigure(nextConfig: AgentVoiceConfig): void {
     const providerOrModelChanged =
       nextConfig.provider !== this._config.provider ||
@@ -548,7 +687,10 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     this.emit("stateChanged", this.snapshot());
   }
 
-  async prompt(rawText: string, options: { source?: "text" | "voice" } = {}): Promise<PiAgentRunResult> {
+  async prompt(
+    rawText: string,
+    options: { source?: "text" | "voice"; voiceMeta?: VoicePromptMeta } = {},
+  ): Promise<PiAgentRunResult> {
     const text = rawText.trim();
     if (!text) {
       return { ok: false, entryId: "", reply: "", toolCalls: [], error: "指令内容不能为空" };
@@ -561,6 +703,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
 
     const source = options.source ?? "text";
     this._activeSource = source;
+    this._activeVoiceMeta = options.voiceMeta ?? null;
+    this._speakCursor = 0;
+    this._emittedSpeakChunks = false;
     this._running = true;
     this._lastError = null;
 
@@ -611,6 +756,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           assistantEntry.text = "已完成处理。";
         }
       }
+      if (this._activeSource === "voice" && this._config.autoSpeakReply && this._emittedSpeakChunks) {
+        this._flushReadySpeakSentences(assistantEntry, true);
+      }
     } catch (err) {
       const cleaned = redactSecretFromText(err instanceof Error ? err.message : String(err));
       assistantEntry.status = "error";
@@ -618,8 +766,10 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       assistantEntry.text = assistantEntry.error;
       this._lastError = assistantEntry.error;
     } finally {
+      const streamedChunks = this._emittedSpeakChunks;
       this._running = false;
       this._activeAssistantEntry = null;
+      this._activeVoiceMeta = null;
       this.emit("stateChanged", this.snapshot());
       this.emit("replyFinished", {
         entryId: assistantEntry.id,
@@ -627,6 +777,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         source: this._activeSource,
         ok: assistantEntry.status === "done",
       });
+      this._emittedSpeakChunks = streamedChunks;
     }
 
     return {
@@ -634,6 +785,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       entryId: assistantEntry.id,
       reply: assistantEntry.text,
       toolCalls: assistantEntry.toolCalls.map((t) => ({ ...t })),
+      streamedSpeakChunks: this._emittedSpeakChunks,
       ...(assistantEntry.error ? { error: assistantEntry.error } : {}),
     };
   }

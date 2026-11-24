@@ -11,7 +11,7 @@
     "dev": "bun --watch src/index.ts --demo",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "build": "bun build src/index.ts --outdir dist --target bun && bun build src/web/app.ts --outdir dist/web --target browser",
+    "build": "bun build src/index.ts --outdir dist --target bun --external sherpa-onnx-node && bun build src/web/app.ts --outdir dist/web --target browser",
     "check:startup": "bun run src/index.ts --demo --check-startup"
   },
   "devDependencies": {
@@ -21,6 +21,7 @@
   "dependencies": {
     "@earendil-works/pi-agent-core": "^1.6.0",
     "@earendil-works/pi-ai": "^1.6.0",
-    "@earendil-works/pi-schema": "^1.6.0"
+    "@earendil-works/pi-schema": "^1.6.0",
+    "sherpa-onnx-node": "^2.0.3"
   }
 }

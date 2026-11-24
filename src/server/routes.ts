@@ -10,7 +10,12 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { fetchProviderModels } from "../agent/modelDiscovery.ts";
 import type { PiAgentService } from "../agent/piAgentService.ts";
-import type { VoiceListenerController, VoiceListenMode } from "../agent/voiceListenerController.ts";
+import type {
+  VoiceListenerController,
+  VoiceListenMode,
+  VoiceRuntimeEngine,
+} from "../agent/voiceListenerController.ts";
+import { listPublicVoiceprints } from "../agent/voiceprintStore.ts";
 import type { AppMode } from "../cli/startup.ts";
 import * as agentConfigStoreModule from "../core/agentConfigStore.ts";
 import { APP_NAME, APP_VERSION, projectRoot } from "../core/appMeta.ts";
@@ -1876,11 +1881,11 @@ export function createRequestHandler(
         }
         const body = await readJsonBody(req);
         const validModes = new Set(["idle", "listening", "awake", "processing", "speaking", "error"]);
-        const validEngines = new Set(["browser", "whisper", "manual"]);
+        const validEngines = new Set(["local", "browser", "whisper", "manual"]);
         const patch: {
           active?: boolean;
           mode?: VoiceListenMode;
-          engine?: "browser" | "whisper" | "manual";
+          engine?: VoiceRuntimeEngine;
           interimTranscript?: string;
           error?: string | null;
         } = {};
@@ -1889,7 +1894,7 @@ export function createRequestHandler(
           patch.mode = body.mode as VoiceListenMode;
         }
         if (typeof body.engine === "string" && validEngines.has(body.engine)) {
-          patch.engine = body.engine as "browser" | "whisper" | "manual";
+          patch.engine = body.engine as VoiceRuntimeEngine;
         }
         if (typeof body.interimTranscript === "string") {
           patch.interimTranscript = body.interimTranscript;
@@ -1909,8 +1914,10 @@ export function createRequestHandler(
         const text = typeof body.text === "string" ? body.text : "";
         const isFinal = body.isFinal !== false;
         const bypassWakeWord = body.bypassWakeWord === true;
-        const engine =
-          body.engine === "whisper" || body.engine === "manual" ? body.engine : "browser";
+        const engine: VoiceRuntimeEngine =
+          body.engine === "local" || body.engine === "whisper" || body.engine === "manual"
+            ? body.engine
+            : "browser";
         const result = await runtime.voiceListener.handleTranscript(text, {
           isFinal,
           bypassWakeWord,
@@ -1922,7 +1929,10 @@ export function createRequestHandler(
         });
       }
 
-      if (method === "POST" && pathname === "/api/voice-listen/transcribe") {
+      if (
+        method === "POST" &&
+        (pathname === "/api/voice-listen/transcribe" || pathname === "/api/voice/audio")
+      ) {
         if (!runtime.voiceListener) {
           throw new HttpError(503, "语音监听服务未初始化");
         }
@@ -1938,35 +1948,134 @@ export function createRequestHandler(
         const lang = typeof form.get("lang") === "string" ? String(form.get("lang")) : undefined;
         const bypassWakeWord = String(form.get("bypassWakeWord") ?? "").toLowerCase() === "true";
         const autoDispatch = String(form.get("autoDispatch") ?? "true").toLowerCase() !== "false";
-        const filename = audio instanceof File && audio.name ? audio.name : "voice.webm";
+        const engineRaw = typeof form.get("engine") === "string" ? String(form.get("engine")).trim() : "";
+        const preferredEngine =
+          engineRaw === "local" || engineRaw === "whisper" || engineRaw === "auto"
+            ? engineRaw
+            : undefined;
+        const filename = audio instanceof File && audio.name ? audio.name : "voice.wav";
 
-        let transcript: string;
         try {
-          transcript = await runtime.voiceListener.transcribeAudio(audio, { filename, lang });
+          const result = await runtime.voiceListener.processAudioUpload(audio, {
+            filename,
+            lang,
+            bypassWakeWord,
+            autoDispatch,
+            preferredEngine,
+          });
+          return jsonResponse({
+            ...result,
+            agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
+          });
         } catch (err) {
           throw new HttpError(400, sanitizeErrorMessage(err));
         }
+      }
 
-        if (!autoDispatch) {
+      if (method === "GET" && pathname === "/api/voice/pipeline/status") {
+        if (!runtime.voiceListener) {
+          throw new HttpError(503, "语音监听服务未初始化");
+        }
+        const snap = runtime.voiceListener.snapshot();
+        return jsonResponse({
+          ok: true,
+          localEngine: snap.localEngine,
+          voiceprints: snap.voiceprints,
+          lastMetrics: snap.lastMetrics,
+          voice: snap,
+        });
+      }
+
+      if (method === "POST" && pathname === "/api/voice/pipeline/download") {
+        if (!runtime.voiceListener) {
+          throw new HttpError(503, "语音监听服务未初始化");
+        }
+        const status = await runtime.voiceListener.localEngine.downloadMissingModels();
+        const voice = runtime.voiceListener.snapshot();
+        emitBroadcast(runtime);
+        return jsonResponse({
+          ok: true,
+          localEngine: status,
+          voice,
+        });
+      }
+
+      if (method === "GET" && pathname === "/api/voiceprints") {
+        return jsonResponse({
+          ok: true,
+          profiles: listPublicVoiceprints(),
+        });
+      }
+
+      if (method === "POST" && pathname === "/api/voiceprints/enroll") {
+        if (!runtime.voiceListener) {
+          throw new HttpError(503, "语音监听服务未初始化");
+        }
+        const contentType = req.headers.get("content-type") ?? "";
+        if (!contentType.includes("multipart/form-data")) {
+          throw new HttpError(400, "请使用 multipart/form-data 上传声纹 WAV 音频");
+        }
+        const form = await req.formData();
+        const audio = form.get("audio") ?? form.get("file");
+        if (!(audio instanceof Blob) || audio.size === 0) {
+          throw new HttpError(400, "缺少有效的声纹录音数据 audio");
+        }
+        const name = typeof form.get("name") === "string" ? String(form.get("name")).trim() : "";
+        const role = form.get("role") === "member" ? "member" : "owner";
+        try {
+          const enrolled = await runtime.voiceListener.enrollVoiceprintFromAudio(audio, { name, role });
+          emitBroadcast(runtime);
           return jsonResponse({
             ok: true,
-            text: transcript,
-            matched: false,
-            wokeOnly: false,
-            command: "",
-            voiceState: runtime.voiceListener.snapshot(),
+            ...enrolled,
+            profiles: listPublicVoiceprints(),
+            voice: runtime.voiceListener.snapshot(),
           });
+        } catch (err) {
+          throw new HttpError(400, sanitizeErrorMessage(err));
         }
+      }
 
-        const dispatched = await runtime.voiceListener.handleTranscript(transcript, {
-          isFinal: true,
-          bypassWakeWord,
-          engine: "whisper",
-        });
+      if (method === "POST" && pathname === "/api/voiceprints/verify") {
+        if (!runtime.voiceListener) {
+          throw new HttpError(503, "语音监听服务未初始化");
+        }
+        const contentType = req.headers.get("content-type") ?? "";
+        if (!contentType.includes("multipart/form-data")) {
+          throw new HttpError(400, "请使用 multipart/form-data 上传待验证 WAV 音频");
+        }
+        const form = await req.formData();
+        const audio = form.get("audio") ?? form.get("file");
+        if (!(audio instanceof Blob) || audio.size === 0) {
+          throw new HttpError(400, "缺少有效的音频数据 audio");
+        }
+        try {
+          const verified = await runtime.voiceListener.verifyVoiceprintFromAudio(audio);
+          return jsonResponse({
+            ok: true,
+            ...verified,
+          });
+        } catch (err) {
+          throw new HttpError(400, sanitizeErrorMessage(err));
+        }
+      }
+
+      const vpDeleteMatch = /^\/api\/voiceprints\/([^/]+)$/.exec(pathname);
+      if (method === "DELETE" && vpDeleteMatch) {
+        if (!runtime.voiceListener) {
+          throw new HttpError(503, "语音监听服务未初始化");
+        }
+        const id = decodeSegment(vpDeleteMatch[1]!);
+        const deleted = runtime.voiceListener.removeVoiceprint(id);
+        if (!deleted) {
+          throw new HttpError(404, "未找到指定声纹档案");
+        }
+        emitBroadcast(runtime);
         return jsonResponse({
-          ...dispatched,
-          text: transcript,
-          agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
+          ok: true,
+          deleted: true,
+          profiles: listPublicVoiceprints(),
+          voice: runtime.voiceListener.snapshot(),
         });
       }
 

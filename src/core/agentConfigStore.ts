@@ -23,7 +23,11 @@ export type AgentProviderMode =
   | "openrouter"
   | "openai-compatible";
 
-export type VoiceEngineMode = "auto" | "browser" | "whisper";
+export type VoiceEngineMode = "auto" | "local" | "browser" | "whisper";
+export type NoiseSuppressionMode = "auto" | "neural" | "dsp" | "off";
+export type VadEngineMode = "silero" | "adaptive";
+export type VoiceprintPolicyMode = "off" | "tag" | "strict";
+export type AttentionMode = "smart" | "strict" | "off";
 export type CustomApiType =
   | "openai-completions"
   | "openai-responses"
@@ -133,7 +137,11 @@ export const PROVIDER_PRESETS: ReadonlyArray<ProviderPreset> = [
 ];
 
 const VALID_PROVIDERS = new Set<string>(PROVIDER_PRESETS.map((p) => p.id));
-const VALID_VOICE_ENGINES = new Set<string>(["auto", "browser", "whisper"]);
+const VALID_VOICE_ENGINES = new Set<string>(["auto", "local", "browser", "whisper"]);
+const VALID_NOISE_MODES = new Set<string>(["auto", "neural", "dsp", "off"]);
+const VALID_VAD_MODES = new Set<string>(["silero", "adaptive"]);
+const VALID_VOICEPRINT_MODES = new Set<string>(["off", "tag", "strict"]);
+const VALID_ATTENTION_MODES = new Set<string>(["smart", "strict", "off"]);
 const VALID_CUSTOM_APIS = new Set<string>([
   "openai-completions",
   "openai-responses",
@@ -163,6 +171,13 @@ export interface AgentVoiceConfig {
   continuousListen: boolean;
   vadThreshold: number;
   vadSilenceMs: number;
+  noiseSuppressionMode: NoiseSuppressionMode;
+  vadMode: VadEngineMode;
+  voiceprintMode: VoiceprintPolicyMode;
+  voiceprintThreshold: number;
+  attentionMode: AttentionMode;
+  conversationWindowSec: number;
+  bargeInEnabled: boolean;
   sttBaseUrl: string;
   sttApiKey: string;
   sttModel: string;
@@ -198,6 +213,13 @@ export interface AgentConfigPatch {
   continuousListen?: unknown;
   vadThreshold?: unknown;
   vadSilenceMs?: unknown;
+  noiseSuppressionMode?: unknown;
+  vadMode?: unknown;
+  voiceprintMode?: unknown;
+  voiceprintThreshold?: unknown;
+  attentionMode?: unknown;
+  conversationWindowSec?: unknown;
+  bargeInEnabled?: unknown;
   sttBaseUrl?: unknown;
   sttApiKey?: unknown;
   clearSttApiKey?: unknown;
@@ -220,11 +242,18 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     voiceLang: "zh-CN",
     wakeWordEnabled: true,
     wakeWords: [...DEFAULT_WAKE_WORDS],
-    wakeWindowSec: 10,
+    wakeWindowSec: 12,
     autoSpeakReply: true,
     continuousListen: true,
-    vadThreshold: 0.025,
-    vadSilenceMs: 1200,
+    vadThreshold: 0.018,
+    vadSilenceMs: 750,
+    noiseSuppressionMode: "auto",
+    vadMode: "silero",
+    voiceprintMode: "tag",
+    voiceprintThreshold: 0.42,
+    attentionMode: "smart",
+    conversationWindowSec: 18,
+    bargeInEnabled: true,
     sttBaseUrl: "",
     sttApiKey: "",
     sttModel: "whisper-1",
@@ -321,6 +350,36 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     ? (customApiRaw as CustomApiType)
     : defaults.customApiType;
 
+  const noiseRaw =
+    typeof raw.noiseSuppressionMode === "string"
+      ? raw.noiseSuppressionMode.trim()
+      : defaults.noiseSuppressionMode;
+  const noiseSuppressionMode: NoiseSuppressionMode = VALID_NOISE_MODES.has(noiseRaw)
+    ? (noiseRaw as NoiseSuppressionMode)
+    : defaults.noiseSuppressionMode;
+
+  const vadModeRaw =
+    typeof raw.vadMode === "string" ? raw.vadMode.trim() : defaults.vadMode;
+  const vadMode: VadEngineMode = VALID_VAD_MODES.has(vadModeRaw)
+    ? (vadModeRaw as VadEngineMode)
+    : defaults.vadMode;
+
+  const vpModeRaw =
+    typeof raw.voiceprintMode === "string"
+      ? raw.voiceprintMode.trim()
+      : defaults.voiceprintMode;
+  const voiceprintMode: VoiceprintPolicyMode = VALID_VOICEPRINT_MODES.has(vpModeRaw)
+    ? (vpModeRaw as VoiceprintPolicyMode)
+    : defaults.voiceprintMode;
+
+  const attModeRaw =
+    typeof raw.attentionMode === "string"
+      ? raw.attentionMode.trim()
+      : defaults.attentionMode;
+  const attentionMode: AttentionMode = VALID_ATTENTION_MODES.has(attModeRaw)
+    ? (attModeRaw as AttentionMode)
+    : defaults.attentionMode;
+
   return {
     version: AGENT_CONFIG_VERSION,
     provider,
@@ -344,8 +403,20 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
       typeof raw.autoSpeakReply === "boolean" ? raw.autoSpeakReply : defaults.autoSpeakReply,
     continuousListen:
       typeof raw.continuousListen === "boolean" ? raw.continuousListen : defaults.continuousListen,
-    vadThreshold: Number(clampNumber(raw.vadThreshold, 0.005, 0.3, defaults.vadThreshold).toFixed(4)),
-    vadSilenceMs: Math.round(clampNumber(raw.vadSilenceMs, 400, 5000, defaults.vadSilenceMs)),
+    vadThreshold: Number(clampNumber(raw.vadThreshold, 0.004, 0.3, defaults.vadThreshold).toFixed(4)),
+    vadSilenceMs: Math.round(clampNumber(raw.vadSilenceMs, 350, 5000, defaults.vadSilenceMs)),
+    noiseSuppressionMode,
+    vadMode,
+    voiceprintMode,
+    voiceprintThreshold: Number(
+      clampNumber(raw.voiceprintThreshold, 0.2, 0.85, defaults.voiceprintThreshold).toFixed(2),
+    ),
+    attentionMode,
+    conversationWindowSec: Math.round(
+      clampNumber(raw.conversationWindowSec, 0, 60, defaults.conversationWindowSec),
+    ),
+    bargeInEnabled:
+      typeof raw.bargeInEnabled === "boolean" ? raw.bargeInEnabled : defaults.bargeInEnabled,
     sttBaseUrl: normalizeUrl(raw.sttBaseUrl),
     sttApiKey: typeof raw.sttApiKey === "string" ? raw.sttApiKey.trim() : "",
     sttModel:
@@ -538,6 +609,43 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
   }
   if (patch.vadSilenceMs !== undefined) {
     nextRaw.vadSilenceMs = patch.vadSilenceMs;
+  }
+  if (patch.noiseSuppressionMode !== undefined) {
+    const nm = String(patch.noiseSuppressionMode).trim();
+    if (!VALID_NOISE_MODES.has(nm)) {
+      throw new Error(`不支持的环境降噪模式: ${nm}`);
+    }
+    nextRaw.noiseSuppressionMode = nm;
+  }
+  if (patch.vadMode !== undefined) {
+    const vm = String(patch.vadMode).trim();
+    if (!VALID_VAD_MODES.has(vm)) {
+      throw new Error(`不支持的 VAD 模式: ${vm}`);
+    }
+    nextRaw.vadMode = vm;
+  }
+  if (patch.voiceprintMode !== undefined) {
+    const vpm = String(patch.voiceprintMode).trim();
+    if (!VALID_VOICEPRINT_MODES.has(vpm)) {
+      throw new Error(`不支持的声纹识别模式: ${vpm}`);
+    }
+    nextRaw.voiceprintMode = vpm;
+  }
+  if (patch.voiceprintThreshold !== undefined) {
+    nextRaw.voiceprintThreshold = patch.voiceprintThreshold;
+  }
+  if (patch.attentionMode !== undefined) {
+    const am = String(patch.attentionMode).trim();
+    if (!VALID_ATTENTION_MODES.has(am)) {
+      throw new Error(`不支持的唤醒词注意力模式: ${am}`);
+    }
+    nextRaw.attentionMode = am;
+  }
+  if (patch.conversationWindowSec !== undefined) {
+    nextRaw.conversationWindowSec = patch.conversationWindowSec;
+  }
+  if (patch.bargeInEnabled !== undefined) {
+    nextRaw.bargeInEnabled = Boolean(patch.bargeInEnabled);
   }
 
   if (patch.sttBaseUrl !== undefined) {

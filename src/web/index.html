@@ -246,6 +246,7 @@
         <button type="button" id="pi-voice-oneshot-btn" class="secondary-button btn-compact" title="免唤醒单次语音输入（快捷键 Alt+V）">单次说话</button>
         <button type="button" id="pi-voice-wake-toggle-btn" class="pi-wake-pill active" title="点击切换唤醒词模式或免唤醒直达模式">唤醒词：小派</button>
       </div>
+      <div id="pi-voice-telemetry" class="pi-voice-telemetry" hidden></div>
     </div>
 
     <!-- Conversation & Tool Execution Timeline -->
@@ -650,36 +651,76 @@
             <textarea id="set-agent-system-prompt" class="agent-textarea" rows="2" placeholder="可选：补充个性化家居控制习惯…" aria-label="Pi Agent 附加指令"></textarea>
           </div>
 
-          <div class="setting-section-title">语音监听设置</div>
+          <div class="setting-section-title">语音监听、环境降噪、声纹与注意力设置</div>
+
+          <div class="setting-card setting-card-wrap" id="voice-pipeline-status-card">
+            <div class="setting-info">
+              <div class="setting-label">本地离线语音 AI 引擎状态（Sherpa-ONNX）</div>
+              <div class="setting-desc" id="voice-pipeline-status-desc">本地离线运行 GTCRN 神经降噪、Silero VAD、3D-Speaker 中文声纹与 SenseVoice 多语种识别，国内无需联网即可稳定识别</div>
+            </div>
+            <div class="voice-status-row">
+              <div class="voice-status-badges" id="voice-model-badges">
+                <span class="voice-badge-pill" id="badge-model-gtcrn">GTCRN 降噪</span>
+                <span class="voice-badge-pill" id="badge-model-vad">Silero VAD</span>
+                <span class="voice-badge-pill" id="badge-model-vp">3D-Speaker 声纹</span>
+                <span class="voice-badge-pill" id="badge-model-asr">SenseVoice 识别</span>
+              </div>
+              <button type="button" id="voice-download-models-btn" class="secondary-button btn-compact" hidden>一键补齐模型</button>
+            </div>
+          </div>
 
           <div class="setting-card">
             <div class="setting-info">
               <div class="setting-label">语音识别引擎</div>
-              <div class="setting-desc">「自动」优先使用浏览器原生实时语音识别，如网络不可达且配置了 STT 接口则自动切换至麦克风 VAD + Whisper 转写</div>
+              <div class="setting-desc">「自动」优先本地离线 SenseVoice + GTCRN 降噪 + 声纹管线，未就绪时自动降级云端 STT 或浏览器原生识别</div>
             </div>
             <select id="set-voice-engine" class="md-select" aria-label="语音识别引擎">
-              <option value="auto">自动（优先浏览器，失败切 STT）</option>
+              <option value="auto">自动（优先本地离线 SenseVoice）</option>
+              <option value="local">本地离线引擎（SenseVoice + 降噪 + 声纹）</option>
+              <option value="whisper">云端/本地 Whisper 兼容 STT（含降噪）</option>
               <option value="browser">浏览器原生实时语音识别</option>
-              <option value="whisper">麦克风 VAD + Whisper 兼容转写</option>
             </select>
           </div>
 
           <div class="setting-card">
             <div class="setting-info">
               <div class="setting-label">识别语言</div>
-              <div class="setting-desc">用于浏览器语音识别与 Whisper 音频转写</div>
+              <div class="setting-desc">用于本地 SenseVoice、Whisper 转写与浏览器语音识别</div>
             </div>
             <select id="set-voice-lang" class="md-select" aria-label="语音识别语言">
-              <option value="zh-CN">中文（普通话）</option>
+              <option value="zh-CN">中文（普通话 · 兼容中英混合）</option>
               <option value="en-US">English (US)</option>
               <option value="zh-HK">中文（粤语）</option>
             </select>
           </div>
 
+          <div class="setting-card setting-card-wrap">
+            <div class="setting-info">
+              <div class="setting-label">环境降噪与语音端点检测（VAD）</div>
+              <div class="setting-desc">前端 AudioWorklet（85Hz 高通 + 400ms 防吞字缓冲）结合后端 GTCRN 深度降噪与 Silero VAD，在风扇/空调/音乐环境下准确提取人声</div>
+            </div>
+            <div class="voice-triple-grid">
+              <select id="set-voice-noise-mode" class="md-select" aria-label="环境降噪模式">
+                <option value="auto">降噪：自动（优先 GTCRN 神经降噪）</option>
+                <option value="neural">降噪：GTCRN 深度降噪</option>
+                <option value="dsp">降噪：轻量频谱减法 DSP</option>
+                <option value="off">降噪：关闭</option>
+              </select>
+              <select id="set-voice-vad-mode" class="md-select" aria-label="语音端点检测模式">
+                <option value="silero">VAD：Silero 神经网络</option>
+                <option value="adaptive">VAD：自适应能量+过零率</option>
+              </select>
+              <div class="agent-window-box" title="说完后等待判停的静音时长，越小响应越快">
+                <input type="number" id="set-voice-vad-silence" class="md-num-input" min="350" max="3000" step="50" value="750" aria-label="尾静音判停毫秒">
+                <span class="agent-unit">ms 判停</span>
+              </div>
+            </div>
+          </div>
+
           <div class="setting-card">
             <div class="setting-info">
               <div class="setting-label">启用唤醒词过滤</div>
-              <div class="setting-desc">开启后仅响应包含唤醒词的语句（防误触）；关闭后持续监听到的每句话都会直接交给 Pi Agent</div>
+              <div class="setting-desc">开启后仅响应定向呼唤助手的语句；关闭后持续监听到的每句话都会直接交给 Pi Agent</div>
             </div>
             <label class="md-switch">
               <input type="checkbox" id="set-voice-wake-enabled">
@@ -689,27 +730,81 @@
 
           <div class="setting-card setting-card-wrap" id="setting-row-wake-words">
             <div class="setting-info">
-              <div class="setting-label">唤醒词列表与聆听窗口</div>
-              <div class="setting-desc">多个唤醒词用逗号分隔；仅说唤醒词后，在等待窗口内说出的下一句也会直接执行</div>
+              <div class="setting-label">唤醒词列表与唤醒窗口</div>
+              <div class="setting-desc">多个唤醒词用逗号分隔（内置中文常见同音容错）；仅喊唤醒词后进入等待窗口</div>
             </div>
             <div class="agent-wake-grid">
               <input type="text" id="set-voice-wake-words" class="md-text-input" placeholder="小派, 派派, pi, 米家助手" aria-label="唤醒词列表">
               <div class="agent-window-box">
-                <input type="number" id="set-voice-wake-window" class="md-num-input" min="3" max="60" value="10" aria-label="唤醒等待秒数">
+                <input type="number" id="set-voice-wake-window" class="md-num-input" min="3" max="60" value="12" aria-label="唤醒等待秒数">
                 <span class="agent-unit">秒</span>
               </div>
             </div>
           </div>
 
+          <div class="setting-card setting-card-wrap">
+            <div class="setting-info">
+              <div class="setting-label">唤醒词注意力机制（防误触思考门控）</div>
+              <div class="setting-desc">提到唤醒词或处于连续对话时，先由 Pi Agent 思考“是在叫我还是旁白提及”，确认后再操作设备</div>
+            </div>
+            <div class="voice-triple-grid">
+              <select id="set-voice-attention-mode" class="md-select" aria-label="唤醒词注意力模式">
+                <option value="smart">智能注意力（直呼极速响应 · 歧义/续聊先思考）</option>
+                <option value="strict">严格思考模式（每次提及唤醒词均经 LLM 复核）</option>
+                <option value="off">关闭注意力思考（仅关键词匹配）</option>
+              </select>
+              <div class="agent-window-box" title="执行完指令后免唤醒续聊窗口，期间旁白会自动被注意力门控过滤">
+                <input type="number" id="set-voice-conv-window" class="md-num-input" min="0" max="60" value="18" aria-label="连续对话窗口秒数">
+                <span class="agent-unit">秒续聊</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="setting-card setting-card-wrap" id="setting-row-voiceprint">
+            <div class="setting-info">
+              <div class="setting-label">声纹识别与说话人管理（3D-Speaker CAM++）</div>
+              <div class="setting-desc" id="vp-status-text">注册声纹后可识别当前说话人身份，或在严格模式下仅响应主人/家庭成员，防止电视与陌生人误操作</div>
+            </div>
+            <div class="vp-stack">
+              <div class="voice-triple-grid">
+                <select id="set-voiceprint-mode" class="md-select" aria-label="声纹识别策略">
+                  <option value="tag">声纹：识别说话人并告知 Pi Agent</option>
+                  <option value="strict">声纹：严格拦截未注册声音</option>
+                  <option value="off">声纹：关闭</option>
+                </select>
+                <div class="agent-window-box" title="余弦相似度匹配阈值（建议 0.38 ~ 0.50）">
+                  <span class="agent-unit">阈值</span>
+                  <input type="number" id="set-voiceprint-threshold" class="md-num-input" min="0.20" max="0.85" step="0.02" value="0.42" aria-label="声纹匹配阈值">
+                </div>
+              </div>
+              <div class="vp-controls-row">
+                <input type="text" id="vp-enroll-name" class="md-text-input" placeholder="说话人名称（如 主人）" maxlength="32" aria-label="说话人名称">
+                <select id="vp-enroll-role" class="md-select vp-role-select" aria-label="说话人角色">
+                  <option value="owner">主人</option>
+                  <option value="member">家庭成员</option>
+                </select>
+                <button type="button" id="vp-record-enroll-btn" class="primary-button btn-compact">录制声纹 (3s)</button>
+                <button type="button" id="vp-record-verify-btn" class="secondary-button btn-compact">声纹测试</button>
+              </div>
+              <div id="vp-profile-list" class="vp-profile-list"></div>
+            </div>
+          </div>
+
           <div class="setting-card">
             <div class="setting-info">
-              <div class="setting-label">语音播报执行结果</div>
-              <div class="setting-desc">通过语音监听控制设备后，自动用系统语音简短朗读 Pi Agent 的执行反馈（播报期间自动防回声）</div>
+              <div class="setting-label">流式语音播报与语音打断（Barge-in）</div>
+              <div class="setting-desc">边生成边播报首句结果以降低等待感；右侧可同时控制是否允许说话打断当前播报</div>
             </div>
-            <label class="md-switch">
-              <input type="checkbox" id="set-voice-auto-speak">
-              <span class="md-switch-track"></span>
-            </label>
+            <div class="voice-toggle-pair">
+              <label class="voice-mini-check">
+                <input type="checkbox" id="set-voice-barge-in" checked>
+                <span>支持打断</span>
+              </label>
+              <label class="md-switch">
+                <input type="checkbox" id="set-voice-auto-speak">
+                <span class="md-switch-track"></span>
+              </label>
+            </div>
           </div>
 
           <div class="setting-card setting-card-wrap" id="setting-row-stt-config">

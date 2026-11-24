@@ -74,18 +74,72 @@ export interface UiPiAgentSnapshot {
   lastError: string | null;
 }
 
+export interface UiLocalVoiceStatus {
+  addonAvailable: boolean;
+  readyForDenoise: boolean;
+  readyForVad: boolean;
+  readyForVoiceprint: boolean;
+  readyForLocalAsr: boolean;
+  downloading?: boolean;
+  models?: {
+    gtcrn: boolean;
+    sileroVad: boolean;
+    speakerCampp: boolean;
+    senseVoice: boolean;
+  };
+}
+
+export interface UiVoiceprintProfile {
+  id: string;
+  name: string;
+  role: "owner" | "member";
+  engine: string;
+  dim: number;
+  sampleCount: number;
+}
+
 export interface UiVoiceSnapshot {
   active: boolean;
   mode: ClientVoiceMode;
-  engine: "browser" | "whisper" | "manual";
+  engine: "local" | "browser" | "whisper" | "manual";
   interimTranscript: string;
   lastTranscript: string;
   lastCommand: string;
   awakeUntil: number | null;
+  conversationUntil?: number | null;
   error: string | null;
   wakeWordEnabled: boolean;
   wakeWords: string[];
   autoSpeakReply: boolean;
+  attentionMode?: "smart" | "strict" | "off";
+  noiseSuppressionMode?: "auto" | "neural" | "dsp" | "off";
+  voiceprintMode?: "off" | "tag" | "strict";
+  localEngine?: UiLocalVoiceStatus;
+  voiceprints?: UiVoiceprintProfile[];
+  lastMetrics?: {
+    denoiseEngine?: string;
+    snrGainDb?: number;
+    vadEngine?: string;
+    asrEngine?: string;
+    voiceprint?: {
+      evaluated?: boolean;
+      matched?: boolean;
+      speakerName?: string | null;
+      score?: number;
+    } | null;
+    attention?: {
+      accept?: boolean;
+      stage?: string;
+      reason?: string;
+      usedLlm?: boolean;
+    } | null;
+    timings?: {
+      totalMs?: number;
+      asrMs?: number;
+      denoiseMs?: number;
+      attentionMs?: number;
+    } | null;
+  } | null;
 }
 
 export interface PiAgentPanelDeps {
@@ -140,14 +194,14 @@ export class PiAgentPanelController {
   private localClientState: {
     active: boolean;
     mode: ClientVoiceMode;
-    engine: "browser" | "whisper";
+    engine: "local" | "browser" | "whisper";
     interimTranscript: string;
     error: string | null;
     oneShot: boolean;
   } = {
     active: false,
     mode: "idle",
-    engine: "browser",
+    engine: "local",
     interimTranscript: "",
     error: null,
     oneShot: false,
@@ -200,11 +254,12 @@ export class PiAgentPanelController {
       },
       onUploadAudio: async (blob, opts) => {
         const form = new FormData();
-        form.append("audio", blob, "voice.webm");
+        form.append("audio", blob, opts.filename || "voice.wav");
         form.append("lang", opts.lang);
+        form.append("engine", opts.engine);
         form.append("bypassWakeWord", String(opts.bypassWakeWord));
         form.append("autoDispatch", "true");
-        const response = await fetch("/api/voice-listen/transcribe", {
+        const response = await fetch("/api/voice/audio", {
           method: "POST",
           body: form,
         });
@@ -213,17 +268,30 @@ export class PiAgentPanelController {
           error?: string;
           text?: string;
           matched?: boolean;
+          wokeOnly?: boolean;
           reply?: string;
+          attention?: { accept?: boolean; reason?: string; stage?: string };
           agent?: UiPiAgentSnapshot;
           voiceState?: UiVoiceSnapshot;
         };
         if (!response.ok || data.ok === false) {
-          throw new Error(data.error || `转写请求失败 (${response.status})`);
+          throw new Error(data.error || `识别请求失败 (${response.status})`);
         }
         if (data.agent) this.applyAgentSnapshot(data.agent);
         if (data.voiceState) this.applyVoiceSnapshot(data.voiceState);
-        if (data.matched && data.reply) {
+        if (data.matched && data.wokeOnly) {
+          this.flashLivePill("已唤醒，请说控制指令…", 4000);
+        } else if (data.matched && data.reply) {
           this.flashLivePill(`Pi Agent：${data.reply}`, 4200);
+        } else if (
+          data.text &&
+          data.attention &&
+          data.attention.accept === false &&
+          (data.attention.stage === "llm-attention" ||
+            data.attention.stage === "pragmatic-reject" ||
+            data.attention.stage === "voiceprint")
+        ) {
+          this.flashLivePill(`已忽略：${data.attention.reason || "非定向呼唤"}`, 2800);
         }
       },
       onToast: (msg, ms) => this.deps.showToast(msg, ms),
@@ -403,7 +471,10 @@ export class PiAgentPanelController {
     if (!rec) return;
     this.agentState = rec as unknown as UiPiAgentSnapshot;
     if (this.agentState.config) {
-      this.voiceClient.updateConfig(this.agentState.config);
+      this.voiceClient.updateConfig({
+        ...this.agentState.config,
+        localAsrReady: Boolean(this.voiceState?.localEngine?.readyForLocalAsr),
+      });
     }
     this.renderAll();
   }
@@ -412,9 +483,18 @@ export class PiAgentPanelController {
     const rec = asRec(raw);
     if (!rec) return;
     this.voiceState = rec as unknown as UiVoiceSnapshot;
+    if (this.voiceState.localEngine) {
+      this.voiceClient.updateConfig({
+        localAsrReady: Boolean(this.voiceState.localEngine.readyForLocalAsr),
+      });
+    }
     this.renderTitleButtons();
     this.renderVoiceStrip();
     this.renderLivePill();
+  }
+
+  getVoiceSnapshot(): UiVoiceSnapshot | null {
+    return this.voiceState;
   }
 
   handleStreamEvent(raw: unknown): void {
@@ -442,6 +522,12 @@ export class PiAgentPanelController {
   handleSpeakEvent(text: string): void {
     if (this.localClientState.active || this.agentState?.config.autoSpeakReply) {
       this.voiceClient.speak(text);
+    }
+  }
+
+  handleSpeakChunkEvent(text: string): void {
+    if (this.localClientState.active || this.agentState?.config.autoSpeakReply) {
+      this.voiceClient.enqueueSpeakChunk(text);
     }
   }
 
@@ -558,7 +644,12 @@ export class PiAgentPanelController {
       statusEl.textContent = "正在语音播报执行结果…";
       subEl.textContent = "播报期间自动静音防回声";
     } else if (isListening) {
-      const engineLabel = this.localClientState.engine === "whisper" ? "Whisper VAD" : "浏览器实时识别";
+      const engineLabel =
+        this.localClientState.engine === "local"
+          ? "本地 SenseVoice"
+          : this.localClientState.engine === "whisper"
+            ? "Whisper 降噪转写"
+            : "浏览器实时识别";
       statusEl.textContent = `语音监听运行中 · ${engineLabel}`;
       subEl.textContent = interim
         ? `实时识别：${interim}`
@@ -566,10 +657,77 @@ export class PiAgentPanelController {
           ? `说出“${firstWake}，打开客厅吸顶灯”即可控制设备`
           : "免唤醒已开启，直接说出设备控制指令即可执行";
     } else {
+      const readyHint = this.voiceState?.localEngine?.readyForLocalAsr
+        ? "本地 SenseVoice · GTCRN 降噪 · 声纹 · 注意力门控已就绪"
+        : wakeEnabled
+          ? `点击「开启持续监听」或按 Alt+V 单次说话（唤醒词：${wakeWords.slice(0, 3).join(" / ")}）`
+          : "点击「开启持续监听」或按 Alt+V 即可语音操控 Pi Agent";
       statusEl.textContent = "语音监听待机中";
-      subEl.textContent = wakeEnabled
-        ? `点击「开启持续监听」或按 Alt+V 单次说话（唤醒词：${wakeWords.slice(0, 3).join(" / ")}）`
-        : "点击「开启持续监听」或按 Alt+V 即可语音操控 Pi Agent";
+      subEl.textContent = readyHint;
+    }
+
+    this.renderVoiceTelemetry();
+  }
+
+  private renderVoiceTelemetry(): void {
+    const wrap = document.getElementById("pi-voice-telemetry");
+    if (!wrap) return;
+    const vs = this.voiceState;
+    const tags: string[] = [];
+
+    if (vs?.localEngine?.readyForLocalAsr) tags.push("离线 SenseVoice");
+    if (vs?.noiseSuppressionMode !== "off") {
+      tags.push(vs?.localEngine?.readyForDenoise ? "GTCRN 降噪" : "DSP 降噪");
+    }
+    if (vs?.attentionMode && vs.attentionMode !== "off") {
+      tags.push(vs.attentionMode === "strict" ? "严格注意力" : "智能注意力");
+    }
+    const vpCount = vs?.voiceprints?.length ?? 0;
+    if (vs?.voiceprintMode && vs.voiceprintMode !== "off" && vpCount > 0) {
+      tags.push(`声纹(${vpCount})`);
+    }
+
+    const m = vs?.lastMetrics;
+    const details: string[] = [];
+    if (m?.voiceprint?.evaluated) {
+      details.push(
+        m.voiceprint.matched && m.voiceprint.speakerName
+          ? `声纹:${m.voiceprint.speakerName} ${Math.round((m.voiceprint.score ?? 0) * 100)}%`
+          : `声纹未匹配 ${Math.round((m.voiceprint.score ?? 0) * 100)}%`,
+      );
+    }
+    if (typeof m?.snrGainDb === "number" && m.snrGainDb > 0) {
+      details.push(`降噪 +${m.snrGainDb.toFixed(1)}dB`);
+    }
+    if (m?.attention?.reason) {
+      details.push(m.attention.accept ? `✓ ${m.attention.reason}` : `⊘ ${m.attention.reason}`);
+    }
+    if (typeof m?.timings?.totalMs === "number" && m.timings.totalMs > 0) {
+      details.push(`${m.timings.totalMs}ms`);
+    }
+
+    if (tags.length === 0 && details.length === 0) {
+      wrap.hidden = true;
+      return;
+    }
+    wrap.hidden = false;
+    wrap.replaceChildren();
+
+    const pillBar = document.createElement("div");
+    pillBar.className = "pi-voice-pill-row";
+    for (const t of tags) {
+      const sp = document.createElement("span");
+      sp.className = "pi-voice-mini-tag";
+      sp.textContent = t;
+      pillBar.appendChild(sp);
+    }
+    wrap.appendChild(pillBar);
+
+    if (details.length > 0) {
+      const meta = document.createElement("div");
+      meta.className = "pi-voice-meta-line";
+      meta.textContent = details.join(" · ");
+      wrap.appendChild(meta);
     }
   }
 

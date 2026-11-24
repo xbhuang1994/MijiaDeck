@@ -6,9 +6,12 @@ import { renderQrSvg } from "../ui/qrSvg.ts";
 import { DeviceDetailModalController } from "./deviceDetailModal.ts";
 import {
   PiAgentPanelController,
+  type UiLocalVoiceStatus,
   type UiProviderPreset,
   type UiPublicAgentConfig,
+  type UiVoiceprintProfile,
 } from "./piAgentPanel.ts";
+import { recordShortWavSample } from "./voiceListener.ts";
 
 // ---------------------------------------------------------------------------
 // Types & Data Models
@@ -1098,6 +1101,9 @@ export class MijiaDeckWebApp {
   };
   private agentConfigCache: UiPublicAgentConfig | null = null;
   private agentProvidersCache: UiProviderPreset[] = [];
+  private localVoiceStatusCache: UiLocalVoiceStatus | null = null;
+  private voiceprintProfilesCache: UiVoiceprintProfile[] = [];
+  private vpRecordingBusy = false;
   private agentClearKeyPending = false;
   private sttClearKeyPending = false;
   private agentModelsFetchGen = 0;
@@ -1885,6 +1891,14 @@ export class MijiaDeckWebApp {
         const text = readStr(p, "text", "message");
         if (text) {
           this.piAgentPanel.handleSpeakEvent(text);
+        }
+        break;
+      }
+      case "agent_speak_chunk": {
+        const p = asRecord(payload) ?? msg;
+        const text = readStr(p, "text", "message");
+        if (text) {
+          this.piAgentPanel.handleSpeakChunkEvent(text);
         }
         break;
       }
@@ -3196,6 +3210,16 @@ export class MijiaDeckWebApp {
     } catch {
       // use cached agent config
     }
+    try {
+      const pipe = await apiGet<{
+        localEngine?: UiLocalVoiceStatus;
+        voiceprints?: UiVoiceprintProfile[];
+      }>("/api/voice/pipeline/status");
+      if (pipe?.localEngine) this.localVoiceStatusCache = pipe.localEngine;
+      if (Array.isArray(pipe?.voiceprints)) this.voiceprintProfilesCache = pipe.voiceprints;
+    } catch {
+      // use cached pipeline status
+    }
 
     const s = this.state.settings;
     this.settingsOriginal = { mode: s.theme, color: s.theme_color };
@@ -3330,11 +3354,19 @@ export class MijiaDeckWebApp {
 
     el<HTMLSelectElement>("set-voice-engine").value = cfg?.voiceEngine || "auto";
     el<HTMLSelectElement>("set-voice-lang").value = cfg?.voiceLang || "zh-CN";
+    el<HTMLSelectElement>("set-voice-noise-mode").value = cfg?.noiseSuppressionMode || "auto";
+    el<HTMLSelectElement>("set-voice-vad-mode").value = cfg?.vadMode || "silero";
+    el<HTMLInputElement>("set-voice-vad-silence").value = String(cfg?.vadSilenceMs ?? 750);
     const wakeEnabled = cfg?.wakeWordEnabled ?? true;
     el<HTMLInputElement>("set-voice-wake-enabled").checked = wakeEnabled;
     el("setting-row-wake-words").classList.toggle("is-disabled", !wakeEnabled);
     el<HTMLInputElement>("set-voice-wake-words").value = (cfg?.wakeWords ?? ["小派", "pi"]).join(", ");
-    el<HTMLInputElement>("set-voice-wake-window").value = String(cfg?.wakeWindowSec ?? 10);
+    el<HTMLInputElement>("set-voice-wake-window").value = String(cfg?.wakeWindowSec ?? 12);
+    el<HTMLSelectElement>("set-voice-attention-mode").value = cfg?.attentionMode || "smart";
+    el<HTMLInputElement>("set-voice-conv-window").value = String(cfg?.conversationWindowSec ?? 18);
+    el<HTMLSelectElement>("set-voiceprint-mode").value = cfg?.voiceprintMode || "tag";
+    el<HTMLInputElement>("set-voiceprint-threshold").value = String(cfg?.voiceprintThreshold ?? 0.42);
+    el<HTMLInputElement>("set-voice-barge-in").checked = cfg?.bargeInEnabled ?? true;
     el<HTMLInputElement>("set-voice-auto-speak").checked = cfg?.autoSpeakReply ?? true;
 
     el<HTMLInputElement>("set-stt-base-url").value = cfg?.sttBaseUrl || "";
@@ -3346,7 +3378,232 @@ export class MijiaDeckWebApp {
       : "STT API Key（留空则复用上方 Key 或环境变量）";
     el("set-stt-clear-key-btn").hidden = !cfg?.hasSttApiKey;
 
+    this.renderVoicePipelineStatus();
+    this.renderVoiceprintProfiles();
     this.syncAgentProviderFormHints(false);
+  }
+
+  private renderVoicePipelineStatus(): void {
+    const status =
+      this.localVoiceStatusCache ?? this.piAgentPanel.getVoiceSnapshot()?.localEngine ?? null;
+    const setBadge = (id: string, label: string, ready: boolean) => {
+      const node = document.getElementById(id);
+      if (!node) return;
+      node.textContent = `${ready ? "✓" : "○"} ${label}`;
+      node.classList.toggle("is-ready", ready);
+      node.classList.toggle("is-missing", !ready);
+    };
+
+    const gtcrnOk = Boolean(status?.readyForDenoise);
+    const vadOk = Boolean(status?.readyForVad);
+    const vpOk = Boolean(status?.readyForVoiceprint);
+    const asrOk = Boolean(status?.readyForLocalAsr);
+
+    setBadge("badge-model-gtcrn", "GTCRN 降噪", gtcrnOk);
+    setBadge("badge-model-vad", "Silero VAD", vadOk);
+    setBadge("badge-model-vp", "3D-Speaker 声纹", vpOk);
+    setBadge("badge-model-asr", "SenseVoice 识别", asrOk);
+
+    const allReady = gtcrnOk && vadOk && vpOk && asrOk;
+    const dlBtn = document.getElementById("voice-download-models-btn") as HTMLButtonElement | null;
+    if (dlBtn) {
+      dlBtn.hidden = allReady || !status?.addonAvailable;
+      dlBtn.disabled = Boolean(status?.downloading);
+      dlBtn.textContent = status?.downloading ? "下载中…" : "一键补齐模型";
+    }
+    const desc = document.getElementById("voice-pipeline-status-desc");
+    if (desc) {
+      desc.textContent = allReady
+        ? "本地 4 套离线语音 AI 模型已全部就绪（GTCRN 降噪 + Silero VAD + 3D-Speaker 中文声纹 + SenseVoice 离线识别），国内零依赖极速响应"
+        : "本地离线语音模型尚未完全就绪，可点击「一键补齐模型」自动下载，未就绪项将自动使用 DSP/云端降级";
+    }
+  }
+
+  private renderVoiceprintProfiles(): void {
+    const listEl = document.getElementById("vp-profile-list");
+    if (!listEl) return;
+    const profiles =
+      this.voiceprintProfilesCache.length > 0
+        ? this.voiceprintProfilesCache
+        : (this.piAgentPanel.getVoiceSnapshot()?.voiceprints ?? []);
+    listEl.replaceChildren();
+
+    if (profiles.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "vp-profile-empty";
+      empty.textContent = "尚未注册任何声纹档案；输入名字后点击「录制声纹 (3s)」朗读一句日常指令即可完成注册（建议同人录制 2~3 次提升准确率）";
+      listEl.appendChild(empty);
+      return;
+    }
+
+    for (const p of profiles) {
+      const item = document.createElement("div");
+      item.className = "vp-profile-item";
+
+      const info = document.createElement("div");
+      info.className = "vp-profile-info";
+      const nameSpan = document.createElement("strong");
+      nameSpan.textContent = p.name;
+      const roleSpan = document.createElement("span");
+      roleSpan.className = "vp-role-tag";
+      roleSpan.textContent = p.role === "owner" ? "主人" : "成员";
+      const metaSpan = document.createElement("span");
+      metaSpan.className = "vp-profile-meta";
+      metaSpan.textContent = `${p.sampleCount} 条样本 · ${p.engine === "3dspeaker-campplus" ? "3D-Speaker" : p.engine}`;
+      info.append(nameSpan, roleSpan, metaSpan);
+
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "secondary-button btn-compact";
+      delBtn.textContent = "删除";
+      delBtn.addEventListener("click", () => {
+        void this.deleteVoiceprintProfile(p.id, p.name);
+      });
+
+      item.append(info, delBtn);
+      listEl.appendChild(item);
+    }
+  }
+
+  private async downloadMissingVoiceModels(): Promise<void> {
+    const btn = el<HTMLButtonElement>("voice-download-models-btn");
+    btn.disabled = true;
+    btn.textContent = "正在下载模型…";
+    try {
+      const res = await apiPost<{ localEngine?: UiLocalVoiceStatus; voice?: unknown }>(
+        "/api/voice/pipeline/download",
+      );
+      if (res.localEngine) this.localVoiceStatusCache = res.localEngine;
+      if (res.voice) this.piAgentPanel.applyVoiceSnapshot(res.voice);
+      this.renderVoicePipelineStatus();
+      this.showToast("本地语音 AI 模型已准备就绪", 3000);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.showToast(`下载本地模型失败：${msg}`, 4000);
+    } finally {
+      this.renderVoicePipelineStatus();
+    }
+  }
+
+  private async handleRecordEnrollVoiceprint(): Promise<void> {
+    if (this.vpRecordingBusy) return;
+    const nameInput = el<HTMLInputElement>("vp-enroll-name");
+    const name = nameInput.value.trim() || "主人";
+    const role = el<HTMLSelectElement>("vp-enroll-role").value === "member" ? "member" : "owner";
+    const btn = el<HTMLButtonElement>("vp-record-enroll-btn");
+    const statusEl = el("vp-status-text");
+
+    this.vpRecordingBusy = true;
+    btn.disabled = true;
+    const prevLabel = btn.textContent || "录制声纹 (3s)";
+    statusEl.textContent = `正在为「${name}」录制 3 秒声纹，请清晰说出：“小派，打开客厅吸顶灯”…`;
+
+    try {
+      const wavBlob = await recordShortWavSample(3200, (ratio) => {
+        btn.textContent = `录音中 ${Math.max(1, Math.ceil((1 - ratio) * 3.2))}s…`;
+      });
+      btn.textContent = "提取声纹…";
+      const form = new FormData();
+      form.append("audio", wavBlob, "enroll.wav");
+      form.append("name", name);
+      form.append("role", role);
+      const res = await fetch("/api/voiceprints/enroll", { method: "POST", body: form });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        profile?: UiVoiceprintProfile;
+        profiles?: UiVoiceprintProfile[];
+        snrGainDb?: number;
+        voice?: unknown;
+      };
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || `声纹注册失败 (${res.status})`);
+      }
+      if (Array.isArray(data.profiles)) this.voiceprintProfilesCache = data.profiles;
+      if (data.voice) this.piAgentPanel.applyVoiceSnapshot(data.voice);
+      this.renderVoiceprintProfiles();
+      const snrNote = typeof data.snrGainDb === "number" && data.snrGainDb > 0 ? `（降噪 +${data.snrGainDb.toFixed(1)}dB）` : "";
+      statusEl.textContent = `✓ 已为「${data.profile?.name || name}」保存声纹（共 ${data.profile?.sampleCount ?? 1} 条样本）${snrNote}`;
+      this.showToast(`声纹注册成功：${data.profile?.name || name}`, 2600);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      statusEl.textContent = `声纹注册失败：${msg}`;
+      this.showToast(`声纹注册失败：${msg}`, 3500);
+    } finally {
+      this.vpRecordingBusy = false;
+      btn.disabled = false;
+      btn.textContent = prevLabel;
+    }
+  }
+
+  private async handleRecordVerifyVoiceprint(): Promise<void> {
+    if (this.vpRecordingBusy) return;
+    const btn = el<HTMLButtonElement>("vp-record-verify-btn");
+    const statusEl = el("vp-status-text");
+    this.vpRecordingBusy = true;
+    btn.disabled = true;
+    const prevLabel = btn.textContent || "声纹测试";
+    statusEl.textContent = "正在录制 3 秒验证语音，请自然说一句话…";
+
+    try {
+      const wavBlob = await recordShortWavSample(3000, (ratio) => {
+        btn.textContent = `测试录音 ${Math.max(1, Math.ceil((1 - ratio) * 3))}s…`;
+      });
+      btn.textContent = "比对中…";
+      const form = new FormData();
+      form.append("audio", wavBlob, "verify.wav");
+      const res = await fetch("/api/voiceprints/verify", { method: "POST", body: form });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        snrGainDb?: number;
+        result?: {
+          evaluated: boolean;
+          matched: boolean;
+          speakerName: string | null;
+          score: number;
+          threshold: number;
+        };
+      };
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || `声纹测试失败 (${res.status})`);
+      }
+      const r = data.result;
+      if (!r?.evaluated) {
+        statusEl.textContent = "请先注册至少一位说话人声纹后再进行测试";
+      } else if (r.matched) {
+        statusEl.textContent = `✓ 声纹验证通过：识别为「${r.speakerName}」（相似度 ${Math.round(r.score * 100)}%，阈值 ${Math.round(r.threshold * 100)}%）`;
+      } else {
+        statusEl.textContent = `✕ 声纹未匹配（最高相似度 ${Math.round(r.score * 100)}% < 阈值 ${Math.round(r.threshold * 100)}%）`;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      statusEl.textContent = `声纹测试失败：${msg}`;
+      this.showToast(`声纹测试失败：${msg}`, 3500);
+    } finally {
+      this.vpRecordingBusy = false;
+      btn.disabled = false;
+      btn.textContent = prevLabel;
+    }
+  }
+
+  private async deleteVoiceprintProfile(id: string, name: string): Promise<void> {
+    try {
+      const res = await fetch(`/api/voiceprints/${encodeURIComponent(id)}`, { method: "DELETE" });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        profiles?: UiVoiceprintProfile[];
+        voice?: unknown;
+      };
+      if (res.ok && data.ok) {
+        if (Array.isArray(data.profiles)) this.voiceprintProfilesCache = data.profiles;
+        if (data.voice) this.piAgentPanel.applyVoiceSnapshot(data.voice);
+        this.renderVoiceprintProfiles();
+        this.showToast(`已删除「${name}」的声纹档案`, 2200);
+      }
+    } catch {
+      this.showToast("删除声纹档案失败", 2500);
+    }
   }
 
   private syncAgentProviderFormHints(resetDefaultsOnSwitch: boolean): void {
@@ -3616,9 +3873,17 @@ export class MijiaDeckWebApp {
       systemPromptExtra: el<HTMLTextAreaElement>("set-agent-system-prompt").value.trim(),
       voiceEngine: el<HTMLSelectElement>("set-voice-engine").value,
       voiceLang: el<HTMLSelectElement>("set-voice-lang").value,
+      noiseSuppressionMode: el<HTMLSelectElement>("set-voice-noise-mode").value,
+      vadMode: el<HTMLSelectElement>("set-voice-vad-mode").value,
+      vadSilenceMs: Number(el<HTMLInputElement>("set-voice-vad-silence").value) || 750,
       wakeWordEnabled: el<HTMLInputElement>("set-voice-wake-enabled").checked,
       wakeWords: el<HTMLInputElement>("set-voice-wake-words").value,
-      wakeWindowSec: Number(el<HTMLInputElement>("set-voice-wake-window").value) || 10,
+      wakeWindowSec: Number(el<HTMLInputElement>("set-voice-wake-window").value) || 12,
+      attentionMode: el<HTMLSelectElement>("set-voice-attention-mode").value,
+      conversationWindowSec: Number(el<HTMLInputElement>("set-voice-conv-window").value) || 18,
+      voiceprintMode: el<HTMLSelectElement>("set-voiceprint-mode").value,
+      voiceprintThreshold: Number(el<HTMLInputElement>("set-voiceprint-threshold").value) || 0.42,
+      bargeInEnabled: el<HTMLInputElement>("set-voice-barge-in").checked,
       autoSpeakReply: el<HTMLInputElement>("set-voice-auto-speak").checked,
       sttBaseUrl: el<HTMLInputElement>("set-stt-base-url").value.trim(),
       sttModel: el<HTMLInputElement>("set-stt-model").value.trim(),
@@ -5035,6 +5300,18 @@ export class MijiaDeckWebApp {
     el<HTMLInputElement>("set-voice-wake-enabled").addEventListener("change", (e) => {
       const enabled = (e.target as HTMLInputElement).checked;
       el("setting-row-wake-words").classList.toggle("is-disabled", !enabled);
+    });
+
+    el("voice-download-models-btn").addEventListener("click", () => {
+      void this.downloadMissingVoiceModels();
+    });
+
+    el("vp-record-enroll-btn").addEventListener("click", () => {
+      void this.handleRecordEnrollVoiceprint();
+    });
+
+    el("vp-record-verify-btn").addEventListener("click", () => {
+      void this.handleRecordVerifyVoiceprint();
     });
 
     el("set-agent-clear-key-btn").addEventListener("click", () => {

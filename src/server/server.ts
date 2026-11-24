@@ -320,6 +320,14 @@ export async function startMijiaDeckServer(
         data: { text },
       });
     }),
+    voiceListener.on("speakChunkRequested", ({ text, final }) => {
+      broadcaster.broadcast({
+        type: "agent_speak_chunk",
+        text,
+        final,
+        data: { text, final },
+      });
+    }),
   ];
   if (mainWindow.tray !== null) {
     unsubscribers.push(
