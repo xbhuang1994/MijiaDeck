@@ -1319,12 +1319,14 @@ foreach ($v in $installed) {
 
 $fallback = if ($installed.Count -gt 0) { $installed[0].VoiceInfo.Name } else { "" }
 $jobsJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($env:MIJIADECK_OWW_TTS_JOBS))
-$jobs = @($jobsJson | ConvertFrom-Json)
+$parsedJobs = $jobsJson | ConvertFrom-Json
+if ($parsedJobs -is [System.Array]) { $jobs = $parsedJobs } else { $jobs = @($parsedJobs) }
+$fmt16k = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono)
 $results = @{}
 
 foreach ($job in $jobs) {
   try {
-    $pool = if ($job.lang -eq "zh") { $zhVoices } else { $enVoices }
+    $pool = @(if ($job.lang -eq "zh") { $zhVoices } else { $enVoices })
     if ($pool.Count -eq 0) {
       if ($fallback -eq "") { continue }
       $voiceName = $fallback
@@ -1336,19 +1338,19 @@ foreach ($job in $jobs) {
     $synth.SelectVoice($voiceName)
     $synth.Rate = [int]$job.rate
     $ms = New-Object System.IO.MemoryStream
-    $synth.SetOutputToWaveStream($ms)
+    $synth.SetOutputToAudioStream($ms, $fmt16k)
     $synth.Speak([string]$job.text)
     $synth.SetOutputToNull()
-    $bytes = $ms.ToArray()
+    $pcmBytes = $ms.ToArray()
     $ms.Dispose()
-    if ($bytes.Length -gt 44) {
+    if ($pcmBytes.Length -ge 3200) {
       $results[$job.key] = @{
         voice = $voiceName
-        wav = [System.Convert]::ToBase64String($bytes)
+        pcm16 = [System.Convert]::ToBase64String($pcmBytes)
       }
     }
   } catch {
-    # 单个合成条目失败时跳过，继续其他条目
+    # skip single failed item
   }
 }
 
@@ -1391,11 +1393,20 @@ async function synthesizeSapiBatch(
       },
     );
 
+    const stdoutPromise =
+      proc.stdout && typeof proc.stdout !== "number"
+        ? new Response(proc.stdout).text()
+        : Promise.resolve("");
+    const stderrPromise =
+      proc.stderr && typeof proc.stderr !== "number"
+        ? new Response(proc.stderr).text()
+        : Promise.resolve("");
+
     const timedOut = new Promise<"timeout">((resolve) => {
       timer = setTimeout(() => resolve("timeout"), timeoutMs);
     });
 
-    const exitPromise = proc.exited.then((code) => code);
+    const exitPromise = Promise.all([proc.exited, stdoutPromise, stderrPromise]);
     const raceResult = await Promise.race([exitPromise, timedOut]);
     if (raceResult === "timeout") {
       try {
@@ -1406,11 +1417,11 @@ async function synthesizeSapiBatch(
       return output;
     }
 
-    if (raceResult !== 0 || !proc.stdout || typeof proc.stdout === "number") {
+    const [exitCode, stdoutText] = raceResult;
+    if (exitCode !== 0) {
       return output;
     }
 
-    const stdoutText = await new Response(proc.stdout).text();
     const trimmed = stdoutText.trim();
     if (!trimmed) return output;
 
@@ -1421,21 +1432,34 @@ async function synthesizeSapiBatch(
 
     for (const [key, val] of Object.entries(parsed as Record<string, unknown>)) {
       if (!val || typeof val !== "object" || Array.isArray(val)) continue;
-      const entry = val as { voice?: unknown; wav?: unknown };
-      if (typeof entry.wav !== "string" || !entry.wav) continue;
+      const entry = val as { voice?: unknown; wav?: unknown; pcm16?: unknown };
       try {
-        const wavBytes = Buffer.from(entry.wav, "base64");
-        const decoded = decodeWavPcm(wavBytes);
-        const pcm16k =
-          decoded.sampleRate === SAMPLE_RATE
-            ? decoded.samples
-            : resampleLinear(decoded.samples, decoded.sampleRate, SAMPLE_RATE);
-        output.set(key, {
-          voice: typeof entry.voice === "string" ? entry.voice : "sapi",
-          pcm16k,
-        });
+        let pcm16k: Float32Array | null = null;
+        if (typeof entry.pcm16 === "string" && entry.pcm16) {
+          const rawPcm = Buffer.from(entry.pcm16, "base64");
+          const count = Math.floor(rawPcm.byteLength / 2);
+          const samples = new Float32Array(count);
+          const view = new DataView(rawPcm.buffer, rawPcm.byteOffset, rawPcm.byteLength);
+          for (let i = 0; i < count; i += 1) {
+            samples[i] = view.getInt16(i * 2, true) / 32768;
+          }
+          pcm16k = samples;
+        } else if (typeof entry.wav === "string" && entry.wav) {
+          const wavBytes = Buffer.from(entry.wav, "base64");
+          const decoded = decodeWavPcm(wavBytes);
+          pcm16k =
+            decoded.sampleRate === SAMPLE_RATE
+              ? decoded.samples
+              : resampleLinear(decoded.samples, decoded.sampleRate, SAMPLE_RATE);
+        }
+        if (pcm16k && pcm16k.length >= 1600) {
+          output.set(key, {
+            voice: typeof entry.voice === "string" ? entry.voice : "sapi",
+            pcm16k,
+          });
+        }
       } catch {
-        // 忽略单条损坏 WAV
+        // 忽略单条损坏音频
       }
     }
   } catch {
@@ -1969,7 +1993,7 @@ export class OpenWakeWordEngine {
         uniqueWords.push({ display, key });
       }
 
-      if (!this.isReady || process.platform !== "win32" || uniqueWords.length === 0) {
+      if (!this.ensureLoaded() || process.platform !== "win32" || uniqueWords.length === 0) {
         return {
           bootstrapped: [],
           skipped: uniqueWords.map((w) => w.display),
