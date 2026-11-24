@@ -8,7 +8,10 @@
 
 import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
+import type { PiAgentService } from "../agent/piAgentService.ts";
+import type { VoiceListenerController, VoiceListenMode } from "../agent/voiceListenerController.ts";
 import type { AppMode } from "../cli/startup.ts";
+import * as agentConfigStoreModule from "../core/agentConfigStore.ts";
 import { APP_NAME, APP_VERSION, projectRoot } from "../core/appMeta.ts";
 import { MESSAGES, speakerHint } from "../core/availability.ts";
 import { CameraPreviewError } from "../core/cameraPreview.ts";
@@ -56,6 +59,7 @@ import {
 
 export type SettingsStoreModule = typeof settingsStoreModule;
 export type TrayStoreModule = typeof trayStoreModule;
+export type AgentConfigStoreModule = typeof agentConfigStoreModule;
 
 export interface WsClient {
   send(data: string | ArrayBuffer | Uint8Array): number | void;
@@ -103,6 +107,9 @@ export interface AppRuntime {
   themeCtrl: ThemeController;
   settingsStore: SettingsStoreModule;
   trayStore: TrayStoreModule;
+  agentConfigStore?: AgentConfigStoreModule;
+  piAgent?: PiAgentService;
+  voiceListener?: VoiceListenerController;
   broadcaster?: StateBroadcaster;
   broadcastState?: () => void;
   speakerAudioProps?: Map<string, { volName: string; muteName: string }>;
@@ -125,8 +132,9 @@ export class HttpError extends Error {
 }
 
 const SECRET_PATTERNS: ReadonlyArray<RegExp> = [
-  /(serviceToken|ssecurity|passToken|cUserId|userId|p2p_id|init_string|authorization|cookie)\s*[:=]\s*[^\s,;'"&}]+/gi,
+  /(serviceToken|ssecurity|passToken|cUserId|userId|p2p_id|init_string|authorization|cookie|api[_-]?key|sttApiKey)\s*[:=]\s*[^\s,;'"&}]+/gi,
   /Bearer\s+[A-Za-z0-9._~+/=-]+/gi,
+  /sk-[A-Za-z0-9_\-]{8,}/g,
 ];
 
 /**
@@ -457,6 +465,8 @@ export function serializeState(runtime: AppRuntime): Record<string, unknown> {
     update: {
       release: mw.footer.release,
     },
+    piAgent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
+    voiceListen: runtime.voiceListener ? runtime.voiceListener.snapshot() : null,
   };
 }
 
@@ -1701,6 +1711,207 @@ export function createRequestHandler(
             error: sanitizeErrorMessage(err),
           });
         }
+      }
+
+      // ---------- 内置 Pi Agent 与语音监听 ----------
+
+      if (method === "GET" && pathname === "/api/agent/state") {
+        if (!runtime.piAgent) {
+          throw new HttpError(503, "Pi Agent 服务未初始化");
+        }
+        return jsonResponse({
+          ok: true,
+          agent: runtime.piAgent.snapshot(),
+          voice: runtime.voiceListener ? runtime.voiceListener.snapshot() : null,
+        });
+      }
+
+      if (method === "POST" && pathname === "/api/agent/prompt") {
+        if (!runtime.piAgent) {
+          throw new HttpError(503, "Pi Agent 服务未初始化");
+        }
+        const body = await readJsonBody(req);
+        const text = typeof body.text === "string" ? body.text.trim() : "";
+        if (!text) {
+          throw new HttpError(400, "请输入要发送给 Pi Agent 的指令内容");
+        }
+        const source = body.source === "voice" ? "voice" : "text";
+        const result = await runtime.piAgent.prompt(text, { source });
+        return jsonResponse({
+          ok: result.ok,
+          entryId: result.entryId,
+          reply: result.reply,
+          toolCalls: result.toolCalls,
+          ...(result.error ? { error: result.error } : {}),
+          agent: runtime.piAgent.snapshot(),
+        });
+      }
+
+      if (method === "POST" && pathname === "/api/agent/abort") {
+        if (!runtime.piAgent) {
+          throw new HttpError(503, "Pi Agent 服务未初始化");
+        }
+        const aborted = runtime.piAgent.abort();
+        return jsonResponse({
+          ok: true,
+          aborted,
+          agent: runtime.piAgent.snapshot(),
+        });
+      }
+
+      if (method === "POST" && pathname === "/api/agent/reset") {
+        if (!runtime.piAgent) {
+          throw new HttpError(503, "Pi Agent 服务未初始化");
+        }
+        runtime.piAgent.reset();
+        return jsonResponse({
+          ok: true,
+          agent: runtime.piAgent.snapshot(),
+        });
+      }
+
+      if (method === "GET" && pathname === "/api/agent/config") {
+        const cfgStore = runtime.agentConfigStore ?? agentConfigStoreModule;
+        const cfg = runtime.piAgent ? runtime.piAgent.config : cfgStore.loadAgentVoiceConfig();
+        return jsonResponse({
+          ok: true,
+          config: cfgStore.toPublicAgentVoiceConfig(cfg),
+          providers: cfgStore.PROVIDER_PRESETS,
+        });
+      }
+
+      if (method === "POST" && pathname === "/api/agent/config") {
+        const cfgStore = runtime.agentConfigStore ?? agentConfigStoreModule;
+        const body = await readJsonBody(req);
+        let updated: agentConfigStoreModule.AgentVoiceConfig;
+        try {
+          updated = cfgStore.updateAgentVoiceConfig(body);
+        } catch (err) {
+          throw new HttpError(400, sanitizeErrorMessage(err));
+        }
+        if (runtime.piAgent) {
+          runtime.piAgent.reconfigure(updated);
+        }
+        if (runtime.voiceListener) {
+          runtime.voiceListener.updateRuntimeState({});
+        }
+        emitBroadcast(runtime);
+        return jsonResponse({
+          ok: true,
+          config: cfgStore.toPublicAgentVoiceConfig(updated),
+          agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
+          voice: runtime.voiceListener ? runtime.voiceListener.snapshot() : null,
+        });
+      }
+
+      if (method === "GET" && pathname === "/api/voice-listen/state") {
+        if (!runtime.voiceListener) {
+          throw new HttpError(503, "语音监听服务未初始化");
+        }
+        return jsonResponse({
+          ok: true,
+          voice: runtime.voiceListener.snapshot(),
+        });
+      }
+
+      if (method === "POST" && pathname === "/api/voice-listen/state") {
+        if (!runtime.voiceListener) {
+          throw new HttpError(503, "语音监听服务未初始化");
+        }
+        const body = await readJsonBody(req);
+        const validModes = new Set(["idle", "listening", "awake", "processing", "speaking", "error"]);
+        const validEngines = new Set(["browser", "whisper", "manual"]);
+        const patch: {
+          active?: boolean;
+          mode?: VoiceListenMode;
+          engine?: "browser" | "whisper" | "manual";
+          interimTranscript?: string;
+          error?: string | null;
+        } = {};
+        if (typeof body.active === "boolean") patch.active = body.active;
+        if (typeof body.mode === "string" && validModes.has(body.mode)) {
+          patch.mode = body.mode as VoiceListenMode;
+        }
+        if (typeof body.engine === "string" && validEngines.has(body.engine)) {
+          patch.engine = body.engine as "browser" | "whisper" | "manual";
+        }
+        if (typeof body.interimTranscript === "string") {
+          patch.interimTranscript = body.interimTranscript;
+        }
+        if (body.error === null || typeof body.error === "string") {
+          patch.error = body.error;
+        }
+        const voice = runtime.voiceListener.updateRuntimeState(patch);
+        return jsonResponse({ ok: true, voice });
+      }
+
+      if (method === "POST" && pathname === "/api/voice-listen/transcript") {
+        if (!runtime.voiceListener) {
+          throw new HttpError(503, "语音监听服务未初始化");
+        }
+        const body = await readJsonBody(req);
+        const text = typeof body.text === "string" ? body.text : "";
+        const isFinal = body.isFinal !== false;
+        const bypassWakeWord = body.bypassWakeWord === true;
+        const engine =
+          body.engine === "whisper" || body.engine === "manual" ? body.engine : "browser";
+        const result = await runtime.voiceListener.handleTranscript(text, {
+          isFinal,
+          bypassWakeWord,
+          engine,
+        });
+        return jsonResponse({
+          ...result,
+          agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
+        });
+      }
+
+      if (method === "POST" && pathname === "/api/voice-listen/transcribe") {
+        if (!runtime.voiceListener) {
+          throw new HttpError(503, "语音监听服务未初始化");
+        }
+        const contentType = req.headers.get("content-type") ?? "";
+        if (!contentType.includes("multipart/form-data")) {
+          throw new HttpError(400, "请使用 multipart/form-data 上传音频文件");
+        }
+        const form = await req.formData();
+        const audio = form.get("audio") ?? form.get("file");
+        if (!(audio instanceof Blob) || audio.size === 0) {
+          throw new HttpError(400, "缺少有效的音频数据 audio");
+        }
+        const lang = typeof form.get("lang") === "string" ? String(form.get("lang")) : undefined;
+        const bypassWakeWord = String(form.get("bypassWakeWord") ?? "").toLowerCase() === "true";
+        const autoDispatch = String(form.get("autoDispatch") ?? "true").toLowerCase() !== "false";
+        const filename = audio instanceof File && audio.name ? audio.name : "voice.webm";
+
+        let transcript: string;
+        try {
+          transcript = await runtime.voiceListener.transcribeAudio(audio, { filename, lang });
+        } catch (err) {
+          throw new HttpError(400, sanitizeErrorMessage(err));
+        }
+
+        if (!autoDispatch) {
+          return jsonResponse({
+            ok: true,
+            text: transcript,
+            matched: false,
+            wokeOnly: false,
+            command: "",
+            voiceState: runtime.voiceListener.snapshot(),
+          });
+        }
+
+        const dispatched = await runtime.voiceListener.handleTranscript(transcript, {
+          isFinal: true,
+          bypassWakeWord,
+          engine: "whisper",
+        });
+        return jsonResponse({
+          ...dispatched,
+          text: transcript,
+          agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
+        });
       }
 
       // ---------- 摄像头云台方向控制 ----------

@@ -6,7 +6,12 @@
  * MijiaDeck 本地 HTTP + WebSocket 服务端装配与生命周期管理。
  */
 
+import type { StreamFn } from "@earendil-works/pi-agent-core";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { PiAgentService } from "../agent/piAgentService.ts";
+import { VoiceListenerController } from "../agent/voiceListenerController.ts";
 import { DEFAULT_HOST, DEFAULT_PORT, type AppMode } from "../cli/startup.ts";
+import * as agentConfigStore from "../core/agentConfigStore.ts";
 import { NetworkMonitor } from "../core/availability.ts";
 import type { IJobExecutor, IMijiaService } from "../core/contracts.ts";
 import { JobExecutor } from "../core/jobs.ts";
@@ -35,6 +40,9 @@ export interface StartServerOptions {
   jobs?: IJobExecutor;
   rootDir?: string;
   updateFetcher?: typeof fetch;
+  sttFetcher?: typeof fetch;
+  agentStreamFn?: StreamFn;
+  agentModel?: Model<Api>;
   autoStart?: boolean;
   autoStartTimers?: boolean;
 }
@@ -235,6 +243,7 @@ export async function startMijiaDeckServer(
     themeCtrl,
     settingsStore,
     trayStore,
+    agentConfigStore,
     broadcaster,
     speakerAudioProps,
     broadcastState: () => {
@@ -246,6 +255,23 @@ export async function startMijiaDeckServer(
       });
     },
   };
+
+  const piAgent = new PiAgentService({
+    deps: {
+      service,
+      jobs,
+      mainWindow,
+      settingsStore,
+      broadcastState: () => runtime.broadcastState?.(),
+    },
+    ...(options.agentStreamFn ? { customStreamFn: options.agentStreamFn } : {}),
+    ...(options.agentModel ? { customModel: options.agentModel } : {}),
+  });
+  const voiceListener = new VoiceListenerController(piAgent, {
+    fetcher: options.sttFetcher,
+  });
+  runtime.piAgent = piAgent;
+  runtime.voiceListener = voiceListener;
 
   const unsubscribers: Array<() => void> = [
     mainWindow.on("stateChanged", () => {
@@ -267,6 +293,31 @@ export async function startMijiaDeckServer(
         data: { resolved: theme },
       });
       runtime.broadcastState?.();
+    }),
+    piAgent.on("stateChanged", (agentSnapshot) => {
+      broadcaster.broadcast({
+        type: "agent_state",
+        data: agentSnapshot,
+      });
+    }),
+    piAgent.on("streamEvent", (ev) => {
+      broadcaster.broadcast({
+        type: "agent_event",
+        data: ev,
+      });
+    }),
+    voiceListener.on("stateChanged", (voiceSnapshot) => {
+      broadcaster.broadcast({
+        type: "voice_state",
+        data: voiceSnapshot,
+      });
+    }),
+    voiceListener.on("speakRequested", (text) => {
+      broadcaster.broadcast({
+        type: "agent_speak",
+        text,
+        data: { text },
+      });
     }),
   ];
   if (mainWindow.tray !== null) {
@@ -345,6 +396,8 @@ export async function startMijiaDeckServer(
       unsub();
     }
     unsubscribers.length = 0;
+    voiceListener.dispose();
+    piAgent.dispose();
     broadcaster.clear();
     await server.stop(true);
     networkMonitor.stop();

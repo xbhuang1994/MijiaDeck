@@ -4,6 +4,11 @@
 
 import { renderQrSvg } from "../ui/qrSvg.ts";
 import { DeviceDetailModalController } from "./deviceDetailModal.ts";
+import {
+  PiAgentPanelController,
+  type UiProviderPreset,
+  type UiPublicAgentConfig,
+} from "./piAgentPanel.ts";
 
 // ---------------------------------------------------------------------------
 // Types & Data Models
@@ -1079,7 +1084,7 @@ export class MijiaDeckWebApp {
   // Settings draft & live preview revert snapshot
   private settingsOriginal: { mode: ThemeMode; color: string } | null = null;
   private settingsDraft: {
-    tab: "appearance" | "features";
+    tab: "appearance" | "features" | "voice-agent";
     mode: ThemeMode;
     color: string;
     customColor: string;
@@ -1091,6 +1096,10 @@ export class MijiaDeckWebApp {
     customColor: "#333333",
     uiScale: 1.0,
   };
+  private agentConfigCache: UiPublicAgentConfig | null = null;
+  private agentProvidersCache: UiProviderPreset[] = [];
+  private agentClearKeyPending = false;
+  private sttClearKeyPending = false;
 
   // Tray manager draft
   private trayMgrTab: "devices" | "scenes" = "devices";
@@ -1101,10 +1110,11 @@ export class MijiaDeckWebApp {
   private trayMgrOrder: TrayOrderItem[] = [];
   private trayMgrDragKey: string | null = null;
 
-  // Light & full device detail controllers
+  // Light, full device detail & Pi Agent controllers
   private modalLightSession: LightControlSession;
   private trayLightSession: LightControlSession;
   private deviceDetailModal: DeviceDetailModalController;
+  private piAgentPanel: PiAgentPanelController;
 
   // Camera preview state
   private cameraDevice: DeviceInfo | null = null;
@@ -1213,6 +1223,15 @@ export class MijiaDeckWebApp {
         if (this.activeModal === "device-detail") this.closeModal();
       },
     });
+
+    this.piAgentPanel = new PiAgentPanelController({
+      apiGet,
+      apiPost,
+      showToast: (msg, ms) => this.showToast(msg, ms),
+      openVoiceAgentSettings: () => {
+        void this.openSettingsModal("voice-agent");
+      },
+    });
   }
 
   private createDefaultState(): AppState {
@@ -1300,6 +1319,7 @@ export class MijiaDeckWebApp {
     this.bindLoginEvents();
     this.bindDiagnosticsEvents();
     this.bindAboutEvents();
+    this.piAgentPanel.bindEvents();
 
     this.renderAll();
     await this.fetchState();
@@ -1595,6 +1615,16 @@ export class MijiaDeckWebApp {
     }
 
     this.syncActiveSpeaker();
+    if ("piAgent" in rec && rec.piAgent) {
+      this.piAgentPanel.applyAgentSnapshot(rec.piAgent);
+      const cfg = this.piAgentPanel.getConfig();
+      if (cfg) this.agentConfigCache = cfg;
+      const provs = this.piAgentPanel.getProviders();
+      if (provs.length > 0) this.agentProvidersCache = provs;
+    }
+    if ("voiceListen" in rec && rec.voiceListen) {
+      this.piAgentPanel.applyVoiceSnapshot(rec.voiceListen);
+    }
     if (themeVisualChanged) {
       this.reloadThemeStylesheet();
     }
@@ -1833,6 +1863,29 @@ export class MijiaDeckWebApp {
         this.state.release = normalizeReleaseInfo(payload);
         this.renderLoadingAndFooter();
         break;
+      case "agent_state":
+        this.piAgentPanel.applyAgentSnapshot(payload);
+        {
+          const cfg = this.piAgentPanel.getConfig();
+          if (cfg) this.agentConfigCache = cfg;
+          const provs = this.piAgentPanel.getProviders();
+          if (provs.length > 0) this.agentProvidersCache = provs;
+        }
+        break;
+      case "agent_event":
+        this.piAgentPanel.handleStreamEvent(payload);
+        break;
+      case "voice_state":
+        this.piAgentPanel.applyVoiceSnapshot(payload);
+        break;
+      case "agent_speak": {
+        const p = asRecord(payload) ?? msg;
+        const text = readStr(p, "text", "message");
+        if (text) {
+          this.piAgentPanel.handleSpeakEvent(text);
+        }
+        break;
+      }
       default:
         // If server sends raw state object without a `type` wrapper
         if ("devices" in msg || "accessState" in msg || "access_state" in msg) {
@@ -1847,28 +1900,30 @@ export class MijiaDeckWebApp {
   // -------------------------------------------------------------------------
 
   reloadThemeStylesheet(): void {
-    const oldLink = document.getElementById("theme-stylesheet") as HTMLLinkElement | null;
-    const nextHref = `/theme.css?t=${Date.now()}`;
-    if (!oldLink) {
-      const created = document.createElement("link");
-      created.rel = "stylesheet";
-      created.id = "theme-stylesheet";
-      created.href = nextHref;
-      document.head.prepend(created);
-      return;
-    }
+    const existingLinks = Array.from(
+      document.querySelectorAll<HTMLLinkElement>('link#theme-stylesheet, link[data-md-theme-sheet="1"]'),
+    );
+    const anchor = existingLinks[existingLinks.length - 1] ?? null;
+    const nextHref = `/theme.css?t=${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const nextLink = document.createElement("link");
     nextLink.rel = "stylesheet";
+    nextLink.dataset.mdThemeSheet = "1";
     nextLink.href = nextHref;
     nextLink.addEventListener("load", () => {
-      oldLink.remove();
+      for (const old of existingLinks) {
+        old.remove();
+      }
       nextLink.id = "theme-stylesheet";
       this.detectResolvedThemeFromCss();
     });
     nextLink.addEventListener("error", () => {
       nextLink.remove();
     });
-    oldLink.insertAdjacentElement("afterend", nextLink);
+    if (anchor) {
+      anchor.insertAdjacentElement("afterend", nextLink);
+    } else {
+      document.head.prepend(nextLink);
+    }
   }
 
   private detectResolvedThemeFromCss(): void {
@@ -3118,7 +3173,9 @@ export class MijiaDeckWebApp {
   // Settings Dialog Logic (with live preview & cancel revert)
   // -------------------------------------------------------------------------
 
-  private async openSettingsModal(): Promise<void> {
+  private async openSettingsModal(
+    initialTab: "appearance" | "features" | "voice-agent" = "appearance",
+  ): Promise<void> {
     try {
       const raw = await apiGet<unknown>("/api/settings");
       const rec = asRecord(raw);
@@ -3127,26 +3184,40 @@ export class MijiaDeckWebApp {
     } catch {
       // use cached state.settings
     }
+    try {
+      const rawAgent = await apiGet<{
+        config?: UiPublicAgentConfig;
+        providers?: UiProviderPreset[];
+      }>("/api/agent/config");
+      if (rawAgent?.config) this.agentConfigCache = rawAgent.config;
+      if (Array.isArray(rawAgent?.providers)) this.agentProvidersCache = rawAgent.providers;
+    } catch {
+      // use cached agent config
+    }
 
     const s = this.state.settings;
     this.settingsOriginal = { mode: s.theme, color: s.theme_color };
     this.settingsDraft = {
-      tab: "appearance",
+      tab: initialTab,
       mode: s.theme,
       color: s.theme_color,
       customColor: s.theme_color.startsWith("#") ? s.theme_color : s.custom_theme_color,
       uiScale: s.ui_scale,
     };
+    this.agentClearKeyPending = false;
+    this.sttClearKeyPending = false;
 
-    this.populateSettingsForm();
+    this.populateSettingsForm(initialTab);
     this.openModal("settings");
   }
 
-  private populateSettingsForm(): void {
+  private populateSettingsForm(
+    initialTab: "appearance" | "features" | "voice-agent" = "appearance",
+  ): void {
     const s = this.state.settings;
     const hasSpeaker = this.state.devices.some((d) => isSpeaker(d) && d.online);
 
-    this.switchSettingsTab("appearance");
+    this.switchSettingsTab(initialTab);
 
     el<HTMLSelectElement>("set-theme-mode").value = this.settingsDraft.mode;
     this.syncSettingsColorUi();
@@ -3206,12 +3277,110 @@ export class MijiaDeckWebApp {
 
     el<HTMLInputElement>("set-hide-no-func").checked = s.hide_no_func_devices;
     el<HTMLInputElement>("set-check-update").checked = s.check_update_enabled;
+
+    this.populateVoiceAgentSettings();
   }
 
-  private switchSettingsTab(tab: "appearance" | "features"): void {
+  private populateVoiceAgentSettings(): void {
+    const cfg = this.agentConfigCache ?? this.piAgentPanel.getConfig();
+    const providers =
+      this.agentProvidersCache.length > 0 ? this.agentProvidersCache : this.piAgentPanel.getProviders();
+
+    const provSelect = el<HTMLSelectElement>("set-agent-provider");
+    provSelect.replaceChildren();
+    const list: UiProviderPreset[] =
+      providers.length > 0
+        ? providers
+        : [
+            {
+              id: "local",
+              label: "内置本地引擎（免 API Key）",
+              description: "免 API Key 本地智能家居规划引擎",
+              defaultModel: "mijia-local-planner",
+              suggestedModels: ["mijia-local-planner"],
+              defaultBaseUrl: "",
+              requiresApiKey: false,
+            },
+          ];
+    for (const p of list) {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = p.label;
+      provSelect.appendChild(opt);
+    }
+
+    const activeProvider = cfg?.provider || "local";
+    provSelect.value = list.some((p) => p.id === activeProvider) ? activeProvider : "local";
+
+    el<HTMLInputElement>("set-agent-model").value = cfg?.modelId || "mijia-local-planner";
+    el<HTMLInputElement>("set-agent-base-url").value = cfg?.baseUrl || "";
+    const keyInput = el<HTMLInputElement>("set-agent-api-key");
+    keyInput.value = "";
+    keyInput.placeholder = cfg?.hasApiKey
+      ? `已保存密钥 (${cfg.apiKeyPreview})，留空保持不变`
+      : cfg?.envApiKeyDetected
+        ? "已检测到环境变量密钥，也可在此覆盖"
+        : "输入新的 API Key（留空保持不变）";
+    el("set-agent-clear-key-btn").hidden = !cfg?.hasApiKey;
+    el<HTMLTextAreaElement>("set-agent-system-prompt").value = cfg?.systemPromptExtra || "";
+
+    el<HTMLSelectElement>("set-voice-engine").value = cfg?.voiceEngine || "auto";
+    el<HTMLSelectElement>("set-voice-lang").value = cfg?.voiceLang || "zh-CN";
+    const wakeEnabled = cfg?.wakeWordEnabled ?? true;
+    el<HTMLInputElement>("set-voice-wake-enabled").checked = wakeEnabled;
+    el("setting-row-wake-words").classList.toggle("is-disabled", !wakeEnabled);
+    el<HTMLInputElement>("set-voice-wake-words").value = (cfg?.wakeWords ?? ["小派", "pi"]).join(", ");
+    el<HTMLInputElement>("set-voice-wake-window").value = String(cfg?.wakeWindowSec ?? 10);
+    el<HTMLInputElement>("set-voice-auto-speak").checked = cfg?.autoSpeakReply ?? true;
+
+    el<HTMLInputElement>("set-stt-base-url").value = cfg?.sttBaseUrl || "";
+    el<HTMLInputElement>("set-stt-model").value = cfg?.sttModel || "whisper-1";
+    const sttKeyInput = el<HTMLInputElement>("set-stt-api-key");
+    sttKeyInput.value = "";
+    sttKeyInput.placeholder = cfg?.hasSttApiKey
+      ? `已保存 STT 密钥 (${cfg.sttApiKeyPreview})，留空保持不变`
+      : "STT API Key（留空则复用上方 Key 或环境变量）";
+    el("set-stt-clear-key-btn").hidden = !cfg?.hasSttApiKey;
+
+    this.syncAgentProviderFormHints(false);
+  }
+
+  private syncAgentProviderFormHints(resetDefaultsOnSwitch: boolean): void {
+    const provId = el<HTMLSelectElement>("set-agent-provider").value;
+    const providers =
+      this.agentProvidersCache.length > 0 ? this.agentProvidersCache : this.piAgentPanel.getProviders();
+    const preset = providers.find((p) => p.id === provId);
+    const isLocal = provId === "local";
+
+    el("setting-row-agent-model").hidden = isLocal;
+    el("setting-row-agent-baseurl").hidden = isLocal;
+    el("setting-row-agent-apikey").hidden = isLocal;
+
+    if (preset) {
+      el("set-agent-provider-desc").textContent = preset.description;
+      const datalist = el("set-agent-model-list");
+      datalist.replaceChildren();
+      for (const m of preset.suggestedModels) {
+        const opt = document.createElement("option");
+        opt.value = m;
+        datalist.appendChild(opt);
+      }
+      el<HTMLInputElement>("set-agent-base-url").placeholder =
+        preset.defaultBaseUrl || "http://127.0.0.1:11434/v1";
+      if (resetDefaultsOnSwitch) {
+        el<HTMLInputElement>("set-agent-model").value = preset.defaultModel;
+        if (provId === "openai-compatible" && !el<HTMLInputElement>("set-agent-base-url").value) {
+          el<HTMLInputElement>("set-agent-base-url").value = preset.defaultBaseUrl;
+        }
+      }
+    }
+  }
+
+  private switchSettingsTab(tab: "appearance" | "features" | "voice-agent"): void {
     this.settingsDraft.tab = tab;
     el("settings-page-appearance").hidden = tab !== "appearance";
     el("settings-page-features").hidden = tab !== "features";
+    el("settings-page-voice-agent").hidden = tab !== "voice-agent";
     document.querySelectorAll<HTMLButtonElement>("[data-settings-tab]").forEach((btn) => {
       const active = btn.dataset.settingsTab === tab;
       btn.classList.toggle("active", active);
@@ -3315,9 +3484,48 @@ export class MijiaDeckWebApp {
       checkUpdateEnabled: checkUpdate,
     };
 
+    const agentPayload: Record<string, unknown> = {
+      provider: el<HTMLSelectElement>("set-agent-provider").value,
+      modelId: el<HTMLInputElement>("set-agent-model").value.trim(),
+      baseUrl: el<HTMLInputElement>("set-agent-base-url").value.trim(),
+      systemPromptExtra: el<HTMLTextAreaElement>("set-agent-system-prompt").value.trim(),
+      voiceEngine: el<HTMLSelectElement>("set-voice-engine").value,
+      voiceLang: el<HTMLSelectElement>("set-voice-lang").value,
+      wakeWordEnabled: el<HTMLInputElement>("set-voice-wake-enabled").checked,
+      wakeWords: el<HTMLInputElement>("set-voice-wake-words").value,
+      wakeWindowSec: Number(el<HTMLInputElement>("set-voice-wake-window").value) || 10,
+      autoSpeakReply: el<HTMLInputElement>("set-voice-auto-speak").checked,
+      sttBaseUrl: el<HTMLInputElement>("set-stt-base-url").value.trim(),
+      sttModel: el<HTMLInputElement>("set-stt-model").value.trim(),
+    };
+    const newApiKey = el<HTMLInputElement>("set-agent-api-key").value.trim();
+    if (this.agentClearKeyPending) {
+      agentPayload.clearApiKey = true;
+    } else if (newApiKey) {
+      agentPayload.apiKey = newApiKey;
+    }
+    const newSttKey = el<HTMLInputElement>("set-stt-api-key").value.trim();
+    if (this.sttClearKeyPending) {
+      agentPayload.clearSttApiKey = true;
+    } else if (newSttKey) {
+      agentPayload.sttApiKey = newSttKey;
+    }
+
     try {
-      const res = await apiPost<unknown>("/api/settings", payload);
+      const [res, agentRes] = await Promise.all([
+        apiPost<unknown>("/api/settings", payload),
+        apiPost<{
+          config?: UiPublicAgentConfig;
+          agent?: unknown;
+          voice?: unknown;
+        }>("/api/agent/config", agentPayload),
+      ]);
       this.settingsOriginal = null;
+      this.agentClearKeyPending = false;
+      this.sttClearKeyPending = false;
+      if (agentRes?.config) this.agentConfigCache = agentRes.config;
+      if (agentRes?.agent) this.piAgentPanel.applyAgentSnapshot(agentRes.agent);
+      if (agentRes?.voice) this.piAgentPanel.applyVoiceSnapshot(agentRes.voice);
       if (asRecord(res)) {
         this.applyStatePatch(res);
       } else {
@@ -4221,6 +4429,10 @@ export class MijiaDeckWebApp {
         this.closeTrayLightPage();
         return;
       }
+      if (this.piAgentPanel.isOpen()) {
+        this.piAgentPanel.setOpen(false);
+        return;
+      }
       if (this.voiceFabExpanded) {
         this.collapseVoiceFab();
       }
@@ -4649,9 +4861,36 @@ export class MijiaDeckWebApp {
   private bindSettingsEvents(): void {
     document.querySelectorAll<HTMLButtonElement>("[data-settings-tab]").forEach((btn) => {
       btn.addEventListener("click", () => {
-        const tab = btn.dataset.settingsTab === "features" ? "features" : "appearance";
+        const raw = btn.dataset.settingsTab;
+        const tab: "appearance" | "features" | "voice-agent" =
+          raw === "features" ? "features" : raw === "voice-agent" ? "voice-agent" : "appearance";
         this.switchSettingsTab(tab);
       });
+    });
+
+    el<HTMLSelectElement>("set-agent-provider").addEventListener("change", () => {
+      this.syncAgentProviderFormHints(true);
+    });
+
+    el<HTMLInputElement>("set-voice-wake-enabled").addEventListener("change", (e) => {
+      const enabled = (e.target as HTMLInputElement).checked;
+      el("setting-row-wake-words").classList.toggle("is-disabled", !enabled);
+    });
+
+    el("set-agent-clear-key-btn").addEventListener("click", () => {
+      this.agentClearKeyPending = true;
+      const input = el<HTMLInputElement>("set-agent-api-key");
+      input.value = "";
+      input.placeholder = "将在保存设置后清除已保存的 API Key";
+      el("set-agent-clear-key-btn").hidden = true;
+    });
+
+    el("set-stt-clear-key-btn").addEventListener("click", () => {
+      this.sttClearKeyPending = true;
+      const input = el<HTMLInputElement>("set-stt-api-key");
+      input.value = "";
+      input.placeholder = "将在保存设置后清除已保存的 STT Key";
+      el("set-stt-clear-key-btn").hidden = true;
     });
 
     el<HTMLSelectElement>("set-theme-mode").addEventListener("change", (e) => {

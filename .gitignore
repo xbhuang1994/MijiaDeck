@@ -30,6 +30,7 @@ device_icons.json
 tray.json
 workbench.json
 settings.json
+pi_agent.json
 account_profiles.json
 *.json.tmp
 

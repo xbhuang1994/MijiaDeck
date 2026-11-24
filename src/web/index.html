@@ -23,6 +23,20 @@
           <span class="ws-dot" id="ws-dot"></span>
           <span class="ws-label" id="ws-label">连接中…</span>
         </span>
+        <button type="button" id="voice-listen-toggle-btn" class="title-action-btn voice-listen-btn" title="开启或停止持续语音监听（Alt+V 单次直说）" aria-label="开启或停止持续语音监听" aria-pressed="false">
+          <span class="voice-btn-dot" aria-hidden="true"></span>
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="9" y="2.5" width="6" height="11" rx="3"></rect>
+            <path d="M5 10.5a7 7 0 0 0 14 0"></path>
+            <line x1="12" y1="17.5" x2="12" y2="21.5"></line>
+            <line x1="8.5" y1="21.5" x2="15.5" y2="21.5"></line>
+          </svg>
+          <span id="voice-listen-label" class="title-action-label">语音监听</span>
+        </button>
+        <button type="button" id="pi-agent-toggle-btn" class="title-action-btn pi-agent-btn" title="打开 / 收起内置 Pi Agent 智能设备控制面板" aria-label="打开或收起内置 Pi Agent 面板" aria-expanded="false">
+          <span class="pi-symbol" aria-hidden="true">π</span>
+          <span class="title-action-label">Pi Agent</span>
+        </button>
         <button type="button" id="tray-toggle-btn" class="title-action-btn" title="打开 / 收起托盘快捷控制" aria-label="打开或收起托盘快捷控制" aria-expanded="false">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <rect x="3" y="4" width="18" height="16" rx="3"></rect>
@@ -139,6 +153,12 @@
       </div>
     </main>
 
+    <!-- Live Voice Listening Subtitle Pill -->
+    <button type="button" id="voice-live-pill" class="voice-live-pill" hidden aria-live="polite" title="点击打开 Pi Agent 面板">
+      <span class="voice-live-dot" aria-hidden="true"></span>
+      <span id="voice-live-pill-text">正在监听…</span>
+    </button>
+
     <!-- Toast Notification (anchored to the left of Voice FAB) -->
     <div id="toast-card" class="toast-card" role="status" aria-live="polite" hidden>
       <span id="toast-text"></span>
@@ -174,6 +194,77 @@
       </div>
     </footer>
   </div>
+
+  <!-- Slide-Over Built-in Pi Agent & Voice Control Drawer -->
+  <aside id="pi-agent-drawer" class="pi-agent-drawer" aria-label="内置 Pi Agent 语音控制面板" hidden>
+    <div class="pi-drawer-header">
+      <div class="pi-drawer-title-group">
+        <span class="pi-drawer-logo" aria-hidden="true">π</span>
+        <div class="pi-drawer-title-col">
+          <div class="pi-drawer-title-row">
+            <h2 class="pi-drawer-title">Pi Agent</h2>
+            <button type="button" id="pi-agent-engine-badge" class="pi-engine-badge" title="点击配置 Pi Agent 引擎与语音监听">内置本地引擎</button>
+          </div>
+          <span class="pi-drawer-sub">语音监听驱动 · 实时控制米家设备</span>
+        </div>
+      </div>
+      <div class="pi-drawer-actions">
+        <button type="button" id="pi-drawer-settings-btn" class="tray-icon-btn" title="配置 Pi Agent 与语音监听" aria-label="配置 Pi Agent 与语音监听">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
+        <button type="button" id="pi-drawer-reset-btn" class="tray-icon-btn" title="清空对话上下文" aria-label="清空对话上下文">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="3 6 5 6 21 6"></polyline>
+            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
+            <path d="M10 11v6M14 11v6"></path>
+          </svg>
+        </button>
+        <button type="button" id="pi-drawer-close-btn" class="tray-icon-btn" title="收起 Pi Agent 面板" aria-label="收起 Pi Agent 面板">✕</button>
+      </div>
+    </div>
+
+    <!-- Voice Listener Control Card -->
+    <div id="pi-voice-strip" class="pi-voice-strip">
+      <div class="pi-voice-top">
+        <div id="pi-voice-wave" class="pi-voice-wave" aria-hidden="true">
+          <span class="pi-wave-bar"></span>
+          <span class="pi-wave-bar"></span>
+          <span class="pi-wave-bar"></span>
+          <span class="pi-wave-bar"></span>
+          <span class="pi-wave-bar"></span>
+        </div>
+        <div class="pi-voice-info">
+          <div id="pi-voice-status-text" class="pi-voice-status">语音监听待机中</div>
+          <div id="pi-voice-sub-text" class="pi-voice-sub">点击「开启持续监听」或按 Alt+V 单次说话</div>
+        </div>
+      </div>
+      <div class="pi-voice-controls">
+        <button type="button" id="pi-voice-start-btn" class="primary-button btn-compact">开启持续监听</button>
+        <button type="button" id="pi-voice-oneshot-btn" class="secondary-button btn-compact" title="免唤醒单次语音输入（快捷键 Alt+V）">单次说话</button>
+        <button type="button" id="pi-voice-wake-toggle-btn" class="pi-wake-pill active" title="点击切换唤醒词模式或免唤醒直达模式">唤醒词：小派</button>
+      </div>
+    </div>
+
+    <!-- Conversation & Tool Execution Timeline -->
+    <div id="pi-agent-scroll" class="pi-agent-scroll">
+      <div id="pi-agent-empty" class="pi-agent-empty">
+        <div class="pi-empty-icon" aria-hidden="true">π</div>
+        <p class="pi-empty-title">用语音或文字直接控制智能家居</p>
+        <p class="pi-empty-desc">支持多设备协同、调光调色、传感器读数、音箱播报、喂食器出粮与手动场景；也可以接入 DeepSeek / OpenAI / Claude / Gemini / Ollama 大模型。</p>
+        <div id="pi-quick-chips" class="pi-quick-chips"></div>
+      </div>
+      <div id="pi-agent-timeline" class="pi-agent-timeline" role="log" aria-live="polite"></div>
+    </div>
+
+    <!-- Bottom Prompt Composer -->
+    <div class="pi-composer">
+      <input type="text" id="pi-agent-input" class="pi-composer-input" placeholder="输入设备控制指令，如“把客厅吸顶灯调到暖光 80%”…" autocomplete="off" spellcheck="false" aria-label="输入 Pi Agent 控制指令">
+      <button type="button" id="pi-agent-send-btn" class="primary-button btn-compact pi-send-btn">发送</button>
+    </div>
+  </aside>
 
   <!-- Floating Tray Quick Window Popup -->
   <aside id="tray-quick-window" class="tray-quick-window" aria-label="托盘快捷控制" hidden>
@@ -341,6 +432,7 @@
       <div class="settings-tabs" role="tablist">
         <button type="button" class="settings-tab active" role="tab" aria-selected="true" data-settings-tab="appearance">主题界面</button>
         <button type="button" class="settings-tab" role="tab" aria-selected="false" data-settings-tab="features">应用功能</button>
+        <button type="button" class="settings-tab" role="tab" aria-selected="false" data-settings-tab="voice-agent">语音与 Pi Agent</button>
       </div>
       <div class="settings-pages">
         <!-- Appearance Tab -->
@@ -481,6 +573,136 @@
               <input type="checkbox" id="set-check-update">
               <span class="md-switch-track"></span>
             </label>
+          </div>
+        </div>
+
+        <!-- Voice Listening & Built-in Pi Agent Tab -->
+        <div id="settings-page-voice-agent" class="settings-page" hidden>
+          <div class="setting-section-title">内置 Pi Agent 引擎</div>
+
+          <div class="setting-card setting-card-wrap">
+            <div class="setting-info">
+              <div class="setting-label">模型引擎</div>
+              <div class="setting-desc" id="set-agent-provider-desc">内置本地引擎免 API Key 即可执行常见开关、调光、温湿度、喂食器与场景操作；也可接入主流云端大模型或本地 Ollama</div>
+            </div>
+            <select id="set-agent-provider" class="md-select agent-select" aria-label="Pi Agent 模型引擎"></select>
+          </div>
+
+          <div class="setting-card setting-card-wrap" id="setting-row-agent-model">
+            <div class="setting-info">
+              <div class="setting-label">模型 ID</div>
+              <div class="setting-desc">选择推荐模型或输入任意目标模型名称</div>
+            </div>
+            <div class="agent-field-control">
+              <input type="text" id="set-agent-model" class="md-text-input" list="set-agent-model-list" placeholder="mijia-local-planner" aria-label="Pi Agent 模型 ID">
+              <datalist id="set-agent-model-list"></datalist>
+            </div>
+          </div>
+
+          <div class="setting-card setting-card-wrap" id="setting-row-agent-baseurl">
+            <div class="setting-info">
+              <div class="setting-label">API Base URL（可选）</div>
+              <div class="setting-desc">留空使用默认官方地址；接入本地 Ollama（如 http://127.0.0.1:11434/v1）或代理网关时填写</div>
+            </div>
+            <div class="agent-field-control">
+              <input type="text" id="set-agent-base-url" class="md-text-input" placeholder="https://api.deepseek.com" spellcheck="false" aria-label="API Base URL">
+            </div>
+          </div>
+
+          <div class="setting-card setting-card-wrap" id="setting-row-agent-apikey">
+            <div class="setting-info">
+              <div class="setting-label">API Key</div>
+              <div class="setting-desc" id="set-agent-api-key-status">密钥仅保存在本机配置文件，绝不向前端回传明文；也自动支持环境变量（如 DEEPSEEK_API_KEY / OPENAI_API_KEY）</div>
+            </div>
+            <div class="agent-key-row">
+              <input type="password" id="set-agent-api-key" class="md-text-input" placeholder="输入新的 API Key（留空保持不变）" autocomplete="off" aria-label="Pi Agent API Key">
+              <button type="button" id="set-agent-clear-key-btn" class="secondary-button btn-compact" hidden>清除密钥</button>
+            </div>
+          </div>
+
+          <div class="setting-card setting-card-wrap">
+            <div class="setting-info">
+              <div class="setting-label">附加指令（可选）</div>
+              <div class="setting-desc">告诉 Pi Agent 你的家庭习惯、房间别名或偏好（如“我说睡了就关客厅和餐厅所有灯”）</div>
+            </div>
+            <textarea id="set-agent-system-prompt" class="agent-textarea" rows="2" placeholder="可选：补充个性化家居控制习惯…" aria-label="Pi Agent 附加指令"></textarea>
+          </div>
+
+          <div class="setting-section-title">语音监听设置</div>
+
+          <div class="setting-card">
+            <div class="setting-info">
+              <div class="setting-label">语音识别引擎</div>
+              <div class="setting-desc">「自动」优先使用浏览器原生实时语音识别，如网络不可达且配置了 STT 接口则自动切换至麦克风 VAD + Whisper 转写</div>
+            </div>
+            <select id="set-voice-engine" class="md-select" aria-label="语音识别引擎">
+              <option value="auto">自动（优先浏览器，失败切 STT）</option>
+              <option value="browser">浏览器原生实时语音识别</option>
+              <option value="whisper">麦克风 VAD + Whisper 兼容转写</option>
+            </select>
+          </div>
+
+          <div class="setting-card">
+            <div class="setting-info">
+              <div class="setting-label">识别语言</div>
+              <div class="setting-desc">用于浏览器语音识别与 Whisper 音频转写</div>
+            </div>
+            <select id="set-voice-lang" class="md-select" aria-label="语音识别语言">
+              <option value="zh-CN">中文（普通话）</option>
+              <option value="en-US">English (US)</option>
+              <option value="zh-HK">中文（粤语）</option>
+            </select>
+          </div>
+
+          <div class="setting-card">
+            <div class="setting-info">
+              <div class="setting-label">启用唤醒词过滤</div>
+              <div class="setting-desc">开启后仅响应包含唤醒词的语句（防误触）；关闭后持续监听到的每句话都会直接交给 Pi Agent</div>
+            </div>
+            <label class="md-switch">
+              <input type="checkbox" id="set-voice-wake-enabled">
+              <span class="md-switch-track"></span>
+            </label>
+          </div>
+
+          <div class="setting-card setting-card-wrap" id="setting-row-wake-words">
+            <div class="setting-info">
+              <div class="setting-label">唤醒词列表与聆听窗口</div>
+              <div class="setting-desc">多个唤醒词用逗号分隔；仅说唤醒词后，在等待窗口内说出的下一句也会直接执行</div>
+            </div>
+            <div class="agent-wake-grid">
+              <input type="text" id="set-voice-wake-words" class="md-text-input" placeholder="小派, 派派, pi, 米家助手" aria-label="唤醒词列表">
+              <div class="agent-window-box">
+                <input type="number" id="set-voice-wake-window" class="md-num-input" min="3" max="60" value="10" aria-label="唤醒等待秒数">
+                <span class="agent-unit">秒</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="setting-card">
+            <div class="setting-info">
+              <div class="setting-label">语音播报执行结果</div>
+              <div class="setting-desc">通过语音监听控制设备后，自动用系统语音简短朗读 Pi Agent 的执行反馈（播报期间自动防回声）</div>
+            </div>
+            <label class="md-switch">
+              <input type="checkbox" id="set-voice-auto-speak">
+              <span class="md-switch-track"></span>
+            </label>
+          </div>
+
+          <div class="setting-card setting-card-wrap" id="setting-row-stt-config">
+            <div class="setting-info">
+              <div class="setting-label">可选 STT 语音转写服务（OpenAI Whisper 兼容）</div>
+              <div class="setting-desc" id="set-stt-key-status">当国内无法使用 Chrome 在线识别或使用 Firefox 时，可配置 SiliconFlow (SenseVoiceSmall) / OpenAI / 本地 faster-whisper 地址</div>
+            </div>
+            <div class="agent-stt-grid">
+              <input type="text" id="set-stt-base-url" class="md-text-input" placeholder="STT Base URL，如 https://api.siliconflow.cn/v1" spellcheck="false" aria-label="STT Base URL">
+              <input type="text" id="set-stt-model" class="md-text-input" placeholder="模型，如 whisper-1 或 FunAudioLLM/SenseVoiceSmall" spellcheck="false" aria-label="STT 模型">
+              <div class="agent-key-row">
+                <input type="password" id="set-stt-api-key" class="md-text-input" placeholder="STT API Key（留空则复用上方 Key）" autocomplete="off" aria-label="STT API Key">
+                <button type="button" id="set-stt-clear-key-btn" class="secondary-button btn-compact" hidden>清除</button>
+              </div>
+            </div>
           </div>
         </div>
       </div>
