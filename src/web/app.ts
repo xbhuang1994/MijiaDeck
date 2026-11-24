@@ -1235,6 +1235,25 @@ export class MijiaDeckWebApp {
     this.piAgentPanel = new PiAgentPanelController({
       apiGet,
       apiPost,
+      isWsOpen: () => this.ws !== null && this.ws.readyState === WebSocket.OPEN,
+      sendWsJson: (payload) => {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+        try {
+          this.ws.send(JSON.stringify(payload));
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      sendWsBinary: (buffer) => {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+        try {
+          this.ws.send(buffer);
+          return true;
+        } catch {
+          return false;
+        }
+      },
       showToast: (msg, ms) => this.showToast(msg, ms),
       openVoiceAgentSettings: () => {
         void this.openSettingsModal("voice-agent");
@@ -1902,6 +1921,9 @@ export class MijiaDeckWebApp {
         }
         break;
       }
+      case "voice_stream_event":
+        this.piAgentPanel.handleVoiceStreamEvent(msg);
+        break;
       default:
         // If server sends raw state object without a `type` wrapper
         if ("devices" in msg || "accessState" in msg || "access_state" in msg) {
@@ -3395,11 +3417,15 @@ export class MijiaDeckWebApp {
     };
 
     const gtcrnOk = Boolean(status?.readyForDenoise);
+    const dpdfOk = Boolean(status?.readyForDpdfnet);
+    const voxOk = Boolean(status?.readyForVoxlock);
     const vadOk = Boolean(status?.readyForVad);
     const vpOk = Boolean(status?.readyForVoiceprint);
     const asrOk = Boolean(status?.readyForLocalAsr);
 
     setBadge("badge-model-gtcrn", "GTCRN 降噪", gtcrnOk);
+    setBadge("badge-model-dpdfnet", "DPDFNet4 强噪", dpdfOk);
+    setBadge("badge-model-voxlock", "VoxLock 声纹提取", voxOk);
     setBadge("badge-model-vad", "Silero VAD", vadOk);
     setBadge("badge-model-vp", "3D-Speaker 声纹", vpOk);
     setBadge("badge-model-asr", "SenseVoice 识别", asrOk);
@@ -3414,7 +3440,7 @@ export class MijiaDeckWebApp {
     const desc = document.getElementById("voice-pipeline-status-desc");
     if (desc) {
       desc.textContent = allReady
-        ? "本地 4 套离线语音 AI 模型已全部就绪（GTCRN 降噪 + Silero VAD + 3D-Speaker 中文声纹 + SenseVoice 离线识别），国内零依赖极速响应"
+        ? "本地流式语音 AI 管线已就绪（WebSocket 连续流 + 双轨抗音乐/强噪融合 + Silero VAD + 3D-Speaker 声纹 + SenseVoice 离线识别）"
         : "本地离线语音模型尚未完全就绪，可点击「一键补齐模型」自动下载，未就绪项将自动使用 DSP/云端降级";
     }
   }

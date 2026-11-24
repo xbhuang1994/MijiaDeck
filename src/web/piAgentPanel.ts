@@ -77,12 +77,16 @@ export interface UiPiAgentSnapshot {
 export interface UiLocalVoiceStatus {
   addonAvailable: boolean;
   readyForDenoise: boolean;
+  readyForDpdfnet?: boolean;
+  readyForVoxlock?: boolean;
   readyForVad: boolean;
   readyForVoiceprint: boolean;
   readyForLocalAsr: boolean;
   downloading?: boolean;
   models?: {
     gtcrn: boolean;
+    dpdfnet4?: boolean;
+    voxlock?: boolean;
     sileroVad: boolean;
     speakerCampp: boolean;
     senseVoice: boolean;
@@ -112,7 +116,7 @@ export interface UiVoiceSnapshot {
   wakeWords: string[];
   autoSpeakReply: boolean;
   attentionMode?: "smart" | "strict" | "off";
-  noiseSuppressionMode?: "auto" | "neural" | "dsp" | "off";
+  noiseSuppressionMode?: "auto" | "neural" | "dpdfnet" | "voxlock" | "dsp" | "off";
   voiceprintMode?: "off" | "tag" | "strict";
   localEngine?: UiLocalVoiceStatus;
   voiceprints?: UiVoiceprintProfile[];
@@ -145,6 +149,9 @@ export interface UiVoiceSnapshot {
 export interface PiAgentPanelDeps {
   apiGet: <T>(url: string) => Promise<T>;
   apiPost: <T>(url: string, body?: unknown) => Promise<T>;
+  isWsOpen?: () => boolean;
+  sendWsJson?: (payload: Record<string, unknown>) => boolean;
+  sendWsBinary?: (buffer: ArrayBuffer) => boolean;
   showToast: (message: string, durationMs?: number) => void;
   openVoiceAgentSettings: () => void;
 }
@@ -294,8 +301,46 @@ export class PiAgentPanelController {
           this.flashLivePill(`已忽略：${data.attention.reason || "非定向呼唤"}`, 2800);
         }
       },
+      isVoiceStreamReady: () => Boolean(this.deps.isWsOpen?.()),
+      sendVoiceStreamControl: (msg) => Boolean(this.deps.sendWsJson?.(msg)),
+      sendVoiceStreamPcm: (buf) => Boolean(this.deps.sendWsBinary?.(buf)),
       onToast: (msg, ms) => this.deps.showToast(msg, ms),
     });
+  }
+
+  handleVoiceStreamEvent(raw: unknown): void {
+    const ev = asRec(raw);
+    if (!ev) return;
+    const kind = String(ev.kind ?? "");
+    const text = typeof ev.text === "string" ? ev.text : "";
+    const matched = ev.matched === true;
+    const wokeOnly = ev.wokeOnly === true;
+    const reply = typeof ev.reply === "string" ? ev.reply : "";
+    const attention = asRec(ev.attention);
+
+    this.voiceClient.handleStreamServerEvent({ kind, text, matched });
+
+    if (kind === "result") {
+      if (ev.agent) this.applyAgentSnapshot(ev.agent);
+      if (ev.voiceState) this.applyVoiceSnapshot(ev.voiceState);
+      if (matched && wokeOnly) {
+        this.flashLivePill("已唤醒，请说控制指令…", 4000);
+      } else if (matched && reply) {
+        this.flashLivePill(`Pi Agent：${reply}`, 4200);
+      } else if (
+        text &&
+        attention &&
+        attention.accept === false &&
+        (attention.stage === "llm-attention" ||
+          attention.stage === "pragmatic-reject" ||
+          attention.stage === "voiceprint")
+      ) {
+        this.flashLivePill(
+          `已忽略：${typeof attention.reason === "string" ? attention.reason : "非定向呼唤"}`,
+          2800,
+        );
+      }
+    }
   }
 
   bindEvents(): void {

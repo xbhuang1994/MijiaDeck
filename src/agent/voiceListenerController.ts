@@ -17,6 +17,7 @@ import { createBoundedFetch, type FetchLike } from "../core/httpTimeout.ts";
 import { decodeWavPcm, encodeWavPcm16, isWavBuffer, resampleLinear } from "./audioPcm.ts";
 import { LocalVoiceEngine, type LocalVoiceEngineStatus } from "./localVoiceEngine.ts";
 import type { AgentToolCallRecord, PiAgentRunResult, PiAgentService } from "./piAgentService.ts";
+import type { VoiceStreamSegmentPayload } from "./voiceStreamSession.ts";
 import {
   evaluateVoiceAttention,
   findWakeWordSpan,
@@ -694,7 +695,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       pref === "local" || (pref === "auto" && localReady) || (pref === "whisper" && !hasCloudStt && localReady);
 
     if (useLocal) {
-      const sv = await this._localEngine.transcribeLocal(vad.speechSamples, 16000, lang);
+      // 双轨抗音乐/强噪融合识别：同时参考高通原始轨（零降噪伪影）与神经降噪轨，避免音乐场景吞字或误词！
+      const sv = await this._localEngine.transcribeDualTrack(pcm16k, vad.speechSamples, {
+        voiceLang: lang,
+        wakeWords: cfg.wakeWords,
+        inputSnrDb: denoised.inputSnrDb,
+      });
       transcript = sv.text;
       acousticEvent = sv.event;
       asrEngine = sv.engine;
@@ -779,7 +785,136 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   }
 
   /**
-   * 声纹注册：先对样本执行环境降噪与 Silero VAD 裁切，再提取 3D-Speaker CAM++ 向量并落盘。
+   * 处理来自连续 WebSocket 实时流会话（VoiceStreamSession）切出的双轨音频分段：
+   * 直接在服务端流式 GTCRN + Silero VAD 切分基础上运行声纹 + 双轨 SenseVoice + 抗歌词注意力门控。
+   */
+  async processDualTrackSegment(
+    segment: VoiceStreamSegmentPayload,
+    options: {
+      lang?: string;
+      bypassWakeWord?: boolean;
+      preferredEngine?: "auto" | "local" | "whisper";
+      llmAttentionOverride?: AttentionLlmEvaluator;
+    } = {},
+  ): Promise<ProcessAudioUploadResult> {
+    const totalStart = performance.now();
+    const cfg = this.config;
+    const lang = options.lang || cfg.voiceLang || "zh-CN";
+
+    // 1. 声纹识别（使用降噪后更干净的说话人语音段）
+    let voiceprintResult: VoiceprintIdentifyResult | null = null;
+    let voiceprintMs = 0;
+    const profiles = listPublicVoiceprints();
+    const vpAudio =
+      segment.denoisedSamples.length >= 4000 ? segment.denoisedSamples : segment.rawSamples;
+    if (cfg.voiceprintMode !== "off" && profiles.length > 0 && vpAudio.length >= 4000) {
+      const emb = this._localEngine.extractSpeakerEmbedding(vpAudio, 16000);
+      voiceprintMs = emb.durationMs;
+      voiceprintResult = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
+    }
+
+    // 2. 双轨语音识别（优先本地 SenseVoice 双轨融合，降级云端 Whisper）
+    const sttAuth = resolveEffectiveSttAuth(cfg);
+    const hasCloudStt = Boolean(
+      sttAuth.baseUrl && (sttAuth.apiKey || isLocalEndpointUrl(sttAuth.baseUrl)),
+    );
+    const localReady = this._localEngine.getStatus().readyForLocalAsr;
+    const pref = options.preferredEngine ?? (cfg.voiceEngine === "whisper" ? "whisper" : "auto");
+    const useLocal =
+      pref === "local" ||
+      (pref === "auto" && localReady) ||
+      (pref === "whisper" && !hasCloudStt && localReady);
+
+    let transcript = "";
+    let acousticEvent = "";
+    let asrEngine = "sensevoice-dual-raw";
+    let asrMs = 0;
+    let runtimeEngine: VoiceRuntimeEngine = "local";
+
+    if (useLocal) {
+      const sv = await this._localEngine.transcribeDualTrack(
+        segment.rawSamples,
+        segment.denoisedSamples,
+        {
+          voiceLang: lang,
+          wakeWords: cfg.wakeWords,
+          inputSnrDb: segment.inputSnrDb,
+          forceDual: segment.forcedRoll || segment.inputSnrDb < 20,
+        },
+      );
+      transcript = sv.text;
+      acousticEvent = sv.event;
+      asrEngine = sv.engine;
+      asrMs = sv.durationMs;
+      runtimeEngine = "local";
+    } else {
+      const wavBytes = encodeWavPcm16(vpAudio, 16000);
+      const blob = new Blob([wavBytes as unknown as BlobPart], { type: "audio/wav" });
+      const t0 = performance.now();
+      transcript = await this.transcribeAudio(blob, { filename: "voice-stream.wav", lang });
+      asrMs = Math.round(performance.now() - t0);
+      asrEngine = "whisper-cloud";
+      runtimeEngine = "whisper";
+    }
+
+    this._lastMetrics = {
+      denoiseEngine: segment.denoiseEngine,
+      snrGainDb: segment.snrGainDb,
+      vadEngine: "silero-stream",
+      speechRatio: 1,
+      asrEngine,
+      voiceprint: voiceprintResult,
+      updatedAt: Date.now(),
+    };
+
+    if (!transcript.trim()) {
+      return {
+        ok: true,
+        text: "",
+        speechDetected: false,
+        denoiseEngine: segment.denoiseEngine,
+        vadEngine: "silero-stream",
+        asrEngine,
+        inputSnrDb: segment.inputSnrDb,
+        outputSnrDb: segment.outputSnrDb,
+        snrGainDb: segment.snrGainDb,
+        acousticEvent,
+        voiceprint: voiceprintResult,
+        matched: false,
+        wokeOnly: false,
+        command: "",
+        timings: { voiceprintMs, asrMs, totalMs: Math.round(performance.now() - totalStart) },
+        voiceState: this.snapshot(),
+      };
+    }
+
+    const dispatched = await this.handleTranscript(transcript, {
+      isFinal: true,
+      bypassWakeWord: options.bypassWakeWord,
+      engine: runtimeEngine,
+      acousticEvent,
+      voiceprint: voiceprintResult,
+      snrGainDb: segment.snrGainDb,
+      timingsBase: { voiceprintMs, asrMs },
+      llmAttentionOverride: options.llmAttentionOverride,
+    });
+
+    return {
+      ...dispatched,
+      text: transcript,
+      speechDetected: true,
+      denoiseEngine: segment.denoiseEngine,
+      vadEngine: "silero-stream",
+      asrEngine,
+      inputSnrDb: segment.inputSnrDb,
+      outputSnrDb: segment.outputSnrDb,
+      snrGainDb: segment.snrGainDb,
+      acousticEvent,
+    };
+  }
+
+  /**
+   * 声纹注册：先对样本执行环境降噪与 Silero VAD 裁切，再提取 3D-Speaker CAM++ 向量并落盘，同时保存参考 WAV 供 VoxLock 使用。
    */
   async enrollVoiceprintFromAudio(
     audioBlob: Blob,
@@ -814,6 +949,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       role: options.role,
       embedding: emb.embedding,
       engine: emb.engine,
+      refAudioSamples16k: speech,
     });
 
     this.emit("stateChanged", this.snapshot());

@@ -25,7 +25,7 @@ export interface ClientVoiceConfig {
   continuousListen: boolean;
   vadThreshold: number;
   vadSilenceMs: number;
-  noiseSuppressionMode?: "auto" | "neural" | "dsp" | "off";
+  noiseSuppressionMode?: "auto" | "neural" | "dpdfnet" | "voxlock" | "dsp" | "off";
   vadMode?: "silero" | "adaptive";
   voiceprintMode?: "off" | "tag" | "strict";
   voiceprintThreshold?: number;
@@ -58,6 +58,9 @@ export interface VoiceListenerClientCallbacks {
     blob: Blob,
     options: { bypassWakeWord: boolean; lang: string; engine: "local" | "whisper"; filename: string },
   ) => Promise<void>;
+  isVoiceStreamReady?: () => boolean;
+  sendVoiceStreamControl?: (msg: Record<string, unknown>) => boolean;
+  sendVoiceStreamPcm?: (buffer: ArrayBuffer) => boolean;
   onToast: (message: string, durationMs?: number) => void;
 }
 
@@ -177,7 +180,14 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
     this.preRollWrite = 0;
     this.preRollFilled = 0;
 
-    // 自适应噪声底噪 + VAD 状态
+    // 连续实时流模式：直接每 128ms (2048 samples) 将 16kHz Int16 PCM 推给服务端在线降噪 + Silero VAD
+    // 彻底避免强噪/背景音乐下浏览器 RMS 门限失效或 15 秒卡死！
+    this.streamMode = Boolean(opts.streamMode);
+    this.streamFrameSize = 2048;
+    this.streamBuf = new Int16Array(this.streamFrameSize);
+    this.streamPos = 0;
+
+    // 兜底 HTTP 模式下的自适应噪声底噪 + VAD 状态
     this.vadThreshold = Number(opts.vadThreshold) || 0.018;
     this.vadSilenceMs = Number(opts.vadSilenceMs) || 750;
     this.noiseFloor = 0.006;
@@ -186,8 +196,8 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
     this.speechSampleCount = 0;
     this.silentSamples = 0;
     this.loudFrames = 0;
-    this.maxSpeechSamples = this.targetRate * 15;
-    this.minSpeechSamples = Math.round(this.targetRate * 0.25);
+    this.maxSpeechSamples = this.targetRate * 5;
+    this.minSpeechSamples = Math.round(this.targetRate * 0.22);
 
     this.paused = false;
     this.levelAccumSq = 0;
@@ -198,6 +208,7 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
       if (msg.type === "config") {
         if (typeof msg.vadThreshold === "number") this.vadThreshold = msg.vadThreshold;
         if (typeof msg.vadSilenceMs === "number") this.vadSilenceMs = msg.vadSilenceMs;
+        if (typeof msg.streamMode === "boolean") this.streamMode = msg.streamMode;
       } else if (msg.type === "pause") {
         this.paused = Boolean(msg.paused);
         if (this.paused) {
@@ -206,6 +217,7 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
           this.speechSampleCount = 0;
           this.silentSamples = 0;
           this.loudFrames = 0;
+          this.streamPos = 0;
         }
       } else if (msg.type === "flush") {
         this.finishUtterance();
@@ -323,10 +335,26 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
       return true;
     }
 
+    // 连续实时流模式：绕过粗糙浏览器能量门限，直接持续将 16kHz Int16 PCM 推给服务端在线神经降噪 + Silero VAD
+    if (this.streamMode) {
+      for (let i = 0; i < pcm16.length; i += 1) {
+        const s = pcm16[i];
+        this.streamBuf[this.streamPos] = s < 0 ? Math.round(s * 0x8000) : Math.round(s * 0x7fff);
+        this.streamPos += 1;
+        if (this.streamPos >= this.streamFrameSize) {
+          const out = this.streamBuf;
+          this.streamBuf = new Int16Array(this.streamFrameSize);
+          this.streamPos = 0;
+          this.port.postMessage({ type: "pcm_frame", buffer: out.buffer }, [out.buffer]);
+        }
+      }
+      return true;
+    }
+
     if (!this.speaking) {
-      // 更新环境噪声底噪（快降慢升，防止稳态风扇/空调底噪导致持续误触发）
+      // 限制 noiseFloor 上限（0.030），避免背景音乐把阈值拉高到 0.20 导致真人语音无法触发
       const rate = rms < this.noiseFloor ? 0.05 : 0.008;
-      this.noiseFloor = Math.max(0.002, Math.min(0.08, this.noiseFloor * (1 - rate) + rms * rate));
+      this.noiseFloor = Math.max(0.002, Math.min(0.03, this.noiseFloor * (1 - rate) + rms * rate));
       this.pushPreRoll(pcm16);
 
       if (isVoiceLike) {
@@ -511,6 +539,7 @@ export class VoiceListenerClient {
   private workletBlobUrl: string | null = null;
   private fallbackProcessor: ScriptProcessorNode | null = null;
   private silentGain: GainNode | null = null;
+  private streamingOverWs = false;
   private uploading = false;
 
   constructor(private readonly cb: VoiceListenerClientCallbacks) {}
@@ -593,6 +622,10 @@ export class VoiceListenerClient {
   }
 
   stop(notifyServer = true): void {
+    if (this.streamingOverWs) {
+      this.cb.sendVoiceStreamControl?.({ type: "voice_stream_stop" });
+      this.streamingOverWs = false;
+    }
     this.active = false;
     this.oneShot = false;
     this.mode = "idle";
@@ -603,6 +636,27 @@ export class VoiceListenerClient {
     this.stopAudioCapture();
     this.cb.onLevelChange(0);
     this.emitState(notifyServer);
+  }
+
+  /**
+   * 接收服务端 WebSocket 实时语音流回执（语音开始/结束/识别结果）。
+   */
+  handleStreamServerEvent(ev: { kind?: string; text?: string; matched?: boolean }): void {
+    if (!this.active || !this.streamingOverWs) return;
+    if (ev.kind === "speech_start") {
+      this.interimTranscript = "检测到人声，正在抗噪双轨识别…";
+      this.emitState(false);
+    } else if (ev.kind === "speech_end") {
+      this.interimTranscript = "正在识别与注意力判断…";
+      this.emitState(false);
+    } else if (ev.kind === "result") {
+      this.interimTranscript = "";
+      if (this.oneShot && (ev.text || ev.matched)) {
+        this.stop(true);
+      } else {
+        this.emitState(false);
+      }
+    }
   }
 
   /**
@@ -955,11 +1009,14 @@ export class VoiceListenerClient {
     this.stopAudioCapture();
 
     try {
+      const useNeuralPipeline = this.config.noiseSuppressionMode !== "off" && this.config.noiseSuppressionMode !== "dsp";
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
+          // 始终保留硬件回声消除（消除本机扬声器回声）；
+          // 服务端启用神经降噪/双轨抗音乐识别时关闭浏览器粗糙的 NS/AGC，避免音乐场景下人声被浏览器抽泵砍断！
           echoCancellation: true,
-          noiseSuppression: this.config.noiseSuppressionMode !== "off",
-          autoGainControl: true,
+          noiseSuppression: !useNeuralPipeline && this.config.noiseSuppressionMode !== "off",
+          autoGainControl: !useNeuralPipeline,
           channelCount: 1,
         },
       });
@@ -986,11 +1043,30 @@ export class VoiceListenerClient {
       silentGain.gain.value = 0;
       this.silentGain = silentGain;
 
+      const canStreamWs =
+        Boolean(this.cb.isVoiceStreamReady?.()) &&
+        Boolean(this.cb.sendVoiceStreamControl) &&
+        Boolean(this.cb.sendVoiceStreamPcm);
+
       if (ctx.audioWorklet && typeof AudioWorkletNode !== "undefined") {
         const blob = new Blob([VOICE_WORKLET_CODE], { type: "application/javascript" });
         const url = URL.createObjectURL(blob);
         this.workletBlobUrl = url;
         await ctx.audioWorklet.addModule(url);
+
+        if (canStreamWs) {
+          this.streamingOverWs = Boolean(
+            this.cb.sendVoiceStreamControl?.({
+              type: "voice_stream_start",
+              sampleRate: 16000,
+              lang: this.config.voiceLang || "zh-CN",
+              bypassWakeWord: this.oneShot,
+              engine,
+            }),
+          );
+        } else {
+          this.streamingOverWs = false;
+        }
 
         const node = new AudioWorkletNode(ctx, "mijia-voice-processor", {
           numberOfInputs: 1,
@@ -999,6 +1075,7 @@ export class VoiceListenerClient {
           processorOptions: {
             vadThreshold: this.config.vadThreshold,
             vadSilenceMs: this.config.vadSilenceMs,
+            streamMode: this.streamingOverWs,
           },
         });
         this.workletNode = node;
@@ -1009,6 +1086,7 @@ export class VoiceListenerClient {
             rms?: number;
             samples?: Float32Array;
             sampleRate?: number;
+            buffer?: ArrayBuffer;
           };
           if (!msg || !this.active) return;
 
@@ -1020,6 +1098,15 @@ export class VoiceListenerClient {
               this.cancelSpeaking();
               this.interimTranscript = "已打断播报，正在聆听…";
               this.emitState(false);
+            }
+          } else if (msg.type === "pcm_frame" && msg.buffer instanceof ArrayBuffer) {
+            if (this.streamingOverWs) {
+              const sent = this.cb.sendVoiceStreamPcm?.(msg.buffer);
+              if (sent === false) {
+                // WebSocket 临时断开时自动降级到本地 VAD + HTTP 上传
+                this.streamingOverWs = false;
+                node.port.postMessage({ type: "config", streamMode: false });
+              }
             }
           } else if (msg.type === "speech_start") {
             if (!this.uploading) {

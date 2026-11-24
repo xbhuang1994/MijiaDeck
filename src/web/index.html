@@ -661,6 +661,8 @@
             <div class="voice-status-row">
               <div class="voice-status-badges" id="voice-model-badges">
                 <span class="voice-badge-pill" id="badge-model-gtcrn">GTCRN 降噪</span>
+                <span class="voice-badge-pill" id="badge-model-dpdfnet">DPDFNet4 强噪</span>
+                <span class="voice-badge-pill" id="badge-model-voxlock">VoxLock 声纹提取</span>
                 <span class="voice-badge-pill" id="badge-model-vad">Silero VAD</span>
                 <span class="voice-badge-pill" id="badge-model-vp">3D-Speaker 声纹</span>
                 <span class="voice-badge-pill" id="badge-model-asr">SenseVoice 识别</span>
@@ -696,13 +698,15 @@
 
           <div class="setting-card setting-card-wrap">
             <div class="setting-info">
-              <div class="setting-label">环境降噪与语音端点检测（VAD）</div>
-              <div class="setting-desc">前端 AudioWorklet（85Hz 高通 + 400ms 防吞字缓冲）结合后端 GTCRN 深度降噪与 Silero VAD，在风扇/空调/音乐环境下准确提取人声</div>
+              <div class="setting-label">环境降噪、抗音乐干扰与语音端点检测（VAD）</div>
+              <div class="setting-desc">AudioWorklet 实时直推 16kHz PCM 至服务端在线降噪 + 流式 Silero VAD + 双轨抗音乐识别，避免背景音乐下人声被门限吞掉或 15 秒卡顿</div>
             </div>
             <div class="voice-triple-grid">
               <select id="set-voice-noise-mode" class="md-select" aria-label="环境降噪模式">
-                <option value="auto">降噪：自动（优先 GTCRN 神经降噪）</option>
-                <option value="neural">降噪：GTCRN 深度降噪</option>
+                <option value="auto">降噪：自动（双轨抗音乐融合 + GTCRN）</option>
+                <option value="neural">降噪：GTCRN 实时神经降噪</option>
+                <option value="dpdfnet">降噪：DPDFNet4 强效深度降噪</option>
+                <option value="voxlock">降噪：VoxLock 声纹锁定人声提取</option>
                 <option value="dsp">降噪：轻量频谱减法 DSP</option>
                 <option value="off">降噪：关闭</option>
               </select>

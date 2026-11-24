@@ -7,8 +7,9 @@
  * 仅在本地保存 L2 归一化说话人嵌入向量，绝不上传至任何外部服务。
  */
 
+import { existsSync, unlinkSync, writeFileSync } from "node:fs";
 import { dataFile, readJson, writeJson } from "../core/jsonStore.ts";
-import { cosineSimilarity, l2Normalize } from "./audioPcm.ts";
+import { cosineSimilarity, encodeWavPcm16, l2Normalize } from "./audioPcm.ts";
 
 const FILENAME = "voiceprints.json";
 const MAX_SAMPLES_PER_SPEAKER = 8;
@@ -24,6 +25,7 @@ export interface VoiceprintProfileRecord {
   centroid: number[];
   samples: number[][];
   sampleCount: number;
+  refWavFilename?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -35,6 +37,7 @@ export interface PublicVoiceprintProfile {
   engine: string;
   dim: number;
   sampleCount: number;
+  hasRefAudio?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -106,6 +109,9 @@ function normalizeStore(raw: unknown): VoiceprintFileSchema {
       centroid: computeCentroid(safeSamples),
       samples: safeSamples,
       sampleCount: safeSamples.length,
+      ...(typeof rec.refWavFilename === "string" && rec.refWavFilename.trim()
+        ? { refWavFilename: rec.refWavFilename.trim() }
+        : {}),
       createdAt: typeof rec.createdAt === "number" ? rec.createdAt : now,
       updatedAt: typeof rec.updatedAt === "number" ? rec.updatedAt : now,
     });
@@ -136,6 +142,9 @@ function makeProfileId(name: string): string {
 }
 
 export function toPublicVoiceprint(profile: VoiceprintProfileRecord): PublicVoiceprintProfile {
+  const hasRefAudio = Boolean(
+    profile.refWavFilename && existsSync(dataFile(profile.refWavFilename)),
+  );
   return {
     id: profile.id,
     name: profile.name,
@@ -143,9 +152,22 @@ export function toPublicVoiceprint(profile: VoiceprintProfileRecord): PublicVoic
     engine: profile.engine,
     dim: profile.dim,
     sampleCount: profile.sampleCount,
+    hasRefAudio,
     createdAt: profile.createdAt,
     updatedAt: profile.updatedAt,
   };
+}
+
+/**
+ * 返回主人的本地参考语音 WAV 路径（用于 VoxLock 目标说话人声纹锁定人声提取）。
+ */
+export function getPrimaryOwnerRefWavPath(): string | null {
+  const profiles = loadVoiceprints();
+  const preferred =
+    profiles.find((p) => p.role === "owner" && p.refWavFilename && existsSync(dataFile(p.refWavFilename))) ??
+    profiles.find((p) => p.refWavFilename && existsSync(dataFile(p.refWavFilename)));
+  if (!preferred?.refWavFilename) return null;
+  return dataFile(preferred.refWavFilename);
 }
 
 export function loadVoiceprints(): VoiceprintProfileRecord[] {
@@ -176,6 +198,7 @@ export function enrollVoiceprint(options: {
   embedding: ArrayLike<number>;
   engine: string;
   role?: VoiceprintRole;
+  refAudioSamples16k?: Float32Array;
 }): PublicVoiceprintProfile {
   const name = options.name.trim().slice(0, 32);
   if (!name) {
@@ -185,6 +208,19 @@ export function enrollVoiceprint(options: {
   if (vec.length === 0) {
     throw new Error("提取到的声纹特征向量为空，请靠近麦克风清晰朗读 2~4 秒后重试");
   }
+
+  const saveRefWav = (profileId: string, pcm?: Float32Array): string | undefined => {
+    if (!pcm || pcm.length < 16000) return undefined;
+    try {
+      const safeId = profileId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 48);
+      const filename = `voiceprint_ref_${safeId}.wav`;
+      const wavBytes = encodeWavPcm16(pcm.slice(0, 16000 * 10), 16000);
+      writeFileSync(dataFile(filename), wavBytes);
+      return filename;
+    } catch {
+      return undefined;
+    }
+  };
 
   const profiles = loadVoiceprints();
   const now = Date.now();
@@ -197,6 +233,8 @@ export function enrollVoiceprint(options: {
     existing.centroid = computeCentroid(existing.samples);
     existing.sampleCount = existing.samples.length;
     if (options.role) existing.role = options.role;
+    const savedRef = saveRefWav(existing.id, options.refAudioSamples16k);
+    if (savedRef) existing.refWavFilename = savedRef;
     existing.updatedAt = now;
     saveVoiceprints(profiles);
     return toPublicVoiceprint(existing);
@@ -204,8 +242,10 @@ export function enrollVoiceprint(options: {
 
   // 若同名档案来自旧引擎/不同维度，用新引擎重新建立
   const filtered = profiles.filter((p) => p.name.toLowerCase() !== name.toLowerCase());
+  const id = makeProfileId(name);
+  const savedRef = saveRefWav(id, options.refAudioSamples16k);
   const record: VoiceprintProfileRecord = {
-    id: makeProfileId(name),
+    id,
     name,
     role: options.role ?? (filtered.length === 0 ? "owner" : "member"),
     engine: options.engine,
@@ -213,6 +253,7 @@ export function enrollVoiceprint(options: {
     centroid: vec,
     samples: [vec],
     sampleCount: 1,
+    ...(savedRef ? { refWavFilename: savedRef } : {}),
     createdAt: now,
     updatedAt: now,
   };
@@ -223,9 +264,18 @@ export function enrollVoiceprint(options: {
 
 export function deleteVoiceprint(id: string): boolean {
   const profiles = loadVoiceprints();
+  const target = profiles.find((p) => p.id === id);
   const next = profiles.filter((p) => p.id !== id);
   if (next.length === profiles.length) {
     return false;
+  }
+  if (target?.refWavFilename) {
+    try {
+      const refPath = dataFile(target.refWavFilename);
+      if (existsSync(refPath)) unlinkSync(refPath);
+    } catch {
+      // ignore
+    }
   }
   saveVoiceprints(next);
   return true;

@@ -10,6 +10,7 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { PiAgentService } from "../agent/piAgentService.ts";
 import { VoiceListenerController } from "../agent/voiceListenerController.ts";
+import { VoiceStreamSession } from "../agent/voiceStreamSession.ts";
 import { DEFAULT_HOST, DEFAULT_PORT, type AppMode } from "../cli/startup.ts";
 import * as agentConfigStore from "../core/agentConfigStore.ts";
 import { NetworkMonitor } from "../core/availability.ts";
@@ -30,6 +31,7 @@ import {
 
 export interface WsData {
   connectedAt: number;
+  voiceStream?: VoiceStreamSession | null;
 }
 
 export interface StartServerOptions {
@@ -115,10 +117,20 @@ async function waitForInitialVirtualLoad(
 }
 
 function handleWsMessage(
-  ws: { send(data: string): number | void },
+  ws: { send(data: string): number | void; data: WsData },
   raw: string | Buffer | Uint8Array,
   runtime: AppRuntime,
 ): void {
+  // 二进制帧：来自浏览器 AudioWorklet 的 16kHz Int16 PCM 实时音频流（零 JSON 开销）
+  if (typeof raw !== "string") {
+    if (ws.data.voiceStream) {
+      const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+      ws.data.voiceStream.pushInt16Frame(bytes);
+      return;
+    }
+    // 兼容极少数客户端以二进制帧发送 ping/JSON
+  }
+
   const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw);
   const trimmed = text.trim();
   if (!trimmed) {
@@ -129,12 +141,90 @@ function handleWsMessage(
     return;
   }
   try {
-    const parsed = JSON.parse(trimmed) as { type?: unknown };
-    if (parsed && parsed.type === "ping") {
+    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object") return;
+    if (parsed.type === "ping") {
       ws.send(JSON.stringify({ type: "pong" }));
-    } else if (parsed && (parsed.type === "get_state" || parsed.type === "refresh_state")) {
+    } else if (parsed.type === "get_state" || parsed.type === "refresh_state") {
       const snapshot = serializeState(runtime);
       ws.send(JSON.stringify({ type: "state", data: snapshot, state: snapshot }));
+    } else if (parsed.type === "voice_stream_start") {
+      ws.data.voiceStream?.dispose();
+      ws.data.voiceStream = null;
+      const vl = runtime.voiceListener;
+      if (!vl) return;
+      const cfg = vl.config;
+      const bypassWakeWord = parsed.bypassWakeWord === true;
+      const lang = typeof parsed.lang === "string" && parsed.lang.trim() ? parsed.lang.trim() : cfg.voiceLang;
+      const sampleRate = typeof parsed.sampleRate === "number" && parsed.sampleRate >= 8000 ? parsed.sampleRate : 16000;
+      const prefRaw = typeof parsed.engine === "string" ? parsed.engine : "auto";
+      const preferredEngine: "auto" | "local" | "whisper" =
+        prefRaw === "local" || prefRaw === "whisper" ? prefRaw : "auto";
+
+      const session = new VoiceStreamSession({
+        localEngine: vl.localEngine,
+        noiseMode: cfg.noiseSuppressionMode,
+        vadSilenceMs: cfg.vadSilenceMs,
+        sampleRate,
+        bypassWakeWord,
+        lang,
+        engine: preferredEngine,
+        onSpeechActivity: (speaking) => {
+          try {
+            ws.send(
+              JSON.stringify({
+                type: "voice_stream_event",
+                kind: speaking ? "speech_start" : "speech_end",
+              }),
+            );
+          } catch {
+            // ignore closed socket
+          }
+        },
+        onSegmentReady: async (seg) => {
+          const result = await vl.processDualTrackSegment(seg, {
+            lang,
+            bypassWakeWord,
+            preferredEngine,
+          });
+          try {
+            ws.send(
+              JSON.stringify({
+                type: "voice_stream_event",
+                kind: "result",
+                text: result.text,
+                matched: result.matched,
+                wokeOnly: result.wokeOnly,
+                command: result.command,
+                reply: result.reply,
+                attention: result.attention,
+                voiceprint: result.voiceprint,
+                snrGainDb: result.snrGainDb,
+                asrEngine: result.asrEngine,
+                timings: result.timings,
+                agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
+                voiceState: result.voiceState,
+              }),
+            );
+          } catch {
+            // ignore closed socket
+          }
+          return result;
+        },
+      });
+      ws.data.voiceStream = session;
+      ws.send(
+        JSON.stringify({
+          type: "voice_stream_event",
+          kind: "started",
+          denoiseEngine: session.denoiseEngine,
+        }),
+      );
+    } else if (parsed.type === "voice_stream_flush") {
+      void ws.data.voiceStream?.flush();
+    } else if (parsed.type === "voice_stream_stop") {
+      ws.data.voiceStream?.dispose();
+      ws.data.voiceStream = null;
     }
   } catch {
     // 忽略非 JSON 心跳或未知文本帧
@@ -380,6 +470,8 @@ export async function startMijiaDeckServer(
         handleWsMessage(ws, message, runtime);
       },
       close(ws) {
+        ws.data.voiceStream?.dispose();
+        ws.data.voiceStream = null;
         broadcaster.remove(ws);
       },
     },

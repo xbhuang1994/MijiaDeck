@@ -24,7 +24,7 @@ export type AgentProviderMode =
   | "openai-compatible";
 
 export type VoiceEngineMode = "auto" | "local" | "browser" | "whisper";
-export type NoiseSuppressionMode = "auto" | "neural" | "dsp" | "off";
+export type NoiseSuppressionMode = "auto" | "neural" | "dpdfnet" | "voxlock" | "dsp" | "off";
 export type VadEngineMode = "silero" | "adaptive";
 export type VoiceprintPolicyMode = "off" | "tag" | "strict";
 export type AttentionMode = "smart" | "strict" | "off";
@@ -138,7 +138,7 @@ export const PROVIDER_PRESETS: ReadonlyArray<ProviderPreset> = [
 
 const VALID_PROVIDERS = new Set<string>(PROVIDER_PRESETS.map((p) => p.id));
 const VALID_VOICE_ENGINES = new Set<string>(["auto", "local", "browser", "whisper"]);
-const VALID_NOISE_MODES = new Set<string>(["auto", "neural", "dsp", "off"]);
+const VALID_NOISE_MODES = new Set<string>(["auto", "neural", "dpdfnet", "voxlock", "dsp", "off"]);
 const VALID_VAD_MODES = new Set<string>(["silero", "adaptive"]);
 const VALID_VOICEPRINT_MODES = new Set<string>(["off", "tag", "strict"]);
 const VALID_ATTENTION_MODES = new Set<string>(["smart", "strict", "off"]);

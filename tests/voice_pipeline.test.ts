@@ -17,12 +17,17 @@ import {
   resampleLinear,
   spectralSubtractDenoise,
 } from "../src/agent/audioPcm.ts";
-import { cleanSenseVoiceText, LocalVoiceEngine } from "../src/agent/localVoiceEngine.ts";
+import {
+  chooseBestAsrCandidate,
+  cleanSenseVoiceText,
+  LocalVoiceEngine,
+} from "../src/agent/localVoiceEngine.ts";
 import {
   computeEchoOverlap,
   evaluateVoiceAttention,
   findWakeWordSpan,
   parseLlmAttentionJson,
+  trimTrailingMusicLyrics,
 } from "../src/agent/voiceAttentionGate.ts";
 import {
   clearVoiceprints,
@@ -359,6 +364,87 @@ describe("Wake-Word Attention Mechanism (DDSD)", () => {
     });
     expect(bgm.accept).toBe(false);
     expect(bgm.stage).toBe("acoustic");
+
+    // Music playing (<|BGM|>) with valid spoken follow-up command MUST NOT be dropped!
+    const bgmValidFollowup = await evaluateVoiceAttention({
+      rawText: "音量小一点",
+      wakeWordEnabled: true,
+      wakeWords,
+      attentionMode: "smart",
+      inConversation: true,
+      acousticEvent: "<|BGM|>",
+    });
+    expect(bgmValidFollowup.accept).toBe(true);
+    expect(bgmValidFollowup.command).toBe("音量小一点");
+
+    // Music lyrics leaking before & after wake command ("也甘愿赴汤蹈火去走小派打开客厅吸顶灯，间走过这世间。")
+    const bgmLyricsWrapped = await evaluateVoiceAttention({
+      rawText: "也甘愿赴汤蹈火去走小派打开客厅吸顶灯，间走过这世间。",
+      wakeWordEnabled: true,
+      wakeWords,
+      attentionMode: "smart",
+      acousticEvent: "<|BGM|>",
+    });
+    expect(bgmLyricsWrapped.accept).toBe(true);
+    expect(bgmLyricsWrapped.command).toBe("打开客厅吸顶灯");
+    expect(trimTrailingMusicLyrics("打开客厅吸顶灯，间走过这世间")).toBe("打开客厅吸顶灯");
+
+    // Harsh-noise phonetic alias recovery ONLY when followed by clear smart-home command
+    const noisyAliasOk = findWakeWordSpan("小开把小米音响音量调到30", wakeWords);
+    expect(noisyAliasOk?.wakeWord).toBe("小派");
+    const noisyEnAliasOk = findWakeWordSpan("Api, turn off the living room light", wakeWords);
+    expect(noisyEnAliasOk?.wakeWord).toBe("pi");
+    // Normal chat containing "API" without device command must NOT false trigger
+    expect(findWakeWordSpan("我们今天讨论一下 API 设计", wakeWords)).toBeNull();
+
+    // Dual-track Raw + Denoised SenseVoice candidate fusion picks best track under both music and harsh noise
+    const pickMusicRaw = chooseBestAsrCandidate(
+      {
+        text: "小派把小米音响音量调到35。",
+        rawText: "小派把小米音响音量调到35。",
+        lang: "<|zh|>",
+        emotion: "",
+        event: "<|BGM|>",
+        engine: "sensevoice-local",
+        durationMs: 140,
+      },
+      {
+        text: "小开把小米将音量调到3度，如不及。",
+        rawText: "小开把小米将音量调到3度，如不及。",
+        lang: "<|zh|>",
+        emotion: "",
+        event: "<|Speech|>",
+        engine: "sensevoice-local",
+        durationMs: 140,
+      },
+      { wakeWords, inputSnrDb: 0 },
+    );
+    expect(pickMusicRaw.engine).toBe("sensevoice-dual-raw");
+    expect(pickMusicRaw.text).toBe("小派把小米音响音量调到35。");
+
+    const pickNoisyDenoised = chooseBestAsrCandidate(
+      {
+        text: "也甘愿赴汤蹈火去走小打开客厅吸顶灯",
+        rawText: "也甘愿赴汤蹈火去走小打开客厅吸顶灯",
+        lang: "<|zh|>",
+        emotion: "",
+        event: "<|BGM|>",
+        engine: "sensevoice-local",
+        durationMs: 140,
+      },
+      {
+        text: "甘觉赴担蹈过去走小派，打开客厅吸顶灯，肩走过这世间。",
+        rawText: "甘觉赴担蹈过去走小派，打开客厅吸顶灯，肩走过这世间。",
+        lang: "<|zh|>",
+        emotion: "",
+        event: "<|BGM|>",
+        engine: "sensevoice-local",
+        durationMs: 140,
+      },
+      { wakeWords, inputSnrDb: -3 },
+    );
+    expect(pickNoisyDenoised.engine).toBe("sensevoice-dual-denoised");
+    expect(pickNoisyDenoised.text).toContain("小派");
 
     expect(
       parseLlmAttentionJson('```json\n{"addressed":false,"inConversation":false,"confidence":0.9,"reason":"旁白","command":""}\n```')

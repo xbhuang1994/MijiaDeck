@@ -88,11 +88,17 @@ export interface WakeSpanMatch {
 const LEADING_PUNCT_RE = /^[\s,，。．.、!！?？:：;；\-—~～"“”'‘’]+/;
 const TRAILING_PUNCT_RE = /[\s,，。．.、!！?？:：;；"“”'‘’]+$/;
 
-// 中文常见同音误识别映射（显著提高嘈杂环境与不同口音下的唤醒召回率）
+// 中文常见同音/噪声近音误识别映射（显著提高嘈杂环境与音乐播放下的唤醒召回率）
 const WAKE_HOMOPHONES: Readonly<Record<string, readonly string[]>> = {
-  小派: ["小湃", "小π", "小拍", "小排", "小牌", "小佩"],
+  小派: ["小湃", "小π", "小拍", "小排", "小牌", "小佩", "肖派", "晓派", "校派", "小帕", "小怕"],
   派派: ["拍拍", "湃湃"],
   米家助手: ["米家主手", "迷家助手"],
+};
+
+// 仅在后面紧跟明确智能家居控制指令时才启用的强噪近音兜底（防止正常聊天误触）
+const NOISE_ONLY_WAKE_ALIASES: Readonly<Record<string, readonly string[]>> = {
+  小派: ["小开", "小块", "小买", "小败", "小拜"],
+  pi: ["heyp", "hey p", "api", "pai"],
 };
 
 // 句首自然呼唤前缀（属于正向呼叫，不视为第三人称）
@@ -109,6 +115,32 @@ const REFERENTIAL_AFTER_RE =
 // 明确面向智能家居/助手的祈使或询问动词（搭配句首唤醒词可安全走 0ms 快速通道）
 const DIRECT_COMMAND_START_RE =
   /^(?:请|帮我|给我|麻烦|快|赶紧|顺便|现在|把|将|打开|开启|关掉|关闭|关上|开一下|关一下|调|设置|设定|设为|改成|换成|切换|播放|放一首|来一首|暂停|继续|停止|静音|取消静音|声音|音量|大一点|小一点|亮一点|暗一点|暖一点|冷一点|查|查看|查询|看看|告诉我|现在|卧室|客厅|餐厅|书房|厨房|阳台|主卧|次卧|玄关|卫生间|全屋|所有|全部|小爱|小米|灯|吸顶灯|台灯|空调|风扇|插座|开关|窗帘|喂食器|出粮|喂|场景|模式|温度|湿度|空气|turn|open|close|set|play|pause|stop|mute|check|what)/i;
+
+export function looksLikeDirectDeviceCommand(text: string): boolean {
+  return DIRECT_COMMAND_START_RE.test(text.trim());
+}
+
+/**
+ * 在背景音乐（<|BGM|>）场景下，裁掉紧跟完整设备指令后面的无关歌词尾段
+ * 例如：“打开客厅吸顶灯，间走过这世间” -> “打开客厅吸顶灯”。
+ */
+export function trimTrailingMusicLyrics(command: string): string {
+  const parts = command.split(/[，,。！？!?;；]/).map((s) => s.trim()).filter(Boolean);
+  if (parts.length <= 1) return command.trim();
+  const kept: string[] = [parts[0]!];
+  for (let i = 1; i < parts.length; i += 1) {
+    const seg = parts[i]!;
+    if (
+      DIRECT_COMMAND_START_RE.test(seg) ||
+      /(?:亮度|色温|颜色|音量|声音|静音|暂停|停止|关闭|打开|调到|调成|调大|调小|温度|湿度|出粮|份|度|%)/.test(seg)
+    ) {
+      kept.push(seg);
+    } else {
+      break;
+    }
+  }
+  return kept.join("，").trim();
+}
 
 // 对话延续中非常明确的短指令特征
 const CLEAR_FOLLOWUP_RE =
@@ -194,44 +226,70 @@ export function findWakeWordSpan(
     }
   }
 
-  for (const cand of candidates) {
-    const isAscii = /^[a-z0-9]+$/i.test(cand.surface);
-    const pattern = isAscii
-      ? new RegExp(
-          `(?:^|[\\s,，。!！?？、])((?:hey\\s+|hi\\s+|ok\\s+)?${escapeRegExp(cand.surface)})(?=$|[\\s,，。!！?？:：、\\u4e00-\\u9fff])`,
-          "i",
-        )
-      : new RegExp(`(${escapeRegExp(cand.surface)})`, "i");
+  const runCandidateList = (
+    list: readonly Candidate[],
+    requireDirectCmdAfter: boolean,
+  ): WakeSpanMatch | null => {
+    for (const cand of list) {
+      const isAscii = /^[a-z0-9\s]+$/i.test(cand.surface);
+      const pattern = isAscii
+        ? new RegExp(
+            `(?:^|[\\s,，。!！?？、])((?:hey\\s+|hi\\s+|ok\\s+)?${escapeRegExp(cand.surface)})(?=$|[\\s,，。!！?？:：、\\u4e00-\\u9fff])`,
+            "i",
+          )
+        : new RegExp(`(${escapeRegExp(cand.surface)})`, "i");
 
-    const m = pattern.exec(cleaned);
-    if (!m) continue;
+      const m = pattern.exec(cleaned);
+      if (!m) continue;
 
-    const surfaceStr = m[1] ?? m[0];
-    const matchStart = cleaned.toLowerCase().indexOf(surfaceStr.toLowerCase(), m.index);
-    const startIdx = matchStart >= 0 ? matchStart : m.index;
-    const endIdx = startIdx + surfaceStr.length;
+      const surfaceStr = m[1] ?? m[0];
+      const matchStart = cleaned.toLowerCase().indexOf(surfaceStr.toLowerCase(), m.index);
+      const startIdx = matchStart >= 0 ? matchStart : m.index;
+      const endIdx = startIdx + surfaceStr.length;
 
-    const beforeText = cleaned.slice(0, startIdx).replace(TRAILING_PUNCT_RE, "").trim();
-    const afterText = cleaned
-      .slice(endIdx)
-      .replace(LEADING_PUNCT_RE, "")
-      .replace(/^(?:同学|你好|您好|在吗|请|帮我一下)?[\s,，。!！?？:：]*/i, "")
-      .replace(TRAILING_PUNCT_RE, "")
-      .trim();
+      const beforeText = cleaned.slice(0, startIdx).replace(TRAILING_PUNCT_RE, "").trim();
+      const afterText = cleaned
+        .slice(endIdx)
+        .replace(LEADING_PUNCT_RE, "")
+        .replace(/^(?:同学|你好|您好|在吗|请|帮我一下)?[\s,，。!！?？:：]*/i, "")
+        .replace(TRAILING_PUNCT_RE, "")
+        .trim();
 
-    return {
-      matched: true,
-      wakeWord: cand.canonical,
-      matchedSurface: surfaceStr,
-      index: startIdx,
-      endIndex: endIdx,
-      beforeText,
-      afterText,
-      fuzzy: cand.fuzzy,
-    };
+      if (requireDirectCmdAfter && (!afterText || !DIRECT_COMMAND_START_RE.test(afterText))) {
+        continue;
+      }
+
+      return {
+        matched: true,
+        wakeWord: cand.canonical,
+        matchedSurface: surfaceStr,
+        index: startIdx,
+        endIndex: endIdx,
+        beforeText,
+        afterText,
+        fuzzy: cand.fuzzy,
+      };
+    }
+    return null;
+  };
+
+  const primary = runCandidateList(candidates, false);
+  if (primary) return primary;
+
+  // 强噪/音乐环境近音兜底：仅当后面紧跟明确的设备控制指令时才命中（如“小开把小米音量调到30” / “Api, turn off the light”）
+  const noiseCands: Candidate[] = [];
+  for (const w of sortedCanonical) {
+    const aliases = NOISE_ONLY_WAKE_ALIASES[w] ?? NOISE_ONLY_WAKE_ALIASES[w.toLowerCase()];
+    if (!aliases) continue;
+    for (const a of aliases) {
+      const key = a.toLowerCase();
+      if (!seenSurface.has(key)) {
+        seenSurface.add(key);
+        noiseCands.push({ canonical: w, surface: a, fuzzy: true });
+      }
+    }
   }
-
-  return null;
+  return runCandidateList(noiseCands, true);
 }
 
 function buildAttentionPrompt(params: {
@@ -285,13 +343,14 @@ function buildAttentionPrompt(params: {
     "",
     "判定准则：",
     "- 若用户直接呼唤你执行设备控制/查询/提问（如“小派，关灯”、“帮我把音量调大一点”、“那卧室灯也关掉”），addressed=true。",
+    "- 注意背景音乐/电视干扰：如果环境中正在放歌，唤醒词前后可能混入无关歌词碎片（例如“也甘愿赴汤蹈火去走小派打开客厅吸顶灯，间走过这世间”）。只要唤醒词后紧跟明确的设备控制/查询指令，就判定 addressed=true，并在 command 字段中只提取干净的用户指令（去掉前后无关歌词）！",
     "- 若用户只是提到你的名字讨论/夸奖/抱怨/叫别人别管你（如“我刚跟朋友聊到小派挺好用的”、“你觉得小派怎么样”、“别管小派了吃饭吧”、“有人叫小派吗”），addressed=false！",
     "- 若处于连续对话窗口，但新句子明显是在和家人说话（如“晚饭吃什么”、“帮我拿双筷子”），addressed=false, inConversation=false！",
     "- 若只是在叫你的名字等待回应（如“小派在吗”、“嘿小派”），addressed=true 且 command 留空字符串。",
     "- 拿不准时宁可保守拒绝（addressed=false），避免误操作智能设备。",
     "",
     "请仅输出一个合法 JSON 对象，不要输出任何额外文字或 Markdown 代码块：",
-    '{"addressed":true/false,"inConversation":true/false,"confidence":0.0-1.0,"reason":"简短中文判断理由","command":"若addressed为true则提取去掉唤醒词后的干净指令，纯唤醒或拒绝则为空字符串"}',
+    '{"addressed":true/false,"inConversation":true/false,"confidence":0.0-1.0,"reason":"简短中文判断理由","command":"若addressed为true则提取去掉唤醒词及无关歌词后的干净指令，纯唤醒或拒绝则为空字符串"}',
   ].join("\n");
 }
 
@@ -325,17 +384,24 @@ export function parseLlmAttentionJson(raw: string): LlmAttentionVerdict | null {
   }
 }
 
-function isPureNonSpeechEvent(event?: string): boolean {
+function isPureNonSpeechEvent(event: string | undefined, cleanedText: string): boolean {
   if (!event) return false;
   const upper = event.toUpperCase();
-  return (
+  const nonSpeech =
     upper.includes("BGM") ||
     upper.includes("APPLAUSE") ||
     upper.includes("LAUGHTER") ||
     upper.includes("CRYING") ||
     upper.includes("SNEEZE") ||
-    upper.includes("COUGH")
-  );
+    upper.includes("COUGH");
+  if (!nonSpeech) return false;
+
+  // 重要：当环境中有音乐播放时，SenseVoice 会给带人声的真实指令也标上 <|BGM|>！
+  // 只有当文本为空、极短或纯拟声/哼唱词时才按纯背景音过滤，绝不误杀音乐下说出的有效中文指令。
+  const meaningful = cleanedText.replace(/[\s,，。．.、!！?？:：;；\-—~～"'“”‘’]/g, "");
+  if (meaningful.length <= 1) return true;
+  if (/^(?:啦+|哼+|嗯+|啊+|哦+|喔+|哈+|呵+|噢+|嘿+|呜+|呀+)+$/.test(meaningful)) return true;
+  return false;
 }
 
 /**
@@ -418,8 +484,8 @@ export async function evaluateVoiceAttention(
 
   const wakeSpan = findWakeWordSpan(cleaned, input.wakeWords);
 
-  // 0C. 声学非语音事件过滤（如纯背景音乐/掌声/笑声且无明确唤醒词）
-  if (!input.bypassWakeWord && !wakeSpan && isPureNonSpeechEvent(input.acousticEvent)) {
+  // 0C. 声学非语音事件过滤（仅拦截无有效指令文本的纯背景音乐/掌声/笑声）
+  if (!input.bypassWakeWord && !wakeSpan && isPureNonSpeechEvent(input.acousticEvent, cleaned)) {
     return wrap({
       accept: false,
       wokeOnly: false,
@@ -427,7 +493,7 @@ export async function evaluateVoiceAttention(
       inConversation: Boolean(input.inConversation),
       confidence: 0.9,
       stage: "acoustic",
-      reason: `识别为环境声学事件 (${input.acousticEvent})，非用户指令`,
+      reason: `识别为纯环境声学事件 (${input.acousticEvent})，非用户指令`,
       wakeWord: null,
       command: "",
       usedLlm: false,
@@ -508,6 +574,8 @@ export async function evaluateVoiceAttention(
       cleanAfter.length > 0 && REFERENTIAL_AFTER_RE.test(cleanAfter);
     const looksDirectCommand =
       cleanAfter.length > 0 && DIRECT_COMMAND_START_RE.test(cleanAfter);
+    const isBgmContext = Boolean(input.acousticEvent?.toUpperCase().includes("BGM"));
+    const trimmedCmd = isBgmContext ? trimTrailingMusicLyrics(cleanAfter) : cleanAfter;
 
     // A1. 纯呼唤（例如“小派”、“嘿，小派”、“小派在吗”）
     const wakeOnlyPhrase =
@@ -529,24 +597,27 @@ export async function evaluateVoiceAttention(
       });
     }
 
-    // A2. 句首明确呼唤 + 清晰控制指令（smart 模式下 0ms 快速通道，保证极速对话体验）
+    // A2. 句首明确呼唤（或背景音乐歌词前缀后紧跟呼唤且无第三人称语境）+ 清晰控制指令
+    // smart 模式下走快速通道，避免歌词前缀误杀或高延迟！
     if (
       input.attentionMode === "smart" &&
-      hasVocativeStart &&
       !hasReferentialBefore &&
       !hasReferentialAfter &&
-      looksDirectCommand
+      looksDirectCommand &&
+      (hasVocativeStart || (isBgmContext && trimmedCmd.length >= 2))
     ) {
       return wrap({
         accept: true,
         wokeOnly: false,
         addressed: true,
         inConversation: true,
-        confidence: 0.94,
+        confidence: hasVocativeStart ? 0.94 : 0.89,
         stage: "fast-wake",
-        reason: `句首明确呼唤「${wakeSpan.wakeWord}」并下达操作指令`,
+        reason: hasVocativeStart
+          ? `句首明确呼唤「${wakeSpan.wakeWord}」并下达操作指令`
+          : `音乐环境下识别到「${wakeSpan.wakeWord}」并紧跟明确控制指令（已剥离无关歌词）`,
         wakeWord: wakeSpan.wakeWord,
-        command: cleanAfter,
+        command: trimmedCmd,
         usedLlm: false,
       });
     }
@@ -586,8 +657,8 @@ export async function evaluateVoiceAttention(
             verdict.command !== undefined
               ? verdict.command
               : hasVocativeStart
-                ? cleanAfter
-                : cleanAfter || cleaned;
+                ? trimmedCmd
+                : trimmedCmd || cleaned;
           return wrap({
             accept: true,
             wokeOnly: extractedCmd.length === 0,
@@ -606,7 +677,23 @@ export async function evaluateVoiceAttention(
       }
     }
 
-    // A4. 无 LLM（如本地引擎离线运行）时的确定性语用判别：拦截明显第三人称提及与讨论
+    // A4. 无 LLM（如本地引擎离线运行）时的确定性语用判别：
+    // 若无第三人称语境且唤醒词后紧跟明确智能家居指令，即使句首混入少量背景噪声/歌词也放行！
+    if (!hasReferentialBefore && !hasReferentialAfter && looksDirectCommand) {
+      return wrap({
+        accept: true,
+        wokeOnly: false,
+        addressed: true,
+        inConversation: true,
+        confidence: 0.86,
+        stage: "fast-wake",
+        reason: `识别到「${wakeSpan.wakeWord}」后紧跟明确设备控制指令`,
+        wakeWord: wakeSpan.wakeWord,
+        command: trimTrailingMusicLyrics(cleanAfter),
+        usedLlm: false,
+      });
+    }
+
     if (hasReferentialBefore || hasReferentialAfter || !hasVocativeStart) {
       return wrap({
         accept: false,
@@ -633,7 +720,7 @@ export async function evaluateVoiceAttention(
       stage: "fast-wake",
       reason: `句首呼唤「${wakeSpan.wakeWord}」`,
       wakeWord: wakeSpan.wakeWord,
-      command: cleanAfter,
+      command: trimmedCmd,
       usedLlm: false,
     });
   }

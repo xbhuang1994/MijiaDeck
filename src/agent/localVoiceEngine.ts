@@ -4,32 +4,40 @@
 
 /**
  * 本地离线语音 AI 引擎（基于 sherpa-onnx-node）：
- * - 环境降噪：GTCRN 神经网络语音增强（gtcrn_simple.onnx，535KB），无模型时自动降级纯 TS 频谱减法
- * - 语音活动检测：Silero VAD 神经端点检测（silero_vad.onnx，643KB），无模型时自动降级自适应能量+过零率 VAD
- * - 声纹识别：阿里 3D-Speaker CAM++（3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx，28MB），无模型时自动降级声学指纹
- * - 本地离线 ASR：FunAudioLLM SenseVoiceSmall int8（中/英/粤/日/韩 + ITN + 声学事件检测），异步非阻塞 decodeAsync
+ * - 环境降噪：GTCRN（gtcrn_simple.onnx，实时极速）/ DPDFNet4（dpdfnet4.onnx，强效去噪）/
+ *   VoxLock 目标说话人声纹锁定人声提取（sherpa-onnx-voxlock-int8），无模型时自动降级纯 TS 频谱减法
+ * - 语音活动检测：Silero VAD 神经端点检测（支持离线与连续流式检测），无模型时自动降级自适应能量+过零率 VAD
+ * - 声纹识别：阿里 3D-Speaker CAM++（192 维中文说话人嵌入），无模型时自动降级声学指纹
+ * - 本地离线 ASR：FunAudioLLM SenseVoiceSmall int8（异步非阻塞 decodeAsync）+ 抗音乐/强噪双轨融合识别
  */
 
 import { existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import type { NoiseSuppressionMode, VadEngineMode } from "../core/agentConfigStore.ts";
 import { projectRoot } from "../core/appMeta.ts";
 import {
   adaptiveEnergyVad,
+  applyHighPassFilter,
   estimateSnrDb,
   extractFallbackVoiceprint,
   l2Normalize,
   resampleLinear,
   spectralSubtractDenoise,
 } from "./audioPcm.ts";
+import { findWakeWordSpan, looksLikeDirectDeviceCommand } from "./voiceAttentionGate.ts";
+import { getPrimaryOwnerRefWavPath } from "./voiceprintStore.ts";
 
-export type NoiseSuppressionMode = "auto" | "neural" | "dsp" | "off";
-export type VadEngineMode = "silero" | "adaptive";
+export type { NoiseSuppressionMode, VadEngineMode };
 
 export interface LocalVoiceModelPaths {
   modelsDir: string;
   gtcrn: string;
+  dpdfnet4: string;
+  voxlockDir: string;
+  voxlockEnroll: string;
+  voxlockChunk: string;
   sileroVad: string;
   speakerCampp: string;
   senseVoiceDir: string;
@@ -43,11 +51,15 @@ export interface LocalVoiceEngineStatus {
   modelsDir: string;
   models: {
     gtcrn: boolean;
+    dpdfnet4: boolean;
+    voxlock: boolean;
     sileroVad: boolean;
     speakerCampp: boolean;
     senseVoice: boolean;
   };
   readyForDenoise: boolean;
+  readyForDpdfnet: boolean;
+  readyForVoxlock: boolean;
   readyForVad: boolean;
   readyForVoiceprint: boolean;
   readyForLocalAsr: boolean;
@@ -58,7 +70,7 @@ export interface LocalVoiceEngineStatus {
 export interface DenoiseOutput {
   samples: Float32Array;
   sampleRate: number;
-  engine: "gtcrn" | "dsp" | "off";
+  engine: "gtcrn" | "dpdfnet4" | "voxlock" | "dsp" | "off";
   inputSnrDb: number;
   outputSnrDb: number;
   snrGainDb: number;
@@ -87,8 +99,31 @@ export interface LocalAsrOutput {
   lang: string;
   emotion: string;
   event: string;
-  engine: "sensevoice-local";
+  engine: "sensevoice-local" | "sensevoice-dual-raw" | "sensevoice-dual-denoised";
   durationMs: number;
+  altText?: string;
+}
+
+export interface OnlineDenoiserHandleLike {
+  sampleRate: number;
+  frameShiftInSamples: number;
+  run(req: { samples: Float32Array; sampleRate: number }): {
+    samples: Float32Array;
+    sampleRate: number;
+  };
+  flush(): { samples: Float32Array; sampleRate: number };
+  reset(): void;
+}
+
+export interface StreamingVadHandleLike {
+  acceptWaveform(samples: Float32Array): void;
+  isEmpty(): boolean;
+  isDetected(): boolean;
+  front(): { start: number; samples: Float32Array };
+  pop(): void;
+  flush(): void;
+  reset(): void;
+  clear(): void;
 }
 
 interface SherpaModuleLike {
@@ -100,16 +135,8 @@ interface SherpaModuleLike {
       sampleRate: number;
     };
   };
-  Vad: new (cfg: Record<string, unknown>, bufferSizeInSeconds: number) => {
-    acceptWaveform(samples: Float32Array): void;
-    isEmpty(): boolean;
-    isDetected(): boolean;
-    front(): { start: number; samples: Float32Array };
-    pop(): void;
-    flush(): void;
-    reset(): void;
-    clear(): void;
-  };
+  OnlineSpeechDenoiser: new (cfg: Record<string, unknown>) => OnlineDenoiserHandleLike;
+  Vad: new (cfg: Record<string, unknown>, bufferSizeInSeconds: number) => StreamingVadHandleLike;
   SpeakerEmbeddingExtractor: new (cfg: Record<string, unknown>) => {
     dim: number;
     createStream(): {
@@ -135,8 +162,12 @@ interface SherpaModuleLike {
 }
 
 const MODEL_URLS = {
-  gtcrn: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/gtcrn_simple.onnx",
-  sileroVad: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+  gtcrn:
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/gtcrn_simple.onnx",
+  dpdfnet4:
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/dpdfnet4.onnx",
+  sileroVad:
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
   speakerCampp:
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
   senseVoiceTar:
@@ -144,6 +175,7 @@ const MODEL_URLS = {
 } as const;
 
 const SENSE_VOICE_DIR_NAME = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17";
+const VOXLOCK_DIR_NAME = "sherpa-onnx-voxlock-int8";
 
 let cachedSherpa: SherpaModuleLike | null | undefined;
 
@@ -171,9 +203,14 @@ export function resolveVoiceModelPaths(modelsDirOverride?: string): LocalVoiceMo
     modelsDirOverride || envDir || path.join(projectRoot(), "voice_models"),
   );
   const senseVoiceDir = path.join(modelsDir, SENSE_VOICE_DIR_NAME);
+  const voxlockDir = path.join(modelsDir, VOXLOCK_DIR_NAME);
   return {
     modelsDir,
     gtcrn: path.join(modelsDir, "gtcrn_simple.onnx"),
+    dpdfnet4: path.join(modelsDir, "dpdfnet4.onnx"),
+    voxlockDir,
+    voxlockEnroll: path.join(voxlockDir, "enroll.onnx"),
+    voxlockChunk: path.join(voxlockDir, "chunk_int8.onnx"),
     sileroVad: path.join(modelsDir, "silero_vad.onnx"),
     speakerCampp: path.join(modelsDir, "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"),
     senseVoiceDir,
@@ -203,9 +240,83 @@ function mapSenseVoiceLang(voiceLang?: string): string {
   return "auto";
 }
 
+/**
+ * 抗音乐/强噪双轨 ASR 候选评分器：
+ * 结合实测规律：
+ * - 在强音乐播放（0dB / -3dB）下，未受神经降噪伪影破坏的 Raw 高通轨往往保留了完整爆破音（如“小派”和数字“35”）；
+ * - 而在极低信噪比或稳态宽带/风扇噪声下，神经降噪轨又能拯救被底噪淹没的音节；
+ * 通过对双轨解码结果做唤醒词完整度 + 指令清晰度 + 声学事件打分，取最优识别结果。
+ */
+export function chooseBestAsrCandidate(
+  rawAsr: LocalAsrOutput,
+  denoisedAsr: LocalAsrOutput,
+  options: { wakeWords: readonly string[]; inputSnrDb?: number },
+): LocalAsrOutput {
+  const score = (cand: LocalAsrOutput, track: "raw" | "denoised"): number => {
+    const text = cand.text.trim();
+    if (!text) return -100;
+    let s = Math.min(18, text.length * 0.9);
+
+    const span = findWakeWordSpan(text, options.wakeWords);
+    if (span) {
+      s += span.fuzzy ? 75 : 105;
+      if (span.afterText && looksLikeDirectDeviceCommand(span.afterText)) {
+        s += 45;
+      }
+      if (span.beforeText.length <= 2) {
+        s += 12;
+      }
+    } else if (looksLikeDirectDeviceCommand(text)) {
+      s += 28;
+    }
+
+    const isBgm = rawAsr.event.toUpperCase().includes("BGM");
+    if (cand.event.toUpperCase().includes("SPEECH")) {
+      s += 10;
+    }
+    if (track === "raw" && isBgm) {
+      // 音乐场景下优先信任无神经伪影的原始高通轨
+      s += 18;
+    } else if (track === "denoised" && !isBgm && (options.inputSnrDb ?? 20) < 15) {
+      // 非音乐稳态强噪场景优先信任神经降噪轨
+      s += 14;
+    }
+
+    // 惩罚异常非中英乱码字符（如强噪误识别出日韩假名）
+    const weirdMatches = text.match(/[\u3040-\u30ff\uac00-\ud7af]/g);
+    if (weirdMatches && weirdMatches.length > 0) {
+      s -= weirdMatches.length * 12;
+    }
+    return s;
+  };
+
+  const rawScore = score(rawAsr, "raw");
+  const denScore = score(denoisedAsr, "denoised");
+
+  if (rawScore >= denScore) {
+    return {
+      ...rawAsr,
+      engine: "sensevoice-dual-raw",
+      durationMs: rawAsr.durationMs + denoisedAsr.durationMs,
+      altText: denoisedAsr.text,
+    };
+  }
+  return {
+    ...denoisedAsr,
+    engine: "sensevoice-dual-denoised",
+    durationMs: rawAsr.durationMs + denoisedAsr.durationMs,
+    altText: rawAsr.text,
+  };
+}
+
 export class LocalVoiceEngine {
   private readonly _modelsDirOverride?: string;
-  private _denoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
+  private _gtcrnDenoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
+  private _dpdfnetDenoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
+  private _voxlockDenoiser: {
+    refPath: string;
+    instance: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]>;
+  } | null = null;
   private _speakerExtractor: InstanceType<SherpaModuleLike["SpeakerEmbeddingExtractor"]> | null =
     null;
   private _recognizers = new Map<
@@ -227,6 +338,8 @@ export class LocalVoiceEngine {
     const sherpa = loadSherpaModule();
     const p = this.paths;
     const gtcrn = existsSync(p.gtcrn);
+    const dpdfnet4 = existsSync(p.dpdfnet4);
+    const voxlock = existsSync(p.voxlockEnroll) && existsSync(p.voxlockChunk);
     const sileroVad = existsSync(p.sileroVad);
     const speakerCampp = existsSync(p.speakerCampp);
     const senseVoice = existsSync(p.senseVoiceModel) && existsSync(p.senseVoiceTokens);
@@ -235,8 +348,10 @@ export class LocalVoiceEngine {
       addonAvailable,
       addonVersion: sherpa?.version ?? null,
       modelsDir: p.modelsDir,
-      models: { gtcrn, sileroVad, speakerCampp, senseVoice },
+      models: { gtcrn, dpdfnet4, voxlock, sileroVad, speakerCampp, senseVoice },
       readyForDenoise: addonAvailable && gtcrn,
+      readyForDpdfnet: addonAvailable && dpdfnet4,
+      readyForVoxlock: addonAvailable && voxlock,
       readyForVad: addonAvailable && sileroVad,
       readyForVoiceprint: addonAvailable && speakerCampp,
       readyForLocalAsr: addonAvailable && senseVoice,
@@ -254,7 +369,7 @@ export class LocalVoiceEngine {
    */
   async warmup(): Promise<void> {
     try {
-      this._ensureDenoiser();
+      this._ensureGtcrnDenoiser();
       this._ensureSpeakerExtractor();
       await this._ensureRecognizer("auto");
     } catch {
@@ -262,13 +377,13 @@ export class LocalVoiceEngine {
     }
   }
 
-  private _ensureDenoiser(): InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null {
-    if (this._denoiser) return this._denoiser;
+  private _ensureGtcrnDenoiser(): InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null {
+    if (this._gtcrnDenoiser) return this._gtcrnDenoiser;
     const sherpa = loadSherpaModule();
     const p = this.paths;
     if (!sherpa || !existsSync(p.gtcrn)) return null;
     try {
-      this._denoiser = new sherpa.OfflineSpeechDenoiser({
+      this._gtcrnDenoiser = new sherpa.OfflineSpeechDenoiser({
         model: {
           gtcrn: { model: p.gtcrn },
           numThreads: this._numThreads(),
@@ -276,7 +391,157 @@ export class LocalVoiceEngine {
           provider: "cpu",
         },
       });
-      return this._denoiser;
+      return this._gtcrnDenoiser;
+    } catch (err) {
+      this._lastError = err instanceof Error ? err.message : String(err);
+      return null;
+    }
+  }
+
+  private _ensureDpdfnetDenoiser(): InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null {
+    if (this._dpdfnetDenoiser) return this._dpdfnetDenoiser;
+    const sherpa = loadSherpaModule();
+    const p = this.paths;
+    if (!sherpa || !existsSync(p.dpdfnet4)) return null;
+    try {
+      this._dpdfnetDenoiser = new sherpa.OfflineSpeechDenoiser({
+        model: {
+          dpdfnet: { model: p.dpdfnet4 },
+          numThreads: this._numThreads(),
+          debug: false,
+          provider: "cpu",
+        },
+      });
+      return this._dpdfnetDenoiser;
+    } catch (err) {
+      this._lastError = err instanceof Error ? err.message : String(err);
+      return null;
+    }
+  }
+
+  private _ensureVoxlockDenoiser(
+    voiceSamplePath?: string | null,
+  ): InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null {
+    const sherpa = loadSherpaModule();
+    const p = this.paths;
+    if (!sherpa || !existsSync(p.voxlockEnroll) || !existsSync(p.voxlockChunk)) return null;
+    const refPath = (voiceSamplePath ?? getPrimaryOwnerRefWavPath() ?? "").trim();
+    if (this._voxlockDenoiser && this._voxlockDenoiser.refPath === refPath) {
+      return this._voxlockDenoiser.instance;
+    }
+    try {
+      const instance = new sherpa.OfflineSpeechDenoiser({
+        model: {
+          voxlock: {
+            enrollModel: p.voxlockEnroll,
+            chunkModel: p.voxlockChunk,
+            ...(refPath && existsSync(refPath) ? { voiceSample: refPath } : {}),
+          },
+          numThreads: this._numThreads(),
+          debug: false,
+          provider: "cpu",
+        },
+      });
+      this._voxlockDenoiser = { refPath, instance };
+      return instance;
+    } catch (err) {
+      this._lastError = err instanceof Error ? err.message : String(err);
+      return null;
+    }
+  }
+
+  /**
+   * 为连续 WebSocket 音频流创建独立的实时流式神经降噪器（GTCRN / DPDFNet4 / VoxLock）。
+   */
+  createOnlineDenoiser(
+    mode: NoiseSuppressionMode = "auto",
+  ): { denoiser: OnlineDenoiserHandleLike; engine: "gtcrn" | "dpdfnet4" | "voxlock" } | null {
+    if (mode === "off" || mode === "dsp") return null;
+    const sherpa = loadSherpaModule();
+    const p = this.paths;
+    if (!sherpa || typeof sherpa.OnlineSpeechDenoiser !== "function") return null;
+
+    try {
+      if (mode === "voxlock" && existsSync(p.voxlockEnroll) && existsSync(p.voxlockChunk)) {
+        const refPath = getPrimaryOwnerRefWavPath();
+        return {
+          engine: "voxlock",
+          denoiser: new sherpa.OnlineSpeechDenoiser({
+            model: {
+              voxlock: {
+                enrollModel: p.voxlockEnroll,
+                chunkModel: p.voxlockChunk,
+                ...(refPath && existsSync(refPath) ? { voiceSample: refPath } : {}),
+              },
+              numThreads: this._numThreads(),
+              debug: false,
+              provider: "cpu",
+            },
+          }),
+        };
+      }
+      if (mode === "dpdfnet" && existsSync(p.dpdfnet4)) {
+        return {
+          engine: "dpdfnet4",
+          denoiser: new sherpa.OnlineSpeechDenoiser({
+            model: {
+              dpdfnet: { model: p.dpdfnet4 },
+              numThreads: this._numThreads(),
+              debug: false,
+              provider: "cpu",
+            },
+          }),
+        };
+      }
+      if (existsSync(p.gtcrn)) {
+        return {
+          engine: "gtcrn",
+          denoiser: new sherpa.OnlineSpeechDenoiser({
+            model: {
+              gtcrn: { model: p.gtcrn },
+              numThreads: this._numThreads(),
+              debug: false,
+              provider: "cpu",
+            },
+          }),
+        };
+      }
+    } catch (err) {
+      this._lastError = err instanceof Error ? err.message : String(err);
+    }
+    return null;
+  }
+
+  /**
+   * 为连续 WebSocket 音频流创建实时 Silero VAD 实例。
+   */
+  createStreamingVad(options: {
+    threshold?: number;
+    minSilenceDuration?: number;
+    minSpeechDuration?: number;
+    maxSpeechDuration?: number;
+  } = {}): StreamingVadHandleLike | null {
+    const sherpa = loadSherpaModule();
+    const p = this.paths;
+    if (!sherpa || !existsSync(p.sileroVad)) return null;
+    try {
+      return new sherpa.Vad(
+        {
+          sileroVad: {
+            model: p.sileroVad,
+            threshold: options.threshold ?? 0.42,
+            minSilenceDuration: options.minSilenceDuration ?? 0.45,
+            minSpeechDuration: options.minSpeechDuration ?? 0.18,
+            maxSpeechDuration: options.maxSpeechDuration ?? 4.2,
+            windowSize: 512,
+          },
+          sampleRate: 16000,
+          numThreads: 1,
+          provider: "cpu",
+          debug: false,
+        },
+        30,
+      );
     } catch (err) {
       this._lastError = err instanceof Error ? err.message : String(err);
       return null;
@@ -339,12 +604,13 @@ export class LocalVoiceEngine {
   }
 
   /**
-   * 实时语音环境降噪：优先 GTCRN 神经网络降噪，缺失或指定 dsp 时自动使用纯 TS 频谱减法。
+   * 实时语音环境降噪：支持 GTCRN / DPDFNet4 / VoxLock 目标人声提取，缺失或指定 dsp 时自动使用纯 TS 频谱减法。
    */
   denoise(
     input: Float32Array,
     sampleRate = 16000,
     mode: NoiseSuppressionMode = "auto",
+    options: { voiceSamplePath?: string | null } = {},
   ): DenoiseOutput {
     const t0 = performance.now();
     const pcm16k = sampleRate === 16000 ? input : resampleLinear(input, sampleRate, 16000);
@@ -362,29 +628,44 @@ export class LocalVoiceEngine {
       };
     }
 
-    if (mode === "auto" || mode === "neural") {
-      const denoiser = this._ensureDenoiser();
-      if (denoiser) {
-        try {
-          const out = denoiser.run({ samples: pcm16k, sampleRate: 16000 });
-          const resSamples =
-            out.sampleRate === 16000
-              ? out.samples
-              : resampleLinear(out.samples, out.sampleRate, 16000);
-          const outputSnrDb = estimateSnrDb(resSamples, 16000);
-          return {
-            samples: resSamples,
-            sampleRate: 16000,
-            engine: "gtcrn",
-            inputSnrDb,
-            outputSnrDb,
-            snrGainDb: Number((outputSnrDb - inputSnrDb).toFixed(2)),
-            durationMs: Math.round(performance.now() - t0),
-          };
-        } catch (err) {
-          this._lastError = err instanceof Error ? err.message : String(err);
-        }
+    const runNeural = (
+      denoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null,
+      engineName: "gtcrn" | "dpdfnet4" | "voxlock",
+    ): DenoiseOutput | null => {
+      if (!denoiser) return null;
+      try {
+        const out = denoiser.run({ samples: pcm16k, sampleRate: 16000 });
+        const resSamples =
+          out.sampleRate === 16000
+            ? out.samples
+            : resampleLinear(out.samples, out.sampleRate, 16000);
+        const outputSnrDb = estimateSnrDb(resSamples, 16000);
+        return {
+          samples: resSamples,
+          sampleRate: 16000,
+          engine: engineName,
+          inputSnrDb,
+          outputSnrDb,
+          snrGainDb: Number((outputSnrDb - inputSnrDb).toFixed(2)),
+          durationMs: Math.round(performance.now() - t0),
+        };
+      } catch (err) {
+        this._lastError = err instanceof Error ? err.message : String(err);
+        return null;
       }
+    };
+
+    if (mode === "voxlock") {
+      const r = runNeural(this._ensureVoxlockDenoiser(options.voiceSamplePath), "voxlock");
+      if (r) return r;
+    }
+    if (mode === "dpdfnet") {
+      const r = runNeural(this._ensureDpdfnetDenoiser(), "dpdfnet4");
+      if (r) return r;
+    }
+    if (mode === "auto" || mode === "neural" || mode === "dpdfnet" || mode === "voxlock") {
+      const r = runNeural(this._ensureGtcrnDenoiser(), "gtcrn");
+      if (r) return r;
     }
 
     const dsp = spectralSubtractDenoise(pcm16k, 16000);
@@ -410,30 +691,17 @@ export class LocalVoiceEngine {
     const t0 = performance.now();
     const pcm16k = sampleRate === 16000 ? input : resampleLinear(input, sampleRate, 16000);
     const mode = options.mode ?? "silero";
-    const sherpa = loadSherpaModule();
-    const p = this.paths;
+    const vad = mode === "silero" && pcm16k.length >= 512
+      ? this.createStreamingVad({
+          threshold: Math.max(0.15, Math.min(0.85, options.threshold ?? 0.4)),
+          minSilenceDuration: 0.3,
+          minSpeechDuration: 0.14,
+          maxSpeechDuration: 20,
+        })
+      : null;
 
-    if (mode === "silero" && sherpa && existsSync(p.sileroVad) && pcm16k.length >= 512) {
+    if (vad) {
       try {
-        const threshold = Math.max(0.15, Math.min(0.85, options.threshold ?? 0.42));
-        const vad = new sherpa.Vad(
-          {
-            sileroVad: {
-              model: p.sileroVad,
-              threshold,
-              minSilenceDuration: 0.3,
-              minSpeechDuration: 0.14,
-              maxSpeechDuration: 20,
-              windowSize: 512,
-            },
-            sampleRate: 16000,
-            numThreads: 1,
-            provider: "cpu",
-            debug: false,
-          },
-          30,
-        );
-
         const win = 512;
         for (let off = 0; off + win <= pcm16k.length; off += win) {
           vad.acceptWaveform(pcm16k.subarray(off, off + win));
@@ -441,7 +709,7 @@ export class LocalVoiceEngine {
         vad.flush();
 
         const segments: Array<{ start: number; end: number }> = [];
-        const padSamples = Math.round(16000 * 0.12); // 前后各留 120ms 安全余量
+        const padSamples = Math.round(16000 * 0.14); // 前后各留 140ms 安全余量
         let rawSpeechSamples = 0;
 
         while (!vad.isEmpty()) {
@@ -506,7 +774,7 @@ export class LocalVoiceEngine {
   }
 
   /**
-   * 声纹特征提取：优先 3D-Speaker CAM++（512 维深度说话人嵌入），缺失时自动降级 64 维梅尔声学指纹。
+   * 声纹特征提取：优先 3D-Speaker CAM++（192 维深度说话人嵌入），缺失时自动降级 64 维梅尔声学指纹。
    */
   extractSpeakerEmbedding(input: Float32Array, sampleRate = 16000): SpeakerEmbeddingOutput {
     const t0 = performance.now();
@@ -552,7 +820,6 @@ export class LocalVoiceEngine {
   ): Promise<LocalAsrOutput> {
     const t0 = performance.now();
     const pcm16k = sampleRate === 16000 ? input : resampleLinear(input, sampleRate, 16000);
-    // 中文环境下使用 auto 能更好兼容中英混合（如 “小派 / pi / LED”）
     const svLang = voiceLang.toLowerCase().startsWith("zh-cn") ? "auto" : mapSenseVoiceLang(voiceLang);
     const recognizer = await this._ensureRecognizer(svLang);
     if (!recognizer) {
@@ -579,7 +846,54 @@ export class LocalVoiceEngine {
   }
 
   /**
-   * 一键补齐下载缺失的本地 ONNX 模型（GTCRN / Silero VAD / 3D-Speaker CAM++ / SenseVoiceSmall int8）。
+   * 抗音乐/强噪双轨本地识别：
+   * - 高信噪比安静环境（SNR >= 22dB 且无强制双轨）：单轨极速解码（~140ms）
+   * - 嘈杂环境或存在音乐播放：同时解码「高通原始轨（零降噪伪影，保留爆破音与数字）」与「神经降噪轨」，
+   *   按唤醒词完整度 + 指令清晰度 + 声学事件融合择优！
+   */
+  async transcribeDualTrack(
+    rawPcm16k: Float32Array,
+    denoisedPcm16k: Float32Array,
+    options: {
+      voiceLang?: string;
+      wakeWords?: readonly string[];
+      inputSnrDb?: number;
+      forceDual?: boolean;
+    } = {},
+  ): Promise<LocalAsrOutput> {
+    const lang = options.voiceLang || "zh-CN";
+    const wakeWords = options.wakeWords ?? [];
+    const inputSnrDb = options.inputSnrDb ?? estimateSnrDb(rawPcm16k, 16000);
+
+    // 非常安静的环境直接单轨返回，保持最低延迟
+    if (!options.forceDual && inputSnrDb >= 24 && denoisedPcm16k.length > 0) {
+      const single = await this.transcribeLocal(denoisedPcm16k, 16000, lang);
+      if (single.text.length > 0 && !single.event.toUpperCase().includes("BGM")) {
+        return single;
+      }
+    }
+
+    const hpRaw = applyHighPassFilter(rawPcm16k, 16000, 85);
+    const [rawRes, denRes] = await Promise.all([
+      this.transcribeLocal(hpRaw, 16000, lang),
+      denoisedPcm16k.length > 0
+        ? this.transcribeLocal(denoisedPcm16k, 16000, lang)
+        : Promise.resolve<LocalAsrOutput>({
+            text: "",
+            rawText: "",
+            lang: "",
+            emotion: "",
+            event: "",
+            engine: "sensevoice-local",
+            durationMs: 0,
+          }),
+    ]);
+
+    return chooseBestAsrCandidate(rawRes, denRes, { wakeWords, inputSnrDb });
+  }
+
+  /**
+   * 一键补齐下载缺失的本地 ONNX 模型（GTCRN / DPDFNet4 / Silero VAD / 3D-Speaker CAM++ / SenseVoiceSmall int8）。
    */
   async downloadMissingModels(): Promise<LocalVoiceEngineStatus> {
     if (this._downloading) {
@@ -605,6 +919,7 @@ export class LocalVoiceEngine {
       };
 
       await fetchFile(MODEL_URLS.gtcrn, p.gtcrn);
+      await fetchFile(MODEL_URLS.dpdfnet4, p.dpdfnet4);
       await fetchFile(MODEL_URLS.sileroVad, p.sileroVad);
       await fetchFile(MODEL_URLS.speakerCampp, p.speakerCampp);
 
@@ -637,7 +952,9 @@ export class LocalVoiceEngine {
   }
 
   dispose(): void {
-    this._denoiser = null;
+    this._gtcrnDenoiser = null;
+    this._dpdfnetDenoiser = null;
+    this._voxlockDenoiser = null;
     this._speakerExtractor = null;
     this._recognizers.clear();
   }

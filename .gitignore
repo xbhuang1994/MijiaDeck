@@ -32,6 +32,7 @@ workbench.json
 settings.json
 pi_agent.json
 voiceprints.json
+voiceprint_ref_*.wav
 voice_models/
 account_profiles.json
 *.json.tmp
