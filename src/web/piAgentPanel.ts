@@ -91,6 +91,65 @@ export interface UiCustomInstructionConflict {
   reason: string;
 }
 
+export interface UiReinforcementMemory {
+  id: string;
+  canonicalKey: string;
+  sampleUtterances: string[];
+  capabilityKey: string;
+  speakerScope: string;
+  summary: string;
+  riskLevel: "L1_LOW" | "L2_MEDIUM_APPLIANCE" | "L2_SEASONAL" | "L3_HIGH_SAFETY";
+  safetyLocked: boolean;
+  confirmCount: number;
+  confirmThreshold: number;
+  autoExecCount: number;
+  status: string;
+  enabled: boolean;
+  retention: number;
+  daysSinceLastUse: number;
+  uiStage: "learning" | "autonomous" | "stale" | "safety_locked" | "disabled";
+  gateReason: string;
+  updatedAt: number;
+}
+
+export interface UiPendingConfirmation {
+  id: string;
+  origin: string;
+  canonicalKey: string;
+  originalUtterance: string;
+  questionText: string;
+  summary: string;
+  riskLevel: string;
+  deviceName: string;
+  homeName?: string;
+  roomName?: string;
+  drumLabel?: string;
+  programLabel?: string;
+  candidateLabels?: string[];
+  createdAt: number;
+  expiresAt: number;
+}
+
+export interface UiAgentMemoryEvent {
+  kind:
+    | "confirmation_requested"
+    | "learned_progress"
+    | "promoted_autonomous"
+    | "autonomous_executed"
+    | "recovered_autonomous"
+    | "safety_confirmed"
+    | "rejected"
+    | "tainted"
+    | "modified";
+  memoryId?: string;
+  summary: string;
+  confirmCount?: number;
+  confirmThreshold?: number;
+  retention?: number;
+  riskLevel?: string;
+  reasonText?: string;
+}
+
 export interface UiAgentTimelineEntry {
   id: string;
   role: "user" | "assistant";
@@ -108,6 +167,8 @@ export interface UiAgentTimelineEntry {
   taskUpdates?: UiAgentTaskUpdate[];
   verification?: UiAgentVerificationSummary | null;
   skillEvent?: UiAgentSkillEvent | null;
+  memoryEvent?: UiAgentMemoryEvent | null;
+  pendingConfirmation?: UiPendingConfirmation | null;
   silentCompleted?: boolean;
   error?: string;
 }
@@ -238,6 +299,8 @@ export interface UiPiAgentSnapshot {
   skills?: UiAgentSkill[];
   customInstructions?: UiCustomInstructionRule[];
   customInstructionConflicts?: Record<string, UiCustomInstructionConflict>;
+  memories?: UiReinforcementMemory[];
+  pendingConfirmation?: UiPendingConfirmation | null;
   timeline: UiAgentTimelineEntry[];
   config: UiPublicAgentConfig;
   providers: UiProviderPreset[];
@@ -392,6 +455,8 @@ export interface UiVoiceSnapshot {
       stage?: string;
       reason?: string;
       usedLlm?: boolean;
+      passSource?: string;
+      matchedCapability?: string;
     } | null;
     timings?: {
       totalMs?: number;
@@ -498,6 +563,8 @@ export class PiAgentPanelController {
   private open = false;
   private skillsExpanded = false;
   private instructionsExpanded = false;
+  private memoriesExpanded = false;
+  private resolvingConfirmIds = new Set<string>();
   private thinkingCollapsed = new Map<string, boolean>();
   private agentState: UiPiAgentSnapshot | null = null;
   private voiceState: UiVoiceSnapshot | null = null;
@@ -838,6 +905,13 @@ export class PiAgentPanelController {
       this.scrollTimelineToBottom();
     });
 
+    const memoriesToggleBtn = document.getElementById("pi-memories-toggle-btn");
+    memoriesToggleBtn?.addEventListener("click", () => {
+      this.memoriesExpanded = !this.memoriesExpanded;
+      this.renderMemoriesBar();
+      this.scrollTimelineToBottom();
+    });
+
     const input = node<HTMLInputElement>("pi-agent-input");
     const submitInput = () => {
       const text = input.value.trim();
@@ -897,6 +971,10 @@ export class PiAgentPanelController {
 
   getCustomInstructionConflicts(): Record<string, UiCustomInstructionConflict> {
     return this.agentState?.customInstructionConflicts ?? {};
+  }
+
+  getMemories(): UiReinforcementMemory[] {
+    return this.agentState?.memories ?? [];
   }
 
   toggleDrawer(): void {
@@ -1272,6 +1350,10 @@ export class PiAgentPanelController {
         target.thinkingActive = false;
         if (ev.verification) target.verification = ev.verification as UiAgentVerificationSummary;
         if (ev.skillEvent) target.skillEvent = ev.skillEvent as UiAgentSkillEvent;
+        if (ev.memoryEvent) target.memoryEvent = ev.memoryEvent as UiAgentMemoryEvent;
+        if (ev.pendingConfirmation) {
+          target.pendingConfirmation = ev.pendingConfirmation as UiPendingConfirmation;
+        }
         this.renderTimeline();
       }
       return;
@@ -1565,6 +1647,7 @@ export class PiAgentPanelController {
     this.renderVoiceStrip();
     this.renderSkillsBar();
     this.renderInstructionsBar();
+    this.renderMemoriesBar();
     this.renderTimeline();
     this.renderComposer();
     this.renderLivePill();
@@ -1802,6 +1885,180 @@ export class PiAgentPanelController {
       });
 
       actions.append(toggle, del);
+      row.append(main, actions);
+      list.appendChild(row);
+    }
+  }
+
+  private async toggleMemory(memoryId: string, enabled: boolean): Promise<void> {
+    try {
+      const res = await this.deps.apiPost<{ agent?: UiPiAgentSnapshot }>(
+        `/api/agent/memories/${encodeURIComponent(memoryId)}/toggle`,
+        { enabled },
+      );
+      if (res.agent) this.applyAgentSnapshot(res.agent);
+      this.deps.showToast(enabled ? "已启用该强化记忆" : "已停用该强化记忆", 1800);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.deps.showToast(`更新强化记忆失败：${msg}`, 3000);
+    }
+  }
+
+  private async resetMemory(memoryId: string): Promise<void> {
+    try {
+      const res = await this.deps.apiPost<{ agent?: UiPiAgentSnapshot }>(
+        `/api/agent/memories/${encodeURIComponent(memoryId)}/reset`,
+      );
+      if (res.agent) this.applyAgentSnapshot(res.agent);
+      this.deps.showToast("已重置该记忆，下次触发将重新确认", 2000);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.deps.showToast(`重置强化记忆失败：${msg}`, 3000);
+    }
+  }
+
+  private async deleteMemory(memoryId: string): Promise<void> {
+    try {
+      const res = await this.deps.apiPost<{ agent?: UiPiAgentSnapshot }>(
+        `/api/agent/memories/${encodeURIComponent(memoryId)}/delete`,
+      );
+      if (res.agent) this.applyAgentSnapshot(res.agent);
+      this.deps.showToast("已删除该强化决策记忆", 1800);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.deps.showToast(`删除强化记忆失败：${msg}`, 3000);
+    }
+  }
+
+  private async resolveConfirmation(
+    id: string,
+    action: "confirm" | "cancel",
+    selectedCandidateIndex?: number,
+  ): Promise<void> {
+    if (this.resolvingConfirmIds.has(id)) return;
+    this.resolvingConfirmIds.add(id);
+    this.renderTimeline();
+    try {
+      const res = await this.deps.apiPost<{ agent?: UiPiAgentSnapshot }>(
+        `/api/agent/confirmations/${encodeURIComponent(id)}/resolve`,
+        {
+          action,
+          ...(typeof selectedCandidateIndex === "number" ? { selectedCandidateIndex } : {}),
+        },
+      );
+      if (res.agent) this.applyAgentSnapshot(res.agent);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.deps.showToast(`处理确认失败：${msg}`, 3000);
+    } finally {
+      this.resolvingConfirmIds.delete(id);
+      this.renderTimeline();
+    }
+  }
+
+  private renderMemoriesBar(): void {
+    const bar = document.getElementById("pi-memories-bar");
+    const countLabel = document.getElementById("pi-memories-count-label");
+    const chevron = document.getElementById("pi-memories-chevron");
+    const toggleBtn = document.getElementById("pi-memories-toggle-btn");
+    const list = document.getElementById("pi-memories-list");
+    if (!bar || !countLabel || !chevron || !toggleBtn || !list) return;
+
+    const memories = this.agentState?.memories ?? [];
+    if (memories.length === 0) {
+      bar.hidden = true;
+      this.memoriesExpanded = false;
+      list.replaceChildren();
+      return;
+    }
+
+    bar.hidden = false;
+    const autoCount = memories.filter((m) => m.uiStage === "autonomous").length;
+    countLabel.textContent = `强化决策记忆 (${memories.length} · ${autoCount} 条免确认直行)`;
+    chevron.textContent = this.memoriesExpanded ? "▾" : "▸";
+    toggleBtn.setAttribute("aria-expanded", String(this.memoriesExpanded));
+    list.hidden = !this.memoriesExpanded;
+    list.replaceChildren();
+
+    if (!this.memoriesExpanded) return;
+
+    for (const mem of memories) {
+      const row = document.createElement("div");
+      row.className = `pi-skill-item pi-inst-item${mem.enabled ? "" : " is-disabled"}`;
+
+      const main = document.createElement("div");
+      main.className = "pi-skill-item-main";
+
+      const title = document.createElement("div");
+      title.className = "pi-inst-item-content";
+      title.textContent = mem.summary;
+
+      const meta = document.createElement("div");
+      meta.className = "pi-inst-item-tags";
+
+      const stageTag = document.createElement("span");
+      if (mem.uiStage === "autonomous") {
+        stageTag.className = "inst-tag mem-tag-autonomous";
+        stageTag.textContent = `已信任 · 免确认 (${mem.confirmCount}/${mem.confirmThreshold})`;
+      } else if (mem.uiStage === "safety_locked") {
+        stageTag.className = "inst-tag mem-tag-safety";
+        stageTag.textContent = "安全锁 · 每次必确认";
+      } else if (mem.uiStage === "stale") {
+        stageTag.className = "inst-tag mem-tag-stale";
+        stageTag.textContent = "休眠/变化 · 待重确认";
+      } else if (mem.uiStage === "disabled") {
+        stageTag.className = "inst-tag";
+        stageTag.textContent = "已停用";
+      } else {
+        stageTag.className = "inst-tag mem-tag-learning";
+        stageTag.textContent = `学习中 ${mem.confirmCount}/${mem.confirmThreshold}`;
+      }
+      stageTag.title = mem.gateReason || mem.summary;
+      meta.appendChild(stageTag);
+
+      const retTag = document.createElement("span");
+      retTag.className = "inst-tag";
+      retTag.textContent = `保留 ${Math.round((mem.retention ?? 1) * 100)}%`;
+      meta.appendChild(retTag);
+
+      if (mem.autoExecCount > 0) {
+        const autoTag = document.createElement("span");
+        autoTag.className = "inst-tag";
+        autoTag.textContent = `直行 ${mem.autoExecCount} 次`;
+        meta.appendChild(autoTag);
+      }
+
+      main.append(title, meta);
+
+      const actions = document.createElement("div");
+      actions.className = "pi-skill-item-actions";
+
+      const resetBtn = document.createElement("button");
+      resetBtn.type = "button";
+      resetBtn.className = "pi-skill-mini-btn";
+      resetBtn.textContent = "重置";
+      resetBtn.title = "重置确认次数，下次触发重新询问";
+      resetBtn.addEventListener("click", () => {
+        void this.resetMemory(mem.id);
+      });
+
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "pi-skill-mini-btn";
+      toggle.textContent = mem.enabled ? "停用" : "启用";
+      toggle.addEventListener("click", () => {
+        void this.toggleMemory(mem.id, !mem.enabled);
+      });
+
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "pi-skill-mini-btn is-danger";
+      del.textContent = "删除";
+      del.addEventListener("click", () => {
+        void this.deleteMemory(mem.id);
+      });
+
+      actions.append(resetBtn, toggle, del);
       row.append(main, actions);
       list.appendChild(row);
     }
@@ -2319,7 +2576,20 @@ export class PiAgentPanelController {
         const preview = heard.length > 26 ? `${heard.slice(0, 26)}…` : heard;
         details.push(`听到：“${preview}”`);
       }
-      details.push(m.attention.accept ? `✓ ${m.attention.reason}` : `⊘ ${m.attention.reason}`);
+      const passBadge =
+        m.attention.passSource === "implicit_capability"
+          ? "隐式设备能力"
+          : m.attention.passSource === "pending_confirmation"
+            ? "待确认回复"
+            : m.attention.passSource === "acoustic_wake_recovery"
+              ? "声学唤醒恢复"
+              : "";
+      const capSuffix = m.attention.matchedCapability ? ` (${m.attention.matchedCapability})` : "";
+      details.push(
+        m.attention.accept
+          ? `✓ ${passBadge ? `[${passBadge}${capSuffix}] ` : ""}${m.attention.reason}`
+          : `⊘ ${m.attention.reason}`,
+      );
     }
     if (typeof m?.timings?.totalMs === "number" && m.timings.totalMs > 0) {
       details.push(`${Math.round(m.timings.totalMs)}ms`);
@@ -2535,8 +2805,8 @@ export class PiAgentPanelController {
         item.appendChild(retryWrap);
       }
 
-      // State verification & Skill precipitation / reuse status pills
-      if (entry.role === "assistant" && (entry.verification || entry.skillEvent)) {
+      // State verification, Skill & Reinforcement Memory status pills
+      if (entry.role === "assistant" && (entry.verification || entry.skillEvent || entry.memoryEvent)) {
         const pillsRow = document.createElement("div");
         pillsRow.className = "pi-status-pills";
 
@@ -2572,6 +2842,44 @@ export class PiAgentPanelController {
           pillsRow.appendChild(sPill);
         }
 
+        if (entry.memoryEvent) {
+          const me = entry.memoryEvent;
+          const mPill = document.createElement("span");
+          const cls =
+            me.kind === "autonomous_executed" ||
+            me.kind === "promoted_autonomous" ||
+            me.kind === "recovered_autonomous"
+              ? "is-autonomous"
+              : me.kind === "safety_confirmed" || me.riskLevel === "L3_HIGH_SAFETY"
+                ? "is-safety"
+                : "is-confirm";
+          mPill.className = `pi-memory-pill ${cls}`;
+          if (me.kind === "confirmation_requested") {
+            mPill.textContent =
+              me.riskLevel === "L3_HIGH_SAFETY"
+                ? "🔒 安全确认 · 暂未执行"
+                : `🧠 渐进确认 (${me.confirmCount ?? 0}/${me.confirmThreshold ?? 2})`;
+          } else if (me.kind === "learned_progress") {
+            mPill.textContent = `🧠 已记录决策 (${me.confirmCount ?? 1}/${me.confirmThreshold ?? 2})`;
+          } else if (me.kind === "promoted_autonomous") {
+            mPill.textContent = "🧠 已晋升自主执行 · 下次免问";
+          } else if (me.kind === "autonomous_executed") {
+            mPill.textContent = "🧠 命中强化记忆 · 免确认直行";
+          } else if (me.kind === "recovered_autonomous") {
+            mPill.textContent = "🧠 休眠重确认通过 · 已恢复直行";
+          } else if (me.kind === "safety_confirmed") {
+            mPill.textContent = "🔒 安全锁记忆 · 每次必确认";
+          } else if (me.kind === "modified") {
+            mPill.textContent = `🧠 已更新目标映射 (${me.confirmCount ?? 1}/${me.confirmThreshold ?? 2})`;
+          } else if (me.kind === "rejected") {
+            mPill.textContent = "⊘ 已重置映射偏好";
+          } else {
+            mPill.textContent = `🧠 ${me.reasonText || me.summary}`;
+          }
+          mPill.title = me.reasonText ? `${me.summary}（${me.reasonText}）` : me.summary;
+          pillsRow.appendChild(mPill);
+        }
+
         if (pillsRow.childElementCount > 0) {
           item.appendChild(pillsRow);
         }
@@ -2590,6 +2898,55 @@ export class PiAgentPanelController {
         bubble.dataset.agentMsgText = entry.id;
         bubble.textContent = bubbleText;
         item.appendChild(bubble);
+      }
+
+      // Inline quick confirm / cancel action buttons for the currently active pending confirmation
+      const activePendingId = this.agentState?.pendingConfirmation?.id;
+      if (
+        entry.role === "assistant" &&
+        entry.pendingConfirmation &&
+        activePendingId &&
+        entry.pendingConfirmation.id === activePendingId
+      ) {
+        const pc = entry.pendingConfirmation;
+        const busy = this.resolvingConfirmIds.has(pc.id);
+        const actionsBar = document.createElement("div");
+        actionsBar.className = "pi-confirm-actions";
+
+        if (pc.candidateLabels && pc.candidateLabels.length > 1) {
+          pc.candidateLabels.forEach((label, idx) => {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "pi-confirm-btn is-primary";
+            btn.disabled = busy;
+            btn.textContent = `✓ ${label}`;
+            btn.addEventListener("click", () => {
+              void this.resolveConfirmation(pc.id, "confirm", idx);
+            });
+            actionsBar.appendChild(btn);
+          });
+        } else {
+          const okBtn = document.createElement("button");
+          okBtn.type = "button";
+          okBtn.className = "pi-confirm-btn is-primary";
+          okBtn.disabled = busy;
+          okBtn.textContent = busy ? "执行中…" : "✓ 确认执行";
+          okBtn.addEventListener("click", () => {
+            void this.resolveConfirmation(pc.id, "confirm");
+          });
+          actionsBar.appendChild(okBtn);
+        }
+
+        const cancelBtn = document.createElement("button");
+        cancelBtn.type = "button";
+        cancelBtn.className = "pi-confirm-btn is-cancel";
+        cancelBtn.disabled = busy;
+        cancelBtn.textContent = "✕ 取消";
+        cancelBtn.addEventListener("click", () => {
+          void this.resolveConfirmation(pc.id, "cancel");
+        });
+        actionsBar.appendChild(cancelBtn);
+        item.appendChild(actionsBar);
       }
 
       list.appendChild(item);

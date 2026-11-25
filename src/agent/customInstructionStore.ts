@@ -14,6 +14,8 @@
  */
 
 import { dataFile, readJson, writeJson } from "../core/jsonStore.ts";
+import { supersedeMemoriesByDomains } from "./reinforcementMemoryStore.ts";
+import { detectSafetyBypassInstruction } from "./safetyGate.ts";
 
 export const CUSTOM_INSTRUCTIONS_FILENAME = "custom_instructions.json";
 export const CUSTOM_INSTRUCTIONS_STORE_VERSION = 1;
@@ -133,8 +135,14 @@ function cleanRuleContent(raw: string): string {
 export function inferInstructionTopic(text: string): string {
   const s = text.trim();
   if (!s) return "通用";
-  if (/(?:洗衣机|洗烘|智洗烘|洗衣|滚筒|波轮|烘干|筒自洁|脱水|洗涤|漂洗|laundry|washer)/i.test(s)) {
+  if (/(?:洗衣机|洗烘|智洗烘|洗衣|滚筒|波轮|烘干|筒自洁|脱水|洗涤|漂洗|袜子筒|内裤筒|袜子|内裤|文胸|干衣机|laundry|washer|socks|underpants|bra)/i.test(s)) {
     return "洗衣机";
+  }
+  if (/(?:浇花|浇水|灌溉|水阀|喷灌|irrigation)/i.test(s)) {
+    return "灌溉";
+  }
+  if (/(?:扫地|拖地|扫拖|吸尘|vacuum)/i.test(s)) {
+    return "扫地机";
   }
   if (/(?:空调|\bac\b|air\s*condition)/i.test(s)) {
     return "空调";
@@ -199,8 +207,13 @@ export function extractConflictDomains(rule: Pick<CustomInstructionRule, "conten
   }
 
   if (topic === "洗衣机") {
-    if (/(?:模式|程序|智洗烘|快洗|速洗|标准洗|混合洗|棉麻|轻柔|大件|羊毛|羽绒|单烘干|烘干|筒自洁|空气洗|洗烘|除菌|强力|mode|program)/i.test(text)) {
-      domains.add(`洗衣机:${room}:program`);
+    const laundryObj = /(?:袜子|socks)/i.test(text)
+      ? "socks"
+      : /(?:内裤|内衣|文胸|underpants|bra)/i.test(text)
+        ? "underpants"
+        : "general";
+    if (/(?:模式|程序|智洗烘|快洗|速洗|标准洗|混合洗|棉麻|轻柔|大件|羊毛|羽绒|单烘干|烘干|筒自洁|空气洗|洗烘|除菌|强力|袜子洗|内裤洗|mode|program)/i.test(text)) {
+      domains.add(`洗衣机:${room}:${laundryObj}:program`);
     }
     if (/(?:水温|温度|\d{2}\s*度|冷水|热水)/i.test(text)) {
       domains.add(`洗衣机:${room}:water_temp`);
@@ -208,12 +221,16 @@ export function extractConflictDomains(rule: Pick<CustomInstructionRule, "conten
     if (/(?:转速|脱水|甩干|\d{3,4}\s*转)/i.test(text)) {
       domains.add(`洗衣机:${room}:spin_speed`);
     }
-    if (/(?:上筒|下筒|左筒|右筒|小筒|大筒|筒位)/i.test(text)) {
-      domains.add(`洗衣机:${room}:drum`);
+    if (/(?:上筒|下筒|左筒|右筒|小筒|大筒|袜子筒|内裤筒|筒位)/i.test(text)) {
+      domains.add(`洗衣机:${room}:${laundryObj}:drum`);
     }
     if (domains.size === 0) {
-      domains.add(`洗衣机:${room}:default`);
+      domains.add(`洗衣机:${room}:${laundryObj}:default`);
     }
+  } else if (topic === "灌溉") {
+    domains.add(`灌溉:${room}:default`);
+  } else if (topic === "扫地机") {
+    domains.add(`扫地机:${room}:default`);
   } else if (topic === "空调") {
     if (/(?:打开空调|开空调|启动空调|室外温度|自动选择|自动判断|默认)/i.test(text)) {
       domains.add(`空调:${room}:open_policy`);
@@ -432,6 +449,10 @@ export function addCustomInstruction(
   if (!content) {
     throw new Error("附加指令内容不能为空");
   }
+  const safetyBypass = detectSafetyBypassInstruction(content);
+  if (safetyBypass.blocked) {
+    throw new Error(safetyBypass.reason || "安全策略禁止通过附加指令跳过高风险操作确认");
+  }
   const normKey = normalizeInstructionKey(content);
   if (!normKey) {
     throw new Error("附加指令内容无效");
@@ -490,6 +511,16 @@ export function addCustomInstruction(
   }
   persistStorePayload(payload);
 
+  // 显式用户规则优先级高于隐式强化记忆：覆盖同冲突域的强化记忆
+  try {
+    const domains = extractConflictDomains(rule);
+    if (domains.length > 0 && rule.enabled) {
+      supersedeMemoriesByDomains(domains);
+    }
+  } catch {
+    // 忽略强化记忆仓库写入异常，绝不影响附加指令主链路
+  }
+
   const conflicts = detectCustomInstructionConflicts(payload.rules);
   const conflictingRules = payload.rules.filter(
     (r) => r.id !== rule.id && conflicts.get(r.id)?.overriddenById === rule.id,
@@ -521,6 +552,10 @@ export function updateCustomInstruction(
     const cleaned = cleanRuleContent(patch.content);
     if (!cleaned) {
       throw new Error("附加指令内容不能为空");
+    }
+    const safetyBypass = detectSafetyBypassInstruction(cleaned);
+    if (safetyBypass.blocked) {
+      throw new Error(safetyBypass.reason || "安全策略禁止通过附加指令跳过高风险操作确认");
     }
     contentChanged = cleaned !== prev.content;
     nextContent = cleaned;

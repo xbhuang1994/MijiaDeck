@@ -29,6 +29,10 @@ import type {
 } from "../core/agentConfigStore.ts";
 import type { EchoUtteranceRecord } from "./echoGuard.ts";
 import {
+  matchesCapabilityAffordance,
+  type HomeCapabilityDigest,
+} from "./intentCanonicalizer.ts";
+import {
   applyHighPassFilter,
   computeRms,
   cosineSimilarity,
@@ -39,6 +43,7 @@ import {
 } from "./audioPcm.ts";
 import type { LocalAsrOutput, LocalVoiceEngine } from "./localVoiceEngine.ts";
 import type { WakeWordAcousticHit } from "./openWakeWordEngine.ts";
+import type { PendingConfirmationGateContext } from "./reinforcementMemoryStore.ts";
 import type { SystemOneClient } from "./systemOneClient.ts";
 import {
   evaluateVoiceAttention,
@@ -130,6 +135,12 @@ export interface SourceSeparationRunOptions {
   preDenoisedGtcrn?: Float32Array;
   /** 可选：复用流式 openWakeWord 预计算声学唤醒命中 */
   precomputedAcousticWake?: WakeWordAcousticHit | null;
+  /** 当前家庭设备特殊能力摘要 */
+  capabilityDigest?: HomeCapabilityDigest | null;
+  /** 已学习的强化记忆触发示例短语 */
+  learnedTriggers?: readonly string[];
+  /** 当前活跃的待确认槽位 */
+  pendingConfirmation?: PendingConfirmationGateContext | null;
 }
 
 export interface SourceSeparationPipelineResult {
@@ -397,10 +408,19 @@ function isAmbiguousZhQuestion(text: string): boolean {
   return /^(?:你有|你又|你好|你给|你是)/.test(c) && /[吗嘛么呢]$/.test(c) && !isWakeQueryText(c.slice(2));
 }
 
-function isValidSmartHomeActionCommand(cmd: string): boolean {
+function isValidSmartHomeActionCommand(
+  cmd: string,
+  capabilityDigest?: HomeCapabilityDigest | null,
+): boolean {
   const c = cleanPunct(cmd);
   if (c.length < 2) return false;
-  if (isAmbiguousZhQuestion(c) || DESCRIPTIVE_NON_COMMAND_RE.test(c) || HOUSEHOLD_SIDETALK_RE.test(c)) {
+  if (isAmbiguousZhQuestion(c) || DESCRIPTIVE_NON_COMMAND_RE.test(c)) {
+    return false;
+  }
+  if (capabilityDigest && matchesCapabilityAffordance(c, capabilityDigest)) {
+    return true;
+  }
+  if (HOUSEHOLD_SIDETALK_RE.test(c)) {
     return false;
   }
   return hasSmartHomeDomainIntent(c) && ACTION_VERB_ANYWHERE_RE.test(c);
@@ -1539,7 +1559,11 @@ export class AudioSourceSeparator {
       if (highOwwOk || tseAssistedOk) {
         const cmd = embeddedCmd || extractCommandAfterAcousticWake(workingText, acousticWake.wakeWord);
         const cleanCmd = cmd ? trimTrailingMusicLyrics(cmd) : "";
-        if (cleanCmd && isValidSmartHomeActionCommand(cleanCmd) && !isWakeQueryText(cleanCmd)) {
+        if (
+          cleanCmd &&
+          isValidSmartHomeActionCommand(cleanCmd, opts.capabilityDigest) &&
+          !isWakeQueryText(cleanCmd)
+        ) {
           workingText = `${acousticWake.wakeWord}，${cleanCmd}`;
           wakeSpan = findWakeWordSpan(workingText, wakeWords);
         } else if (
@@ -1555,13 +1579,18 @@ export class AudioSourceSeparator {
       }
     }
 
-    if (!opts.bypassWakeWord && inConv && !wakeSpan) {
-      if (HOUSEHOLD_SIDETALK_RE.test(workingText) && !hasSmartHomeDomainIntent(workingText)) {
+    const hasPendingConfirm = Boolean(opts.pendingConfirmation);
+    if (!opts.bypassWakeWord && inConv && !wakeSpan && !hasPendingConfirm) {
+      if (
+        HOUSEHOLD_SIDETALK_RE.test(workingText) &&
+        !hasSmartHomeDomainIntent(workingText) &&
+        !matchesCapabilityAffordance(workingText, opts.capabilityDigest)
+      ) {
         return makeRejected("pragmatic-reject", "连续对话窗口内判定为家人旁白/家务闲聊", acousticWake);
       }
     }
 
-    if (!opts.bypassWakeWord && wakeWordEnabled && !inConv && !wakeSpan) {
+    if (!opts.bypassWakeWord && wakeWordEnabled && !inConv && !wakeSpan && !hasPendingConfirm) {
       return makeRejected("no-wake", "未检测到有效唤醒词或受控声学唤醒信号", acousticWake);
     }
 
@@ -1590,12 +1619,24 @@ export class AudioSourceSeparator {
       voiceprintMode: opts.voiceprintMode,
       systemOneClient: opts.systemOneClient,
       llmEvaluator: opts.llmEvaluator,
+      capabilityDigest: opts.capabilityDigest,
+      learnedTriggers: opts.learnedTriggers,
+      pendingConfirmation: opts.pendingConfirmation,
     });
 
     let finalDecision = decision;
     if (decision.accept && !decision.wokeOnly && decision.command) {
       let cleanedCmd = trimTrailingMusicLyrics(stripLeadingVocativeOrFragment(decision.command));
-      if (cleanedCmd && !hasSmartHomeDomainIntent(cleanedCmd) && !inConv && !opts.bypassWakeWord) {
+      const matchedCapCmd = matchesCapabilityAffordance(cleanedCmd, opts.capabilityDigest);
+      const isPendingReply = decision.stage === "pending-confirm";
+      if (
+        cleanedCmd &&
+        !hasSmartHomeDomainIntent(cleanedCmd) &&
+        !matchedCapCmd &&
+        !isPendingReply &&
+        !inConv &&
+        !opts.bypassWakeWord
+      ) {
         if (HOUSEHOLD_SIDETALK_RE.test(cleanedCmd) || DESCRIPTIVE_NON_COMMAND_RE.test(cleanedCmd)) {
           return makeRejected("pragmatic-reject", "提取文本为非设备控制日常对话，已拦截", acousticWake);
         }
@@ -1607,6 +1648,8 @@ export class AudioSourceSeparator {
       if (
         !opts.bypassWakeWord &&
         !inConv &&
+        !isPendingReply &&
+        !matchedCapCmd &&
         cleanedCmd.length <= 4 &&
         !ACTION_VERB_ANYWHERE_RE.test(cleanedCmd) &&
         !/^(?:静音|开灯|关灯|闭麦|开麦)$/.test(cleanedCmd)
@@ -2137,6 +2180,9 @@ export class AudioSourceSeparator {
               voiceprintMode: opts.voiceprintMode,
               systemOneClient: opts.systemOneClient,
               llmEvaluator: opts.llmEvaluator,
+              capabilityDigest: opts.capabilityDigest,
+              learnedTriggers: opts.learnedTriggers,
+              pendingConfirmation: opts.pendingConfirmation,
             });
             if (recoveredDecision.accept) {
               allCandidates.push({

@@ -385,10 +385,34 @@ describe("Qwen3-ASR GPU Auto-Detection, Compute Device & Streaming Segmentation"
     expect(endsWithStrongSentencePunct("温度25.")).toBe(false);
   });
 
-  test("Qwen3StreamingHypothesisTracker commits mid-stream punctuation splits and fast 320ms punctuation pauses", () => {
+  test("Qwen3StreamingHypothesisTracker keeps whole utterance intact by default and supports opt-in mid-stream split", () => {
+    // 1. Default behavior: live partials stream cleanly, NEVER forcibly split on mid-speech punctuation or 320ms pause
+    const defaultTracker = new Qwen3StreamingHypothesisTracker({
+      wakeWords: ["Neo", "小派"],
+      punctuationPauseMs: 320,
+    });
+    const d1 = defaultTracker.ingestHypothesis("Neo。打开客厅吸顶灯。", {
+      engine: "qwen3-asr-gpu-stream",
+      latencyMs: 140,
+    });
+    expect(d1.completedSentences).toEqual([]);
+    expect(d1.partial?.text).toBe("Neo。打开客厅吸顶灯。");
+
+    const d2 = defaultTracker.ingestHypothesis("Neo。打开客厅吸顶灯。关闭卧室灯。", {
+      engine: "qwen3-asr-gpu-stream",
+      latencyMs: 155,
+    });
+    expect(d2.completedSentences).toEqual([]);
+    expect(d2.partial?.text).toBe("Neo。打开客厅吸顶灯。关闭卧室灯。");
+    expect(defaultTracker.advanceFrame(400, false).shouldCommitByPunctPause).toBe(false);
+    expect(defaultTracker.flush()).toEqual(["Neo。打开客厅吸顶灯。关闭卧室灯。"]);
+
+    // 2. Explicit opt-in split mode still supports mid-stream punctuation splits and fast 320ms punctuation pauses
     const tracker = new Qwen3StreamingHypothesisTracker({
       wakeWords: ["Neo", "小派"],
       punctuationPauseMs: 320,
+      splitMidUtterance: true,
+      enablePunctuationPauseCommit: true,
     });
 
     // Standalone wake word should NOT trigger punctuation pause commit
@@ -537,7 +561,7 @@ describe("Qwen3-ASR GPU Auto-Detection, Compute Device & Streaming Segmentation"
       return out;
     };
 
-    // Case A: streamingAsrEnabled = true -> live partials + mid-stream sentence split + zero duplicates
+    // Case A (Default): streamingAsrEnabled = true -> live partials WITHOUT premature mid-utterance splitting!
     const partials: StreamingPartialUpdate[] = [];
     const emitted: VoiceStreamSegmentPayload[] = [];
     const mockOn = createMockEngine([
@@ -552,7 +576,6 @@ describe("Qwen3-ASR GPU Auto-Detection, Compute Device & Streaming Segmentation"
       owwEnabled: false,
       streamingAsrEnabled: true,
       streamingPollIntervalMs: 256,
-      streamingPunctuationPauseMs: 256,
       onPartialTranscript: (ev) => partials.push(ev),
       onSegmentReady: async (seg) => {
         emitted.push(seg);
@@ -563,25 +586,60 @@ describe("Qwen3-ASR GPU Auto-Detection, Compute Device & Streaming Segmentation"
     // Push first 384ms speech -> triggers hypothesis #1 ("打开客厅吸顶灯")
     sessionOn.pushFloat32Samples(makeTone(384, 0.12));
     await Bun.sleep(20);
-    // Push next 384ms speech -> triggers hypothesis #2 ("打开客厅吸顶灯。把空调调到25度。") -> mid-stream splits sentence 1!
+    // Push next 384ms speech -> triggers hypothesis #2 ("打开客厅吸顶灯。把空调调到25度。") -> MUST NOT split mid-speech!
     sessionOn.pushFloat32Samples(makeTone(384, 0.12));
     await Bun.sleep(20);
-    // Push 320ms silence -> triggers fast punctuation_pause for sentence 2!
+    // Push brief 320ms slow-speech pause -> MUST NOT cut early on punctuation pause!
     sessionOn.pushFloat32Samples(makeTone(320, 0));
+    await Bun.sleep(20);
+    expect(emitted.length).toBe(0);
+    // Push remaining silence past VAD hold (~704ms total) -> emits 1 single combined utterance!
+    sessionOn.pushFloat32Samples(makeTone(512, 0));
     await sessionOn.waitForIdle();
 
     expect(partials.length).toBeGreaterThanOrEqual(2);
-    expect(emitted.map((s) => s.precomputedTranscript)).toEqual([
-      "打开客厅吸顶灯。",
-      "把空调调到25度。",
-    ]);
-    expect(emitted[0]!.commitReason).toBe("punctuation_split");
-    expect(emitted[1]!.commitReason).toBe("punctuation_pause");
+    expect(emitted.length).toBe(1);
+    expect(emitted[0]!.commitReason).toBe("vad_silence");
 
     // Hot toggle OFF disables speculative streaming cleanly
     sessionOn.setStreamingAsrEnabled(false);
     expect(sessionOn.streamingAsrEnabled).toBe(false);
     sessionOn.dispose();
+
+    // Case A2 (Opt-in legacy split): streamingSentenceSplit = true -> preserves explicit mid-stream splitting
+    const emittedSplit: VoiceStreamSegmentPayload[] = [];
+    const mockSplit = createMockEngine([
+      "打开客厅吸顶灯",
+      "打开客厅吸顶灯。把空调调到25度。",
+    ]);
+    const sessionSplit = new VoiceStreamSession({
+      localEngine: mockSplit as unknown as LocalVoiceEngine,
+      noiseMode: "off",
+      bypassWakeWord: true,
+      wakeWords: ["Neo"],
+      owwEnabled: false,
+      streamingAsrEnabled: true,
+      streamingSentenceSplit: true,
+      streamingPollIntervalMs: 256,
+      streamingPunctuationPauseMs: 256,
+      onSegmentReady: async (seg) => {
+        emittedSplit.push(seg);
+        return null;
+      },
+    });
+    sessionSplit.pushFloat32Samples(makeTone(384, 0.12));
+    await Bun.sleep(20);
+    sessionSplit.pushFloat32Samples(makeTone(384, 0.12));
+    await Bun.sleep(20);
+    sessionSplit.pushFloat32Samples(makeTone(320, 0));
+    await sessionSplit.waitForIdle();
+    expect(emittedSplit.map((s) => s.precomputedTranscript)).toEqual([
+      "打开客厅吸顶灯。",
+      "把空调调到25度。",
+    ]);
+    expect(emittedSplit[0]!.commitReason).toBe("punctuation_split");
+    expect(emittedSplit[1]!.commitReason).toBe("punctuation_pause");
+    sessionSplit.dispose();
 
     // Case B: streamingAsrEnabled = false -> zero speculative streaming calls, pure batch VAD compatibility
     const partialsOff: StreamingPartialUpdate[] = [];

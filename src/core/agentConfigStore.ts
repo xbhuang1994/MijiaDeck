@@ -433,7 +433,7 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     ttsSpeed: DEFAULT_TTS_SPEED,
     continuousListen: true,
     vadThreshold: 0.018,
-    vadSilenceMs: 600,
+    vadSilenceMs: 1000,
     vadSensitivity: "default",
     noiseSuppressionMode: "auto",
     sourceSeparationMode: "auto",

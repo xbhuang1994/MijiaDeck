@@ -51,6 +51,35 @@ import {
   loadCustomInstructions,
   type CustomInstructionSource,
 } from "./customInstructionStore.ts";
+import {
+  buildHomeCapabilityDigest,
+  canonicalizeImplicitIntent,
+  probeImplicitCapabilities,
+  type HomeCapabilityDigest,
+} from "./intentCanonicalizer.ts";
+import {
+  clearReinforcementMemories,
+  computeRetention,
+  computeUiTrustStage,
+  deleteReinforcementMemory,
+  evaluateReinforcementGate,
+  findMatchingReinforcementMemory,
+  getReinforcementNow,
+  listReinforcementMemories,
+  resetReinforcementMemory,
+  type MemoryActionBinding,
+  type PendingConfirmation,
+  type PendingConfirmationOrigin,
+} from "./reinforcementMemoryStore.ts";
+import {
+  classifyActionRisk,
+  computeActionFingerprint,
+  probeWasherRuntimeSafety,
+  resolveSpeakerPrincipal,
+  type RiskLevel,
+  type SafetyConfirmationRegistry,
+  type SpeakerPrincipal,
+} from "./safetyGate.ts";
 
 const PLATFORM_LABELS_ZH: Readonly<Record<string, string>> = {
   mijia: "米家",
@@ -76,6 +105,20 @@ export interface SmartHomeToolDeps {
   getActivePromptSource?: () => "text" | "voice";
   getActivePromptRawText?: () => string;
   onCustomInstructionsChanged?: () => void;
+  /** 宿主独占的安全确认票据表（PiAgentService 自动注入；单元测试直调时省略保持向后兼容） */
+  safetyConfirmRegistry?: SafetyConfirmationRegistry;
+  /** 返回当前请求说话人身份与权限 */
+  getActiveSpeakerPrincipal?: () => SpeakerPrincipal;
+  /** 返回当前家庭设备能力摘要 */
+  getCapabilityDigest?: () => HomeCapabilityDigest;
+  /** 由大模型工具发起结构化待确认提问 */
+  openPendingConfirmation?: (
+    input: Omit<PendingConfirmation, "id" | "createdAt" | "expiresAt" | "promptEndedAt" | "consumed">,
+  ) => PendingConfirmation;
+  /** 强化记忆变更回调 */
+  onMemoriesChanged?: () => void;
+  /** 可注入时钟 */
+  now?: () => number;
 }
 
 function runJob<T>(jobs: IJobExecutor, fn: () => T | Promise<T>, priority = 1): Promise<T> {
@@ -178,6 +221,18 @@ function deviceMatchesCategory(device: DeviceInfo, category: string): boolean {
       device.name.includes("洗衣") ||
       device.name.includes("洗烘")
     );
+  }
+  if (cat === "dryer" || cat === "干衣机" || cat === "烘干机") {
+    const s = `${device.name} ${device.model} ${device.spec_type}`.toLowerCase();
+    return /dryer|干衣机|烘干机|0xdc/.test(s);
+  }
+  if (cat === "vacuum" || cat === "扫地机" || cat === "扫地机器人" || cat === "拖地") {
+    const s = `${device.name} ${device.model} ${device.spec_type}`.toLowerCase();
+    return /vacuum|扫地|拖地|扫拖/.test(s);
+  }
+  if (cat === "irrigation" || cat === "灌溉" || cat === "浇花" || cat === "水阀") {
+    const s = `${device.name} ${device.model} ${device.spec_type}`.toLowerCase();
+    return /irrigation|valve|灌溉|浇花|浇水|水阀/.test(s);
   }
   if (cat === "inverter" || cat === "solar-inverter" || cat === "逆变器" || cat === "光伏") {
     return (
@@ -379,6 +434,42 @@ function resolveSingleDevice(devices: readonly DeviceInfo[], target: string): De
   if (matched.length === 0) return null;
   // 优先在线设备
   return matched.find((d) => d.online) ?? matched[0] ?? null;
+}
+
+/**
+ * 带跨家庭/同名在线设备歧义检测的单设备解析：
+ * 当 target 不是精确 did 且存在多台同名在线设备位于不同家庭/房间时，显式返回 ambiguous 候选供消歧，避免静默误控另一套房子的同名设备。
+ */
+function resolveSingleDeviceChecked(
+  devices: readonly DeviceInfo[],
+  target: string,
+): { device: DeviceInfo | null; ambiguous: DeviceInfo[] } {
+  const trimmed = target.trim();
+  const exactDid = devices.find((d) => d.did === trimmed);
+  if (exactDid) {
+    return { device: exactDid, ambiguous: [] };
+  }
+  const matched = resolveDevices(devices, { target: trimmed });
+  if (matched.length === 0) {
+    return { device: null, ambiguous: [] };
+  }
+  const onlineMatched = matched.filter((d) => d.online);
+  if (onlineMatched.length > 1) {
+    const normTarget = normalizeQuery(trimmed);
+    // 若目标明确包含某个家庭名，优先收窄到该家庭
+    const homeFiltered = onlineMatched.filter(
+      (d) => d.home_name && normTarget.includes(normalizeQuery(d.home_name)),
+    );
+    if (homeFiltered.length === 1) {
+      return { device: homeFiltered[0]!, ambiguous: [] };
+    }
+    const distinctHomes = new Set(onlineMatched.map((d) => d.home_name || ""));
+    const distinctRooms = new Set(onlineMatched.map((d) => `${d.home_name || ""}/${d.room_name || ""}`));
+    if (distinctHomes.size > 1 || distinctRooms.size > 1) {
+      return { device: null, ambiguous: onlineMatched };
+    }
+  }
+  return { device: onlineMatched[0] ?? matched[0] ?? null, ambiguous: [] };
 }
 
 function findPowerProp(props: readonly PropInfo[]): PropInfo | null {
@@ -882,7 +973,29 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       const blocked = ensureAccessReady(deps);
       if (blocked) return textResult(blocked, { ok: false, error: blocked }, true);
 
-      const device = resolveSingleDevice(deps.mainWindow.activeDevices(), params.target);
+      const resolved = resolveSingleDeviceChecked(deps.mainWindow.activeDevices(), params.target);
+      if (resolved.ambiguous.length > 1) {
+        const choices = resolved.ambiguous
+          .map((d) => `${d.home_name ? `${d.home_name}/` : ""}${d.room_name}/${d.name}`)
+          .join("、");
+        const msg = `存在多台同名在线设备（${choices}），请明确指定家庭或具体设备后再查看详情。`;
+        return textResult(
+          msg,
+          {
+            ok: false,
+            ambiguousDevices: true,
+            candidates: resolved.ambiguous.map((d) => ({
+              did: d.did,
+              name: d.name,
+              home: d.home_name,
+              room: d.room_name,
+            })),
+            uiSummary: msg,
+          },
+          true,
+        );
+      }
+      const device = resolved.device;
       if (!device) {
         const msg = `未找到设备：${params.target}`;
         return textResult(msg, { ok: false, uiSummary: msg }, true);
@@ -1042,6 +1155,40 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         return textResult(msg, { ok: false, uiSummary: msg }, true);
       }
 
+      // 确定性安全闸门：批量关断 all/switch/camera 或单台高危设备（门锁/安防/开启灌溉水阀/关键基建断电）
+      if (deps.safetyConfirmRegistry) {
+        const speaker = deps.getActiveSpeakerPrincipal?.() ?? resolveSpeakerPrincipal({ source: "web" });
+        if (
+          params.state === "off" &&
+          candidates.length > 1 &&
+          (params.category === "all" || params.category === "switch" || params.category === "camera")
+        ) {
+          const batchRisk = classifyActionRisk(
+            {
+              toolName: "batch_control_devices",
+              category: params.category,
+              power: "off",
+            },
+            speaker,
+          );
+          if (batchRisk.safetyLocked) {
+            const fp = computeActionFingerprint({
+              toolName: "batch_control_devices",
+              category: params.category,
+              power: "off",
+            });
+            if (!speaker.canExecuteL3WithConfirm) {
+              const msg = `权限不足：${batchRisk.reasons.join("；")}，需主人本人确认或通过客户端操作，暂未执行。`;
+              return textResult(msg, { ok: false, safetyGateBlocked: true, riskLevel: batchRisk.riskLevel, uiSummary: msg }, true);
+            }
+            if (!deps.safetyConfirmRegistry.consumeMatching({ fingerprint: fp, toolName: "batch_control_devices" })) {
+              const msg = `安全提示：${batchRisk.reasons.join("；")}，暂未执行。请先向用户确认具体设备后再操作。`;
+              return textResult(msg, { ok: false, safetyGateBlocked: true, requiresConfirmation: true, riskLevel: batchRisk.riskLevel, uiSummary: msg }, true);
+            }
+          }
+        }
+      }
+
       const succeeded: Array<{ did: string; name: string; state: boolean; note?: string }> = [];
       const failed: Array<{ did: string; name: string; reason: string }> = [];
 
@@ -1049,6 +1196,35 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         if (!dev.online) {
           failed.push({ did: dev.did, name: dev.name, reason: "离线" });
           continue;
+        }
+        if (deps.safetyConfirmRegistry) {
+          const speaker = deps.getActiveSpeakerPrincipal?.() ?? resolveSpeakerPrincipal({ source: "web" });
+          const targetPower: "on" | "off" = params.state === "off" ? "off" : "on";
+          const risk = classifyActionRisk(
+            {
+              toolName: "set_device_power",
+              did: dev.did,
+              device: dev,
+              power: targetPower,
+              value: targetPower === "on",
+            },
+            speaker,
+          );
+          if (risk.safetyLocked) {
+            const fp = computeActionFingerprint({
+              toolName: "set_device_power",
+              did: dev.did,
+              power: targetPower,
+            });
+            if (!speaker.canExecuteL3WithConfirm) {
+              const msg = `权限不足：${dev.name}（${risk.reasons.join("；")}）需主人确认后才可执行，暂未执行。`;
+              return textResult(msg, { ok: false, safetyGateBlocked: true, riskLevel: risk.riskLevel, did: dev.did, uiSummary: msg }, true);
+            }
+            if (!deps.safetyConfirmRegistry.consumeMatching({ fingerprint: fp, did: dev.did, toolName: "set_device_power" })) {
+              const msg = `安全提示：${dev.name}（${risk.reasons.join("；")}），暂未执行。请先向用户二次确认后再执行。`;
+              return textResult(msg, { ok: false, safetyGateBlocked: true, requiresConfirmation: true, riskLevel: risk.riskLevel, did: dev.did, uiSummary: msg }, true);
+            }
+          }
         }
         try {
           if (isSpeaker(dev)) {
@@ -1361,7 +1537,29 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       const blocked = ensureAccessReady(deps);
       if (blocked) return textResult(blocked, { ok: false, error: blocked }, true);
 
-      const device = resolveSingleDevice(deps.mainWindow.activeDevices(), params.target);
+      const resolved = resolveSingleDeviceChecked(deps.mainWindow.activeDevices(), params.target);
+      if (resolved.ambiguous.length > 1) {
+        const choices = resolved.ambiguous
+          .map((d) => `${d.home_name ? `${d.home_name}/` : ""}${d.room_name}/${d.name}`)
+          .join("、");
+        const msg = `存在多台同名在线设备（${choices}），请明确指定家庭或具体设备后再设置属性。`;
+        return textResult(
+          msg,
+          {
+            ok: false,
+            ambiguousDevices: true,
+            candidates: resolved.ambiguous.map((d) => ({
+              did: d.did,
+              name: d.name,
+              home: d.home_name,
+              room: d.room_name,
+            })),
+            uiSummary: msg,
+          },
+          true,
+        );
+      }
+      const device = resolved.device;
       if (!device) {
         const msg = `未找到设备：${params.target}`;
         return textResult(msg, { ok: false, uiSummary: msg }, true);
@@ -1410,6 +1608,56 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       if (!coerced.ok) {
         const msg = `属性 ${prop.desc || prop.name} 参数无效：${coerced.error}`;
         return textResult(msg, { ok: false, uiSummary: msg }, true);
+      }
+
+      if (deps.safetyConfirmRegistry) {
+        const speaker = deps.getActiveSpeakerPrincipal?.() ?? resolveSpeakerPrincipal({ source: "web" });
+        const risk = classifyActionRisk(
+          {
+            toolName: "set_device_property",
+            did: device.did,
+            device,
+            propName: prop.name,
+            value: coerced.value,
+          },
+          speaker,
+        );
+        // 洗衣机通过 control-status=true 启动时同样执行实时硬件安全探针
+        if (isWasherDevice(device) && prop.name === "control-status" && coerced.value === true) {
+          const probe = await probeWasherRuntimeSafety(deps.service, device.did);
+          if (probe.status === "hard_block") {
+            const msg = `安全提示：${probe.reasons.join("；")}，已硬阻断，暂未执行。`;
+            return textResult(msg, { ok: false, safetyGateBlocked: true, hardBlocked: true, did: device.did, uiSummary: msg }, true);
+          }
+          if (probe.status === "require_confirm") {
+            const fp = computeActionFingerprint({
+              toolName: "set_device_property",
+              did: device.did,
+              propName: prop.name,
+              value: coerced.value,
+            });
+            if (!deps.safetyConfirmRegistry.consumeMatching({ fingerprint: fp, did: device.did, toolName: "set_device_property" })) {
+              const msg = `安全提示：${probe.reasons.join("；")}，暂未执行。请确认安全后再启动。`;
+              return textResult(msg, { ok: false, safetyGateBlocked: true, requiresConfirmation: true, did: device.did, uiSummary: msg }, true);
+            }
+          }
+        }
+        if (risk.safetyLocked) {
+          const fp = computeActionFingerprint({
+            toolName: "set_device_property",
+            did: device.did,
+            propName: prop.name,
+            value: coerced.value,
+          });
+          if (!speaker.canExecuteL3WithConfirm) {
+            const msg = `权限不足：${device.name}（${risk.reasons.join("；")}）需主人确认，暂未执行。`;
+            return textResult(msg, { ok: false, safetyGateBlocked: true, riskLevel: risk.riskLevel, did: device.did, uiSummary: msg }, true);
+          }
+          if (!deps.safetyConfirmRegistry.consumeMatching({ fingerprint: fp, did: device.did, toolName: "set_device_property" })) {
+            const msg = `安全提示：${device.name}（${risk.reasons.join("；")}），暂未执行。请先向用户确认后再执行。`;
+            return textResult(msg, { ok: false, safetyGateBlocked: true, requiresConfirmation: true, riskLevel: risk.riskLevel, did: device.did, uiSummary: msg }, true);
+          }
+        }
       }
 
       await runJob(deps.jobs, () => deps.service.writeProp(device.did, prop.name, coerced.value), 1);
@@ -1471,7 +1719,29 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       const blocked = ensureAccessReady(deps);
       if (blocked) return textResult(blocked, { ok: false, error: blocked }, true);
 
-      const device = resolveSingleDevice(deps.mainWindow.activeDevices(), params.target);
+      const resolved = resolveSingleDeviceChecked(deps.mainWindow.activeDevices(), params.target);
+      if (resolved.ambiguous.length > 1) {
+        const choices = resolved.ambiguous
+          .map((d) => `${d.home_name ? `${d.home_name}/` : ""}${d.room_name}/${d.name}`)
+          .join("、");
+        const msg = `存在多台同名在线设备（${choices}），请明确指定家庭或具体设备后再设置属性。`;
+        return textResult(
+          msg,
+          {
+            ok: false,
+            ambiguousDevices: true,
+            candidates: resolved.ambiguous.map((d) => ({
+              did: d.did,
+              name: d.name,
+              home: d.home_name,
+              room: d.room_name,
+            })),
+            uiSummary: msg,
+          },
+          true,
+        );
+      }
+      const device = resolved.device;
       if (!device) {
         const msg = `未找到设备：${params.target}`;
         return textResult(msg, { ok: false, uiSummary: msg }, true);
@@ -1502,6 +1772,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
           {
             ok: false,
             blockedDangerousAction: true,
+            safetyGateBlocked: true,
             requiresConfirmation: true,
             did: device.did,
             name: device.name,
@@ -1511,6 +1782,115 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
           },
           true,
         );
+      }
+
+      if (deps.safetyConfirmRegistry) {
+        const speaker = deps.getActiveSpeakerPrincipal?.() ?? resolveSpeakerPrincipal({ source: "web" });
+        const drumParam =
+          Array.isArray(params.params) && typeof params.params[0] === "string"
+            ? params.params[0]
+            : undefined;
+        // 洗衣机启动动作执行实时物理安全探针（过热/故障/未开远程控制直接硬阻断；门未关/童锁/高温残留升级确认）
+        if (isWasherDevice(device) && (actionName === "start-wash" || actionName === "start_wash")) {
+          const probe = await probeWasherRuntimeSafety(deps.service, device.did, drumParam);
+          if (probe.status === "hard_block") {
+            const msg = `安全提示：${probe.reasons.join("；")}，已硬阻断，暂未执行。`;
+            return textResult(
+              msg,
+              {
+                ok: false,
+                safetyGateBlocked: true,
+                hardBlocked: true,
+                did: device.did,
+                action: actionName,
+                uiSummary: msg,
+              },
+              true,
+            );
+          }
+          if (probe.status === "require_confirm") {
+            const fp = computeActionFingerprint({
+              toolName: "run_device_action",
+              did: device.did,
+              actionName,
+              drumKey: drumParam,
+            });
+            if (
+              !deps.safetyConfirmRegistry.consumeMatching({
+                fingerprint: fp,
+                did: device.did,
+                toolName: "run_device_action",
+              })
+            ) {
+              const msg = `安全提示：${probe.reasons.join("；")}，暂未执行。请确认后再启动洗衣机。`;
+              return textResult(
+                msg,
+                {
+                  ok: false,
+                  safetyGateBlocked: true,
+                  requiresConfirmation: true,
+                  did: device.did,
+                  action: actionName,
+                  uiSummary: msg,
+                },
+                true,
+              );
+            }
+          }
+        }
+
+        const risk = classifyActionRisk(
+          {
+            toolName: "run_device_action",
+            did: device.did,
+            device,
+            actionName,
+            params:
+              Array.isArray(params.params) && params.params.length > 0
+                ? { portions: params.params[0] }
+                : undefined,
+            drumKey: drumParam,
+          },
+          speaker,
+        );
+        if (risk.safetyLocked) {
+          const fp = computeActionFingerprint({
+            toolName: "run_device_action",
+            did: device.did,
+            actionName,
+            drumKey: drumParam,
+          });
+          if (!speaker.canExecuteL3WithConfirm) {
+            const msg = `权限不足：${device.name}的「${actionLabel}」（${risk.reasons.join("；")}）需主人确认后才可执行，暂未执行。`;
+            return textResult(
+              msg,
+              { ok: false, safetyGateBlocked: true, riskLevel: risk.riskLevel, did: device.did, uiSummary: msg },
+              true,
+            );
+          }
+          if (
+            !deps.safetyConfirmRegistry.consumeMatching({
+              fingerprint: fp,
+              did: device.did,
+              toolName: "run_device_action",
+            })
+          ) {
+            const msg = `安全提示：${device.name}的「${actionLabel}」（${risk.reasons.join("；")}），暂未执行。请先通过宿主向用户确认后再执行。`;
+            return textResult(
+              msg,
+              {
+                ok: false,
+                safetyGateBlocked: true,
+                requiresConfirmation: true,
+                riskLevel: risk.riskLevel,
+                did: device.did,
+                action: actionName,
+                uiSummary: msg,
+              },
+              true,
+            );
+          }
+        }
       }
       await runJob(deps.jobs, () => deps.service.runAction(device.did, actionName, params.params), 1);
 
@@ -2318,6 +2698,241 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
     },
   };
 
+  const proposeConfirmationTool: AgentTool<any> = {
+    name: "propose_confirmation",
+    label: "发起渐进确认",
+    description:
+      "当遇到歧义/隐式请求尚未形成可信记忆、长期休眠需重确认、多台同名设备需消歧或涉及高安全风险操作时，调用此只读工具在宿主登记一条结构化待确认提问，以便用户口头答复「嗯/好/对/取消」或点击界面按钮直接确认执行，并在成功后自动总结记录强化记忆。",
+    parameters: obj({
+      question: str({ description: "向用户发出的简短明确中文确认问题（例如：确认一下，是要用阳台「美的可爱多」的左筒·袜子筒帮你洗袜子吗？）" }),
+      summary: str({ description: "自动总结的决策规则摘要（例如：说「洗袜子」→ 启动阳台「美的可爱多」左筒·袜子筒）" }),
+      target_did: str({ description: "拟执行的目标设备精确 did" }),
+      capability_key: opt(str({ description: "设备能力键，如 did#left:socks" })),
+      drum_key: opt(str({ description: "多筒洗衣机目标筒位（left/right/bottom/top/main）" })),
+      program: opt(str({ description: "目标洗涤/运行程序名（如 socks/underpants/smart_wash_dry）" })),
+      risk_level: opt(
+        oneOf(["L1_LOW", "L2_MEDIUM_APPLIANCE", "L2_SEASONAL", "L3_HIGH_SAFETY"] as const, {
+          description: "风险等级（默认 L2_MEDIUM_APPLIANCE）",
+        }),
+      ),
+      origin: opt(
+        oneOf(
+          [
+            "new_implicit",
+            "learning_second_ask",
+            "dormancy_reconfirm",
+            "safety_required",
+            "device_disambiguation",
+            "tool_proposal",
+          ] as const,
+          { description: "触发确认的原因类型" },
+        ),
+      ),
+      action_name: opt(str({ description: "确认后拟执行的动作名（如 start-wash、pet-food-out）" })),
+      power_state: opt(oneOf(["on", "off"] as const, { description: "确认后拟设置的开关状态（可选）" })),
+    }),
+    execute: async (_id, params) => {
+      const devices = deps.mainWindow.activeDevices();
+      const targetDev = devices.find((d) => d.did === params.target_did) ?? resolveSingleDevice(devices, params.target_did);
+      const rawUtterance = deps.getActivePromptRawText?.()?.trim() || params.summary;
+      const digest = deps.getCapabilityDigest?.() ?? buildHomeCapabilityDigest(devices, deps.now?.());
+      const intent = canonicalizeImplicitIntent(rawUtterance);
+      const speaker = deps.getActiveSpeakerPrincipal?.() ?? resolveSpeakerPrincipal({ source: "web" });
+
+      const steps: MemoryActionBinding["steps"] = [];
+      const did = targetDev?.did ?? params.target_did;
+      if (params.drum_key) {
+        steps.push({ toolName: "set_device_property", did, propName: "drum-location", value: params.drum_key });
+      }
+      if (params.program) {
+        steps.push({ toolName: "set_device_property", did, propName: "program", value: params.program });
+      }
+      if (params.action_name) {
+        steps.push({ toolName: "run_device_action", did, actionName: params.action_name });
+      } else if (params.power_state) {
+        steps.push({ toolName: "set_device_power", did, power: params.power_state });
+      }
+
+      const binding: MemoryActionBinding = {
+        did,
+        deviceName: targetDev?.name ?? params.target_did,
+        homeName: targetDev?.home_name,
+        roomName: targetDev?.room_name,
+        capabilityKey:
+          params.capability_key ||
+          `${did}#${params.drum_key || "main"}:${params.program || params.action_name || params.power_state || "default"}`,
+        drumKey: params.drum_key,
+        program: params.program,
+        steps,
+      };
+
+      const riskLevel: RiskLevel = (params.risk_level as RiskLevel | undefined) ?? "L2_MEDIUM_APPLIANCE";
+      const pending = deps.openPendingConfirmation?.({
+        origin: (params.origin as PendingConfirmationOrigin | undefined) ?? "tool_proposal",
+        canonicalKey: intent.canonicalKey,
+        originalUtterance: rawUtterance,
+        questionText: params.question.trim(),
+        summary: params.summary.trim(),
+        binding,
+        riskLevel,
+        topologyHash: digest.topologyHash,
+        conflictDomains: [],
+        speakerScope:
+          speaker.role === "verified_member" && riskLevel !== "L1_LOW" ? speaker.speakerId : "global",
+      });
+
+      const uiSummary = params.question.trim();
+      return textResult(uiSummary, {
+        ok: true,
+        awaitingConfirmation: true,
+        pendingConfirmationId: pending?.id ?? null,
+        question: uiSummary,
+        summary: params.summary.trim(),
+        uiSummary,
+      });
+    },
+  };
+
+  const resolveDecisionMemoryTool: AgentTool<any> = {
+    name: "resolve_decision_memory",
+    label: "查询强化决策记忆",
+    description:
+      "查询某句口语/隐式指令对应的强化决策记忆与渐进确认状态（返回是否可直接免确认执行、剩余确认次数、记忆保留率或是否因休眠/安全需再次确认）。",
+    parameters: obj({
+      utterance: str({ description: "用户原话或规范化意图短语（例如：帮我洗一下袜子）" }),
+    }),
+    execute: async (_id, params: { utterance: string }) => {
+      const devices = deps.mainWindow.activeDevices();
+      const nowMs = deps.now?.() ?? getReinforcementNow();
+      const digest = deps.getCapabilityDigest?.() ?? buildHomeCapabilityDigest(devices, nowMs);
+      const speaker = deps.getActiveSpeakerPrincipal?.() ?? resolveSpeakerPrincipal({ source: "web" });
+      const intent = canonicalizeImplicitIntent(params.utterance);
+      const { memory, borrowedOwnerHint } = findMatchingReinforcementMemory(intent.canonicalKey, speaker);
+      const capProbe = probeImplicitCapabilities(params.utterance, digest);
+
+      if (!memory) {
+        const uiSummary = capProbe
+          ? `未找到已沉淀记忆，探测到候选能力：${capProbe.matchedCapabilityLabel}，建议向用户确认`
+          : "未找到匹配的强化记忆规则";
+        return textResult(uiSummary, {
+          ok: true,
+          found: false,
+          canonicalKey: intent.canonicalKey,
+          borrowedOwnerHint: borrowedOwnerHint ? { id: borrowedOwnerHint.id, summary: borrowedOwnerHint.summary } : null,
+          capabilityProbe: capProbe
+            ? {
+                ambiguousDevices: capProbe.ambiguousDevices,
+                matchedCapabilityLabel: capProbe.matchedCapabilityLabel,
+                suggestedQuestion: capProbe.suggestedQuestion,
+              }
+            : null,
+          uiSummary,
+        });
+      }
+
+      const gate = evaluateReinforcementGate(memory, {
+        nowMs,
+        currentTopologyHash: digest.topologyHash,
+        speaker,
+      });
+      const uiSummary = `${memory.summary}｜裁决：${gate.decision === "execute_directly" ? "直接执行" : "需确认"}（${gate.reasonText}）`;
+      return textResult(uiSummary, {
+        ok: true,
+        found: true,
+        memory,
+        gate,
+        uiSummary,
+      });
+    },
+  };
+
+  const listDecisionMemoriesTool: AgentTool<any> = {
+    name: "list_decision_memories",
+    label: "查看强化决策记忆",
+    description:
+      "列出所有通过渐进确认自动总结记录的强化决策记忆（含已确认次数、信任阶段、记忆保留率、安全锁状态与摘要）。",
+    parameters: obj({
+      include_disabled: opt(bool({ description: "是否包含已停用或被覆盖的记忆，默认 false" })),
+    }),
+    execute: async (_id, params: { include_disabled?: boolean }) => {
+      const nowMs = deps.now?.() ?? getReinforcementNow();
+      const digest = deps.getCapabilityDigest?.() ?? buildHomeCapabilityDigest(deps.mainWindow.activeDevices(), nowMs);
+      const list = listReinforcementMemories({ includeDisabled: Boolean(params.include_disabled) });
+      if (list.length === 0) {
+        const uiSummary = "当前还没有自动学习的强化决策记忆";
+        return textResult(uiSummary, { ok: true, count: 0, memories: [], uiSummary });
+      }
+      const enriched = list.map((m) => ({
+        ...m,
+        retention: Number(computeRetention(m, nowMs).toFixed(2)),
+        uiStage: computeUiTrustStage(m, nowMs, digest.topologyHash),
+      }));
+      const lines = enriched.map(
+        (m, idx) =>
+          `${idx + 1}. [${m.uiStage} · ${m.confirmCount}/${m.confirmThreshold} · 保留${Math.round(m.retention * 100)}%] ${m.summary}`,
+      );
+      const uiSummary = `共有 ${enriched.length} 条强化决策记忆`;
+      return textResult(lines.join("\n"), {
+        ok: true,
+        count: enriched.length,
+        memories: enriched,
+        uiSummary,
+      });
+    },
+  };
+
+  const forgetDecisionMemoryTool: AgentTool<any> = {
+    name: "forget_decision_memory",
+    label: "遗忘/重置强化记忆",
+    description:
+      "删除、重置或清空已学习的强化决策记忆（支持按 id、关键词删除或重置确认次数，或清空全部）。",
+    parameters: obj({
+      id: opt(str({ description: "记忆 ID" })),
+      query: opt(str({ description: "按摘要或触发词关键词匹配" })),
+      reset_only: opt(bool({ description: "true 表示仅重置确认次数回学习态（下次重新问），false 表示直接删除" })),
+      clear_all: opt(bool({ description: "是否清空全部强化记忆" })),
+    }),
+    execute: async (
+      _id,
+      params: { id?: string; query?: string; reset_only?: boolean; clear_all?: boolean },
+    ) => {
+      if (params.clear_all) {
+        const count = clearReinforcementMemories();
+        deps.onMemoriesChanged?.();
+        deps.broadcastState();
+        const uiSummary = count > 0 ? `已清空全部 ${count} 条强化决策记忆` : "当前没有强化决策记忆";
+        return textResult(uiSummary, { ok: true, cleared: count, uiSummary });
+      }
+      let targetId = params.id?.trim() || "";
+      if (!targetId && params.query?.trim()) {
+        const q = params.query.trim().toLowerCase();
+        const hit = listReinforcementMemories({ includeDisabled: true }).find(
+          (m) =>
+            m.summary.toLowerCase().includes(q) ||
+            m.canonicalKey.toLowerCase().includes(q) ||
+            m.sampleUtterances.some((u) => u.toLowerCase().includes(q)),
+        );
+        targetId = hit?.id ?? "";
+      }
+      if (!targetId) {
+        const msg = "未找到匹配的强化决策记忆";
+        return textResult(msg, { ok: false, uiSummary: msg }, true);
+      }
+      if (params.reset_only) {
+        const updated = resetReinforcementMemory(targetId);
+        deps.onMemoriesChanged?.();
+        deps.broadcastState();
+        const uiSummary = updated ? `已重置强化记忆「${updated.summary}」，下次将重新确认` : "未找到指定记忆";
+        return textResult(uiSummary, { ok: Boolean(updated), memory: updated, uiSummary }, !updated);
+      }
+      const ok = deleteReinforcementMemory(targetId);
+      deps.onMemoriesChanged?.();
+      deps.broadcastState();
+      const uiSummary = ok ? "已删除该条强化决策记忆" : "未找到指定记忆";
+      return textResult(uiSummary, { ok, uiSummary }, !ok);
+    },
+  };
+
   return [
     listDevicesTool,
     listPlatformsTool,
@@ -2332,5 +2947,9 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
     saveCustomInstructionTool,
     listCustomInstructionsTool,
     deleteCustomInstructionTool,
+    proposeConfirmationTool,
+    resolveDecisionMemoryTool,
+    listDecisionMemoriesTool,
+    forgetDecisionMemoryTool,
   ];
 }

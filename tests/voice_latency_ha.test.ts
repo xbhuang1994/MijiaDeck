@@ -54,11 +54,12 @@ afterEach(() => {
 });
 
 describe("Home Assistant-inspired Voice Command Segmenter, AGC & Cooldown", () => {
-  test("vadSensitivityToSeconds maps aggressive / default / relaxed cleanly", () => {
+  test("vadSensitivityToSeconds maps aggressive / default / relaxed cleanly and honors user vadSilenceMs", () => {
     expect(vadSensitivityToSeconds("aggressive")).toBe(0.3);
-    expect(vadSensitivityToSeconds("default")).toBe(0.55);
-    expect(vadSensitivityToSeconds("default", 1200)).toBeLessThanOrEqual(0.68);
+    expect(vadSensitivityToSeconds("default")).toBe(0.95);
+    expect(vadSensitivityToSeconds("default", 1200)).toBe(1.2);
     expect(vadSensitivityToSeconds("relaxed")).toBe(1.05);
+    expect(vadSensitivityToSeconds("relaxed", 1500)).toBe(1.5);
   });
 
   test("VoiceCommandSegmenter enforces dual-threshold hysteresis and ignores brief music/drum spikes", () => {
@@ -190,7 +191,7 @@ describe("Config Store (vadSensitivity & preferLocalIntents)", () => {
     expect(def.version).toBe(AGENT_CONFIG_VERSION);
     expect(def.vadSensitivity).toBe("default");
     expect(def.preferLocalIntents).toBe(false);
-    expect(def.vadSilenceMs).toBe(600);
+    expect(def.vadSilenceMs).toBe(1000);
 
     const enabled = updateAgentVoiceConfig({
       vadSensitivity: "aggressive",

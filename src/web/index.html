@@ -332,6 +332,18 @@
       <div id="pi-instructions-list" class="pi-skills-list" hidden></div>
     </div>
 
+    <!-- Auto-Learned Reinforcement Decision Memories Bar (progressive confirmation) -->
+    <div id="pi-memories-bar" class="pi-skills-bar pi-memories-bar" hidden>
+      <button type="button" id="pi-memories-toggle-btn" class="pi-skills-toggle-btn" aria-expanded="false">
+        <span class="pi-skills-toggle-left">
+          <span class="pi-skills-icon" aria-hidden="true">🧠</span>
+          <span id="pi-memories-count-label">强化决策记忆 (0 · 渐进确认)</span>
+        </span>
+        <span id="pi-memories-chevron" class="pi-skills-chevron" aria-hidden="true">▸</span>
+      </button>
+      <div id="pi-memories-list" class="pi-skills-list" hidden></div>
+    </div>
+
     <!-- Conversation & Tool Execution Timeline -->
     <div id="pi-agent-scroll" class="pi-agent-scroll">
       <div id="pi-agent-empty" class="pi-agent-empty">
@@ -785,6 +797,20 @@
                 <label for="set-agent-system-prompt" class="agent-inst-legacy-label">补充自由文本说明（可选，优先级低于上方规则）</label>
                 <textarea id="set-agent-system-prompt" class="agent-textarea" rows="2" placeholder="可选：补充个性化家居控制习惯…" aria-label="Pi Agent 附加指令"></textarea>
               </div>
+            </div>
+          </div>
+
+          <div class="setting-card setting-card-wrap" id="setting-row-agent-memories">
+            <div class="setting-info">
+              <div class="setting-label">强化决策记忆（渐进确认 · 最多问 2 次，第 3 次直行）</div>
+              <div class="setting-desc">对“帮我洗一下袜子”等歧义/隐式指令，先核查设备专能并向你确认，自动总结记录决策；连续确认 2 次后第 3 次自动执行，久未触发（数月休眠）或涉及高温/涉水/安防等安全风险时自动重新确认。</div>
+            </div>
+            <div class="agent-inst-panel">
+              <div class="agent-mem-toolbar">
+                <span id="set-agent-memories-summary" class="agent-mem-summary">当前暂无自动学习的强化记忆</span>
+                <button type="button" id="set-agent-memories-clear-btn" class="secondary-button btn-compact" hidden>清空全部记忆</button>
+              </div>
+              <div id="set-agent-memories-list" class="agent-inst-list"></div>
             </div>
           </div>
 

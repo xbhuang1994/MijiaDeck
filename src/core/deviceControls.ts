@@ -36,6 +36,8 @@ const APPLIANCE_POWER_KINDS: ReadonlySet<string> = new Set([
   "dehumidifier",
   "heater",
   "water-heater",
+  "irrigation",
+  "valve",
 ]);
 
 const SPEAKER_KINDS: ReadonlySet<string> = new Set(["speaker", "wifispeaker"]);

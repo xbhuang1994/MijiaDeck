@@ -65,6 +65,8 @@ export interface LocalPlannerDeps {
   getCustomInstructions?: () => readonly CustomInstructionRule[];
   getLegacySystemPromptExtra?: () => string;
   classifyImplicitAction?: (utterance: string) => Promise<ImplicitActionLabel | null>;
+  /** 当前是否存在未消费的待确认提问（存在时禁用确定性本地直通，交由确认状态机处理） */
+  hasPendingConfirmation?: () => boolean;
 }
 
 export type LocalPlannerContextProvider = LocalPlannerDeps;
@@ -153,9 +155,17 @@ function roomMatchesDevice(device: DeviceInfo, room: string): boolean {
 export function planDeterministicLocalCalls(
   userText: string,
   deps: Pick<LocalPlannerDeps, "getDevices" | "getScenes"> &
-    Partial<Pick<LocalPlannerDeps, "getCustomInstructions" | "getLegacySystemPromptExtra">>,
+    Partial<
+      Pick<
+        LocalPlannerDeps,
+        "getCustomInstructions" | "getLegacySystemPromptExtra" | "hasPendingConfirmation"
+      >
+    >,
   recentTarget: string | null = null,
 ): PlannedCall[] | null {
+  if (deps.hasPendingConfirmation?.()) {
+    return null;
+  }
   const trimmed = userText.trim();
   if (
     !trimmed ||

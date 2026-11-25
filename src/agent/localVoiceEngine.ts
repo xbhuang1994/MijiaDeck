@@ -996,7 +996,7 @@ export class LocalVoiceEngine {
           provider: "cpu",
           debug: false,
         },
-        30,
+        Math.max(35, Math.ceil((options.maxSpeechDuration ?? 4.2) + 8)),
       );
     } catch (err) {
       this._lastError = err instanceof Error ? err.message : String(err);
@@ -1045,8 +1045,8 @@ export class LocalVoiceEngine {
           decoder: p.qwen3AsrDecoder,
           tokenizer: p.qwen3AsrTokenizer,
           hotwords: "",
-          maxTotalLen: 512,
-          maxNewTokens: 128,
+          maxTotalLen: 1024,
+          maxNewTokens: 256,
           temperature: 1e-6,
           topP: 0.8,
           seed: 42,
@@ -1200,7 +1200,7 @@ export class LocalVoiceEngine {
           threshold: Math.max(0.15, Math.min(0.85, options.threshold ?? 0.4)),
           minSilenceDuration: 0.3,
           minSpeechDuration: 0.14,
-          maxSpeechDuration: 20,
+          maxSpeechDuration: 30,
         })
       : null;
 
@@ -1398,13 +1398,14 @@ export class LocalVoiceEngine {
         stream.setOption("hotwords", csv);
       }
     }
-    if (
+    const effectiveMaxNewTokens =
       typeof options.maxNewTokens === "number" &&
       Number.isFinite(options.maxNewTokens) &&
-      options.maxNewTokens > 0 &&
-      typeof stream.setOption === "function"
-    ) {
-      stream.setOption("max_new_tokens", String(Math.round(options.maxNewTokens)));
+      options.maxNewTokens > 0
+        ? Math.round(options.maxNewTokens)
+        : Math.max(128, Math.min(384, Math.ceil((pcm16k.length / 16000) * 16) + 32));
+    if (typeof stream.setOption === "function") {
+      stream.setOption("max_new_tokens", String(effectiveMaxNewTokens));
     }
     stream.acceptWaveform({ samples: pcm16k, sampleRate: 16000 });
     const rawResult = await recognizer.decodeAsync(stream);

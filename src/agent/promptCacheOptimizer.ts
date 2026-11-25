@@ -48,6 +48,8 @@ export interface BuildRuntimeContextInput {
   currentHome?: string;
   currentStates: ReadonlyMap<string, DeviceLiveStateEntry>;
   previousStates: ReadonlyMap<string, DeviceLiveStateEntry> | null;
+  /** 可选附加动态上下文段（如强化记忆实时门控状态、当前挂起的待确认提问等），仅注入尾部 User Message 不破坏前缀缓存 */
+  extraSections?: readonly string[];
 }
 
 export interface AgentUsageSummary {
@@ -228,6 +230,15 @@ export function buildRuntimeContextBlock(input: BuildRuntimeContextInput): strin
       lines.push(...changedLines);
     } else if (currentStates.size > 0) {
       lines.push("实时设备状态：较上轮无变化");
+    }
+  }
+
+  if (input.extraSections && input.extraSections.length > 0) {
+    for (const sec of input.extraSections) {
+      const trimmed = sec.trim();
+      if (trimmed) {
+        lines.push("", trimmed);
+      }
     }
   }
 

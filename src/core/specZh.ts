@@ -333,7 +333,7 @@ export const UNIT_ZH: Record<string, string> = {
 const SENSITIVE_PROP_RE = /(?:password|passwd|secret|token|private[-_]?key)/i;
 const DEBUG_PROP_RE = /(?:^|[-_])(dbg|debug)(?:$|[-_])|^moto-speed-rpm$/i;
 const DANGEROUS_ACTION_RE =
-  /^(?:reboot|reset[-_].+|set[-_]default|restore|factory[-_]reset|format|del|delete)$/i;
+  /^(?:reboot|reset[-_].+|set[-_]default|restore|factory[-_]reset|format|del|delete|weigh[-_]manual[-_]calibrate|clear[-_]feed[-_]plan|unlock|unbind)$/i;
 
 const NUM_SUFFIX_RE = /-\d+$/;
 const CJK_RE = /[\u4e00-\u9fff]/;

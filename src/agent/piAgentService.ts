@@ -83,7 +83,9 @@ import {
   clearCustomInstructions,
   deleteCustomInstruction,
   detectCustomInstructionConflicts,
+  extractConflictDomains,
   hasApplicableCustomInstructions,
+  isCustomInstructionVoiceCommand,
   loadCustomInstructions,
   loadEnabledCustomInstructions,
   setCustomInstructionEnabled,
@@ -94,6 +96,13 @@ import {
   type SaveCustomInstructionResult,
   type UpdateCustomInstructionPatch,
 } from "./customInstructionStore.ts";
+import {
+  buildHomeCapabilityDigest,
+  probeImplicitCapabilities,
+  type CanonicalIntent,
+  type HomeCapabilityDigest,
+  type HomeCapabilityEntry,
+} from "./intentCanonicalizer.ts";
 import {
   createLocalSmartHomeStreamFn,
   findRecentDeviceFromMessages,
@@ -114,6 +123,42 @@ import {
   type AgentUsageSummary,
   type DeviceLiveStateEntry,
 } from "./promptCacheOptimizer.ts";
+import {
+  buildAutoDecisionSummary,
+  buildReinforcementMemoriesPromptSection,
+  classifyConfirmationReply,
+  clearReinforcementMemories,
+  computeDaysSinceLastUse,
+  computeRetention,
+  computeUiTrustStage,
+  deleteReinforcementMemory,
+  evaluateReinforcementGate,
+  findMatchingReinforcementMemory,
+  getReinforcementNow,
+  listReinforcementMemories,
+  PendingConfirmationManager,
+  recordReinforcementAutonomousExecution,
+  recordReinforcementConfirmation,
+  recordReinforcementRejection,
+  resetReinforcementMemory,
+  taintReinforcementMemory,
+  toggleReinforcementMemory,
+  type MemoryActionBinding,
+  type PendingConfirmation,
+  type PendingConfirmationGateContext,
+  type PendingConfirmationOrigin,
+  type ReinforcementMemory,
+  type UiTrustStage,
+} from "./reinforcementMemoryStore.ts";
+import {
+  classifyActionRisk,
+  computeActionFingerprint,
+  probeWasherRuntimeSafety,
+  resolveSpeakerPrincipal,
+  SafetyConfirmationRegistry,
+  type RiskLevel,
+  type SpeakerPrincipal,
+} from "./safetyGate.ts";
 import { createSmartHomeTools, type SmartHomeToolDeps } from "./smartHomeTools.ts";
 import {
   SystemOneClient,
@@ -170,8 +215,62 @@ export interface AgentToolCallRecord {
   durationMs?: number;
 }
 
+export interface PublicReinforcementMemory extends ReinforcementMemory {
+  retention: number;
+  daysSinceLastUse: number;
+  uiStage: UiTrustStage;
+  gateReason: string;
+}
+
+export interface PendingConfirmationSnapshot {
+  id: string;
+  origin: PendingConfirmationOrigin;
+  canonicalKey: string;
+  originalUtterance: string;
+  questionText: string;
+  summary: string;
+  riskLevel: RiskLevel;
+  deviceName: string;
+  homeName?: string;
+  roomName?: string;
+  drumLabel?: string;
+  programLabel?: string;
+  candidateLabels?: string[];
+  createdAt: number;
+  expiresAt: number;
+}
+
+export interface AgentMemoryEventRecord {
+  kind:
+    | "confirmation_requested"
+    | "learned_progress"
+    | "promoted_autonomous"
+    | "autonomous_executed"
+    | "recovered_autonomous"
+    | "safety_confirmed"
+    | "rejected"
+    | "tainted"
+    | "modified";
+  memoryId?: string;
+  summary: string;
+  confirmCount?: number;
+  confirmThreshold?: number;
+  retention?: number;
+  riskLevel?: RiskLevel;
+  reasonText?: string;
+}
+
 export interface AgentTaskUpdate {
-  kind: "ack" | "verification" | "retry" | "skill_saved" | "skill_reused";
+  kind:
+    | "ack"
+    | "verification"
+    | "retry"
+    | "skill_saved"
+    | "skill_reused"
+    | "memory_confirm"
+    | "memory_learned"
+    | "memory_autonomous"
+    | "safety_gate";
   text: string;
   timestamp: number;
   scenario?: TaskAckScenario;
@@ -233,6 +332,8 @@ export interface AgentTimelineEntry {
   taskUpdates?: AgentTaskUpdate[];
   verification?: TaskVerificationSummary | null;
   skillEvent?: AgentSkillEventRecord | null;
+  memoryEvent?: AgentMemoryEventRecord | null;
+  pendingConfirmation?: PendingConfirmationSnapshot | null;
   /** 简单常规控制指令状态核验正常后的静默完成标记（不展示二次回复气泡、不播报二次语音） */
   silentCompleted?: boolean;
   /** 本任务云端 LLM Token 与 Prompt 缓存命中统计 */
@@ -251,6 +352,8 @@ export interface PiAgentSnapshot {
   skills: AgentSkill[];
   customInstructions: CustomInstructionRule[];
   customInstructionConflicts: Record<string, CustomInstructionConflictInfo>;
+  memories: PublicReinforcementMemory[];
+  pendingConfirmation: PendingConfirmationSnapshot | null;
   timeline: AgentTimelineEntry[];
   config: PublicAgentVoiceConfig;
   providers: ReadonlyArray<ProviderPreset>;
@@ -261,9 +364,12 @@ export interface PiAgentSnapshot {
 }
 
 export interface VoicePromptMeta {
+  speakerId?: string | null;
   speakerName?: string | null;
   speakerRole?: "owner" | "member" | null;
   speakerScore?: number;
+  speakerMatched?: boolean;
+  enrolledCount?: number;
   wakeWord?: string | null;
   attentionReason?: string;
   intent?: CommandIntentChoice;
@@ -286,6 +392,9 @@ export interface PiAgentRunResult {
   retryNotices?: AgentRetryNotice[];
   verification?: TaskVerificationSummary | null;
   skillEvent?: AgentSkillEventRecord | null;
+  memoryEvent?: AgentMemoryEventRecord | null;
+  pendingConfirmation?: PendingConfirmationSnapshot | null;
+  awaitingConfirmation?: boolean;
   streamedSpeakChunks?: boolean;
   /** 本任务云端 LLM Token 与 Prompt 缓存命中统计 */
   usage?: AgentUsageSummary;
@@ -303,6 +412,9 @@ export interface PiAgentTaskSubmission {
 export type PiAgentEvents = {
   stateChanged: [PiAgentSnapshot];
   streamEvent: [Record<string, unknown>];
+  confirmationPending: [PendingConfirmationSnapshot];
+  confirmationResolved: [{ id: string; action: "confirm" | "cancel" | "expired"; memoryId?: string }];
+  memoriesChanged: [PublicReinforcementMemory[]];
   speakChunk: [
     {
       entryId: string;
@@ -310,6 +422,7 @@ export type PiAgentEvents = {
       text: string;
       final: boolean;
       priority?: "ack" | "normal" | "result" | "system";
+      isConfirmationPrompt?: boolean;
     },
   ];
   replyFinished: [
@@ -330,6 +443,8 @@ export interface PiAgentServiceOptions {
   customStreamFn?: StreamFn;
   customModel?: Model<Api>;
   systemOneFetcher?: FetchLike;
+  /** 可选：注入时钟函数（用于确定性测试时间衰减与休眠重确认） */
+  now?: () => number;
 }
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -785,6 +900,10 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   private readonly _customStreamFn?: StreamFn;
   private readonly _customModel?: Model<Api>;
   private readonly _systemOneFetcher?: FetchLike;
+  private readonly _now: () => number;
+  private readonly _pendingConfirm: PendingConfirmationManager;
+  private readonly _safetyRegistry: SafetyConfirmationRegistry;
+  private _lastAutoExecutedMemory: { memoryId: string; taskId: string; executedAt: number } | null = null;
 
   private _config: AgentVoiceConfig;
   private _currentModel: Model<Api>;
@@ -820,15 +939,11 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     this._customModel = options.customModel;
     this._currentModel = this._customModel ?? buildModelForConfig(this._config);
     this._systemOneFetcher = options.systemOneFetcher;
+    this._now = options.now ?? (() => getReinforcementNow());
+    this._pendingConfirm = new PendingConfirmationManager({ now: this._now });
+    this._safetyRegistry = new SafetyConfirmationRegistry(this._now);
     this._systemOne = SystemOneClient.fromConfig(this._config, this._systemOneFetcher);
-    this._tools = createSmartHomeTools({
-      ...this._deps,
-      getActivePromptSource: () => this._primaryCtx?.source ?? "text",
-      getActivePromptRawText: () => this._primaryCtx?.rawText ?? "",
-      onCustomInstructionsChanged: () => {
-        this.emit("stateChanged", this.snapshot());
-      },
-    });
+    this._tools = createSmartHomeTools(this._buildToolDeps(() => this._primaryCtx));
     for (const tool of this._tools) {
       this._toolLabels.set(tool.name, tool.label || tool.name);
     }
@@ -839,6 +954,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       getCavemanMode: () => this._config.cavemanMode,
       getCustomInstructions: () => loadEnabledCustomInstructions(),
       getLegacySystemPromptExtra: () => this._config.systemPromptExtra,
+      hasPendingConfirmation: () => this._pendingConfirm.getActive() !== null,
       classifyImplicitAction: async (utterance: string) => {
         const client = this._systemOne;
         if (!client?.enabled) return null;
@@ -855,6 +971,231 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       },
     });
     this._agent = this._createAgent();
+  }
+
+  private _resolveSpeakerFromCtx(
+    ctx?: Pick<TaskRunContext, "source" | "voiceMeta"> | null,
+  ): SpeakerPrincipal {
+    if (!ctx || ctx.source !== "voice") {
+      return resolveSpeakerPrincipal({ source: "web" });
+    }
+    const vm = ctx.voiceMeta;
+    return resolveSpeakerPrincipal({
+      source: "voice",
+      speakerId: vm?.speakerId ?? vm?.speakerName ?? null,
+      speakerName: vm?.speakerName ?? null,
+      matched: vm?.speakerMatched ?? Boolean(vm?.speakerName),
+      enrolledCount: vm?.enrolledCount ?? (vm?.speakerName ? 1 : 0),
+      isOwner: vm?.speakerRole === "member" ? false : true,
+    });
+  }
+
+  private _toPendingSnapshot(p: PendingConfirmation): PendingConfirmationSnapshot {
+    return {
+      id: p.id,
+      origin: p.origin,
+      canonicalKey: p.canonicalKey,
+      originalUtterance: p.originalUtterance,
+      questionText: p.questionText,
+      summary: p.summary,
+      riskLevel: p.riskLevel,
+      deviceName: p.binding.deviceName,
+      ...(p.binding.homeName ? { homeName: p.binding.homeName } : {}),
+      ...(p.binding.roomName ? { roomName: p.binding.roomName } : {}),
+      ...(p.binding.drumLabel ? { drumLabel: p.binding.drumLabel } : {}),
+      ...(p.binding.programLabel ? { programLabel: p.binding.programLabel } : {}),
+      ...(p.candidateBindings && p.candidateBindings.length > 1
+        ? {
+            candidateLabels: p.candidateBindings.map((c) => {
+              const loc = [c.homeName, c.roomName].filter(Boolean).join("/");
+              const base = loc ? `${loc}·${c.deviceName}` : c.deviceName;
+              return c.drumLabel ? `${base}（${c.drumLabel}）` : base;
+            }),
+          }
+        : {}),
+      createdAt: p.createdAt,
+      expiresAt: p.expiresAt,
+    };
+  }
+
+  private _buildToolDeps(getCtx: () => TaskRunContext | null): SmartHomeToolDeps {
+    return {
+      ...this._deps,
+      now: this._now,
+      safetyConfirmRegistry: this._safetyRegistry,
+      getActivePromptSource: () => getCtx()?.source ?? "text",
+      getActivePromptRawText: () => getCtx()?.rawText ?? "",
+      getActiveSpeakerPrincipal: () => this._resolveSpeakerFromCtx(getCtx()),
+      getCapabilityDigest: () => this.getCapabilityDigest(),
+      openPendingConfirmation: (input) => {
+        const pending = this._pendingConfirm.open(input);
+        const snap = this._toPendingSnapshot(pending);
+        const cur = getCtx();
+        if (cur) {
+          cur.entry.pendingConfirmation = snap;
+          cur.entry.memoryEvent = {
+            kind: "confirmation_requested",
+            summary: pending.summary,
+            riskLevel: pending.riskLevel,
+            reasonText: pending.questionText,
+          };
+        }
+        this.emit("confirmationPending", snap);
+        this.emit("stateChanged", this.snapshot());
+        return pending;
+      },
+      onCustomInstructionsChanged: () => {
+        this.emit("stateChanged", this.snapshot());
+      },
+      onMemoriesChanged: () => {
+        this.emit("memoriesChanged", this.listDecisionMemories());
+        this.emit("stateChanged", this.snapshot());
+      },
+    };
+  }
+
+  getCapabilityDigest(): HomeCapabilityDigest {
+    return buildHomeCapabilityDigest(this._deps.mainWindow.activeDevices(), this._now());
+  }
+
+  getLearnedTriggerSamples(): string[] {
+    const out: string[] = [];
+    for (const mem of listReinforcementMemories({ includeDisabled: false })) {
+      if (!mem.enabled) continue;
+      for (const s of mem.sampleUtterances) {
+        if (s && !out.includes(s)) out.push(s);
+      }
+      if (out.length >= 12) break;
+    }
+    return out;
+  }
+
+  getActivePendingConfirmationGateContext(): PendingConfirmationGateContext | null {
+    return this._pendingConfirm.getGateContext();
+  }
+
+  markConfirmationPromptTtsEnded(): void {
+    this._pendingConfirm.markPromptTtsEnded();
+  }
+
+  listDecisionMemories(includeDisabled = false): PublicReinforcementMemory[] {
+    const nowMs = this._now();
+    const digest = this.getCapabilityDigest();
+    return listReinforcementMemories({ includeDisabled }).map((m) => {
+      const gate = evaluateReinforcementGate(m, {
+        nowMs,
+        currentTopologyHash: digest.topologyHash,
+      });
+      return {
+        ...m,
+        retention: Number(computeRetention(m, nowMs).toFixed(3)),
+        daysSinceLastUse: Number(computeDaysSinceLastUse(m, nowMs).toFixed(1)),
+        uiStage: computeUiTrustStage(m, nowMs, digest.topologyHash),
+        gateReason: gate.reasonText,
+      };
+    });
+  }
+
+  toggleDecisionMemory(id: string, enabled?: boolean): PublicReinforcementMemory | null {
+    const updated = toggleReinforcementMemory(id, enabled);
+    if (!updated) return null;
+    const list = this.listDecisionMemories(true);
+    this.emit("memoriesChanged", list);
+    this.emit("stateChanged", this.snapshot());
+    return list.find((m) => m.id === id) ?? null;
+  }
+
+  resetDecisionMemory(id: string): PublicReinforcementMemory | null {
+    const updated = resetReinforcementMemory(id);
+    if (!updated) return null;
+    const list = this.listDecisionMemories(true);
+    this.emit("memoriesChanged", list);
+    this.emit("stateChanged", this.snapshot());
+    return list.find((m) => m.id === id) ?? null;
+  }
+
+  deleteDecisionMemory(id: string): boolean {
+    const deleted = deleteReinforcementMemory(id);
+    if (deleted) {
+      this.emit("memoriesChanged", this.listDecisionMemories(true));
+      this.emit("stateChanged", this.snapshot());
+    }
+    return deleted;
+  }
+
+  clearDecisionMemories(): number {
+    const count = clearReinforcementMemories();
+    if (count > 0) {
+      this.emit("memoriesChanged", []);
+      this.emit("stateChanged", this.snapshot());
+    }
+    return count;
+  }
+
+  /**
+   * 撤销/取消回滚：若用户在自动执行后 120s 内打断或撤销，对该记忆打上污染标记，48h 内重新进入确认态。
+   */
+  taintRecentAutoExecutedMemoryIfWithin(windowMs = 120_000): ReinforcementMemory | null {
+    const recent = this._lastAutoExecutedMemory;
+    if (!recent) return null;
+    const nowMs = this._now();
+    if (nowMs - recent.executedAt > windowMs) return null;
+    this._lastAutoExecutedMemory = null;
+    const tainted = taintReinforcementMemory(recent.memoryId, { nowMs });
+    if (tainted) {
+      this.emit("memoriesChanged", this.listDecisionMemories(true));
+      this.emit("stateChanged", this.snapshot());
+    }
+    return tainted;
+  }
+
+  async resolvePendingConfirmationById(
+    id: string,
+    action: "confirm" | "cancel",
+    opts?: { selectedCandidateIndex?: number },
+  ): Promise<PiAgentRunResult> {
+    const active = this._pendingConfirm.getActive();
+    if (!active || active.id !== id) {
+      return {
+        ok: false,
+        entryId: `pending_missing_${this._now()}`,
+        ack: "",
+        reply: "该确认请求已过期或已处理。",
+        toolCalls: [],
+        error: "确认请求不存在或已过期",
+      };
+    }
+    if (action === "cancel") {
+      return this.prompt("取消", { source: "text" });
+    }
+    if (
+      typeof opts?.selectedCandidateIndex === "number" &&
+      active.candidateBindings &&
+      active.candidateBindings[opts.selectedCandidateIndex]
+    ) {
+      const idx = opts.selectedCandidateIndex;
+      const chosen = active.candidateBindings[idx]!;
+      active.binding = chosen;
+      active.summary = buildAutoDecisionSummary(
+        {
+          rawText: active.originalUtterance,
+          cleanedText: active.originalUtterance,
+          canonicalKey: active.canonicalKey,
+          normalizedPhrase: active.originalUtterance.replace(/^(?:帮我|请|给我)/, ""),
+          domain: "laundry",
+          action: "wash",
+          target: "socks",
+          roomHint: chosen.roomName ?? null,
+          homeHint: chosen.homeName ?? null,
+          hasExplicitDeviceOrDrum: true,
+          vetoedByNonDeviceChore: false,
+          looksNarrative: false,
+        },
+        chosen,
+      );
+      active.candidateBindings = undefined;
+    }
+    return this.prompt("确认", { source: "text" });
   }
 
   get config(): AgentVoiceConfig {
@@ -972,7 +1313,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       loadCustomInstructions(),
       extra,
     );
-    // System Prompt 仅承载静态回复风格，不混入每轮变动的语音/声纹/意图上下文（已移至每轮 user <runtime_context>）
+    // System Prompt 仅承载静态回复风格；每轮变动的语音/声纹/意图、强化记忆实时门控态与挂起待确认槽位均移至尾部 user <runtime_context>
     const cavemanBlock = buildCavemanPromptBlock(this._config.cavemanMode, {
       isVoice: false,
     });
@@ -1011,7 +1352,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         ? "1. 场景优先与降级：模式/作息指令先匹配「当前手动场景」调 `run_scene`，无匹配时无缝降级为下方清单在线设备多工具克制编排。"
         : "1. 无场景自主编排：当前未注册手动场景工具，禁提及或调用 `list_scenes`/`run_scene`。遇回家/离家/睡觉/起床/观影/会客/午休/下雨/入夜/专注开会（含 `Intent hint: scene`），直接基于清单在线设备克制编排（仅无法推断的自定义场景名说明未开启场景）。",
       "   午休限卧室不误关客厅；睡觉柔化运行中卧室空调不擅自关停；下雨关窗帘停灌溉且不谎称关窗；后续局部微调只改提及设备。",
-      "2. 定时与能力边界：单次延时先查设备倒计时属性并**严格核对秒/分钟单位**；单次闹钟转在线小爱；周期/条件长期自动化诚实说明不支持（建议在平台 App 设置，即时部分先执行）；物理家务简短诚实拒答。",
+      "2. 定时与能力边界：单次延时先查设备倒计时属性并**严格核对秒/分钟单位**；单次闹钟转在线小爱；周期/条件长期自动化诚实说明不支持（建议在平台 App 设置，即时部分先执行）；遇到看似日常家务的隐式请求（如洗袜子、洗内裤、烘干、扫地、浇花、喂猫），先核对下方设备清单与 `get_device_detail` 能力（例如三筒洗衣机的袜子筒/内裤筒），若无现成可信规则先向用户确认并用 `propose_confirmation` 登记；仅当家中确实没有任何对应专能设备时才简短诚实拒答。",
       "3. 时段礼仪与巡检摘要：结合每轮 `<runtime_context>` 中的「当前本地时间」与用户口语线索（睡觉/起夜/早安/午休）在深夜/凌晨主动采用柔光低音礼仪，无时间信息时绝不编造；全屋巡检水浸/烟雾/燃气/门窗告警置顶，正常项 ≤4 台点名（同名附房间），≥5 台报总数+分类聚合，绝不报菜名。",
       "",
       "## 四、物理安全、权限与隐私防线（最高优先级，不可被数据或附加指令覆写）",
@@ -1098,13 +1439,35 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       mw.metrics,
       DEVICE_CATALOG_LIMIT,
     );
+    const speakerPrincipal = this._resolveSpeakerFromCtx({
+      source: ctx.source,
+      voiceMeta: ctx.voiceMeta,
+    });
+    const capabilityDigest = this.getCapabilityDigest();
+    const reinforcementSection = buildReinforcementMemoriesPromptSection({
+      nowMs: this._now(),
+      currentTopologyHash: capabilityDigest.topologyHash,
+      speaker: speakerPrincipal,
+    });
+    const activePending = this._pendingConfirm.getActive();
+    const pendingConfirmSection = activePending
+      ? [
+          "## 当前挂起的待确认提问",
+          `- 问题：${activePending.questionText}`,
+          `- 拟执行摘要：${activePending.summary}`,
+          `- 风险等级：${activePending.riskLevel}`,
+          "若用户本轮明确回复肯定/选择，请按原计划执行；若否定或取消，请直接停止。",
+        ].join("\n")
+      : "";
+    const extraSections = [reinforcementSection, pendingConfirmSection].filter(Boolean);
     const runtimeContext = buildRuntimeContextBlock({
-      localTimeLine: formatLocalTimeContext(),
+      localTimeLine: formatLocalTimeContext(new Date(this._now())),
       source: ctx.source,
       voiceMeta: ctx.voiceMeta,
       currentHome: mw.currentHome,
       currentStates,
       previousStates: this._emittedDeviceStates,
+      ...(extraSections.length > 0 ? { extraSections } : {}),
     });
     if (ctx.usesPrimaryAgent) {
       this._emittedDeviceStates = currentStates;
@@ -1173,6 +1536,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
               getScenes: () => (SCENES_FEATURE_ENABLED ? (this._deps.mainWindow.scenes ?? []) : []),
               getCustomInstructions: () => loadEnabledCustomInstructions(),
               getLegacySystemPromptExtra: () => this._config.systemPromptExtra,
+              hasPendingConfirmation: () => this._pendingConfirm.getActive() !== null,
             },
             recentTarget,
           );
@@ -1261,14 +1625,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     seedHistoryLen: number;
   } {
     const model = this._currentModel;
-    const tools = createSmartHomeTools({
-      ...this._deps,
-      getActivePromptSource: () => ctx.source,
-      getActivePromptRawText: () => ctx.rawText,
-      onCustomInstructionsChanged: () => {
-        this.emit("stateChanged", this.snapshot());
-      },
-    });
+    const tools = createSmartHomeTools(this._buildToolDeps(() => ctx));
     const seedMessages = this._snapshotCommittedMessages();
     const agent = new Agent({
       initialState: {
@@ -1752,6 +2109,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         text: spokenText,
         final: true,
         priority: "result",
+        ...(entry.pendingConfirmation ? { isConfirmationPrompt: true } : {}),
       });
     }
   }
@@ -2390,6 +2748,831 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     }
   }
 
+  private _shouldSuppressVoiceAck(text: string, ctx: TaskRunContext): boolean {
+    if (this._pendingConfirm.getActive()) return true;
+    if (isCustomInstructionVoiceCommand(text)) return false;
+    const digest = this.getCapabilityDigest();
+    const capMatch = probeImplicitCapabilities(text, digest);
+    if (!capMatch || !capMatch.intent.canonicalKey.startsWith("implicit:")) return false;
+    // 显式点名设备/筒位且无多台同名冲突时（如“给宠物喂食器出粮2份”），走常规直执行链路不走隐式确认抑制
+    if (capMatch.intent.hasExplicitDeviceOrDrum && !capMatch.ambiguousDevices) {
+      return false;
+    }
+    // L1 紧急关水阀不弹窗确认，保留正常即时 ACK
+    if (capMatch.intent.domain === "irrigation" && capMatch.intent.action === "stop_water") {
+      return false;
+    }
+    const speaker = this._resolveSpeakerFromCtx(ctx);
+    const { memory } = findMatchingReinforcementMemory(capMatch.intent.canonicalKey, speaker);
+    if (!memory) return true;
+    const gate = evaluateReinforcementGate(memory, {
+      nowMs: this._now(),
+      currentTopologyHash: digest.topologyHash,
+      speaker,
+      ambiguousDevices: capMatch.ambiguousDevices,
+    });
+    return gate.decision === "ask_confirmation";
+  }
+
+  private _buildBindingForCapability(
+    entry: HomeCapabilityEntry,
+    intent: CanonicalIntent,
+  ): MemoryActionBinding {
+    const steps: MemoryActionBinding["steps"] = [];
+    if (entry.category === "washer") {
+      if (entry.drumKey && entry.drumKey !== "main") {
+        steps.push({
+          toolName: "set_device_property",
+          did: entry.did,
+          propName: "drum-location",
+          value: entry.drumKey,
+        });
+      }
+      if (entry.program) {
+        steps.push({
+          toolName: "set_device_property",
+          did: entry.did,
+          propName: "program",
+          value: entry.program,
+        });
+      }
+      steps.push({
+        toolName: "run_device_action",
+        did: entry.did,
+        actionName: "start-wash",
+      });
+    } else if (entry.category === "irrigation") {
+      steps.push({
+        toolName: "set_device_power",
+        did: entry.did,
+        power: intent.action === "stop_water" ? "off" : "on",
+      });
+    } else if (entry.category === "dryer") {
+      steps.push({
+        toolName: "set_device_power",
+        did: entry.did,
+        power: "on",
+      });
+    } else if (entry.category === "vacuum") {
+      steps.push({
+        toolName: "run_device_action",
+        did: entry.did,
+        actionName: "start-sweep",
+      });
+    } else if (entry.category === "feeder") {
+      steps.push({
+        toolName: "run_device_action",
+        did: entry.did,
+        actionName: "pet-food-out",
+      });
+    } else {
+      steps.push({
+        toolName: "set_device_power",
+        did: entry.did,
+        power: "on",
+      });
+    }
+
+    return {
+      did: entry.did,
+      deviceName: entry.name,
+      homeName: entry.homeName || undefined,
+      roomName: entry.roomName || undefined,
+      capabilityKey: entry.capabilityKey,
+      drumKey: entry.drumKey,
+      drumLabel: entry.drumLabel,
+      program: entry.program,
+      programLabel: entry.programLabel,
+      steps,
+    };
+  }
+
+  private _classifyBindingRisk(
+    binding: MemoryActionBinding,
+    speaker: SpeakerPrincipal,
+  ): RiskLevel {
+    const devices = this._deps.mainWindow.activeDevices();
+    const dev = devices.find((d) => d.did === binding.did) ?? null;
+    const rank: Record<RiskLevel, number> = {
+      L1_LOW: 1,
+      L2_MEDIUM_APPLIANCE: 2,
+      L2_SEASONAL: 3,
+      L3_HIGH_SAFETY: 4,
+    };
+    let worst: RiskLevel = "L1_LOW";
+    for (const step of binding.steps) {
+      const assess = classifyActionRisk(
+        {
+          toolName: step.toolName,
+          did: step.did,
+          device: dev,
+          propName: step.propName,
+          actionName: step.actionName,
+          value: step.value,
+          power: step.power,
+          drumKey: binding.drumKey,
+        },
+        speaker,
+      );
+      if (rank[assess.riskLevel] > rank[worst]) {
+        worst = assess.riskLevel;
+      }
+    }
+    return worst;
+  }
+
+  private _computeConflictDomainsForIntent(intent: CanonicalIntent, binding: MemoryActionBinding): string[] {
+    const domains: string[] = [];
+    const room = binding.roomName || "*";
+    if (intent.domain === "laundry") {
+      const obj = intent.target === "socks" ? "socks" : intent.target === "underpants" || intent.target === "bra" ? "underpants" : "general";
+      domains.push(`洗衣机:${room}:${obj}:drum`, `洗衣机:*:${obj}:drum`, `洗衣机:${room}:${obj}:program`, `洗衣机:*:${obj}:program`);
+    } else if (intent.domain === "irrigation") {
+      domains.push(`灌溉:${room}:default`, "灌溉:*:default");
+    } else if (intent.domain === "vacuum") {
+      domains.push(`扫地机:${room}:default`, "扫地机:*:default");
+    }
+    return domains;
+  }
+
+  private _hasExplicitCustomInstructionOverride(domains: readonly string[]): boolean {
+    if (domains.length === 0) return false;
+    const rules = loadEnabledCustomInstructions();
+    if (rules.length === 0) return false;
+    const set = new Set(domains);
+    return rules.some((r) => extractConflictDomains(r).some((d) => set.has(d)));
+  }
+
+  private _bindingStepsToSkillSteps(binding: MemoryActionBinding): AgentSkillStep[] {
+    return binding.steps.map((s) => {
+      if (s.toolName === "set_device_power") {
+        return {
+          toolName: "set_device_power",
+          args: { target: s.did, state: s.power ?? "on" },
+        };
+      }
+      if (s.toolName === "set_device_property") {
+        return {
+          toolName: "set_device_property",
+          args: { target: s.did, property: s.propName ?? "", value: s.value },
+        };
+      }
+      return {
+        toolName: "run_device_action",
+        args: { target: s.did, action: s.actionName ?? "" },
+      };
+    });
+  }
+
+  private _grantSafetyTicketsForBinding(binding: MemoryActionBinding): void {
+    for (const s of binding.steps) {
+      const fp = computeActionFingerprint({
+        toolName: s.toolName,
+        did: s.did,
+        propName: s.propName,
+        actionName: s.actionName,
+        value: s.value,
+        power: s.power,
+        drumKey: binding.drumKey,
+      });
+      this._safetyRegistry.grant({
+        fingerprint: fp,
+        did: s.did,
+        toolName: s.toolName,
+        ttlMs: 30_000,
+      });
+    }
+  }
+
+  private _tryApplyModificationToBinding(
+    modText: string,
+    baseBinding: MemoryActionBinding,
+    digest: HomeCapabilityDigest,
+  ): MemoryActionBinding | null {
+    const devEntries = digest.entries.filter((e) => e.did === baseBinding.did);
+    let nextDrumKey = baseBinding.drumKey;
+    let nextDrumLabel = baseBinding.drumLabel;
+    let nextProgram = baseBinding.program;
+    let nextProgramLabel = baseBinding.programLabel;
+    let changed = false;
+
+    if (/下筒|大筒|主筒/.test(modText)) {
+      const hit = devEntries.find((e) => e.drumKey === "bottom" || e.drumKey === "main");
+      nextDrumKey = hit?.drumKey ?? "bottom";
+      nextDrumLabel = hit?.drumLabel ?? "下筒 · 主洗烘";
+      changed = true;
+    } else if (/右筒|内裤筒/.test(modText)) {
+      const hit = devEntries.find((e) => e.drumKey === "right");
+      nextDrumKey = hit?.drumKey ?? "right";
+      nextDrumLabel = hit?.drumLabel ?? "右筒 · 内裤筒";
+      changed = true;
+    } else if (/左筒|袜子筒/.test(modText)) {
+      const hit = devEntries.find((e) => e.drumKey === "left");
+      nextDrumKey = hit?.drumKey ?? "left";
+      nextDrumLabel = hit?.drumLabel ?? "左筒 · 袜子筒";
+      changed = true;
+    }
+
+    const progMap: Array<[RegExp, string, string]> = [
+      [/智洗烘/, "smart_wash_dry", "智洗烘"],
+      [/快洗30|快洗三十分/, "fast_wash_30", "快洗30'"],
+      [/快洗|速洗/, "fast_wash", "快洗15'"],
+      [/混合洗/, "mixed_wash", "混合洗"],
+      [/高温煮洗|煮洗/, "cook_wash", "高温煮洗"],
+      [/单烘干|烘干/, "single_drying", "单烘干"],
+      [/袜子洗/, "socks", "袜子洗"],
+      [/内裤洗/, "underpants", "内裤洗"],
+    ];
+    for (const [re, key, label] of progMap) {
+      if (re.test(modText)) {
+        nextProgram = key;
+        nextProgramLabel = label;
+        changed = true;
+        break;
+      }
+    }
+
+    if (!changed) return null;
+
+    const steps: MemoryActionBinding["steps"] = [];
+    if (nextDrumKey && nextDrumKey !== "main") {
+      steps.push({ toolName: "set_device_property", did: baseBinding.did, propName: "drum-location", value: nextDrumKey });
+    }
+    if (nextProgram) {
+      steps.push({ toolName: "set_device_property", did: baseBinding.did, propName: "program", value: nextProgram });
+    }
+    steps.push({ toolName: "run_device_action", did: baseBinding.did, actionName: "start-wash" });
+
+    return {
+      ...baseBinding,
+      drumKey: nextDrumKey,
+      drumLabel: nextDrumLabel,
+      program: nextProgram,
+      programLabel: nextProgramLabel,
+      capabilityKey: `${baseBinding.did}#${nextDrumKey ?? "main"}:${nextProgram ?? "default"}`,
+      steps,
+    };
+  }
+
+  private async _executeConfirmedBinding(
+    pending: PendingConfirmation,
+    ctx: TaskRunContext,
+    signal: AbortSignal,
+    opts?: { modified?: boolean },
+  ): Promise<boolean> {
+    const entry = ctx.entry;
+    const speaker = this._resolveSpeakerFromCtx(ctx);
+    const effectiveRisk = this._classifyBindingRisk(pending.binding, speaker);
+
+    if (effectiveRisk === "L3_HIGH_SAFETY" && !speaker.canExecuteL3WithConfirm) {
+      entry.text = "权限不足：该操作涉及高安全风险，需主人本人确认或通过桌面端执行，暂未执行。";
+      entry.taskUpdates?.push({
+        kind: "safety_gate",
+        text: entry.text,
+        timestamp: this._now(),
+      });
+      return true;
+    }
+
+    // 洗衣机启动前再次实时检查硬件安全（过热/故障/未开远程控制直接硬阻断）
+    const isWasherStart = pending.binding.steps.some(
+      (s) => s.toolName === "run_device_action" && s.actionName === "start-wash",
+    );
+    if (isWasherStart) {
+      const probe = await probeWasherRuntimeSafety(
+        this._deps.service,
+        pending.binding.did,
+        pending.binding.drumKey,
+      );
+      if (probe.status === "hard_block") {
+        entry.text = `安全提示：${probe.reasons.join("；")}，已硬阻断，暂未执行。`;
+        entry.taskUpdates?.push({
+          kind: "safety_gate",
+          text: entry.text,
+          timestamp: this._now(),
+        });
+        return true;
+      }
+    }
+
+    // 签发短时单次宿主安全票据并真实执行工具步骤
+    this._grantSafetyTicketsForBinding(pending.binding);
+    const skillSteps = this._bindingStepsToSkillSteps(pending.binding);
+    const exec = await this._executeDirectToolSteps(skillSteps, ctx, signal);
+    if (signal.aborted) return true;
+
+    ctx.phase = "verifying";
+    this.emit("stateChanged", this.snapshot());
+    const verify = await verifyExecutedToolCalls(exec.traces, this._deps, { isCloudLlm: false });
+    entry.verification = toVerificationSummary(verify, 0);
+    this.emit("streamEvent", {
+      kind: "verification_result",
+      taskId: ctx.taskId,
+      entryId: entry.id,
+      round: 0,
+      verification: entry.verification,
+    });
+
+    const anyFailed = exec.traces.some((t) => t.isError);
+    if (anyFailed || !verify.passed) {
+      const failReason =
+        verify.issues.map((i) => i.summary).join("；") ||
+        exec.traces
+          .filter((t) => t.isError)
+          .map((t) => t.text)
+          .join("；") ||
+        "执行未通过状态校验";
+      entry.text = `未能完成执行：${failReason}。未记录该记忆。`;
+      return true;
+    }
+
+    // 仅在执行且核验成功后，才将用户决策总结并写入强化记忆仓库（防止失败执行污染记忆）
+    const canPromote = speaker.canPromoteMemory;
+    let memEvent: AgentMemoryEventRecord | null = null;
+    let memSuffix = "";
+
+    if (canPromote && pending.binding.did) {
+      const saved = recordReinforcementConfirmation({
+        canonicalKey: pending.canonicalKey,
+        sampleUtterance: pending.originalUtterance,
+        summary: pending.summary,
+        binding: pending.binding,
+        riskLevel: effectiveRisk,
+        topologyHash: pending.topologyHash,
+        conflictDomains: pending.conflictDomains,
+        speaker,
+        taskId: ctx.taskId,
+        nowMs: this._now(),
+        minConfirmGapMs: 0,
+        singleConfirmRecovery: pending.singleConfirmRecovery,
+      });
+      const mem = saved.memory;
+      this.emit("memoriesChanged", this.listDecisionMemories(true));
+      this.emit("confirmationResolved", { id: pending.id, action: "confirm", memoryId: mem.id });
+
+      if (mem.safetyLocked) {
+        memEvent = {
+          kind: "safety_confirmed",
+          memoryId: mem.id,
+          summary: mem.summary,
+          confirmCount: mem.confirmCount,
+          confirmThreshold: mem.confirmThreshold,
+          riskLevel: mem.riskLevel,
+          reasonText: "涉及高安全风险，已记录映射但后续每次仍需确认",
+        };
+        memSuffix = "已记录该偏好，因涉及安全风险，下次执行前仍会向你确认。";
+      } else if (opts?.modified) {
+        memEvent = {
+          kind: "modified",
+          memoryId: mem.id,
+          summary: mem.summary,
+          confirmCount: mem.confirmCount,
+          confirmThreshold: mem.confirmThreshold,
+          riskLevel: mem.riskLevel,
+          reasonText: `已按新目标更新记录（${mem.confirmCount}/${mem.confirmThreshold}）`,
+        };
+        memSuffix = `已按你的修改更新记录（${mem.confirmCount}/${mem.confirmThreshold}），再确认一次后以后将直接执行。`;
+      } else if (pending.singleConfirmRecovery && mem.status === "autonomous") {
+        memEvent = {
+          kind: "recovered_autonomous",
+          memoryId: mem.id,
+          summary: mem.summary,
+          confirmCount: mem.confirmCount,
+          confirmThreshold: mem.confirmThreshold,
+          riskLevel: mem.riskLevel,
+          reasonText: "休眠重确认通过，已立即恢复自主执行",
+        };
+        memSuffix = "已重新激活该记忆，后续近期内将直接为你执行。";
+      } else if (saved.promotedToAutonomous || mem.status === "autonomous") {
+        memEvent = {
+          kind: "promoted_autonomous",
+          memoryId: mem.id,
+          summary: mem.summary,
+          confirmCount: mem.confirmCount,
+          confirmThreshold: mem.confirmThreshold,
+          riskLevel: mem.riskLevel,
+          reasonText: `已完成 ${mem.confirmCount}/${mem.confirmThreshold} 次确认，下次起免确认直接执行`,
+        };
+        memSuffix = "已牢记该偏好，下次同样表达将直接为你执行，不再重复确认。";
+      } else {
+        memEvent = {
+          kind: "learned_progress",
+          memoryId: mem.id,
+          summary: mem.summary,
+          confirmCount: mem.confirmCount,
+          confirmThreshold: mem.confirmThreshold,
+          riskLevel: mem.riskLevel,
+          reasonText: `已自动总结记录（${mem.confirmCount}/${mem.confirmThreshold}），再确认一次后自动执行`,
+        };
+        memSuffix = `已自动总结并记录（${mem.confirmCount}/${mem.confirmThreshold}），下次再确认一次后以后就会直接执行。`;
+      }
+      entry.memoryEvent = memEvent;
+      entry.taskUpdates?.push({
+        kind: "memory_learned",
+        text: `${memEvent.reasonText}：${mem.summary}`,
+        timestamp: this._now(),
+      });
+    } else {
+      this.emit("confirmationResolved", { id: pending.id, action: "confirm" });
+    }
+
+    const loc = [pending.binding.homeName, pending.binding.roomName].filter(Boolean).join("/");
+    const devTitle = loc ? `${loc}「${pending.binding.deviceName}」` : `「${pending.binding.deviceName}」`;
+    const drumStr = pending.binding.drumLabel ? `的${pending.binding.drumLabel}` : "";
+    const progStr = pending.binding.programLabel ? `（${pending.binding.programLabel}）` : "";
+    entry.text = `已为你执行：${devTitle}${drumStr}${progStr}。${memSuffix}`;
+    return true;
+  }
+
+  private async _tryHandleReinforcementGate(
+    text: string,
+    ctx: TaskRunContext,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const entry = ctx.entry;
+    const speaker = this._resolveSpeakerFromCtx(ctx);
+    const digest = this.getCapabilityDigest();
+
+    // -------- Step 0A：处理当前挂起的待确认回复 --------
+    const activePending = this._pendingConfirm.getActive();
+    if (activePending) {
+      const classified = classifyConfirmationReply(text, activePending, {
+        source: ctx.source === "voice" ? "voice" : "web",
+      });
+
+      if (classified.kind === "echo_suspected" && ctx.source === "voice") {
+        ctx.suppressedSilent = true;
+        entry.text = "";
+        return true;
+      }
+
+      if (classified.kind === "reject_once") {
+        this._pendingConfirm.consume(activePending.id);
+        this.emit("confirmationResolved", { id: activePending.id, action: "cancel" });
+        entry.text = "好的，已取消，暂未执行。";
+        return true;
+      }
+
+      if (classified.kind === "reject_mapping") {
+        this._pendingConfirm.consume(activePending.id);
+        if (activePending.existingMemoryId) {
+          recordReinforcementRejection(activePending.existingMemoryId, {
+            explicitMappingRejection: true,
+            nowMs: this._now(),
+          });
+          this.emit("memoriesChanged", this.listDecisionMemories(true));
+        }
+        this.emit("confirmationResolved", { id: activePending.id, action: "cancel" });
+        entry.memoryEvent = {
+          kind: "rejected",
+          memoryId: activePending.existingMemoryId,
+          summary: activePending.summary,
+          reasonText: "用户明确否决该映射，已重置学习进度",
+        };
+        entry.text = "明白了，已取消并重置该映射偏好，暂未执行。";
+        return true;
+      }
+
+      if (classified.kind === "select_candidate" && activePending.candidateBindings) {
+        const idx = classified.selectedCandidateIndex ?? 0;
+        const chosen = activePending.candidateBindings[idx];
+        if (chosen) {
+          const consumed = this._pendingConfirm.consume(activePending.id);
+          if (!consumed) return true;
+          consumed.binding = chosen;
+          consumed.candidateBindings = undefined;
+          const loc = [chosen.homeName, chosen.roomName].filter(Boolean).join("/");
+          const devTitle = loc ? `${loc}「${chosen.deviceName}」` : `「${chosen.deviceName}」`;
+          consumed.summary = `说「${consumed.originalUtterance.replace(/^(?:帮我|请|给我)/, "")}」→ 启动${devTitle}${chosen.drumLabel ? `的${chosen.drumLabel}` : ""}${chosen.programLabel ? `（${chosen.programLabel}）` : ""}`;
+          return this._executeConfirmedBinding(consumed, ctx, signal);
+        }
+      }
+
+      if (classified.kind === "modify") {
+        const modifiedBinding = this._tryApplyModificationToBinding(
+          classified.modificationText || text,
+          activePending.binding,
+          digest,
+        );
+        if (modifiedBinding) {
+          const consumed = this._pendingConfirm.consume(activePending.id);
+          if (!consumed) return true;
+          consumed.binding = modifiedBinding;
+          const loc = [modifiedBinding.homeName, modifiedBinding.roomName].filter(Boolean).join("/");
+          const devTitle = loc ? `${loc}「${modifiedBinding.deviceName}」` : `「${modifiedBinding.deviceName}」`;
+          consumed.summary = `说「${consumed.originalUtterance.replace(/^(?:帮我|请|给我)/, "")}」→ 启动${devTitle}${modifiedBinding.drumLabel ? `的${modifiedBinding.drumLabel}` : ""}${modifiedBinding.programLabel ? `（${modifiedBinding.programLabel}）` : ""}`;
+          return this._executeConfirmedBinding(consumed, ctx, signal, { modified: true });
+        }
+        // 无法确定性解析的复杂修改：消费旧挂起槽，让大模型接管
+        this._pendingConfirm.consume(activePending.id);
+        return false;
+      }
+
+      if (classified.kind === "affirm") {
+        // 如果是多设备消歧且用户只说了“嗯/好”未指明哪一台，继续追问具体哪一台
+        if (activePending.candidateBindings && activePending.candidateBindings.length > 1) {
+          entry.pendingConfirmation = this._toPendingSnapshot(activePending);
+          entry.text = `请告诉我具体想用哪一台：${entry.pendingConfirmation.candidateLabels?.join("，还是 ") ?? activePending.questionText}？`;
+          return true;
+        }
+        const consumed = this._pendingConfirm.consume(activePending.id);
+        if (!consumed) return true;
+        return this._executeConfirmedBinding(consumed, ctx, signal);
+      }
+
+      // 用户说了全新的无关指令：清理旧挂起槽，顺延进入 Step 0B / 正常链路
+      this._pendingConfirm.clear(activePending.id);
+    }
+
+    // -------- Step 0B：隐式能力探测 + 强化决策记忆与渐进确认闸门 --------
+    if (isCustomInstructionVoiceCommand(text)) return false;
+
+    const capMatch = probeImplicitCapabilities(text, digest);
+    if (!capMatch || !capMatch.intent.canonicalKey.startsWith("implicit:")) {
+      return false;
+    }
+
+    // 显式点名具体设备/筒位且无跨家庭同名冲突时（如“给宠物喂食器出粮2份”），不属于隐式歧义请求，直接交常规工具执行
+    if (capMatch.intent.hasExplicitDeviceOrDrum && !capMatch.ambiguousDevices) {
+      const explicitEntry = capMatch.primaryCandidate ?? capMatch.matchedEntries[0]!;
+      const explicitBinding = this._buildBindingForCapability(explicitEntry, capMatch.intent);
+      const explicitRisk = this._classifyBindingRisk(explicitBinding, speaker);
+      if (explicitRisk !== "L3_HIGH_SAFETY") {
+        return false;
+      }
+    }
+
+    // 显式规则优先级金字塔：若用户对同一细分域保存了手动附加指令（例如专门给袜子定过规则），交由显式规则执行
+    const firstEntry = capMatch.primaryCandidate ?? capMatch.matchedEntries[0]!;
+    const provisionalBinding = this._buildBindingForCapability(firstEntry, capMatch.intent);
+    const conflictDomains = this._computeConflictDomainsForIntent(capMatch.intent, provisionalBinding);
+    if (this._hasExplicitCustomInstructionOverride(conflictDomains)) {
+      return false;
+    }
+
+    // 特例：L1 紧急关闭灌溉水阀（安全降级零确认直通）
+    if (capMatch.intent.domain === "irrigation" && capMatch.intent.action === "stop_water" && !capMatch.ambiguousDevices) {
+      const exec = await this._executeDirectToolSteps(this._bindingStepsToSkillSteps(provisionalBinding), ctx, signal);
+      if (signal.aborted) return true;
+      const verify = await verifyExecutedToolCalls(exec.traces, this._deps, { isCloudLlm: false });
+      entry.verification = toVerificationSummary(verify, 0);
+      entry.text = verify.passed
+        ? `已立即关闭「${firstEntry.name}」（安全降级操作免确认执行）。`
+        : `关闭「${firstEntry.name}」未通过状态核验，请检查水阀连接。`;
+      return true;
+    }
+
+    const { memory, borrowedOwnerHint } = findMatchingReinforcementMemory(capMatch.intent.canonicalKey, speaker);
+
+    // 1. 已有记忆：由代码级渐进确认闸门裁决「直接执行」还是「再次确认」
+    if (memory) {
+      const targetDevice = this._deps.mainWindow.activeDevices().find((d) => d.did === memory.binding.did);
+      const isWasherStart = memory.binding.steps.some(
+        (s) => s.toolName === "run_device_action" && s.actionName === "start-wash",
+      );
+
+      // 若是洗衣机，实时检查硬件安全探针（即使已 autonomous，遇到过热/门未关/童锁也会硬阻断或升级确认！）
+      let runtimeHazardReasons: string[] = [];
+      if (isWasherStart && targetDevice?.online) {
+        const probe = await probeWasherRuntimeSafety(
+          this._deps.service,
+          memory.binding.did,
+          memory.binding.drumKey,
+        );
+        if (probe.status === "hard_block") {
+          entry.text = `安全提示：${probe.reasons.join("；")}，已硬阻断，暂未执行。`;
+          entry.taskUpdates?.push({
+            kind: "safety_gate",
+            text: entry.text,
+            timestamp: this._now(),
+          });
+          return true;
+        }
+        if (probe.status === "require_confirm") {
+          runtimeHazardReasons = probe.reasons;
+        }
+      }
+
+      const gate = evaluateReinforcementGate(memory, {
+        nowMs: this._now(),
+        currentTopologyHash: digest.topologyHash,
+        speaker,
+        runtimeHazardReasons,
+        ambiguousDevices: false,
+      });
+
+      // 第 3 次起（有效期内、无安全锁、无运行时危险）-> 真正免确认直接执行！
+      if (gate.decision === "execute_directly") {
+        const exec = await this._executeDirectToolSteps(
+          this._bindingStepsToSkillSteps(memory.binding),
+          ctx,
+          signal,
+        );
+        if (signal.aborted) return true;
+        ctx.phase = "verifying";
+        this.emit("stateChanged", this.snapshot());
+        const verify = await verifyExecutedToolCalls(exec.traces, this._deps, { isCloudLlm: false });
+        entry.verification = toVerificationSummary(verify, 0);
+        this.emit("streamEvent", {
+          kind: "verification_result",
+          taskId: ctx.taskId,
+          entryId: entry.id,
+          round: 0,
+          verification: entry.verification,
+        });
+
+        const anyErr = exec.traces.some((t) => t.isError);
+        if (!anyErr && verify.passed) {
+          const updated = recordReinforcementAutonomousExecution(memory.id, {
+            nowMs: this._now(),
+            sampleUtterance: text,
+          });
+          this._lastAutoExecutedMemory = {
+            memoryId: memory.id,
+            taskId: ctx.taskId,
+            executedAt: this._now(),
+          };
+          this.emit("memoriesChanged", this.listDecisionMemories(true));
+          entry.memoryEvent = {
+            kind: "autonomous_executed",
+            memoryId: memory.id,
+            summary: memory.summary,
+            confirmCount: updated?.confirmCount ?? memory.confirmCount,
+            confirmThreshold: memory.confirmThreshold,
+            retention: Number(gate.retention.toFixed(2)),
+            riskLevel: memory.riskLevel,
+            reasonText: gate.reasonText,
+          };
+          entry.taskUpdates?.push({
+            kind: "memory_autonomous",
+            text: `命中可信强化记忆（已确认 ${memory.confirmCount} 次），免确认直接执行：${memory.summary}`,
+            timestamp: this._now(),
+          });
+          const loc = [memory.binding.homeName, memory.binding.roomName].filter(Boolean).join("/");
+          const devTitle = loc ? `${loc}「${memory.binding.deviceName}」` : `「${memory.binding.deviceName}」`;
+          const drumStr = memory.binding.drumLabel ? `的${memory.binding.drumLabel}` : "";
+          const progStr = memory.binding.programLabel ? `（${memory.binding.programLabel}）` : "";
+          entry.text = `已按记住的偏好直接为你启动${devTitle}${drumStr}${progStr}。`;
+          return true;
+        }
+        entry.text = `按已记住偏好执行时未通过校验：${verify.issues.map((i) => i.summary).join("；") || "设备无响应"}。`;
+        return true;
+      }
+
+      // 需要再次确认：学习第 2 次 / 久未触发休眠重确认 / 设备变化 / 换季 / L3 安全锁 / 运行时硬件告警
+      const loc = [memory.binding.homeName, memory.binding.roomName].filter(Boolean).join("/");
+      const devTitle = loc ? `${loc}「${memory.binding.deviceName}」` : `「${memory.binding.deviceName}」`;
+      const drumStr = memory.binding.drumLabel ? `的${memory.binding.drumLabel}` : "";
+      const progStr = memory.binding.programLabel ? `（${memory.binding.programLabel}）` : "";
+
+      let origin: PendingConfirmationOrigin = "learning_second_ask";
+      let questionText = "";
+      if (gate.reasonCode === "safety_locked" || gate.reasonCode === "runtime_hazard") {
+        origin = "safety_required";
+        questionText = `安全提示：${gate.reasonText} 确认一下，还是要为你启动${devTitle}${drumStr}${progStr}吗？暂未执行。`;
+      } else if (gate.singleConfirmRecovery) {
+        origin = "dormancy_reconfirm";
+        questionText = `${gate.reasonText} 确认一下，还是用${devTitle}${drumStr}${progStr}为你${capMatch.intent.normalizedPhrase}吗？（确认后立即恢复免确认）`;
+      } else {
+        origin = "learning_second_ask";
+        questionText = `再确认最后一次：是要用${devTitle}${drumStr}${progStr}帮你${capMatch.intent.normalizedPhrase}吗？确认后下次将直接启动。`;
+      }
+
+      // 查一次目标设备详情，保证用户/审计看到真实的设备核查链路
+      if (targetDevice?.online) {
+        await this._executeDirectToolSteps(
+          [{ toolName: "get_device_detail", args: { target: targetDevice.did } }],
+          ctx,
+          signal,
+        );
+      }
+
+      const pending = this._pendingConfirm.open({
+        origin,
+        canonicalKey: memory.canonicalKey,
+        originalUtterance: text,
+        questionText,
+        summary: memory.summary,
+        binding: memory.binding,
+        riskLevel: memory.riskLevel,
+        topologyHash: digest.topologyHash,
+        conflictDomains: memory.conflictDomains,
+        existingMemoryId: memory.id,
+        singleConfirmRecovery: gate.singleConfirmRecovery,
+        speakerScope: memory.speakerScope,
+      });
+      const snap = this._toPendingSnapshot(pending);
+      entry.pendingConfirmation = snap;
+      entry.memoryEvent = {
+        kind: "confirmation_requested",
+        memoryId: memory.id,
+        summary: memory.summary,
+        confirmCount: memory.confirmCount,
+        confirmThreshold: memory.confirmThreshold,
+        retention: Number(gate.retention.toFixed(2)),
+        riskLevel: memory.riskLevel,
+        reasonText: gate.reasonText,
+      };
+      entry.taskUpdates?.push({
+        kind: "memory_confirm",
+        text: gate.reasonText,
+        timestamp: this._now(),
+      });
+      entry.text = questionText;
+      this.emit("confirmationPending", snap);
+      return true;
+    }
+
+    // 2. 首次遇到该隐式请求（无记忆）：先真实查看设备详情，再发起结构化确认提问！
+    const targetCandidateEntries = capMatch.ambiguousDevices
+      ? capMatch.matchedEntries.slice(0, 3)
+      : [firstEntry];
+    for (const cand of targetCandidateEntries) {
+      if (signal.aborted) return true;
+      await this._executeDirectToolSteps(
+        [{ toolName: "get_device_detail", args: { target: cand.did } }],
+        ctx,
+        signal,
+      );
+    }
+    if (signal.aborted) return true;
+
+    const candidateBindings = capMatch.ambiguousDevices
+      ? targetCandidateEntries.map((e) => this._buildBindingForCapability(e, capMatch.intent))
+      : undefined;
+
+    // 成员角色若无个人记忆但主人已绑定，把主人绑定作为首选提示（仍需成员本人确认 2 次）
+    const chosenBinding =
+      !capMatch.ambiguousDevices && borrowedOwnerHint
+        ? borrowedOwnerHint.binding
+        : provisionalBinding;
+    const riskLevel = this._classifyBindingRisk(chosenBinding, speaker);
+
+    // 首次也做一次洗衣机硬件硬阻断检查（若已经过热/故障，直接告警不白问）
+    if (
+      !capMatch.ambiguousDevices &&
+      chosenBinding.steps.some((s) => s.toolName === "run_device_action" && s.actionName === "start-wash")
+    ) {
+      const probe = await probeWasherRuntimeSafety(
+        this._deps.service,
+        chosenBinding.did,
+        chosenBinding.drumKey,
+      );
+      if (probe.status === "hard_block") {
+        entry.text = `安全提示：${probe.reasons.join("；")}，暂未执行。`;
+        return true;
+      }
+    }
+
+    const summary = buildAutoDecisionSummary(capMatch.intent, chosenBinding);
+    const origin: PendingConfirmationOrigin = capMatch.ambiguousDevices
+      ? "device_disambiguation"
+      : riskLevel === "L3_HIGH_SAFETY"
+        ? "safety_required"
+        : "new_implicit";
+    const questionText =
+      riskLevel === "L3_HIGH_SAFETY" && !capMatch.suggestedQuestion.includes("安全")
+        ? `安全提示：${capMatch.suggestedQuestion} 暂未执行。`
+        : capMatch.suggestedQuestion;
+
+    const pending = this._pendingConfirm.open({
+      origin,
+      canonicalKey: capMatch.intent.canonicalKey,
+      originalUtterance: text,
+      questionText,
+      summary,
+      binding: chosenBinding,
+      candidateBindings,
+      riskLevel,
+      topologyHash: digest.topologyHash,
+      conflictDomains,
+      speakerScope:
+        speaker.role === "verified_member" && riskLevel !== "L1_LOW" ? speaker.speakerId : "global",
+    });
+    const snap = this._toPendingSnapshot(pending);
+    entry.pendingConfirmation = snap;
+    entry.memoryEvent = {
+      kind: "confirmation_requested",
+      summary,
+      confirmCount: 0,
+      confirmThreshold: 2,
+      riskLevel,
+      reasonText: capMatch.ambiguousDevices
+        ? "检测到多台同名在线设备，等待用户消歧确认"
+        : riskLevel === "L3_HIGH_SAFETY"
+          ? "高安全风险操作，等待用户确认"
+          : "首次遇到隐式能力请求，确认后自动总结并记录规则",
+    };
+    entry.taskUpdates?.push({
+      kind: "memory_confirm",
+      text: entry.memoryEvent.reasonText || "等待用户确认",
+      timestamp: this._now(),
+    });
+    entry.text = questionText;
+    this.emit("confirmationPending", snap);
+    return true;
+  }
+
   private async _executeTaskContext(ctx: TaskRunContext): Promise<void> {
     const text = ctx.rawText;
     const source = ctx.source;
@@ -2420,50 +3603,89 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     let retriesUsed = 0;
 
     try {
-      // Step 0：收到新输入后先由 SystemOne 快速判定场景并回复贴合语境的简短应答词，再进入任何匹配/执行步骤
-      const ackDecision = await this._resolveTaskAck(text, source, ctx.priorHistory, signal);
-      if (signal.aborted) {
-        assistantEntry.status = "aborted";
-        assistantEntry.text = "已中断当前操作。";
+      // Step 0：收到新输入后先由 SystemOne 快速判定场景并回复贴合语境的简短应答词，再进入任何匹配/执行步骤；
+      // 自适应 ACK 抑制：若本轮为待确认答复或即将直接抛出确认提问，跳过前置“好的”应答，避免回声误杀与割裂感
+      const suppressConfirmAck = this._shouldSuppressVoiceAck(text, ctx);
+      if (suppressConfirmAck) {
+        ctx.ackText = "";
+        assistantEntry.ackText = "";
       } else {
-        ctx.ackSource = ackDecision.source;
-        ctx.ackText = ackDecision.text;
-        assistantEntry.ackText = ackDecision.text;
-        assistantEntry.ackScenario = ackDecision.scenario;
-        assistantEntry.taskUpdates?.push({
-          kind: "ack",
-          text: ackDecision.text,
-          scenario: ackDecision.scenario,
-          timestamp: Date.now(),
-        });
-        this.emit("streamEvent", {
-          kind: "task_ack",
-          taskId: ctx.taskId,
-          entryId: assistantEntry.id,
-          text: ackDecision.text,
-          scenario: ackDecision.scenario,
-          source: ackDecision.source,
-        });
-        this.emit("stateChanged", this.snapshot());
-        if (source === "voice" && this._config.autoSpeakReply) {
-          ctx.emittedAckSpeak = true;
-          ctx.emittedSpeakChunks = true;
-          this.emit("speakChunk", {
-            entryId: assistantEntry.id,
-            taskId: ctx.taskId,
+        const ackDecision = await this._resolveTaskAck(text, source, ctx.priorHistory, signal);
+        if (signal.aborted) {
+          assistantEntry.status = "aborted";
+          assistantEntry.text = "已中断当前操作。";
+        } else {
+          ctx.ackSource = ackDecision.source;
+          ctx.ackText = ackDecision.text;
+          assistantEntry.ackText = ackDecision.text;
+          assistantEntry.ackScenario = ackDecision.scenario;
+          assistantEntry.taskUpdates?.push({
+            kind: "ack",
             text: ackDecision.text,
-            final: false,
-            priority: "ack",
+            scenario: ackDecision.scenario,
+            timestamp: Date.now(),
           });
+          this.emit("streamEvent", {
+            kind: "task_ack",
+            taskId: ctx.taskId,
+            entryId: assistantEntry.id,
+            text: ackDecision.text,
+            scenario: ackDecision.scenario,
+            source: ackDecision.source,
+          });
+          this.emit("stateChanged", this.snapshot());
+          if (source === "voice" && this._config.autoSpeakReply) {
+            ctx.emittedAckSpeak = true;
+            ctx.emittedSpeakChunks = true;
+            this.emit("speakChunk", {
+              entryId: assistantEntry.id,
+              taskId: ctx.taskId,
+              text: ackDecision.text,
+              final: false,
+              priority: "ack",
+            });
+          }
         }
       }
       let currentOutcome: TaskVerificationOutcome | null = null;
       let handledBySkill = false;
+      let handledByMemoryGate = false;
       let initialPitfall = "";
+
+      // Step 0：待确认回复处理 + 隐式设备能力探测与强化记忆渐进确认闸门
+      if (!signal.aborted) {
+        handledByMemoryGate = await this._tryHandleReinforcementGate(text, ctx, signal);
+        if (handledByMemoryGate && ctx.usesPrimaryAgent && assistantEntry.text.trim()) {
+          const ts = this._now();
+          this._agent.state.messages = [
+            ...this._agent.state.messages,
+            { role: "user", content: [{ type: "text", text }], timestamp: ts },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: assistantEntry.text }],
+              api: this._agent.state.model.api,
+              provider: this._agent.state.model.provider,
+              model: this._agent.state.model.id,
+              usage: {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                totalTokens: 0,
+                cost: { ...ZERO_COST, total: 0 },
+              },
+              stopReason: "stop",
+              timestamp: ts,
+            },
+          ];
+        }
+      }
 
       // Step 1：检查是否存在已沉淀的可复用 Skill，命中则直接按避坑流程执行并核验；
       // 若用户在沉淀该 Skill 之后保存了更新且适用的附加指令规则，则跳过旧 Skill，优先按最新附加指令执行
-      const candidateSkill = matchAgentSkill(text, this._deps.mainWindow.activeDevices());
+      const candidateSkill = handledByMemoryGate
+        ? null
+        : matchAgentSkill(text, this._deps.mainWindow.activeDevices());
       const matchedSkill =
         candidateSkill &&
         !hasApplicableCustomInstructions(
@@ -2566,8 +3788,8 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         }
       }
 
-      // Step 2：常规执行（未命中技能时交由本任务专属 Pi Agent 执行）
-      if (!handledBySkill && !currentOutcome && !signal.aborted) {
+      // Step 2：常规执行（未命中强化记忆闸门与技能时交由本任务专属 Pi Agent 执行）
+      if (!handledByMemoryGate && !handledBySkill && !currentOutcome && !signal.aborted) {
         const activeAgent = ctx.agent!;
         const turnPrompt = this._prepareTurnPrompt(ctx);
         await activeAgent.prompt(turnPrompt);
@@ -2779,20 +4001,27 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             const skillName = buildSkillNameForRecovery(text, winningSteps);
             let savedSkill: AgentSkill | null = null;
             let skillCreated = false;
+            const looksLikeShortConfirmationReply =
+              text.trim().length < 4 ||
+              /^(?:嗯+|对|是的?|好的?|可以|行|确认|确定|取消|不用了?|算了|ok|yes|no)$/i.test(
+                text.trim().replace(/[。！!？?，,\s]+/g, ""),
+              );
             try {
-              const saved = saveAgentSkill({
-                name: skillName,
-                description: `自动排错沉淀：解决「${pitfallText}」，第 ${attempt} 轮验证通过`,
-                triggerText: text,
-                targetDids,
-                pitfall: pitfallText,
-                resolutionSummary: plan.plan,
-                steps: winningSteps,
-                verification: currentOutcome.specs,
-                createdFromRetry: true,
-              });
-              savedSkill = saved.skill;
-              skillCreated = saved.created;
+              if (!looksLikeShortConfirmationReply) {
+                const saved = saveAgentSkill({
+                  name: skillName,
+                  description: `自动排错沉淀：解决「${pitfallText}」，第 ${attempt} 轮验证通过`,
+                  triggerText: text,
+                  targetDids,
+                  pitfall: pitfallText,
+                  resolutionSummary: plan.plan,
+                  steps: winningSteps,
+                  verification: currentOutcome.specs,
+                  createdFromRetry: true,
+                });
+                savedSkill = saved.skill;
+                skillCreated = saved.created;
+              }
             } catch {
               savedSkill = null;
             }
@@ -2918,6 +4147,10 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           ...(ctx.usage.llmCalls > 0 ? { usage: { ...ctx.usage } } : {}),
           verification: assistantEntry.verification,
           skillEvent: assistantEntry.skillEvent,
+          ...(assistantEntry.memoryEvent ? { memoryEvent: assistantEntry.memoryEvent } : {}),
+          ...(assistantEntry.pendingConfirmation
+            ? { pendingConfirmation: assistantEntry.pendingConfirmation }
+            : {}),
         });
         if (assistantEntry.status !== "aborted") {
           this._emitVerifiedFinalVoiceChunk(ctx);
@@ -2979,6 +4212,13 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       ...(retryNotices.length > 0 ? { retryNotices } : {}),
       verification: assistantEntry.verification ?? null,
       ...(assistantEntry.skillEvent ? { skillEvent: { ...assistantEntry.skillEvent } } : {}),
+      ...(assistantEntry.memoryEvent ? { memoryEvent: { ...assistantEntry.memoryEvent } } : {}),
+      ...(assistantEntry.pendingConfirmation
+        ? {
+            pendingConfirmation: { ...assistantEntry.pendingConfirmation },
+            awaitingConfirmation: true,
+          }
+        : {}),
       streamedSpeakChunks: ctx.emittedSpeakChunks,
       ...(ctx.usage.llmCalls > 0 ? { usage: { ...ctx.usage } } : {}),
       ...(assistantEntry.error ? { error: assistantEntry.error } : {}),
@@ -3059,6 +4299,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     this._systemPromptRefreshes = 0;
     this._historyCompactions = 0;
     this._syncStaticSystemPromptIfNeeded(this._agent, false);
+    this._pendingConfirm.clear();
+    this._safetyRegistry.clear();
+    this._lastAutoExecutedMemory = null;
     this._pendingHistoryMerges = [];
     this._timeline = [];
     this._lastError = null;
@@ -3075,6 +4318,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     const customInstructionConflicts = Object.fromEntries(
       detectCustomInstructionConflicts(customInstructions).entries(),
     );
+    const memories = this.listDecisionMemories(true);
+    const activePending = this._pendingConfirm.getActive();
+    const pendingConfirmation = activePending ? this._toPendingSnapshot(activePending) : null;
     const activeTasks = this.getActiveTasks();
     return {
       running: activeTasks.length > 0,
@@ -3091,6 +4337,8 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       skills: loadAgentSkills(),
       customInstructions,
       customInstructionConflicts,
+      memories,
+      pendingConfirmation,
       timeline: this._timeline.map((e) => ({
         ...e,
         toolCalls: e.toolCalls.map((tc) => ({ ...tc, args: { ...tc.args } })),
@@ -3106,6 +4354,8 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           : {}),
         ...(e.skillEvent ? { skillEvent: { ...e.skillEvent } } : {}),
         ...(e.usage ? { usage: { ...e.usage } } : {}),
+        ...(e.memoryEvent ? { memoryEvent: { ...e.memoryEvent } } : {}),
+        ...(e.pendingConfirmation ? { pendingConfirmation: { ...e.pendingConfirmation } } : {}),
       })),
       config: toPublicAgentVoiceConfig(this._config),
       providers: PROVIDER_PRESETS,
