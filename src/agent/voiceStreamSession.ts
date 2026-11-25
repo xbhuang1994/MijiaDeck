@@ -17,8 +17,14 @@
  *   -> 双轨 SenseVoice 融合识别 + 3D-Speaker 声纹 + 抗歌词唤醒词注意力门控 -> Pi Agent
  */
 
-import type { VadSensitivityMode } from "../core/agentConfigStore.ts";
+import type { VadSensitivityMode, VoicePipelineMode } from "../core/agentConfigStore.ts";
 import { computeRms, estimateSnrDb, resampleLinear } from "./audioPcm.ts";
+import {
+  ClearVoiceRealtimeChunker,
+  ClearVoiceSliceAssembler,
+  type ClearVoiceChunkDescriptor,
+  type ClearVoiceTriggerReason,
+} from "./clearVoiceChunker.ts";
 import type {
   LocalVoiceEngine,
   OnlineDenoiserHandleLike,
@@ -64,6 +70,18 @@ export interface VoiceStreamSegmentPayload {
   stripCommittedPrefixHint?: string;
   /** 流式智能断句触发原因 */
   commitReason?: StreamingCommitReason;
+  /** 产出该分段的语音前端方案：legacy（原方案）或 clearvoice（新方案 GPU 准实时切片） */
+  pipelineMode?: VoicePipelineMode;
+  /** ClearVoice 准实时切片元数据（切片数、20ms 交叉淡入淡出次数、降噪耗时等） */
+  clearVoiceMeta?: {
+    sliceCount: number;
+    crossfadeCount: number;
+    triggerReason: ClearVoiceTriggerReason;
+    denoiseMs: number;
+    gpuName?: string | null;
+  };
+  /** 该分段是否在 TTS 播报活跃期或刚结束尾窗内采集（供服务端回声防护增强判定） */
+  duringTtsPlayback?: boolean;
 }
 
 export interface VoiceStreamSessionOptions {
@@ -84,6 +102,13 @@ export interface VoiceStreamSessionOptions {
   owwThreshold?: number;
   /** 是否启用 Qwen3-ASR 实时流式转写与智能断句（默认 false 保持非流式兼容，服务端按配置透传） */
   streamingAsrEnabled?: boolean;
+  /** 语音前端方案：legacy（原方案）或 clearvoice（新方案 ClearVoice GPU 准实时切片 -> Qwen3-ASR） */
+  voicePipelineMode?: VoicePipelineMode;
+  /** ClearVoice 切片参数覆写（默认 280ms 静音触发 / 2000ms 超时切分 / 300ms 历史上下文 / 20ms 交叉淡入淡出） */
+  clearVoiceSilenceMs?: number;
+  clearVoiceMaxChunkMs?: number;
+  clearVoiceLookbackMs?: number;
+  clearVoiceCrossfadeMs?: number;
   /** 实时流式字幕增量更新回调 */
   onPartialTranscript?: (ev: StreamingPartialUpdate) => void;
   /** 流式假设刷新最小新音频步进（ms，默认 GPU 360ms / CPU 850ms） */
@@ -132,7 +157,21 @@ export class VoiceStreamSession {
 
   // 实时流式转写与智能断句状态（受开关 streamingAsrEnabled 控制，关闭时零额外开销）
   private _streamingAsrEnabled: boolean;
+  private _voicePipelineMode: VoicePipelineMode;
   private readonly _streamTracker: Qwen3StreamingHypothesisTracker;
+
+  // ClearVoice GPU 准实时切片管线状态（按需惰性初始化，支持运行期无缝热切换）
+  private _cvChunker: ClearVoiceRealtimeChunker | null = null;
+  private _cvAssembler: ClearVoiceSliceAssembler | null = null;
+  private _cvSliceQueue: ClearVoiceChunkDescriptor[] = [];
+  private _cvInFlight = false;
+  private _cvIdleResolvers: Array<() => void> = [];
+  private _cvRawChunks: Float32Array[] = [];
+  private _cvTotalDenoiseMs = 0;
+  private _cvLastEngine = "clearvoice-mossformer2-gpu";
+  private _cvLastGpuName: string | null = null;
+  private _cvUtteranceStartSample: number | null = null;
+  private _cvGen = 0;
   private _streamSpeechOriginSample: number | null = null;
   private _streamLastDecodedEndSample = 0;
   private _streamDecodeInFlight = false;
@@ -159,6 +198,8 @@ export class VoiceStreamSession {
   private _lastDenOverlap = new Float32Array(0);
   private _lastMatchedStartSec = -1;
   private _lastMatchedEndSec = -1;
+  private _ttsSpeaking = false;
+  private _ttsLastEndedAt = 0;
 
   // 无 Silero VAD 时的纯 TS 兜底窗口缓冲
   private _fallbackChunks: Float32Array[] = [];
@@ -179,6 +220,7 @@ export class VoiceStreamSession {
     this._wakeWords = [...(options.wakeWords ?? [])];
     this._owwThreshold = options.owwThreshold;
     this._streamingAsrEnabled = options.streamingAsrEnabled === true;
+    this._voicePipelineMode = options.voicePipelineMode === "clearvoice" ? "clearvoice" : "legacy";
     this._streamTracker = new Qwen3StreamingHypothesisTracker({
       wakeWords: this._wakeWords,
       punctuationPauseMs: options.streamingPunctuationPauseMs ?? 320,
@@ -289,6 +331,285 @@ export class VoiceStreamSession {
     return this._streamingAsrEnabled;
   }
 
+  get voicePipelineMode(): VoicePipelineMode {
+    return this._voicePipelineMode;
+  }
+
+  /**
+   * 运行期无缝热切换新旧语音方案（原方案 legacy <-> 新方案 clearvoice GPU 准实时切片），
+   * 切换后立即清理挂起缓冲，无需断开或重连 WebSocket。
+   */
+  setVoicePipelineMode(mode: VoicePipelineMode): void {
+    const next: VoicePipelineMode = mode === "clearvoice" ? "clearvoice" : "legacy";
+    if (this._voicePipelineMode === next) return;
+    this._voicePipelineMode = next;
+    this._resetClearVoiceState();
+    this._resetVadState();
+    this._resetStreamingState(true);
+    this._wakeAnchorSample = null;
+    this._wakeAnchorHit = null;
+    this._activeSegmentStartSample = null;
+    this._denoisedPending = new Float32Array(0);
+    this._segmenter.reset();
+    if (next === "clearvoice") {
+      this._ensureClearVoicePipeline();
+    }
+  }
+
+  private _ensureClearVoicePipeline(): void {
+    if (!this._cvChunker) {
+      // ClearVoice 专用 Silero VAD：极短 minSilenceDuration (64ms) 使 isDetected() 实时反映帧级语音/静音，
+      // 由 ClearVoiceRealtimeChunker 的双触发状态机精准把控 280ms 静音触发与 2.0s 超时强制切分。
+      const cvVad = this._opts.localEngine.createStreamingVad({
+        threshold: this._opts.vadThreshold ?? 0.4,
+        minSilenceDuration: 0.064,
+        minSpeechDuration: 0.064,
+        maxSpeechDuration: 2.5,
+      });
+      this._cvChunker = new ClearVoiceRealtimeChunker({
+        sampleRate: TARGET_SR,
+        inputSampleRate: TARGET_SR,
+        frameSizeMs: 32,
+        silenceTriggerMs: this._opts.clearVoiceSilenceMs ?? 280,
+        maxChunkMs: this._opts.clearVoiceMaxChunkMs ?? 2000,
+        lookbackMs: this._opts.clearVoiceLookbackMs ?? 300,
+        crossfadeMs: this._opts.clearVoiceCrossfadeMs ?? 20,
+        vad: cvVad,
+        onSpeechActivity: (speaking) => {
+          this._opts.onSpeechActivity?.(speaking);
+        },
+      });
+    }
+    if (!this._cvAssembler) {
+      this._cvAssembler = new ClearVoiceSliceAssembler({
+        sampleRate: TARGET_SR,
+        crossfadeMs: this._opts.clearVoiceCrossfadeMs ?? 20,
+      });
+    }
+  }
+
+  private _resetClearVoiceState(): void {
+    this._cvGen += 1;
+    this._cvSliceQueue = [];
+    this._cvRawChunks = [];
+    this._cvTotalDenoiseMs = 0;
+    this._cvUtteranceStartSample = null;
+    this._cvChunker?.reset();
+    this._cvAssembler?.reset();
+    if (!this._cvInFlight) {
+      const resolvers = this._cvIdleResolvers;
+      this._cvIdleResolvers = [];
+      for (const r of resolvers) r();
+    }
+  }
+
+  private _enqueueClearVoiceSlice(chunk: ClearVoiceChunkDescriptor): void {
+    if (this._disposed) return;
+    if (this._cvSliceQueue.length >= 6) {
+      this._cvSliceQueue.shift();
+      this._droppedStaleCount += 1;
+    }
+    this._cvSliceQueue.push(chunk);
+    this._pumpClearVoiceQueue();
+  }
+
+  private _pumpClearVoiceQueue(): void {
+    if (this._cvInFlight || this._disposed) return;
+    const next = this._cvSliceQueue.shift();
+    if (!next) {
+      const resolvers = this._cvIdleResolvers;
+      this._cvIdleResolvers = [];
+      for (const r of resolvers) r();
+      return;
+    }
+
+    this._cvInFlight = true;
+    const gen = this._cvGen;
+    void Promise.resolve()
+      .then(async () => {
+        if (this._disposed || gen !== this._cvGen) return;
+        this._ensureClearVoicePipeline();
+        const assembler = this._cvAssembler!;
+
+        if (this._cvUtteranceStartSample === null) {
+          this._cvUtteranceStartSample = next.startSample;
+        }
+
+        // 阶段 3：带 0.3s 历史上下文送入 GPU ClearVoice (MossFormer2_SE_48K) 推理
+        let enhancedWithContext: Float32Array;
+        let sliceDenoiseMs = 0;
+        const cvGpu = this._opts.localEngine.clearVoiceGpu;
+        const canUseCvGpu = cvGpu.getStatus().ready && !cvGpu.isInFailureCooldown();
+
+        if (canUseCvGpu) {
+          try {
+            const res = await cvGpu.denoiseSlice(next.rawWithContext, {
+              inputSampleRate: TARGET_SR,
+              outputSampleRate: TARGET_SR,
+            });
+            enhancedWithContext = res.samples;
+            sliceDenoiseMs = res.durationMs;
+            this._cvLastEngine =
+              res.device === "gpu" ? "clearvoice-mossformer2-gpu" : "clearvoice-mossformer2-cpu";
+            this._cvLastGpuName = res.gpuName;
+          } catch {
+            // GPU ClearVoice 服务临时失败时优雅回退本地降噪，保证语音链路不断流
+            const fb = this._opts.localEngine.denoise(
+              next.rawWithContext,
+              TARGET_SR,
+              this._opts.noiseMode,
+            );
+            enhancedWithContext = fb.samples;
+            sliceDenoiseMs = fb.durationMs;
+            this._cvLastEngine = `clearvoice-fallback-${fb.engine}`;
+          }
+        } else {
+          const fb = this._opts.localEngine.denoise(
+            next.rawWithContext,
+            TARGET_SR,
+            this._opts.noiseMode,
+          );
+          enhancedWithContext = fb.samples;
+          sliceDenoiseMs = fb.durationMs;
+          this._cvLastEngine = `clearvoice-fallback-${fb.engine}`;
+        }
+
+        if (this._disposed || gen !== this._cvGen) return;
+        this._cvTotalDenoiseMs += sliceDenoiseMs;
+        this._cvRawChunks.push(next.rawNewSamples);
+
+        // 阶段 3（裁掉前 0.3s 历史输出）+ 阶段 4（20ms 线性交叉淡入淡出 Overlap-Add）
+        assembler.appendEnhancedSlice({
+          enhancedWithContext,
+          lookbackSamples: next.lookbackSamples,
+          newSamples: next.rawNewSamples.length,
+          applyCrossfade: next.needsCrossfade,
+        });
+
+        const stitchedClean = assembler.getStitchedAudio();
+
+        // 若为 2.0s 超时强制切分且话语仍在继续：
+        // 1) 立即用 Qwen3-ASR 刷新实时流式字幕；
+        // 2) 若累计超长（>= 8.0s 连续不停顿）则先行提交当前已平滑拼接段，避免无限积压。
+        if (!next.utteranceEnded) {
+          if (this._streamingAsrEnabled && stitchedClean.length >= TARGET_SR * 0.4) {
+            try {
+              const status = this._opts.localEngine.getStatus();
+              if (status.readyForLocalAsr) {
+                const asrRes = await this._opts.localEngine.transcribeLocal(
+                  stitchedClean,
+                  TARGET_SR,
+                  this.lang,
+                  {
+                    hotwords: this._wakeWords.length > 0 ? this._wakeWords : undefined,
+                  },
+                );
+                if (!this._disposed && gen === this._cvGen && asrRes.text) {
+                  const ingested = this._streamTracker.ingestHypothesis(asrRes.text, {
+                    engine: asrRes.engine,
+                    latencyMs: asrRes.durationMs,
+                  });
+                  if (ingested.partial) {
+                    this._opts.onPartialTranscript?.(ingested.partial);
+                  }
+                }
+              }
+            } catch {
+              // 句中预览识别失败忽略，交由话语收尾完整转写兜底
+            }
+          }
+
+          // 安全上限：连续无停顿讲话 >= 8.0s 时自动先提交一段已降噪平滑音频给 Qwen3-ASR
+          if (stitchedClean.length >= TARGET_SR * 8.0) {
+            this._emitClearVoiceUtterance("timeout");
+          }
+          return;
+        }
+
+        // 静音触发（250–300ms）或 flush：将无缝拼接后的纯净音频送交 Qwen3-ASR 做语音转文字
+        this._emitClearVoiceUtterance(next.triggerReason);
+      })
+      .catch(() => {
+        // 单个切片异常不中断连续流会话
+      })
+      .finally(() => {
+        this._cvInFlight = false;
+        this._pumpClearVoiceQueue();
+      });
+  }
+
+  private _emitClearVoiceUtterance(triggerReason: ClearVoiceTriggerReason): void {
+    const assembler = this._cvAssembler;
+    if (!assembler || assembler.totalSamples < Math.round(TARGET_SR * 0.14)) {
+      this._cvAssembler?.reset();
+      this._cvRawChunks = [];
+      this._cvTotalDenoiseMs = 0;
+      this._cvUtteranceStartSample = null;
+      this._streamTracker.reset();
+      return;
+    }
+
+    const cleanSlice = assembler.getStitchedAudio();
+    const rawLen = this._cvRawChunks.reduce((acc, c) => acc + c.length, 0);
+    const rawSlice = new Float32Array(rawLen);
+    let rawOff = 0;
+    for (const c of this._cvRawChunks) {
+      rawSlice.set(c, rawOff);
+      rawOff += c.length;
+    }
+
+    const sliceCount = assembler.sliceCount;
+    const crossfadeCount = assembler.crossfadeCount;
+    const denoiseMs = Math.round(this._cvTotalDenoiseMs);
+    const startSample = this._cvUtteranceStartSample ?? 0;
+
+    assembler.reset();
+    this._cvRawChunks = [];
+    this._cvTotalDenoiseMs = 0;
+    this._cvUtteranceStartSample = null;
+    this._streamTracker.reset();
+
+    const inputSnrDb = estimateSnrDb(rawSlice, TARGET_SR);
+    const outputSnrDb = estimateSnrDb(cleanSlice, TARGET_SR);
+    const payload: VoiceStreamSegmentPayload = {
+      rawSamples: rawSlice,
+      denoisedSamples: cleanSlice,
+      denoiseEngine: this._cvLastEngine,
+      inputSnrDb,
+      outputSnrDb,
+      snrGainDb: Number((outputSnrDb - inputSnrDb).toFixed(2)),
+      startSec: Number((startSample / TARGET_SR).toFixed(2)),
+      durationSec: Number((cleanSlice.length / TARGET_SR).toFixed(2)),
+      forcedRoll: triggerReason === "timeout",
+      acousticWake: null,
+      wakeAnchored: false,
+      commitReason:
+        triggerReason === "flush"
+          ? "manual_flush"
+          : triggerReason === "timeout"
+            ? "max_duration"
+            : "vad_silence",
+      pipelineMode: "clearvoice",
+      clearVoiceMeta: {
+        sliceCount,
+        crossfadeCount,
+        triggerReason,
+        denoiseMs,
+        gpuName: this._cvLastGpuName,
+      },
+    };
+    this._enqueueSegment(payload);
+  }
+
+  private async _waitForClearVoiceIdle(): Promise<void> {
+    if (!this._cvInFlight && this._cvSliceQueue.length === 0) {
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      this._cvIdleResolvers.push(resolve);
+    });
+  }
+
   /**
    * 完整重置 Silero VAD 内部语音状态与残余队列，并记录采样原点偏移 `_vadSampleBase`，
    * 彻底杜绝 `vad.clear()` 仅清空已出队段却保留正在进行中的语音缓冲导致“一句话二次识别”！
@@ -319,7 +640,7 @@ export class VoiceStreamSession {
   }
 
   /**
-   * TTS 播报开始/结束切换时清理挂起状态与残余 VAD 缓冲，防止播报前后残留帧拼接触发误识别。
+   * TTS 播报开始/结束切换时清理挂起状态与残余 VAD 缓冲（兼容传统半双工模式与单测调用）。
    */
   resetAfterTts(): void {
     if (this._disposed) return;
@@ -332,8 +653,33 @@ export class VoiceStreamSession {
     this._segmenter.reset();
     this._resetVadState();
     this._resetStreamingState(true);
+    this._resetClearVoiceState();
     this._oww?.resetSegmentTracking();
     this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, this._rawTotalSamples);
+  }
+
+  /**
+   * 全双工异步模式下的非破坏性 TTS 播报状态同步：
+   * - 绝不强行清空正在进行中的用户说话（VAD 活跃 / 已命中唤醒锚点），保障播报与对话完全并行不截断；
+   * - 仅更新播报时间标记以便给后续切段打上 `duringTtsPlayback` 标记，并在无说话时清除滚窗噪声重叠。
+   */
+  notifyTtsState(speaking: boolean): void {
+    if (this._disposed) return;
+    const now = Date.now();
+    this._ttsSpeaking = Boolean(speaking);
+    if (!speaking) {
+      this._ttsLastEndedAt = now;
+    }
+    const userCurrentlySpeaking = this._vadDetected || this._wakeAnchorSample !== null;
+    if (!userCurrentlySpeaking) {
+      this._lastRawOverlap = new Float32Array(0);
+      this._lastDenOverlap = new Float32Array(0);
+    }
+  }
+
+  private _isDuringTtsWindow(): boolean {
+    if (this._ttsSpeaking) return true;
+    return this._ttsLastEndedAt > 0 && Date.now() - this._ttsLastEndedAt <= 900;
   }
 
   /**
@@ -374,7 +720,7 @@ export class VoiceStreamSession {
   }
 
   get denoiseEngine(): string {
-    return this._denoiseEngine;
+    return this._voicePipelineMode === "clearvoice" ? this._cvLastEngine : this._denoiseEngine;
   }
 
   get droppedStaleCount(): number {
@@ -401,6 +747,16 @@ export class VoiceStreamSession {
     if (this._disposed || samples.length === 0) return;
     const pcm16k =
       this._inputRate === TARGET_SR ? samples : resampleLinear(samples, this._inputRate, TARGET_SR);
+
+    // 新方案：ClearVoice GPU 准实时切片（32ms 帧 -> Silero VAD 双触发 + 环形缓冲 -> 0.3s 历史上下文 GPU MossFormer2 -> 20ms Cross-fade -> Qwen3-ASR）
+    if (this._voicePipelineMode === "clearvoice") {
+      this._ensureClearVoicePipeline();
+      const chunks = this._cvChunker!.pushSamples(pcm16k);
+      for (const ch of chunks) {
+        this._enqueueClearVoiceSlice(ch);
+      }
+      return;
+    }
 
     // 1. 写入时间对齐的原始 Raw 环形缓冲（零失真）
     for (let i = 0; i < pcm16k.length; i += 1) {
@@ -936,6 +1292,19 @@ export class VoiceStreamSession {
    */
   async flush(): Promise<void> {
     if (this._disposed) return;
+    if (this._voicePipelineMode === "clearvoice") {
+      const tailChunk = this._cvChunker?.flush();
+      if (tailChunk) {
+        this._enqueueClearVoiceSlice(tailChunk);
+      }
+      await this._waitForClearVoiceIdle();
+      // 若之前仅触发了超时切分而未收尾，主动提交残余已降噪语音
+      if (this._cvAssembler && this._cvAssembler.totalSamples > 0) {
+        this._emitClearVoiceUtterance("flush");
+      }
+      await this.waitForIdle();
+      return;
+    }
     if (this._streamingAsrEnabled) {
       this._abortStreamingDecode();
     }
@@ -1181,21 +1550,25 @@ export class VoiceStreamSession {
 
   private _enqueueSegment(payload: VoiceStreamSegmentPayload): void {
     if (this._disposed) return;
-    const isPriorityWake = Boolean(payload.wakeAnchored || payload.acousticWake?.matched);
+    const enrichedPayload: VoiceStreamSegmentPayload =
+      payload.duringTtsPlayback !== undefined
+        ? payload
+        : { ...payload, duringTtsPlayback: this._isDuringTtsWindow() };
+    const isPriorityWake = Boolean(enrichedPayload.wakeAnchored || enrichedPayload.acousticWake?.matched);
     if (isPriorityWake) {
       if (this._pendingWake.length >= 2) {
         this._pendingWake.shift();
         this._droppedStaleCount += 1;
       }
-      this._pendingWake.push(payload);
+      this._pendingWake.push(enrichedPayload);
     } else {
       // 有界反压：非唤醒待处理队列最多保留最新 2 段（流式多句切分放宽至 6 句防吞掉连续指令），彻底防止持续背景音乐下队列无限积压！
-      const maxQueue = payload.precomputedTranscript ? 6 : 2;
+      const maxQueue = enrichedPayload.precomputedTranscript ? 6 : 2;
       if (this._pendingNormalQueue.length >= maxQueue) {
         this._pendingNormalQueue.shift();
         this._droppedStaleCount += 1;
       }
-      this._pendingNormalQueue.push(payload);
+      this._pendingNormalQueue.push(enrichedPayload);
     }
     this._pumpQueue();
   }
@@ -1266,6 +1639,9 @@ export class VoiceStreamSession {
 
   dispose(): void {
     this._disposed = true;
+    this._resetClearVoiceState();
+    this._cvChunker = null;
+    this._cvAssembler = null;
     this._resetStreamingState(true);
     this._pendingWake = [];
     this._pendingNormalQueue = [];

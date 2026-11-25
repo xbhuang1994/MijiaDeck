@@ -156,7 +156,10 @@ export interface AppRuntime {
   reloadVoiceStreams?: (
     wakeWords: readonly string[],
     threshold?: number,
-    options?: { streamingAsrEnabled?: boolean },
+    options?: {
+      streamingAsrEnabled?: boolean;
+      voicePipelineMode?: agentConfigStoreModule.VoicePipelineMode;
+    },
   ) => void;
   speakerAudioProps?: Map<string, { volName: string; muteName: string }>;
 }
@@ -1995,9 +1998,23 @@ export function createRequestHandler(
           throw new HttpError(400, "请输入要发送给 Pi Agent 的指令内容");
         }
         const source = body.source === "voice" ? "voice" : "text";
+        const isAsync = body.async === true;
+        if (isAsync) {
+          const submission = runtime.piAgent.submitPrompt(text, { source });
+          return jsonResponse({
+            ok: submission.accepted,
+            accepted: submission.accepted,
+            async: true,
+            taskId: submission.taskId,
+            entryId: submission.entryId,
+            ack: submission.ack,
+            agent: runtime.piAgent.snapshot(),
+          });
+        }
         const result = await runtime.piAgent.prompt(text, { source });
         return jsonResponse({
           ok: result.ok,
+          taskId: result.taskId,
           entryId: result.entryId,
           ack: result.ack,
           ...(result.ackScenario ? { ackScenario: result.ackScenario } : {}),
@@ -2011,6 +2028,21 @@ export function createRequestHandler(
           verification: result.verification ?? null,
           ...(result.skillEvent ? { skillEvent: result.skillEvent } : {}),
           ...(result.error ? { error: result.error } : {}),
+          agent: runtime.piAgent.snapshot(),
+        });
+      }
+
+      const abortTaskMatch = /^\/api\/agent\/tasks\/([^/]+)\/abort$/.exec(pathname);
+      if (method === "POST" && abortTaskMatch) {
+        if (!runtime.piAgent) {
+          throw new HttpError(503, "Pi Agent 服务未初始化");
+        }
+        const taskId = decodeSegment(abortTaskMatch[1]!);
+        const aborted = runtime.piAgent.abortTask(taskId);
+        return jsonResponse({
+          ok: true,
+          aborted,
+          taskId,
           agent: runtime.piAgent.snapshot(),
         });
       }
@@ -2354,9 +2386,16 @@ export function createRequestHandler(
           if (updated.ttsEngine !== "browser" && updated.autoSpeakReply) {
             void runtime.voiceListener.prewarmLocalTts().catch(() => {});
           }
+          if (
+            updated.voicePipelineMode === "clearvoice" &&
+            runtime.voiceListener.localEngine.clearVoiceGpu.getStatus().ready
+          ) {
+            void runtime.voiceListener.localEngine.clearVoiceGpu.warmup().catch(() => {});
+          }
         }
         runtime.reloadVoiceStreams?.(updated.wakeWords, updated.owwThreshold, {
           streamingAsrEnabled: updated.qwen3StreamingEnabled,
+          voicePipelineMode: updated.voicePipelineMode,
         });
         emitBroadcast(runtime);
         return jsonResponse({
@@ -2503,10 +2542,15 @@ export function createRequestHandler(
           body.engine === "local" || body.engine === "whisper" || body.engine === "manual"
             ? body.engine
             : "browser";
+        const asyncDispatch = body.asyncDispatch === true;
+        const duringTtsPlayback =
+          typeof body.duringTtsPlayback === "boolean" ? body.duringTtsPlayback : undefined;
         const result = await runtime.voiceListener.handleTranscript(text, {
           isFinal,
           bypassWakeWord,
           engine,
+          asyncDispatch,
+          duringTtsPlayback,
         });
         return jsonResponse({
           ...result,
@@ -2533,6 +2577,10 @@ export function createRequestHandler(
         const lang = typeof form.get("lang") === "string" ? String(form.get("lang")) : undefined;
         const bypassWakeWord = String(form.get("bypassWakeWord") ?? "").toLowerCase() === "true";
         const autoDispatch = String(form.get("autoDispatch") ?? "true").toLowerCase() !== "false";
+        const asyncDispatch = String(form.get("asyncDispatch") ?? "").toLowerCase() === "true";
+        const duringTtsRaw = form.get("duringTtsPlayback");
+        const duringTtsPlayback =
+          typeof duringTtsRaw === "string" ? duringTtsRaw.toLowerCase() === "true" : undefined;
         const engineRaw = typeof form.get("engine") === "string" ? String(form.get("engine")).trim() : "";
         const preferredEngine =
           engineRaw === "local" || engineRaw === "whisper" || engineRaw === "auto"
@@ -2547,6 +2595,8 @@ export function createRequestHandler(
             bypassWakeWord,
             autoDispatch,
             preferredEngine,
+            asyncDispatch,
+            duringTtsPlayback,
           });
           return jsonResponse({
             ...result,

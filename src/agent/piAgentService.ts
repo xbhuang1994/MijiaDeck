@@ -14,6 +14,7 @@
 import {
   Agent,
   type AgentEvent,
+  type AgentMessage,
   type AgentTool,
   type StreamFn,
 } from "@earendil-works/pi-agent-core";
@@ -178,8 +179,20 @@ export interface AgentRetryNotice {
   text: string;
 }
 
+export type AgentTaskPhase = "queued" | "executing" | "verifying" | "retrying";
+
+export interface AgentActiveTask {
+  taskId: string;
+  entryId: string;
+  command: string;
+  source: "text" | "voice";
+  phase: AgentTaskPhase;
+  startedAt: number;
+}
+
 export interface AgentTimelineEntry {
   id: string;
+  taskId?: string;
   role: "user" | "assistant";
   source: "text" | "voice";
   text: string;
@@ -204,6 +217,8 @@ export interface AgentTimelineEntry {
 
 export interface PiAgentSnapshot {
   running: boolean;
+  activeTaskCount: number;
+  activeTasks: AgentActiveTask[];
   provider: AgentProviderMode;
   providerLabel: string;
   modelId: string;
@@ -229,6 +244,7 @@ export interface VoicePromptMeta {
 
 export interface PiAgentRunResult {
   ok: boolean;
+  taskId?: string;
   entryId: string;
   ack: string;
   ackScenario?: TaskAckScenario;
@@ -245,11 +261,35 @@ export interface PiAgentRunResult {
   error?: string;
 }
 
+export interface PiAgentTaskSubmission {
+  accepted: boolean;
+  taskId: string;
+  entryId: string;
+  ack: string;
+  promise: Promise<PiAgentRunResult>;
+}
+
 export type PiAgentEvents = {
   stateChanged: [PiAgentSnapshot];
   streamEvent: [Record<string, unknown>];
-  speakChunk: [{ entryId: string; text: string; final: boolean }];
-  replyFinished: [{ entryId: string; text: string; source: "text" | "voice"; ok: boolean }];
+  speakChunk: [
+    {
+      entryId: string;
+      taskId?: string;
+      text: string;
+      final: boolean;
+      priority?: "ack" | "normal" | "result" | "system";
+    },
+  ];
+  replyFinished: [
+    {
+      entryId: string;
+      taskId?: string;
+      text: string;
+      source: "text" | "voice";
+      ok: boolean;
+    },
+  ];
 };
 
 export interface PiAgentServiceOptions {
@@ -623,6 +663,45 @@ export function formatLocalTimeContext(now: Date = new Date()): string {
   return `当前本地时间：${y}-${m}-${d} ${String(hh).padStart(2, "0")}:${mm}（周${wd}，${period}）`;
 }
 
+const MAX_CONCURRENT_TASKS = 4;
+
+interface TaskRunContext {
+  taskId: string;
+  entry: AgentTimelineEntry;
+  source: "text" | "voice";
+  rawText: string;
+  voiceMeta: VoicePromptMeta | null;
+  priorHistory: ReadonlyArray<{ role: "user" | "assistant"; text: string }>;
+  phase: AgentTaskPhase;
+  startedAt: number;
+  abortController: AbortController;
+  agent: Agent | null;
+  usesPrimaryAgent: boolean;
+  tools: AgentTool<any>[];
+  unsubAgent: (() => void) | null;
+  seedHistoryLen: number;
+  speakCursor: number;
+  rawStreamText: string;
+  inlineThinkSplitter: InlineThinkStreamSplitter;
+  thinkingStreamedInMessage: boolean;
+  needsThinkingSeparator: boolean;
+  speakChunkState: CavemanSpeakChunkState;
+  suppressedSilent: boolean;
+  emittedSpeakChunks: boolean;
+  emittedAckSpeak: boolean;
+  ackText: string;
+  ackSource?: "systemone" | "fallback";
+  emittedFinalSpeak: boolean;
+  holdReplyUntilVerified: boolean;
+  inCloudRecoveryTurn: boolean;
+  cloudRecoveryFailed: boolean;
+  bufferedPostToolText: string;
+  roundToolTraces: ExecutedToolTrace[];
+  roundToolArgs: Map<string, Record<string, unknown>>;
+  useLocalFastPath: boolean;
+  resolvePromise: (result: PiAgentRunResult) => void;
+}
+
 export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   private readonly _deps: SmartHomeToolDeps;
   private readonly _tools: AgentTool<any>[];
@@ -637,33 +716,13 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   private _agent: Agent;
   private _unsubAgent: (() => void) | null = null;
   private _timeline: AgentTimelineEntry[] = [];
-  private _activeAssistantEntry: AgentTimelineEntry | null = null;
-  private _activeSource: "text" | "voice" = "text";
-  private _activePromptRawText = "";
-  private _activeVoiceMeta: VoicePromptMeta | null = null;
-  private _speakCursor = 0;
-  private _rawStreamText = "";
-  private _inlineThinkSplitter = new InlineThinkStreamSplitter();
-  private _thinkingStreamedInMessage = false;
-  private _needsThinkingSeparator = false;
-  private _speakChunkState: CavemanSpeakChunkState = { emittedAny: false };
-  private _suppressedSilent = false;
-  private _emittedSpeakChunks = false;
-  private _emittedAckSpeak = false;
-  private _activeAckText = TASK_ACK_TEXT;
-  private _emittedFinalSpeak = false;
-  private _holdReplyUntilVerified = false;
-  private _inCloudRecoveryTurn = false;
-  private _cloudRecoveryFailed = false;
-  private _bufferedPostToolText = "";
-  private _roundToolTraces: ExecutedToolTrace[] = [];
-  private _roundToolArgs = new Map<string, Record<string, unknown>>();
-  private _turnAbortController: AbortController | null = null;
-  private _activeTurnDone: Promise<void> | null = null;
-  private _turnUseLocalFastPath = false;
+  private _primaryCtx: TaskRunContext | null = null;
+  private readonly _activeTasks = new Map<string, TaskRunContext>();
+  private readonly _queuedTasks: TaskRunContext[] = [];
+  private _pendingHistoryMerges: AgentMessage[] = [];
   private _lastError: string | null = null;
-  private _running = false;
   private _entrySeq = 0;
+  private _taskSeq = 0;
 
   // Lazy provider stream singletons
   private readonly _openaiCompletions = openAICompletionsApi();
@@ -681,8 +740,8 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     this._systemOne = SystemOneClient.fromConfig(this._config, this._systemOneFetcher);
     this._tools = createSmartHomeTools({
       ...this._deps,
-      getActivePromptSource: () => this._activeSource,
-      getActivePromptRawText: () => this._activePromptRawText,
+      getActivePromptSource: () => this._primaryCtx?.source ?? "text",
+      getActivePromptRawText: () => this._primaryCtx?.rawText ?? "",
       onCustomInstructionsChanged: () => {
         this.emit("stateChanged", this.snapshot());
       },
@@ -724,14 +783,43 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   }
 
   get running(): boolean {
-    return this._running;
+    return this._activeTasks.size > 0 || this._queuedTasks.length > 0;
+  }
+
+  get activeTaskCount(): number {
+    return this._activeTasks.size + this._queuedTasks.length;
+  }
+
+  getActiveTasks(): AgentActiveTask[] {
+    const list: AgentActiveTask[] = [];
+    for (const ctx of this._activeTasks.values()) {
+      list.push({
+        taskId: ctx.taskId,
+        entryId: ctx.entry.id,
+        command: ctx.rawText,
+        source: ctx.source,
+        phase: ctx.phase,
+        startedAt: ctx.startedAt,
+      });
+    }
+    for (const ctx of this._queuedTasks) {
+      list.push({
+        taskId: ctx.taskId,
+        entryId: ctx.entry.id,
+        command: ctx.rawText,
+        source: ctx.source,
+        phase: "queued",
+        startedAt: ctx.startedAt,
+      });
+    }
+    return list;
   }
 
   get agent(): Agent {
     return this._agent;
   }
 
-  private _buildSystemPrompt(): string {
+  private _buildSystemPrompt(ctx?: Pick<TaskRunContext, "source" | "voiceMeta"> | null): string {
     const mw = this._deps.mainWindow;
     const devices = mw.activeDevices();
     const scenes = SCENES_FEATURE_ENABLED ? (mw.scenes ?? []) : [];
@@ -777,9 +865,10 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       loadCustomInstructions(),
       extra,
     );
-    const vm = this._activeVoiceMeta;
+    const vm = ctx?.voiceMeta ?? this._primaryCtx?.voiceMeta ?? null;
+    const effectiveSource = ctx?.source ?? this._primaryCtx?.source ?? "text";
     const cavemanBlock = buildCavemanPromptBlock(this._config.cavemanMode, {
-      isVoice: this._activeSource === "voice",
+      isVoice: effectiveSource === "voice",
       speakerName: vm?.speakerName,
       speakerRole: vm?.speakerRole,
     });
@@ -861,7 +950,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       .join("\n");
   }
 
-  private _createStreamFn(): StreamFn {
+  private _createStreamFn(getCtx: () => TaskRunContext | null = () => this._primaryCtx): StreamFn {
     if (this._customStreamFn) {
       return this._customStreamFn;
     }
@@ -888,9 +977,10 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       // 也由本地规划器 + 工具循环零延迟执行（省去两次云端 LLM 往返 ~1.5~4s），
       // 复杂推理、口语隐式意图或开放问答无缝交由云端大模型处理。
       if (this._config.preferLocalIntents === true) {
+        const ctx = getCtx();
         const msgs = context.messages;
         const lastMsg = msgs[msgs.length - 1];
-        if (lastMsg && lastMsg.role === "toolResult" && this._turnUseLocalFastPath) {
+        if (lastMsg && lastMsg.role === "toolResult" && ctx?.useLocalFastPath) {
           return this._localStreamFn(model, context, options);
         }
         if (lastMsg && lastMsg.role === "user") {
@@ -913,10 +1003,10 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             recentTarget,
           );
           if (deterministicCalls) {
-            this._turnUseLocalFastPath = true;
+            if (ctx) ctx.useLocalFastPath = true;
             return this._localStreamFn(model, context, options);
           }
-          this._turnUseLocalFastPath = false;
+          if (ctx) ctx.useLocalFastPath = false;
         }
       }
 
@@ -944,6 +1034,103 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     };
   }
 
+  private _snapshotCommittedMessages(): AgentMessage[] {
+    const msgs = [...this._agent.state.messages];
+    // 排除尚未收尾的尾部消息（防止并发任务继承到另一任务进行中的半截工具调用）
+    while (msgs.length > 0) {
+      const tail = msgs[msgs.length - 1]!;
+      if (tail.role === "assistant" && Array.isArray(tail.content)) {
+        const hasToolCall = tail.content.some((b: { type?: string }) => b.type === "toolCall");
+        if (hasToolCall) {
+          msgs.pop();
+          continue;
+        }
+      }
+      if (tail.role === "user" || tail.role === "toolResult") {
+        // 如果主任务正在进行中，剥离主任务尚未完成的尾部 user/toolResult
+        if (this._primaryCtx !== null) {
+          msgs.pop();
+          continue;
+        }
+      }
+      break;
+    }
+    return msgs;
+  }
+
+  private _flushPendingHistoryMerges(): void {
+    if (this._primaryCtx !== null || this._pendingHistoryMerges.length === 0) {
+      return;
+    }
+    const merged = [...this._agent.state.messages, ...this._pendingHistoryMerges];
+    this._pendingHistoryMerges = [];
+    this._agent.state.messages = merged;
+  }
+
+  private _createScopedAgent(ctx: TaskRunContext): {
+    agent: Agent;
+    tools: AgentTool<any>[];
+    unsub: () => void;
+    seedHistoryLen: number;
+  } {
+    const model = this._customModel ?? buildModelForConfig(this._config);
+    const tools = createSmartHomeTools({
+      ...this._deps,
+      getActivePromptSource: () => ctx.source,
+      getActivePromptRawText: () => ctx.rawText,
+      onCustomInstructionsChanged: () => {
+        this.emit("stateChanged", this.snapshot());
+      },
+    });
+    const seedMessages = this._snapshotCommittedMessages();
+    const agent = new Agent({
+      initialState: {
+        systemPrompt: this._buildSystemPrompt(ctx),
+        model,
+        thinkingLevel: this._config.thinkingLevel,
+        tools,
+        ...(seedMessages.length > 0 ? { messages: seedMessages } : {}),
+      },
+      streamFn: this._createStreamFn(() => ctx),
+      getApiKey: () => resolveEffectiveApiKey(this._config),
+      toolExecution: "sequential",
+      prepareRequest: ({ context, model: reqModel }) => {
+        const msgs = [...context.messages];
+        const freshPrompt = this._buildSystemPrompt(ctx);
+        if (msgs.length > 0 && msgs[0]!.role === "system") {
+          msgs[0] = {
+            ...msgs[0]!,
+            content: freshPrompt,
+          };
+        }
+        const maxMsgs = Math.max(6, this._config.maxHistoryTurns * 4);
+        let trimmed = msgs;
+        if (msgs.length > maxMsgs + 1) {
+          const head = msgs[0]!.role === "system" ? [msgs[0]!] : [];
+          const tail = msgs.slice(-maxMsgs);
+          while (tail.length > 0 && tail[0]!.role === "toolResult") {
+            tail.shift();
+          }
+          trimmed = [...head, ...tail];
+        }
+        return {
+          context: { ...context, messages: trimmed },
+          model: this._customModel ?? buildModelForConfig(this._config) ?? reqModel,
+          thinkingLevel: this._config.thinkingLevel,
+        };
+      },
+    });
+    const unsub = agent.subscribe((event) => {
+      this._handleAgentEvent(event, ctx);
+    });
+    return {
+      agent,
+      tools,
+      unsub,
+      seedHistoryLen: agent.state.messages.length,
+    };
+  }
+
   private _createAgent(): Agent {
     this._unsubAgent?.();
     const model = this._customModel ?? buildModelForConfig(this._config);
@@ -954,13 +1141,13 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         thinkingLevel: this._config.thinkingLevel,
         tools: this._tools,
       },
-      streamFn: this._createStreamFn(),
+      streamFn: this._createStreamFn(() => this._primaryCtx),
       getApiKey: () => resolveEffectiveApiKey(this._config),
       toolExecution: "sequential",
       prepareRequest: ({ context, model: reqModel }) => {
         // 每次请求前刷新最新设备目录到首条 system message，同时按 maxHistoryTurns 裁剪过长历史
         const msgs = [...context.messages];
-        const freshPrompt = this._buildSystemPrompt();
+        const freshPrompt = this._buildSystemPrompt(this._primaryCtx);
         if (msgs.length > 0 && msgs[0]!.role === "system") {
           msgs[0] = {
             ...msgs[0]!,
@@ -987,16 +1174,19 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     });
 
     this._unsubAgent = agent.subscribe((event) => {
-      this._handleAgentEvent(event);
+      if (this._primaryCtx) {
+        this._handleAgentEvent(event, this._primaryCtx);
+      }
     });
     return agent;
   }
 
-  private _appendThinkingDelta(entry: AgentTimelineEntry, delta: string): void {
+  private _appendThinkingDelta(ctx: TaskRunContext, delta: string): void {
+    const entry = ctx.entry;
     if (!delta) return;
-    if (this._needsThinkingSeparator && entry.thinking && entry.thinking.trim().length > 0) {
+    if (ctx.needsThinkingSeparator && entry.thinking && entry.thinking.trim().length > 0) {
       entry.thinking = `${entry.thinking.replace(/\s+$/, "")}\n\n${delta.replace(/^\s+/, "")}`;
-      this._needsThinkingSeparator = false;
+      ctx.needsThinkingSeparator = false;
     } else {
       entry.thinking = (entry.thinking ?? "") + delta;
     }
@@ -1004,6 +1194,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     // 仅通过 streamEvent 推送到对话框渲染，绝不触发 speakChunk / 语音播报
     this.emit("streamEvent", {
       kind: "thinking_delta",
+      taskId: ctx.taskId,
       entryId: entry.id,
       delta,
       thinking: entry.thinking,
@@ -1012,11 +1203,13 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     });
   }
 
-  private _finishThinkingPhase(entry: AgentTimelineEntry): void {
+  private _finishThinkingPhase(ctx: TaskRunContext): void {
+    const entry = ctx.entry;
     if (!entry.thinkingActive) return;
     entry.thinkingActive = false;
     this.emit("streamEvent", {
       kind: "thinking_end",
+      taskId: ctx.taskId,
       entryId: entry.id,
       thinking: entry.thinking ?? "",
       thinkingActive: false,
@@ -1024,98 +1217,100 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     });
   }
 
-  private _pushAnswerTextDelta(entry: AgentTimelineEntry, delta: string): void {
+  private _pushAnswerTextDelta(ctx: TaskRunContext, delta: string): void {
+    const entry = ctx.entry;
     if (!delta) return;
     let piece = delta;
-    if (!entry.text && !this._rawStreamText && !this._bufferedPostToolText) {
+    if (!entry.text && !ctx.rawStreamText && !ctx.bufferedPostToolText) {
       piece = piece.replace(/^\s+/, "");
       if (!piece) return;
     }
-    if (this._holdReplyUntilVerified || this._inCloudRecoveryTurn) {
-      this._bufferedPostToolText += piece;
+    if (ctx.holdReplyUntilVerified || ctx.inCloudRecoveryTurn) {
+      ctx.bufferedPostToolText += piece;
       return;
     }
-    this._rawStreamText += piece;
+    ctx.rawStreamText += piece;
     entry.text += piece;
     this.emit("streamEvent", {
       kind: "text_delta",
+      taskId: ctx.taskId,
       entryId: entry.id,
       delta: piece,
       text: entry.text,
     });
     // 无设备变更的纯问答/闲聊可立即流式分句播报，降低首字播报延迟（TTFA）
-    if (this._activeSource === "voice" && this._config.autoSpeakReply) {
-      this._flushReadySpeakSentences(entry, false);
+    if (ctx.source === "voice" && this._config.autoSpeakReply) {
+      this._flushReadySpeakSentences(ctx, false);
     }
   }
 
-  private _handleAgentEvent(event: AgentEvent): void {
-    const entry = this._activeAssistantEntry;
+  private _handleAgentEvent(event: AgentEvent, ctx: TaskRunContext): void {
+    const entry = ctx.entry;
 
     switch (event.type) {
       case "message_start": {
         if (!entry) break;
         if (event.message.role === "assistant") {
-          this._inlineThinkSplitter.reset();
-          this._thinkingStreamedInMessage = false;
+          ctx.inlineThinkSplitter.reset();
+          ctx.thinkingStreamedInMessage = false;
         }
         break;
       }
       case "message_update": {
-        if (!entry) break;
         const ev = event.assistantMessageEvent;
         if (ev.type === "thinking_start") {
           if (entry.thinking && entry.thinking.trim().length > 0) {
-            this._needsThinkingSeparator = true;
+            ctx.needsThinkingSeparator = true;
           }
           entry.thinkingActive = true;
-          this._thinkingStreamedInMessage = true;
+          ctx.thinkingStreamedInMessage = true;
           this.emit("streamEvent", {
             kind: "thinking_start",
+            taskId: ctx.taskId,
             entryId: entry.id,
             thinking: entry.thinking ?? "",
             thinkingActive: true,
             thinkingLevel: entry.thinkingLevel,
           });
         } else if (ev.type === "thinking_delta" && ev.delta) {
-          if (!this._thinkingStreamedInMessage && entry.thinking && entry.thinking.trim().length > 0) {
-            this._needsThinkingSeparator = true;
+          if (!ctx.thinkingStreamedInMessage && entry.thinking && entry.thinking.trim().length > 0) {
+            ctx.needsThinkingSeparator = true;
           }
-          this._thinkingStreamedInMessage = true;
-          this._appendThinkingDelta(entry, ev.delta);
+          ctx.thinkingStreamedInMessage = true;
+          this._appendThinkingDelta(ctx, ev.delta);
         } else if (ev.type === "thinking_end") {
           if (ev.content && !entry.thinking) {
-            this._appendThinkingDelta(entry, ev.content);
+            this._appendThinkingDelta(ctx, ev.content);
           }
-          this._finishThinkingPhase(entry);
+          this._finishThinkingPhase(ctx);
         } else if (ev.type === "text_delta" && ev.delta) {
-          const split = this._inlineThinkSplitter.push(ev.delta);
+          const split = ctx.inlineThinkSplitter.push(ev.delta);
           if (split.thinking) {
-            if (!this._thinkingStreamedInMessage && entry.thinking && entry.thinking.trim().length > 0) {
-              this._needsThinkingSeparator = true;
+            if (!ctx.thinkingStreamedInMessage && entry.thinking && entry.thinking.trim().length > 0) {
+              ctx.needsThinkingSeparator = true;
             }
-            this._thinkingStreamedInMessage = true;
-            this._appendThinkingDelta(entry, split.thinking);
+            ctx.thinkingStreamedInMessage = true;
+            this._appendThinkingDelta(ctx, split.thinking);
           }
           if (split.text) {
-            this._finishThinkingPhase(entry);
-            this._pushAnswerTextDelta(entry, split.text);
+            this._finishThinkingPhase(ctx);
+            this._pushAnswerTextDelta(ctx, split.text);
           }
         }
         break;
       }
       case "tool_execution_start": {
         if (!entry) break;
-        this._finishThinkingPhase(entry);
+        this._finishThinkingPhase(ctx);
         const label = this._toolLabels.get(event.toolName) ?? event.toolName;
         const args =
           event.args && typeof event.args === "object" && !Array.isArray(event.args)
             ? (event.args as Record<string, unknown>)
             : {};
-        this._roundToolArgs.set(event.toolCallId, { ...args });
+        ctx.roundToolArgs.set(event.toolCallId, { ...args });
         if (MUTATING_TOOLS.has(event.toolName)) {
           // 涉及设备状态变更的工具调用完成后必须先执行真实状态校验，校验通过后再回复用户
-          this._holdReplyUntilVerified = true;
+          ctx.holdReplyUntilVerified = true;
         }
         const tc: AgentToolCallRecord = {
           id: event.toolCallId,
@@ -1128,6 +1323,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         entry.toolCalls.push(tc);
         this.emit("streamEvent", {
           kind: "tool_start",
+          taskId: ctx.taskId,
           entryId: entry.id,
           toolCall: { ...tc },
         });
@@ -1135,7 +1331,6 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         break;
       }
       case "tool_execution_end": {
-        if (!entry) break;
         const existing = entry.toolCalls.find((t) => t.id === event.toolCallId);
         const detailsObj =
           event.result?.details &&
@@ -1162,8 +1357,8 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             ? "执行失败"
             : "执行完成";
 
-        const recordedArgs = this._roundToolArgs.get(event.toolCallId) ?? existing?.args ?? {};
-        this._roundToolTraces.push({
+        const recordedArgs = ctx.roundToolArgs.get(event.toolCallId) ?? existing?.args ?? {};
+        ctx.roundToolTraces.push({
           toolCallId: event.toolCallId,
           name: event.toolName,
           args: { ...recordedArgs },
@@ -1173,7 +1368,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         });
 
         if (event.isError) {
-          this._holdReplyUntilVerified = true;
+          ctx.holdReplyUntilVerified = true;
         }
 
         if (existing) {
@@ -1182,6 +1377,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           existing.durationMs = event.durationMs;
           this.emit("streamEvent", {
             kind: "tool_end",
+            taskId: ctx.taskId,
             entryId: entry.id,
             toolCall: { ...existing },
           });
@@ -1190,20 +1386,19 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         break;
       }
       case "message_end": {
-        if (!entry) break;
         const msg = event.message;
         if (msg.role === "assistant") {
-          const tail = this._inlineThinkSplitter.flush();
+          const tail = ctx.inlineThinkSplitter.flush();
           if (tail.thinking) {
-            if (!this._thinkingStreamedInMessage && entry.thinking && entry.thinking.trim().length > 0) {
-              this._needsThinkingSeparator = true;
+            if (!ctx.thinkingStreamedInMessage && entry.thinking && entry.thinking.trim().length > 0) {
+              ctx.needsThinkingSeparator = true;
             }
-            this._thinkingStreamedInMessage = true;
-            this._appendThinkingDelta(entry, tail.thinking);
+            ctx.thinkingStreamedInMessage = true;
+            this._appendThinkingDelta(ctx, tail.thinking);
           }
           if (tail.text) {
-            this._finishThinkingPhase(entry);
-            this._pushAnswerTextDelta(entry, tail.text);
+            this._finishThinkingPhase(ctx);
+            this._pushAnswerTextDelta(ctx, tail.text);
           }
 
           // 若后端未走 thinking_delta 流式事件（例如一次性返回 ThinkingContent），此处补全思考过程
@@ -1213,11 +1408,11 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             .map((t) => t.trim())
             .filter(Boolean)
             .join("\n\n");
-          if (structuredThinking && !this._thinkingStreamedInMessage) {
+          if (structuredThinking && !ctx.thinkingStreamedInMessage) {
             if (entry.thinking && entry.thinking.trim().length > 0) {
-              this._needsThinkingSeparator = true;
+              ctx.needsThinkingSeparator = true;
             }
-            this._appendThinkingDelta(entry, structuredThinking);
+            this._appendThinkingDelta(ctx, structuredThinking);
           }
 
           const rawTextBlocks = msg.content
@@ -1225,18 +1420,18 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             .map((b) => b.text)
             .join("");
           const splitFinal = splitInlineThinkBlocks(rawTextBlocks);
-          if (splitFinal.thinking && !this._thinkingStreamedInMessage) {
+          if (splitFinal.thinking && !ctx.thinkingStreamedInMessage) {
             if (entry.thinking && entry.thinking.trim().length > 0) {
-              this._needsThinkingSeparator = true;
+              ctx.needsThinkingSeparator = true;
             }
-            this._appendThinkingDelta(entry, splitFinal.thinking);
+            this._appendThinkingDelta(ctx, splitFinal.thinking);
           }
-          this._finishThinkingPhase(entry);
+          this._finishThinkingPhase(ctx);
 
           const textBlocks = splitFinal.text.trim();
           if (msg.stopReason === "error") {
-            if (this._inCloudRecoveryTurn) {
-              this._cloudRecoveryFailed = true;
+            if (ctx.inCloudRecoveryTurn) {
+              ctx.cloudRecoveryFailed = true;
               break;
             }
             entry.status = "error";
@@ -1250,26 +1445,26 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             if (!entry.text) {
               entry.text = "已中断当前操作。";
             }
-          } else if (this._holdReplyUntilVerified || this._inCloudRecoveryTurn) {
+          } else if (ctx.holdReplyUntilVerified || ctx.inCloudRecoveryTurn) {
             if (textBlocks) {
-              this._bufferedPostToolText = textBlocks;
+              ctx.bufferedPostToolText = textBlocks;
             }
           } else {
             if (textBlocks) {
-              if (!this._rawStreamText) {
-                this._rawStreamText = textBlocks;
+              if (!ctx.rawStreamText) {
+                ctx.rawStreamText = textBlocks;
               }
               entry.text = textBlocks;
             }
             if (entry.text) {
               if (isSilentSentinel(entry.text)) {
                 entry.text = "";
-                this._suppressedSilent = true;
+                ctx.suppressedSilent = true;
               } else {
                 entry.text = compressCavemanReply(
                   entry.text,
                   this._config.cavemanMode,
-                  this._activeSource === "voice",
+                  ctx.source === "voice",
                 );
               }
             }
@@ -1282,100 +1477,121 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     }
   }
 
-  private _flushReadySpeakSentences(entry: AgentTimelineEntry, final: boolean): void {
-    const sourceText = this._rawStreamText || entry.text;
+  private _flushReadySpeakSentences(ctx: TaskRunContext, final: boolean): void {
+    const entry = ctx.entry;
+    const sourceText = ctx.rawStreamText || entry.text;
     if (!final) {
-      while (this._speakCursor < sourceText.length) {
-        const remaining = sourceText.slice(this._speakCursor);
+      while (ctx.speakCursor < sourceText.length) {
+        const remaining = sourceText.slice(ctx.speakCursor);
         const m = /^([\s\S]*?(?:[。！？!?\n]|(?<!\d)\.(?=\s|$)))/.exec(remaining);
         if (!m) break;
-        this._speakCursor += m[1]!.length;
+        ctx.speakCursor += m[1]!.length;
         let filtered = compressCavemanSpeakChunk(
           m[1]!,
           this._config.cavemanMode,
-          this._speakChunkState,
+          ctx.speakChunkState,
         );
-        if (this._emittedAckSpeak && !this._emittedFinalSpeak) {
-          filtered = stripDuplicatedAckPrefix(filtered, this._activeAckText, {
+        if (ctx.emittedAckSpeak && !ctx.emittedFinalSpeak) {
+          filtered = stripDuplicatedAckPrefix(filtered, ctx.ackText, {
             suppressPureMatch: true,
           });
         }
         if (filtered.length >= 2) {
-          this._emittedSpeakChunks = true;
-          this._emittedFinalSpeak = true;
-          this.emit("speakChunk", { entryId: entry.id, text: filtered, final: false });
+          ctx.emittedSpeakChunks = true;
+          ctx.emittedFinalSpeak = true;
+          this.emit("speakChunk", {
+            entryId: entry.id,
+            taskId: ctx.taskId,
+            text: filtered,
+            final: false,
+            priority: "normal",
+          });
         }
       }
       return;
     }
 
-    const remaining = sourceText.slice(this._speakCursor);
-    this._speakCursor = sourceText.length;
+    const remaining = sourceText.slice(ctx.speakCursor);
+    ctx.speakCursor = sourceText.length;
     if (!remaining.trim()) return;
     let filtered = compressCavemanSpeakChunk(
       remaining,
       this._config.cavemanMode,
-      this._speakChunkState,
+      ctx.speakChunkState,
     );
-    if (this._emittedAckSpeak && !this._emittedFinalSpeak) {
-      filtered = stripDuplicatedAckPrefix(filtered, this._activeAckText);
+    if (ctx.emittedAckSpeak && !ctx.emittedFinalSpeak) {
+      filtered = stripDuplicatedAckPrefix(filtered, ctx.ackText);
     }
     if (filtered) {
-      this._emittedSpeakChunks = true;
-      this._emittedFinalSpeak = true;
-      this.emit("speakChunk", { entryId: entry.id, text: filtered, final: true });
+      ctx.emittedSpeakChunks = true;
+      ctx.emittedFinalSpeak = true;
+      this.emit("speakChunk", {
+        entryId: entry.id,
+        taskId: ctx.taskId,
+        text: filtered,
+        final: true,
+        priority: "result",
+      });
     }
   }
 
-  private _formatVerifiedReplyText(raw: string): string {
+  private _formatVerifiedReplyText(ctx: TaskRunContext, raw: string): string {
     const trimmed = raw.trim();
     if (!trimmed) return "";
     if (isSilentSentinel(trimmed)) {
-      this._suppressedSilent = true;
+      ctx.suppressedSilent = true;
       return "";
     }
     return compressCavemanReply(
       trimmed,
       this._config.cavemanMode,
-      this._activeSource === "voice",
+      ctx.source === "voice",
     );
   }
 
-  private _emitVerifiedFinalVoiceChunk(entry: AgentTimelineEntry): void {
-    if (this._activeSource !== "voice" || !this._config.autoSpeakReply || this._suppressedSilent) {
+  private _emitVerifiedFinalVoiceChunk(ctx: TaskRunContext): void {
+    const entry = ctx.entry;
+    if (ctx.source !== "voice" || !this._config.autoSpeakReply || ctx.suppressedSilent) {
       return;
     }
     const finalText = entry.text.trim();
     if (!finalText) return;
 
-    if (this._emittedFinalSpeak) {
-      this._flushReadySpeakSentences(entry, true);
+    if (ctx.emittedFinalSpeak) {
+      this._flushReadySpeakSentences(ctx, true);
       return;
     }
 
     // 任务开始时已先播报场景化简短应答词，若最终口语回复也以该应答词或“好的，”开头且后面有实质内容，仅对语音播报去重避免连续念两次
     let spokenText = finalText;
-    if (this._emittedAckSpeak) {
-      spokenText = stripDuplicatedAckPrefix(spokenText, this._activeAckText);
+    if (ctx.emittedAckSpeak) {
+      spokenText = stripDuplicatedAckPrefix(spokenText, ctx.ackText);
     }
     if (spokenText) {
-      this._emittedSpeakChunks = true;
-      this._emittedFinalSpeak = true;
-      this.emit("speakChunk", { entryId: entry.id, text: spokenText, final: true });
+      ctx.emittedSpeakChunks = true;
+      ctx.emittedFinalSpeak = true;
+      this.emit("speakChunk", {
+        entryId: entry.id,
+        taskId: ctx.taskId,
+        text: spokenText,
+        final: true,
+        priority: "result",
+      });
     }
   }
 
   private async _executeDirectToolSteps(
     steps: readonly AgentSkillStep[],
-    entry: AgentTimelineEntry,
+    ctx: TaskRunContext,
     signal?: AbortSignal,
   ): Promise<{ traces: ExecutedToolTrace[]; toolResultMessages: ToolResultMessage[] }> {
+    const entry = ctx.entry;
     const traces: ExecutedToolTrace[] = [];
     const toolResultMessages: ToolResultMessage[] = [];
 
     for (const step of steps) {
       if (signal?.aborted) break;
-      const tool = this._tools.find((t) => t.name === step.toolName);
+      const tool = ctx.tools.find((t) => t.name === step.toolName);
       const toolCallId = `step_${Date.now()}_${++this._entrySeq}`;
       const label = tool?.label || this._toolLabels.get(step.toolName) || step.toolName;
       const args = { ...(step.args ?? {}) };
@@ -1391,6 +1607,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       entry.toolCalls.push(tc);
       this.emit("streamEvent", {
         kind: "tool_start",
+        taskId: ctx.taskId,
         entryId: entry.id,
         toolCall: { ...tc },
       });
@@ -1444,6 +1661,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
 
       this.emit("streamEvent", {
         kind: "tool_end",
+        taskId: ctx.taskId,
         entryId: entry.id,
         toolCall: { ...tc },
       });
@@ -1473,7 +1691,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
 
   private async _runCloudLlmRecovery(
     plan: RecoveryPlan,
-    entry: AgentTimelineEntry,
+    ctx: TaskRunContext,
     signal?: AbortSignal,
   ): Promise<{
     traces: ExecutedToolTrace[];
@@ -1481,25 +1699,26 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     llmText: string;
     llmMarkedUnsolvable: boolean;
   }> {
-    this._roundToolTraces = [];
-    this._roundToolArgs.clear();
-    this._bufferedPostToolText = "";
-    this._inCloudRecoveryTurn = true;
-    this._cloudRecoveryFailed = false;
+    ctx.roundToolTraces = [];
+    ctx.roundToolArgs.clear();
+    ctx.bufferedPostToolText = "";
+    ctx.inCloudRecoveryTurn = true;
+    ctx.cloudRecoveryFailed = false;
 
     try {
-      await this._agent.prompt(plan.llmGuidancePrompt);
-      await this._agent.waitForIdle();
+      const activeAgent = ctx.agent ?? this._agent;
+      await activeAgent.prompt(plan.llmGuidancePrompt);
+      await activeAgent.waitForIdle();
     } catch {
-      this._cloudRecoveryFailed = true;
+      ctx.cloudRecoveryFailed = true;
     } finally {
-      this._inCloudRecoveryTurn = false;
+      ctx.inCloudRecoveryTurn = false;
     }
 
-    const llmText = this._bufferedPostToolText.trim();
-    const hasMutatingRecoveryCall = this._roundToolTraces.some((tr) => MUTATING_TOOLS.has(tr.name));
+    const llmText = ctx.bufferedPostToolText.trim();
+    const hasMutatingRecoveryCall = ctx.roundToolTraces.some((tr) => MUTATING_TOOLS.has(tr.name));
     if (
-      !this._cloudRecoveryFailed &&
+      !ctx.cloudRecoveryFailed &&
       !hasMutatingRecoveryCall &&
       /^\[UNSOLVABLE\]/i.test(llmText)
     ) {
@@ -1511,11 +1730,11 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       };
     }
 
-    const hasEffectiveRecoveryCall = this._roundToolTraces.some(
+    const hasEffectiveRecoveryCall = ctx.roundToolTraces.some(
       (tr) => MUTATING_TOOLS.has(tr.name) || tr.isError,
     );
-    if (!this._cloudRecoveryFailed && hasEffectiveRecoveryCall) {
-      const toolResultMessages: ToolResultMessage[] = this._roundToolTraces.map((tr) => ({
+    if (!ctx.cloudRecoveryFailed && hasEffectiveRecoveryCall) {
+      const toolResultMessages: ToolResultMessage[] = ctx.roundToolTraces.map((tr) => ({
         role: "toolResult",
         toolCallId: tr.toolCallId,
         toolName: tr.name,
@@ -1525,7 +1744,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         timestamp: Date.now(),
       }));
       return {
-        traces: [...this._roundToolTraces],
+        traces: [...ctx.roundToolTraces],
         toolResultMessages,
         llmText,
         llmMarkedUnsolvable: false,
@@ -1533,7 +1752,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     }
 
     // 云端模型未产出有效修复调用或出现流异常时，平滑回退到确定性修复步骤
-    const fallback = await this._executeDirectToolSteps(plan.steps, entry, signal);
+    const fallback = await this._executeDirectToolSteps(plan.steps, ctx, signal);
     return {
       traces: fallback.traces,
       toolResultMessages: fallback.toolResultMessages,
@@ -1736,7 +1955,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     this._config = nextConfig;
     this._systemOne?.reset();
     this._systemOne = SystemOneClient.fromConfig(this._config, this._systemOneFetcher);
-    if (!this._running) {
+    if (this._primaryCtx === null) {
       this._agent.state.thinkingLevel = this._config.thinkingLevel;
       if (providerOrModelChanged) {
         // 保留现有 UI timeline，但更新底层 Agent 的 model 配置
@@ -1812,29 +2031,30 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     };
   }
 
-  async prompt(
+  /**
+   * 非阻塞提交执行任务：立即记录时间线并投递到异步并发执行通道（绝不中断已有运行中的独立任务），
+   * 在任务执行第一步（Step 0）由 SystemOne 快速判定场景并派发简短应答词后再进入任何工具/LLM 执行。
+   */
+  submitPrompt(
     rawText: string,
     options: { source?: "text" | "voice"; voiceMeta?: VoicePromptMeta } = {},
-  ): Promise<PiAgentRunResult> {
+  ): PiAgentTaskSubmission {
     const text = rawText.trim();
     if (!text) {
       return {
-        ok: false,
+        accepted: false,
+        taskId: "",
         entryId: "",
         ack: "",
-        reply: "",
-        toolCalls: [],
-        error: "指令内容不能为空",
+        promise: Promise.resolve({
+          ok: false,
+          entryId: "",
+          ack: "",
+          reply: "",
+          toolCalls: [],
+          error: "指令内容不能为空",
+        }),
       };
-    }
-    if (this._running) {
-      // 等待上一轮尽快收敛，或中止后立即响应最新语音指令
-      this._turnAbortController?.abort();
-      this._agent.abort();
-      await this._agent.waitForIdle();
-      if (this._activeTurnDone) {
-        await this._activeTurnDone;
-      }
     }
 
     const source = options.source ?? "text";
@@ -1842,44 +2062,12 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       role: t.role,
       text: t.text,
     }));
-    let resolveTurnDone!: () => void;
-    const turnDone = new Promise<void>((resolve) => {
-      resolveTurnDone = resolve;
-    });
-    this._activeTurnDone = turnDone;
-
-    this._activeSource = source;
-    this._activePromptRawText = text;
-    this._activeVoiceMeta = options.voiceMeta ?? null;
-    this._speakCursor = 0;
-    this._rawStreamText = "";
-    this._inlineThinkSplitter.reset();
-    this._thinkingStreamedInMessage = false;
-    this._needsThinkingSeparator = false;
-    this._speakChunkState = { emittedAny: false };
-    this._suppressedSilent = false;
-    this._emittedSpeakChunks = false;
-    this._emittedAckSpeak = false;
-    this._activeAckText = TASK_ACK_TEXT;
-    this._emittedFinalSpeak = false;
-    this._holdReplyUntilVerified = false;
-    this._inCloudRecoveryTurn = false;
-    this._cloudRecoveryFailed = false;
-    this._bufferedPostToolText = "";
-    this._roundToolTraces = [];
-    this._roundToolArgs.clear();
-    this._turnAbortController = new AbortController();
-    this._turnUseLocalFastPath = false;
-    this._running = true;
-    this._lastError = null;
-
-    const retryNotices: AgentRetryNotice[] = [];
-    let retriesUsed = 0;
-    let ackSource: "systemone" | "fallback" | undefined;
+    const initialAckHint = resolveTaskAckPhrase(inferFallbackTaskAckScenario(text), text);
     const now = Date.now();
-
+    const taskId = `task_${now}_${++this._taskSeq}`;
     const userEntry: AgentTimelineEntry = {
       id: `msg_${now}_${++this._entrySeq}`,
+      taskId,
       role: "user",
       source,
       text,
@@ -1889,6 +2077,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     };
     const assistantEntry: AgentTimelineEntry = {
       id: `msg_${now}_${++this._entrySeq}`,
+      taskId,
       role: "assistant",
       source,
       text: "",
@@ -1911,22 +2100,131 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     if (this._timeline.length > 60) {
       this._timeline = this._timeline.slice(-60);
     }
-    this._activeAssistantEntry = assistantEntry;
+    this._lastError = null;
+
+    let resolvePromise!: (result: PiAgentRunResult) => void;
+    const promise = new Promise<PiAgentRunResult>((resolve) => {
+      resolvePromise = resolve;
+    });
+
+    const ctx: TaskRunContext = {
+      taskId,
+      entry: assistantEntry,
+      source,
+      rawText: text,
+      voiceMeta: options.voiceMeta ?? null,
+      priorHistory,
+      phase: "queued",
+      startedAt: now,
+      abortController: new AbortController(),
+      agent: null,
+      usesPrimaryAgent: false,
+      tools: this._tools,
+      unsubAgent: null,
+      seedHistoryLen: 0,
+      speakCursor: 0,
+      rawStreamText: "",
+      inlineThinkSplitter: new InlineThinkStreamSplitter(),
+      thinkingStreamedInMessage: false,
+      needsThinkingSeparator: false,
+      speakChunkState: { emittedAny: false },
+      suppressedSilent: false,
+      emittedSpeakChunks: false,
+      emittedAckSpeak: false,
+      ackText: "",
+      emittedFinalSpeak: false,
+      holdReplyUntilVerified: false,
+      inCloudRecoveryTurn: false,
+      cloudRecoveryFailed: false,
+      bufferedPostToolText: "",
+      roundToolTraces: [],
+      roundToolArgs: new Map<string, Record<string, unknown>>(),
+      useLocalFastPath: false,
+      resolvePromise,
+    };
+
+    if (this._activeTasks.size < MAX_CONCURRENT_TASKS) {
+      ctx.phase = "executing";
+      this._activeTasks.set(taskId, ctx);
+    } else {
+      ctx.phase = "queued";
+      this._queuedTasks.push(ctx);
+    }
     this.emit("stateChanged", this.snapshot());
 
-    const signal = this._turnAbortController.signal;
-    const isCloudLlm =
-      (this._config.provider !== "local" || Boolean(this._customStreamFn)) && !this._turnUseLocalFastPath;
+    if (ctx.phase === "executing") {
+      void this._executeTaskContext(ctx);
+    }
+
+    return {
+      accepted: true,
+      taskId,
+      entryId: assistantEntry.id,
+      ack: initialAckHint,
+      promise,
+    };
+  }
+
+  private _pumpQueuedTasks(): void {
+    while (this._activeTasks.size < MAX_CONCURRENT_TASKS && this._queuedTasks.length > 0) {
+      const next = this._queuedTasks.shift()!;
+      if (next.abortController.signal.aborted) {
+        next.entry.status = "aborted";
+        if (!next.entry.text) next.entry.text = "已取消等待中的任务。";
+        next.resolvePromise({
+          ok: false,
+          taskId: next.taskId,
+          entryId: next.entry.id,
+          ack: next.entry.ackText ?? TASK_ACK_TEXT,
+          reply: next.entry.text,
+          toolCalls: [],
+          streamedSpeakChunks: next.emittedSpeakChunks,
+        });
+        continue;
+      }
+      next.phase = "executing";
+      this._activeTasks.set(next.taskId, next);
+      this.emit("stateChanged", this.snapshot());
+      void this._executeTaskContext(next);
+    }
+  }
+
+  private async _executeTaskContext(ctx: TaskRunContext): Promise<void> {
+    const text = ctx.rawText;
+    const source = ctx.source;
+    const assistantEntry = ctx.entry;
+    const signal = ctx.abortController.signal;
+
+    // 独占空闲主 Agent，或为并发任务派生独立隔离 Agent（互不中断、互不污染上下文）
+    if (this._primaryCtx === null) {
+      this._flushPendingHistoryMerges();
+      this._primaryCtx = ctx;
+      ctx.usesPrimaryAgent = true;
+      ctx.agent = this._agent;
+      ctx.tools = this._tools;
+      this._agent.state.model = this._customModel ?? buildModelForConfig(this._config);
+      this._agent.state.thinkingLevel = this._config.thinkingLevel;
+    } else {
+      const scoped = this._createScopedAgent(ctx);
+      ctx.usesPrimaryAgent = false;
+      ctx.agent = scoped.agent;
+      ctx.tools = scoped.tools;
+      ctx.unsubAgent = scoped.unsub;
+      ctx.seedHistoryLen = scoped.seedHistoryLen;
+    }
+
+    const retryNotices: AgentRetryNotice[] = [];
+    let retriesUsed = 0;
 
     try {
       // Step 0：收到新输入后先由 SystemOne 快速判定场景并回复贴合语境的简短应答词，再进入任何匹配/执行步骤
-      const ackDecision = await this._resolveTaskAck(text, source, priorHistory, signal);
+      const ackDecision = await this._resolveTaskAck(text, source, ctx.priorHistory, signal);
       if (signal.aborted) {
         assistantEntry.status = "aborted";
         assistantEntry.text = "已中断当前操作。";
       } else {
-        ackSource = ackDecision.source;
-        this._activeAckText = ackDecision.text;
+        ctx.ackSource = ackDecision.source;
+        ctx.ackText = ackDecision.text;
         assistantEntry.ackText = ackDecision.text;
         assistantEntry.ackScenario = ackDecision.scenario;
         assistantEntry.taskUpdates?.push({
@@ -1937,6 +2235,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         });
         this.emit("streamEvent", {
           kind: "task_ack",
+          taskId: ctx.taskId,
           entryId: assistantEntry.id,
           text: ackDecision.text,
           scenario: ackDecision.scenario,
@@ -1944,9 +2243,15 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         });
         this.emit("stateChanged", this.snapshot());
         if (source === "voice" && this._config.autoSpeakReply) {
-          this._emittedAckSpeak = true;
-          this._emittedSpeakChunks = true;
-          this.emit("speakChunk", { entryId: assistantEntry.id, text: ackDecision.text, final: false });
+          ctx.emittedAckSpeak = true;
+          ctx.emittedSpeakChunks = true;
+          this.emit("speakChunk", {
+            entryId: assistantEntry.id,
+            taskId: ctx.taskId,
+            text: ackDecision.text,
+            final: false,
+            priority: "ack",
+          });
         }
       }
       let currentOutcome: TaskVerificationOutcome | null = null;
@@ -1967,9 +2272,10 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           ? candidateSkill
           : null;
       if (matchedSkill && !signal.aborted) {
-        this._holdReplyUntilVerified = true;
+        ctx.holdReplyUntilVerified = true;
         this.emit("streamEvent", {
           kind: "skill_matched",
+          taskId: ctx.taskId,
           entryId: assistantEntry.id,
           skill: {
             id: matchedSkill.id,
@@ -1978,8 +2284,10 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           },
         });
 
-        const skillExec = await this._executeDirectToolSteps(matchedSkill.steps, assistantEntry, signal);
+        const skillExec = await this._executeDirectToolSteps(matchedSkill.steps, ctx, signal);
         if (!signal.aborted) {
+          ctx.phase = "verifying";
+          this.emit("stateChanged", this.snapshot());
           const skillVerify = await verifyExecutedToolCalls(skillExec.traces, this._deps, {
             isCloudLlm: false,
           });
@@ -1987,6 +2295,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           assistantEntry.verification = toVerificationSummary(skillVerify, 0);
           this.emit("streamEvent", {
             kind: "verification_result",
+            taskId: ctx.taskId,
             entryId: assistantEntry.id,
             round: 0,
             verification: assistantEntry.verification,
@@ -2013,6 +2322,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             });
             this.emit("streamEvent", {
               kind: "skill_reused",
+              taskId: ctx.taskId,
               entryId: assistantEntry.id,
               skill: matchedSkill,
               skillEvent,
@@ -2022,45 +2332,49 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
               text,
               this._config.cavemanMode,
             );
-            assistantEntry.text = this._formatVerifiedReplyText(summaryText) || summaryText;
+            assistantEntry.text = this._formatVerifiedReplyText(ctx, summaryText) || summaryText;
           } else {
             initialPitfall = skillVerify.issues.map((i) => i.summary).join("；");
           }
         }
       }
 
-      // Step 2：常规执行（未命中技能时交由 Pi Agent 执行）
+      // Step 2：常规执行（未命中技能时交由本任务专属 Pi Agent 执行）
       if (!handledBySkill && !currentOutcome && !signal.aborted) {
-        await this._agent.prompt(text);
-        await this._agent.waitForIdle();
+        const activeAgent = ctx.agent!;
+        await activeAgent.prompt(text);
+        await activeAgent.waitForIdle();
 
         const effectiveCloudLlm =
-          (this._config.provider !== "local" || Boolean(this._customStreamFn)) && !this._turnUseLocalFastPath;
+          (this._config.provider !== "local" || Boolean(this._customStreamFn)) && !ctx.useLocalFastPath;
 
         const isFatalAgentState =
           assistantEntry.status === "error" || assistantEntry.status === "aborted";
 
         if (!isFatalAgentState && !signal.aborted) {
           // Step 3：执行完成后执行真实设备状态检查
-          currentOutcome = await verifyExecutedToolCalls(this._roundToolTraces, this._deps, {
+          ctx.phase = "verifying";
+          this.emit("stateChanged", this.snapshot());
+          currentOutcome = await verifyExecutedToolCalls(ctx.roundToolTraces, this._deps, {
             isCloudLlm: effectiveCloudLlm,
           });
           assistantEntry.verification = toVerificationSummary(currentOutcome, 0);
           this.emit("streamEvent", {
             kind: "verification_result",
+            taskId: ctx.taskId,
             entryId: assistantEntry.id,
             round: 0,
             verification: assistantEntry.verification,
           });
 
           if (currentOutcome.passed) {
-            if (this._holdReplyUntilVerified && this._bufferedPostToolText.trim()) {
-              assistantEntry.text = this._formatVerifiedReplyText(this._bufferedPostToolText);
+            if (ctx.holdReplyUntilVerified && ctx.bufferedPostToolText.trim()) {
+              assistantEntry.text = this._formatVerifiedReplyText(ctx, ctx.bufferedPostToolText);
             }
           } else if (!currentOutcome.solvable) {
             // 思考判断不可自动解决：不盲目空转重试，如实向用户说明原因
-            const buffered = this._bufferedPostToolText.trim()
-              ? this._formatVerifiedReplyText(this._bufferedPostToolText)
+            const buffered = ctx.bufferedPostToolText.trim()
+              ? this._formatVerifiedReplyText(ctx, ctx.bufferedPostToolText)
               : "";
             assistantEntry.text =
               buffered ||
@@ -2082,8 +2396,10 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         assistantEntry.status !== "aborted" &&
         !signal.aborted
       ) {
+        ctx.phase = "retrying";
+        this.emit("stateChanged", this.snapshot());
         const effectiveCloudLlm =
-          (this._config.provider !== "local" || Boolean(this._customStreamFn)) && !this._turnUseLocalFastPath;
+          (this._config.provider !== "local" || Boolean(this._customStreamFn)) && !ctx.useLocalFastPath;
 
         for (let attempt = 1; attempt <= MAX_RECOVERY_ROUNDS; attempt += 1) {
           if (signal.aborted) {
@@ -2129,16 +2445,19 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           });
           this.emit("streamEvent", {
             kind: "retry_notice",
+            taskId: ctx.taskId,
             entryId: assistantEntry.id,
             ...retryRecord,
           });
           this.emit("stateChanged", this.snapshot());
           if (source === "voice" && this._config.autoSpeakReply) {
-            this._emittedSpeakChunks = true;
+            ctx.emittedSpeakChunks = true;
             this.emit("speakChunk", {
               entryId: assistantEntry.id,
+              taskId: ctx.taskId,
               text: plan.noticeText,
               final: false,
+              priority: "normal",
             });
           }
 
@@ -2148,7 +2467,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           let llmRecoveryText = "";
 
           if (effectiveCloudLlm) {
-            const cloudAttempt = await this._runCloudLlmRecovery(plan, assistantEntry, signal);
+            const cloudAttempt = await this._runCloudLlmRecovery(plan, ctx, signal);
             if (cloudAttempt.llmMarkedUnsolvable) {
               currentOutcome = {
                 ...currentOutcome,
@@ -2163,7 +2482,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             attemptToolMsgs = cloudAttempt.toolResultMessages;
             llmRecoveryText = cloudAttempt.llmText;
           } else {
-            const directAttempt = await this._executeDirectToolSteps(plan.steps, assistantEntry, signal);
+            const directAttempt = await this._executeDirectToolSteps(plan.steps, ctx, signal);
             attemptTraces = directAttempt.traces;
             attemptToolMsgs = directAttempt.toolResultMessages;
           }
@@ -2175,12 +2494,14 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           }
 
           // 修复完成后再次执行状态检查
+          ctx.phase = "verifying";
           currentOutcome = await verifyExecutedToolCalls(attemptTraces, this._deps, {
             isCloudLlm: effectiveCloudLlm,
           });
           assistantEntry.verification = toVerificationSummary(currentOutcome, retriesUsed);
           this.emit("streamEvent", {
             kind: "verification_result",
+            taskId: ctx.taskId,
             entryId: assistantEntry.id,
             round: attempt,
             verification: assistantEntry.verification,
@@ -2240,6 +2561,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
               });
               this.emit("streamEvent", {
                 kind: "skill_saved",
+                taskId: ctx.taskId,
                 entryId: assistantEntry.id,
                 skill: savedSkill,
                 created: skillCreated,
@@ -2248,8 +2570,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             }
 
             const baseReply =
-              (llmRecoveryText ? this._formatVerifiedReplyText(llmRecoveryText) : "") ||
+              (llmRecoveryText ? this._formatVerifiedReplyText(ctx, llmRecoveryText) : "") ||
               this._formatVerifiedReplyText(
+                ctx,
                 summarizeToolResults(attemptToolMsgs, text, this._config.cavemanMode),
               ) ||
               summarizeToolResults(attemptToolMsgs, text, this._config.cavemanMode);
@@ -2264,6 +2587,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             assistantEntry.text = `已中止重试，原因无法自动解决：${currentOutcome.issues.map((i) => i.summary).join("；")}。`;
             break;
           }
+          ctx.phase = "retrying";
         }
 
         // 3 轮重试后仍未能解决：如实告诉用户具体问题
@@ -2280,16 +2604,21 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         }
       }
 
-      if (assistantEntry.status === "streaming") {
+      if (signal.aborted && assistantEntry.status === "streaming") {
+        assistantEntry.status = "aborted";
+        if (!assistantEntry.text) {
+          assistantEntry.text = "已中断当前操作。";
+        }
+      } else if (assistantEntry.status === "streaming") {
         assistantEntry.status = "done";
       }
 
-      if (!this._suppressedSilent) {
+      if (!ctx.suppressedSilent) {
         if (!assistantEntry.text.trim()) {
           if (assistantEntry.error) {
             assistantEntry.text = assistantEntry.error;
-          } else if (this._bufferedPostToolText.trim()) {
-            assistantEntry.text = this._formatVerifiedReplyText(this._bufferedPostToolText);
+          } else if (ctx.bufferedPostToolText.trim()) {
+            assistantEntry.text = this._formatVerifiedReplyText(ctx, ctx.bufferedPostToolText);
           } else if (assistantEntry.toolCalls.length > 0) {
             assistantEntry.text = assistantEntry.toolCalls
               .map((t) => t.summary)
@@ -2300,9 +2629,10 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           }
         }
 
-        this._finishThinkingPhase(assistantEntry);
+        this._finishThinkingPhase(ctx);
         this.emit("streamEvent", {
           kind: "final_reply",
+          taskId: ctx.taskId,
           entryId: assistantEntry.id,
           text: assistantEntry.text,
           ...(assistantEntry.thinking?.trim() ? { thinking: assistantEntry.thinking } : {}),
@@ -2311,7 +2641,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           skillEvent: assistantEntry.skillEvent,
         });
         if (assistantEntry.status !== "aborted") {
-          this._emitVerifiedFinalVoiceChunk(assistantEntry);
+          this._emitVerifiedFinalVoiceChunk(ctx);
         }
       }
     } catch (err) {
@@ -2322,44 +2652,44 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       this._lastError = assistantEntry.error;
     } finally {
       assistantEntry.thinkingActive = false;
-      const streamedChunks = this._emittedSpeakChunks;
-      this._running = false;
-      this._turnUseLocalFastPath = false;
-      this._holdReplyUntilVerified = false;
-      this._inCloudRecoveryTurn = false;
-      this._cloudRecoveryFailed = false;
-      this._bufferedPostToolText = "";
-      this._inlineThinkSplitter.reset();
-      this._thinkingStreamedInMessage = false;
-      this._needsThinkingSeparator = false;
-      this._roundToolTraces = [];
-      this._roundToolArgs.clear();
-      this._turnAbortController = null;
-      this._activeAssistantEntry = null;
-      this._activePromptRawText = "";
-      this._activeVoiceMeta = null;
-      this._activeAckText = TASK_ACK_TEXT;
-      if (this._activeTurnDone === turnDone) {
-        this._activeTurnDone = null;
+      ctx.inlineThinkSplitter.reset();
+      // 合并并发隔离 Agent 的已完成对话消息回主历史，保证后续多轮指代连续性
+      if (!ctx.usesPrimaryAgent && ctx.agent) {
+        ctx.unsubAgent?.();
+        ctx.unsubAgent = null;
+        if (assistantEntry.status === "done") {
+          const addedMsgs = ctx.agent.state.messages.slice(ctx.seedHistoryLen);
+          if (addedMsgs.length > 0) {
+            this._pendingHistoryMerges.push(...addedMsgs);
+          }
+        }
       }
-      resolveTurnDone();
+      if (this._primaryCtx === ctx) {
+        this._primaryCtx = null;
+        this._flushPendingHistoryMerges();
+      } else {
+        this._flushPendingHistoryMerges();
+      }
+      this._activeTasks.delete(ctx.taskId);
       this.emit("stateChanged", this.snapshot());
       this.emit("replyFinished", {
         entryId: assistantEntry.id,
+        taskId: ctx.taskId,
         text: assistantEntry.text,
-        source: this._activeSource,
+        source: ctx.source,
         ok: assistantEntry.status === "done",
       });
-      this._emittedSpeakChunks = streamedChunks;
+      this._pumpQueuedTasks();
     }
 
     const trimmedThinking = assistantEntry.thinking?.trim();
-    return {
+    ctx.resolvePromise({
       ok: assistantEntry.status === "done",
+      taskId: ctx.taskId,
       entryId: assistantEntry.id,
       ack: assistantEntry.ackText ?? (assistantEntry.status === "aborted" ? "" : TASK_ACK_TEXT),
       ...(assistantEntry.ackScenario ? { ackScenario: assistantEntry.ackScenario } : {}),
-      ...(ackSource ? { ackSource } : {}),
+      ...(ctx.ackSource ? { ackSource: ctx.ackSource } : {}),
       reply: assistantEntry.text,
       ...(trimmedThinking ? { thinking: trimmedThinking } : {}),
       ...(assistantEntry.thinkingLevel ? { thinkingLevel: assistantEntry.thinkingLevel } : {}),
@@ -2368,29 +2698,81 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       ...(retryNotices.length > 0 ? { retryNotices } : {}),
       verification: assistantEntry.verification ?? null,
       ...(assistantEntry.skillEvent ? { skillEvent: { ...assistantEntry.skillEvent } } : {}),
-      streamedSpeakChunks: this._emittedSpeakChunks,
+      streamedSpeakChunks: ctx.emittedSpeakChunks,
       ...(assistantEntry.error ? { error: assistantEntry.error } : {}),
-    };
+    });
+  }
+
+  async prompt(
+    rawText: string,
+    options: { source?: "text" | "voice"; voiceMeta?: VoicePromptMeta } = {},
+  ): Promise<PiAgentRunResult> {
+    return this.submitPrompt(rawText, options).promise;
+  }
+
+  abortTask(taskId: string): boolean {
+    const active = this._activeTasks.get(taskId);
+    if (active) {
+      active.abortController.abort();
+      active.agent?.abort();
+      return true;
+    }
+    const qIdx = this._queuedTasks.findIndex((t) => t.taskId === taskId);
+    if (qIdx >= 0) {
+      const [removed] = this._queuedTasks.splice(qIdx, 1);
+      if (removed) {
+        removed.abortController.abort();
+        removed.entry.status = "aborted";
+        if (!removed.entry.text) removed.entry.text = "已取消等待中的任务。";
+        removed.resolvePromise({
+          ok: false,
+          taskId: removed.taskId,
+          entryId: removed.entry.id,
+          ack: removed.entry.ackText ?? TASK_ACK_TEXT,
+          reply: removed.entry.text,
+          toolCalls: [],
+          streamedSpeakChunks: removed.emittedSpeakChunks,
+        });
+        this.emit("stateChanged", this.snapshot());
+      }
+      return true;
+    }
+    return false;
   }
 
   abort(): boolean {
-    if (!this._running) {
+    if (!this.running) {
       return false;
     }
-    this._turnAbortController?.abort();
-    this._agent.abort();
+    for (const ctx of this._activeTasks.values()) {
+      ctx.abortController.abort();
+      ctx.agent?.abort();
+    }
+    while (this._queuedTasks.length > 0) {
+      const queued = this._queuedTasks.shift()!;
+      queued.abortController.abort();
+      queued.entry.status = "aborted";
+      if (!queued.entry.text) queued.entry.text = "已取消等待中的任务。";
+      queued.resolvePromise({
+        ok: false,
+        taskId: queued.taskId,
+        entryId: queued.entry.id,
+        ack: queued.entry.ackText ?? TASK_ACK_TEXT,
+        reply: queued.entry.text,
+        toolCalls: [],
+        streamedSpeakChunks: queued.emittedSpeakChunks,
+      });
+    }
+    this.emit("stateChanged", this.snapshot());
     return true;
   }
 
   reset(): void {
-    if (this._running) {
-      this._turnAbortController?.abort();
-      this._agent.abort();
-    }
+    this.abort();
     this._agent.reset();
+    this._pendingHistoryMerges = [];
     this._timeline = [];
     this._lastError = null;
-    this._activeAssistantEntry = null;
     this.emit("stateChanged", this.snapshot());
   }
 
@@ -2404,8 +2786,11 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     const customInstructionConflicts = Object.fromEntries(
       detectCustomInstructionConflicts(customInstructions).entries(),
     );
+    const activeTasks = this.getActiveTasks();
     return {
-      running: this._running,
+      running: activeTasks.length > 0,
+      activeTaskCount: activeTasks.length,
+      activeTasks,
       provider: this._config.provider,
       providerLabel,
       modelId: this._customModel?.id ?? (this._config.modelId || preset.defaultModel),
@@ -2440,10 +2825,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   }
 
   dispose(): void {
-    if (this._running) {
-      this._turnAbortController?.abort();
-      this._agent.abort();
-    }
+    this.abort();
     this._unsubAgent?.();
     this._unsubAgent = null;
     this.clear();

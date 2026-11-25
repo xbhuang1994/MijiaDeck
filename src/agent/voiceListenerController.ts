@@ -12,6 +12,7 @@ import {
   resolveEffectiveSttAuth,
   type AgentVoiceConfig,
   type CavemanReplyMode,
+  type EchoCancellationMode,
 } from "../core/agentConfigStore.ts";
 import { TypedEmitter } from "../core/contracts.ts";
 import { createBoundedFetch, type FetchLike } from "../core/httpTimeout.ts";
@@ -21,6 +22,7 @@ import {
   formatExitConversationAck,
   resolveWakeAckReply,
 } from "./cavemanReplyPolicy.ts";
+import { TtsEchoGuard } from "./echoGuard.ts";
 import { LocalVoiceEngine, type LocalVoiceEngineStatus } from "./localVoiceEngine.ts";
 import type {
   OpenWakeWordBootstrapResult,
@@ -28,7 +30,12 @@ import type {
   OpenWakeWordEnrollResult,
   WakeWordAcousticHit,
 } from "./openWakeWordEngine.ts";
-import type { AgentToolCallRecord, PiAgentRunResult, PiAgentService } from "./piAgentService.ts";
+import type {
+  AgentActiveTask,
+  AgentToolCallRecord,
+  PiAgentRunResult,
+  PiAgentService,
+} from "./piAgentService.ts";
 import {
   splitStreamingSentences,
   stripCommittedPrefix,
@@ -113,6 +120,36 @@ export interface VoiceLastMetrics {
   updatedAt: number;
 }
 
+export interface VoiceRuntimeLanes {
+  conversation: {
+    active: boolean;
+    dialogState: VoiceDialogState;
+    speechActive: boolean;
+    fullDuplex: boolean;
+  };
+  execution: {
+    active: boolean;
+    activeCount: number;
+    tasks: AgentActiveTask[];
+  };
+  speaking: {
+    active: boolean;
+    utteranceId: string | null;
+    text: string | null;
+    queueLength: number;
+    ducked: boolean;
+  };
+  echo: {
+    mode: EchoCancellationMode;
+    activeAec: boolean;
+    erleDb: number;
+    doubleTalkActive: boolean;
+    suppressedCount: number;
+    strippedCount: number;
+    activeTtsUtterances: number;
+  };
+}
+
 export interface VoiceListenerSnapshot {
   active: boolean;
   mode: VoiceListenMode;
@@ -126,9 +163,15 @@ export interface VoiceListenerSnapshot {
   consecutiveSidetalkCount: number;
   lastTransitionReason: string | null;
   engine: VoiceRuntimeEngine;
+  voicePipelineMode: AgentVoiceConfig["voicePipelineMode"];
+  clearVoiceServiceUrl: string;
   localAsrEngine: AgentVoiceConfig["localAsrEngine"];
   qwen3ComputeDevice: AgentVoiceConfig["qwen3ComputeDevice"];
   qwen3StreamingEnabled: boolean;
+  asyncVoicePipeline: boolean;
+  echoCancellationMode: EchoCancellationMode;
+  bargeInDuckingEnabled: boolean;
+  lanes: VoiceRuntimeLanes;
   interimTranscript: string;
   lastTranscript: string;
   lastCommand: string;
@@ -182,12 +225,19 @@ export interface HandleTranscriptOptions {
   timingsBase?: Partial<VoicePipelineTimings>;
   llmAttentionOverride?: AttentionLlmEvaluator;
   precomputedAttention?: AttentionDecision;
+  /** 开启异步非阻塞派发：命令确认后立即投递后台执行并返回，不阻塞语音监听与后续对话 */
+  asyncDispatch?: boolean;
+  /** 音频是否在 TTS 播报期间或刚结束的回声尾窗内采集 */
+  duringTtsPlayback?: boolean;
 }
 
 export interface HandleTranscriptResult {
   ok: boolean;
   matched: boolean;
   wokeOnly: boolean;
+  dispatchedAsync?: boolean;
+  taskId?: string;
+  entryId?: string;
   command: string;
   reply?: string;
   toolCalls?: AgentToolCallRecord[];
@@ -215,14 +265,31 @@ export interface ProcessAudioUploadResult extends HandleTranscriptResult {
   separatedStreams?: SeparatedAudioStreamInfo[];
 }
 
+export interface SpeakRequestMeta {
+  utteranceId?: string;
+  priority?: "ack" | "normal" | "result" | "system";
+  taskId?: string;
+  interrupt?: boolean;
+}
+
 export type VoiceListenerEvents = {
   stateChanged: [VoiceListenerSnapshot];
-  speakRequested: [string];
-  speakChunkRequested: [{ text: string; final: boolean }];
+  speakRequested: [string, SpeakRequestMeta?];
+  speakChunkRequested: [
+    {
+      text: string;
+      final: boolean;
+      utteranceId?: string;
+      priority?: "ack" | "normal" | "result" | "system";
+      taskId?: string;
+    },
+  ];
 };
 
 const LEADING_PUNCT_RE = /^[\s,，。．.、!！?？:：;；\-—~～]+/;
 const TRAILING_PUNCT_RE = /[\s,，。．.、!！?？:：;；]+$/;
+const CANCEL_RUNNING_TASK_RE =
+  /^(?:停止执行|取消执行|取消任务|取消刚才的任务|取消刚才的操作|别执行了|不要执行了|停止刚才的操作|停止任务)$/i;
 const MAX_SPEECH_GRACE_MS = 3500;
 const CONTINUOUS_VAD_STALE_MS = 5000;
 const TTS_PAUSE_WATCHDOG_MS = 30_000;
@@ -278,6 +345,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   private readonly _agent: PiAgentService;
   private readonly _fetcher: FetchLike;
   private readonly _localEngine: LocalVoiceEngine;
+  private readonly _echoGuard = new TtsEchoGuard();
   private readonly _unsubAgentSpeak: () => void;
 
   private _active = false;
@@ -324,13 +392,20 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._localEngine = options.localEngine ?? new LocalVoiceEngine();
     this._localEngine.setPreferredAsrEngine?.(this.config.localAsrEngine);
     this._localEngine.setQwen3ComputeDevice?.(this.config.qwen3ComputeDevice);
+    this._localEngine.setClearVoiceServiceUrl?.(this.config.clearVoiceServiceUrl);
     this._engine = this._localEngine.getStatus().readyForLocalAsr ? "local" : "browser";
 
-    // 转发 Pi Agent 流式分句语音播报事件，并记录用于自回声抑制
-    this._unsubAgentSpeak = this._agent.on("speakChunk", ({ text, final }) => {
+    // 转发 Pi Agent 流式分句语音播报事件，并登记到多语段回声账本（带唯一 utteranceId 供前后端精准对齐）
+    this._unsubAgentSpeak = this._agent.on("speakChunk", ({ text, final, taskId, priority }) => {
       if (!this.config.autoSpeakReply) return;
-      this._recordSpoken(text);
-      this.emit("speakChunkRequested", { text, final });
+      const rec = this._recordSpoken(text, Date.now(), { priority, taskId });
+      this.emit("speakChunkRequested", {
+        text,
+        final,
+        utteranceId: rec?.id,
+        priority,
+        taskId,
+      });
     });
   }
 
@@ -340,6 +415,10 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
 
   get localEngine(): LocalVoiceEngine {
     return this._localEngine;
+  }
+
+  get echoGuard(): TtsEchoGuard {
+    return this._echoGuard;
   }
 
   get dialogState(): VoiceDialogState {
@@ -510,8 +589,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const snap = this.snapshot();
     this.emit("stateChanged", snap);
     if (willSpeakAck) {
-      this._recordSpoken(ack, now);
-      this.emit("speakRequested", ack);
+      const rec = this._recordSpoken(ack, now, { priority: "ack" });
+      this.emit("speakRequested", ack, {
+        utteranceId: rec?.id,
+        priority: "ack",
+        interrupt: false,
+      });
     }
     return snap;
   }
@@ -548,8 +631,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this.emit("stateChanged", snap);
     if (options.speakAck && cfg.autoSpeakReply) {
       const ack = formatExitConversationAck(cfg.cavemanMode);
-      this._recordSpoken(ack, now);
-      this.emit("speakRequested", ack);
+      const rec = this._recordSpoken(ack, now, { priority: "system" });
+      this.emit("speakRequested", ack, {
+        utteranceId: rec?.id,
+        priority: "system",
+        interrupt: true,
+      });
     }
     return snap;
   }
@@ -674,15 +761,60 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._lastWakeHit = { ...hit, timestamp: Date.now() };
   }
 
-  private _recordSpoken(text: string, now = Date.now()): void {
+  /**
+   * 接收前端播报通道与实时 AEC 回声消除状态同步（解耦于对话通道，绝不覆盖 dialogState）。
+   */
+  handleTtsClientState(patch: {
+    speaking?: boolean;
+    phase?: "start" | "end" | "cancel" | "duck" | "unduck" | "telemetry";
+    utteranceId?: string | null;
+    text?: string | null;
+    queueLength?: number;
+    ducked?: boolean;
+    aecActive?: boolean;
+    erleDb?: number;
+    doubleTalk?: boolean;
+  }): void {
+    const prevSpeaking = this._echoGuard.isSpeaking;
+    const prevDucked = this._echoGuard.clientDucked;
+    const prevUtterance = this._echoGuard.activeUtteranceId;
+    const prevAec = this._echoGuard.aecActive;
+    const prevDt = this._echoGuard.doubleTalkActive;
+
+    this._echoGuard.updateClientPlaybackState(patch);
+    if (typeof patch.speaking === "boolean") {
+      this.setTtsSpeaking(patch.speaking);
+    }
+
+    const changed =
+      prevSpeaking !== this._echoGuard.isSpeaking ||
+      prevDucked !== this._echoGuard.clientDucked ||
+      prevUtterance !== this._echoGuard.activeUtteranceId ||
+      prevAec !== this._echoGuard.aecActive ||
+      prevDt !== this._echoGuard.doubleTalkActive;
+    if (changed) {
+      this.emit("stateChanged", this.snapshot());
+    }
+  }
+
+  private _recordSpoken(
+    text: string,
+    now = Date.now(),
+    meta?: { priority?: "ack" | "normal" | "result" | "system"; taskId?: string },
+  ) {
     const t = text.trim();
-    if (!t) return;
+    if (!t) return null;
     if (now >= this._lastSpokenAt && now - this._lastSpokenAt < 3500 && this._lastSpokenReply.length < 300) {
       this._lastSpokenReply = `${this._lastSpokenReply} ${t}`.trim();
     } else {
       this._lastSpokenReply = t;
     }
     this._lastSpokenAt = now;
+    return this._echoGuard.registerUtterance(t, {
+      now,
+      priority: meta?.priority,
+      taskId: meta?.taskId,
+    });
   }
 
   private _normalizeDedupText(raw: string): string {
@@ -726,6 +858,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   }): VoiceListenerSnapshot {
     this._localEngine.setPreferredAsrEngine?.(this.config.localAsrEngine);
     this._localEngine.setQwen3ComputeDevice?.(this.config.qwen3ComputeDevice);
+    this._localEngine.setClearVoiceServiceUrl?.(this.config.clearVoiceServiceUrl);
     if (patch.active !== undefined) {
       this._active = Boolean(patch.active);
       if (!this._active) {
@@ -760,6 +893,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           preloadEnglish: hasAsciiWake,
           localAsrEngine: this.config.localAsrEngine,
           qwen3ComputeDevice: this.config.qwen3ComputeDevice,
+          voicePipelineMode: this.config.voicePipelineMode,
         });
         if (this.config.sourceSeparationMode !== "off") {
           void this._localEngine.sourceSeparator.warmupAsync().catch(() => {});
@@ -916,6 +1050,11 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       this._lastWakeHit = { ...options.acousticWake, timestamp: now };
     }
 
+    const legacySpoken = this._echoGuard.getLegacyLastSpoken(now);
+    const recentSpokenUtterances = this._echoGuard.getRecentUtterances(now);
+    const ttsActiveNow = this._echoGuard.isSpeaking;
+    const duringTtsPlayback = options.duringTtsPlayback ?? ttsActiveNow;
+
     const decision =
       options.precomputedAttention ??
       (await evaluateVoiceAttention({
@@ -932,14 +1071,24 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         owwActiveForWord,
         systemOneClient: this._agent.systemOneClient,
         recentTurns: this._agent.recentConversationTurns(5),
-        lastSpokenReply: this._lastSpokenReply,
-        lastSpokenAt: this._lastSpokenAt,
+        lastSpokenReply: legacySpoken.text || this._lastSpokenReply,
+        lastSpokenAt: legacySpoken.at || this._lastSpokenAt,
+        recentSpokenUtterances,
+        ttsActive: ttsActiveNow,
+        duringTtsPlayback,
+        echoCancellationMode: cfg.echoCancellationMode,
         now,
         acousticEvent: options.acousticEvent,
         voiceprint: options.voiceprint,
         voiceprintMode: cfg.voiceprintMode,
         llmEvaluator,
       }));
+
+    if (decision.stage === "echo") {
+      this._echoGuard.recordSuppressed();
+    } else if (decision.echoStripped) {
+      this._echoGuard.recordStripped();
+    }
 
     const preMs =
       (options.timingsBase?.denoiseMs ?? 0) +
@@ -1097,8 +1246,42 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       };
     }
 
-    // 确认在呼叫/对话：进入 Pi Agent 工具执行循环
+    // 确认在呼叫/对话：若用户明确要求取消当前后台执行任务，直接中止执行通道，不阻塞对话
+    const normalizedCancelCmd = decision.command
+      .replace(LEADING_PUNCT_RE, "")
+      .replace(TRAILING_PUNCT_RE, "")
+      .trim();
+    if (this._agent.activeTaskCount > 0 && CANCEL_RUNNING_TASK_RE.test(normalizedCancelCmd)) {
+      this._agent.abort();
+      const cancelReply = "已取消正在执行的任务";
+      entry.reply = cancelReply;
+      const cancelSnap = this.snapshot();
+      this.emit("stateChanged", cancelSnap);
+      if (cfg.autoSpeakReply) {
+        const rec = this._recordSpoken(cancelReply, now, { priority: "system" });
+        this.emit("speakRequested", cancelReply, {
+          utteranceId: rec?.id,
+          priority: "system",
+          interrupt: true,
+        });
+      }
+      return {
+        ok: true,
+        matched: true,
+        wokeOnly: false,
+        command: decision.command,
+        reply: cancelReply,
+        attention: decision,
+        voiceprint: options.voiceprint,
+        acousticWake: options.acousticWake ?? null,
+        timings,
+        voiceState: cancelSnap,
+      };
+    }
+
+    // 确认在呼叫/对话：进入异步解耦的 Pi Agent 执行通道（支持非阻塞投递，对话与播报持续畅通）
     const commandEpoch = this._dialogEpoch;
+    const useAsyncDispatch = Boolean(options.asyncDispatch && cfg.asyncVoicePipeline !== false);
     this._consecutiveSidetalkCount = 0;
     this._consecutiveAmbientNoiseCount = 0;
     this._speechGraceSuppressed = false;
@@ -1108,11 +1291,28 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._lastDispatchedAt = now;
     this._lastDispatchedCompletedAt = 0;
     this._lastCommand = decision.command;
-    this._mode = "processing";
-    this.emit("stateChanged", this.snapshot());
+
+    // 立即维持/刷新连续对话窗口：即便任务在后台执行，用户也无需重复喊唤醒词即可继续对话
+    if (cfg.conversationWindowSec > 0) {
+      const convMs = cfg.conversationWindowSec * 1000;
+      this._dialogState = "conversation";
+      this._lastTransitionReason = useAsyncDispatch ? "command_dispatched_async" : "command_running";
+      const nextUntil = Date.now() + convMs;
+      this._conversationUntil = nextUntil;
+      this._remainingConversationMs = convMs;
+      this._setConversationDeadlines(nextUntil, true);
+      this._armConversationTimer(convMs, this._dialogEpoch);
+    }
+
+    if (useAsyncDispatch) {
+      this._mode =
+        this._dialogState === "conversation" ? "awake" : this._active ? "listening" : "idle";
+    } else {
+      this._mode = "processing";
+    }
 
     const agentStart = performance.now();
-    const runResult: PiAgentRunResult = await this._agent.prompt(decision.command, {
+    const submission = this._agent.submitPrompt(decision.command, {
       source: "voice",
       voiceMeta: {
         speakerName: options.voiceprint?.speakerName ?? null,
@@ -1123,74 +1323,126 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         ...(decision.intent ? { intent: decision.intent } : {}),
       },
     });
-    const agentMs = Math.round(performance.now() - agentStart);
-    this._lastDispatchedCompletedAt =
-      options.now !== undefined ? Math.max(now, now + agentMs) : Date.now();
+    this.emit("stateChanged", this.snapshot());
 
-    timings.agentMs = agentMs;
-    timings.totalMs = Math.round(
-      (options.timingsBase?.denoiseMs ?? 0) +
-        (options.timingsBase?.vadMs ?? 0) +
-        (options.timingsBase?.voiceprintMs ?? 0) +
-        (options.timingsBase?.asrMs ?? 0) +
-        (timings.attentionMs ?? 0) +
-        agentMs,
-    );
-    entry.timings = timings;
-    entry.reply = runResult.reply;
-    if (runResult.error) {
-      entry.error = runResult.error;
-    }
+    const finalizeRunResult = (runResult: PiAgentRunResult): VoiceListenerSnapshot => {
+      const agentMs = Math.round(performance.now() - agentStart);
+      this._lastDispatchedCompletedAt =
+        options.now !== undefined ? Math.max(now, now + agentMs) : Date.now();
 
-    // 执行完成后若 epoch 未被手动退出打断，则维护双状态机连续对话窗口
-    if (commandEpoch === this._dialogEpoch) {
-      if (cfg.conversationWindowSec > 0 && runResult.ok) {
-        const convMs = cfg.conversationWindowSec * 1000;
-        this._dialogState = "conversation";
-        this._consecutiveSidetalkCount = 0;
-        this._consecutiveAmbientNoiseCount = 0;
-        this._speechGraceSuppressed = false;
-        this._lastTransitionReason = "command_done";
-        const nextUntil = Date.now() + convMs;
-        this._conversationUntil = nextUntil;
-        this._remainingConversationMs = convMs;
-        this._setConversationDeadlines(nextUntil, true);
-        this._armConversationTimer(convMs, this._dialogEpoch);
-      } else if (cfg.conversationWindowSec <= 0) {
-        this._dialogState = "standby";
-        this._conversationUntil = null;
-        this._conversationBaseUntil = null;
-        this._conversationHardUntil = null;
-        this._remainingConversationMs = 0;
-        this._consecutiveAmbientNoiseCount = 0;
-        this._speechGraceSuppressed = false;
-        this._clearConversationTimer();
-        this._clearTtsPauseWatchdog();
-        this._lastTransitionReason = "command_done_no_window";
+      timings.agentMs = agentMs;
+      timings.totalMs = Math.round(
+        (options.timingsBase?.denoiseMs ?? 0) +
+          (options.timingsBase?.vadMs ?? 0) +
+          (options.timingsBase?.voiceprintMs ?? 0) +
+          (options.timingsBase?.asrMs ?? 0) +
+          (timings.attentionMs ?? 0) +
+          agentMs,
+      );
+      entry.timings = timings;
+      entry.reply = runResult.reply;
+      if (runResult.error) {
+        entry.error = runResult.error;
       }
-      this._mode = this._active ? "listening" : "idle";
-    }
 
-    this._lastMetrics = {
-      ...(this._lastMetrics ?? {}),
-      attention: decision,
-      timings,
-      updatedAt: Date.now(),
+      // 执行完成后若 epoch 未被手动退出打断，刷新连续对话窗口且绝不抢占其他仍在进行中的后台任务状态
+      if (commandEpoch === this._dialogEpoch) {
+        if (cfg.conversationWindowSec > 0 && runResult.ok) {
+          const convMs = cfg.conversationWindowSec * 1000;
+          this._dialogState = "conversation";
+          this._consecutiveSidetalkCount = 0;
+          this._consecutiveAmbientNoiseCount = 0;
+          this._speechGraceSuppressed = false;
+          this._lastTransitionReason = "command_done";
+          const nextUntil = Date.now() + convMs;
+          this._conversationUntil = nextUntil;
+          this._remainingConversationMs = convMs;
+          this._setConversationDeadlines(nextUntil, true);
+          this._armConversationTimer(convMs, this._dialogEpoch);
+        } else if (cfg.conversationWindowSec <= 0 && this._agent.activeTaskCount === 0) {
+          this._dialogState = "standby";
+          this._conversationUntil = null;
+          this._conversationBaseUntil = null;
+          this._conversationHardUntil = null;
+          this._remainingConversationMs = 0;
+          this._consecutiveAmbientNoiseCount = 0;
+          this._speechGraceSuppressed = false;
+          this._clearConversationTimer();
+          this._clearTtsPauseWatchdog();
+          this._lastTransitionReason = "command_done_no_window";
+        }
+        if (this._agent.activeTaskCount === 0) {
+          this._mode = this._active
+            ? useAsyncDispatch && this._dialogState === "conversation"
+              ? "awake"
+              : "listening"
+            : "idle";
+        }
+      }
+
+      this._lastMetrics = {
+        ...(this._lastMetrics ?? {}),
+        attention: decision,
+        timings,
+        updatedAt: Date.now(),
+      };
+      const finalSnap = this.snapshot();
+      this.emit("stateChanged", finalSnap);
+
+      if (cfg.autoSpeakReply && runResult.reply && !runResult.streamedSpeakChunks) {
+        const rec = this._recordSpoken(runResult.reply, Date.now(), {
+          priority: "result",
+          taskId: runResult.taskId,
+        });
+        this.emit("speakRequested", runResult.reply, {
+          utteranceId: rec?.id,
+          priority: "result",
+          taskId: runResult.taskId,
+          interrupt: false,
+        });
+      }
+      return finalSnap;
     };
-    const finalSnap = this.snapshot();
-    this.emit("stateChanged", finalSnap);
 
-    if (cfg.autoSpeakReply && runResult.reply) {
-      this._recordSpoken(runResult.reply);
-      if (!runResult.streamedSpeakChunks) {
-        this.emit("speakRequested", runResult.reply);
-      }
+    if (useAsyncDispatch) {
+      entry.reply = submission.ack;
+      void submission.promise
+        .then((runResult) => {
+          finalizeRunResult(runResult);
+        })
+        .catch((err) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          entry.error = msg;
+          this.emit("stateChanged", this.snapshot());
+        });
+
+      const dispatchedSnap = this.snapshot();
+      return {
+        ok: true,
+        matched: true,
+        wokeOnly: false,
+        dispatchedAsync: true,
+        taskId: submission.taskId,
+        entryId: submission.entryId,
+        command: decision.command,
+        reply: submission.ack,
+        attention: decision,
+        voiceprint: options.voiceprint,
+        acousticWake: options.acousticWake ?? null,
+        timings,
+        voiceState: dispatchedSnap,
+      };
     }
+
+    const runResult: PiAgentRunResult = await submission.promise;
+    const finalSnap = finalizeRunResult(runResult);
 
     return {
       ok: runResult.ok,
       matched: true,
       wokeOnly: false,
+      taskId: runResult.taskId,
+      entryId: runResult.entryId,
       command: decision.command,
       reply: runResult.reply,
       toolCalls: runResult.toolCalls,
@@ -1217,6 +1469,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       autoDispatch?: boolean;
       preferredEngine?: "auto" | "local" | "whisper";
       llmAttentionOverride?: AttentionLlmEvaluator;
+      asyncDispatch?: boolean;
+      duringTtsPlayback?: boolean;
     } = {},
   ): Promise<ProcessAudioUploadResult> {
     const totalStart = performance.now();
@@ -1251,6 +1505,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         engine: "whisper",
         timingsBase: { asrMs },
         llmAttentionOverride: options.llmAttentionOverride,
+        asyncDispatch: options.asyncDispatch,
+        duringTtsPlayback: options.duringTtsPlayback,
       });
       return {
         ...dispatched,
@@ -1272,6 +1528,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     // ---- Stage 1.5: 本地自适应多级声源分离与说话人隔离主通道（S_Fused 最终方案） ----
     this._localEngine.setPreferredAsrEngine?.(cfg.localAsrEngine);
     this._localEngine.setQwen3ComputeDevice?.(cfg.qwen3ComputeDevice);
+    this._localEngine.setClearVoiceServiceUrl?.(cfg.clearVoiceServiceUrl);
     const sttAuthPre = resolveEffectiveSttAuth(cfg);
     const hasCloudSttPre = Boolean(
       sttAuthPre.baseUrl && (sttAuthPre.apiKey || isLocalEndpointUrl(sttAuthPre.baseUrl)),
@@ -1282,6 +1539,184 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       prefPre === "local" ||
       (prefPre === "auto" && engineStatusPre.readyForLocalAsr) ||
       (prefPre === "whisper" && !hasCloudSttPre && engineStatusPre.readyForLocalAsr);
+
+    // ---- Stage 1.2 (新方案): ClearVoice GPU 准实时滑窗降噪（2.0s 切片 + 0.3s 历史上下文 + 20ms 交叉淡入淡出）-> Qwen3-ASR ----
+    if (
+      useLocalPre &&
+      cfg.voicePipelineMode === "clearvoice" &&
+      engineStatusPre.readyForClearVoiceGpu &&
+      !this._localEngine.clearVoiceGpu.isInFailureCooldown()
+    ) {
+      try {
+        const cvRes = await this._localEngine.clearVoiceGpu.enhanceOfflineWithChunking(pcm16k, 16000);
+        const vad = this._localEngine.detectSpeechSegments(cvRes.samples, 16000, {
+          mode: cfg.vadMode,
+        });
+        const speechSamples =
+          vad.hasSpeech && vad.speechSamples.length >= 1600 ? vad.speechSamples : cvRes.samples;
+
+        if (!vad.hasSpeech && cvRes.samples.length >= 3200) {
+          if (autoDispatch) {
+            this._noteNonConversationSegment("ambient_noise");
+          }
+          const timings: VoicePipelineTimings = {
+            denoiseMs: cvRes.durationMs,
+            vadMs: vad.durationMs,
+            totalMs: Math.round(performance.now() - totalStart),
+          };
+          this._lastMetrics = {
+            denoiseEngine: cvRes.engine,
+            snrGainDb: cvRes.snrGainDb,
+            vadEngine: `clearvoice-${vad.engine}`,
+            speechRatio: vad.speechRatio,
+            asrEngine: "skipped-no-speech",
+            timings,
+            updatedAt: Date.now(),
+          };
+          return {
+            ok: true,
+            text: "",
+            speechDetected: false,
+            denoiseEngine: cvRes.engine,
+            vadEngine: `clearvoice-${vad.engine}`,
+            asrEngine: "skipped-no-speech",
+            inputSnrDb: cvRes.inputSnrDb,
+            outputSnrDb: cvRes.outputSnrDb,
+            snrGainDb: cvRes.snrGainDb,
+            speechRatio: vad.speechRatio,
+            matched: false,
+            wokeOnly: false,
+            command: "",
+            timings,
+            voiceState: this.snapshot(),
+          };
+        }
+
+        let voiceprintResult: VoiceprintIdentifyResult | null = null;
+        let voiceprintMs = 0;
+        const profiles = listPublicVoiceprints();
+        if (cfg.voiceprintMode !== "off" && profiles.length > 0 && speechSamples.length >= 4000) {
+          const emb = this._localEngine.extractSpeakerEmbedding(speechSamples, 16000);
+          voiceprintMs = emb.durationMs;
+          voiceprintResult = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
+        }
+
+        const owwEvaluated = Boolean(cfg.owwEnabled && this._localEngine.openWakeWord.isReady);
+        const acousticWake = owwEvaluated
+          ? this._localEngine.scoreWakeWordAudio(speechSamples, cfg.wakeWords, {
+              threshold: cfg.owwThreshold,
+              headOnlySec: 2.0,
+            })
+          : null;
+        if (acousticWake?.matched) {
+          this._lastWakeHit = { ...acousticWake, timestamp: Date.now() };
+        }
+
+        const qwenRes = await this._localEngine.transcribeLocal(speechSamples, 16000, lang, {
+          engine: cfg.localAsrEngine === "sensevoice" ? "sensevoice" : "auto",
+          hotwords: cfg.wakeWords.length > 0 ? cfg.wakeWords : undefined,
+        });
+
+        const timingsBase: Partial<VoicePipelineTimings> = {
+          denoiseMs: cvRes.durationMs,
+          vadMs: vad.durationMs,
+          voiceprintMs,
+          asrMs: qwenRes.durationMs,
+        };
+        const vadLabel = `clearvoice-${vad.engine}`;
+        this._lastMetrics = {
+          denoiseEngine: cvRes.engine,
+          snrGainDb: cvRes.snrGainDb,
+          vadEngine: vadLabel,
+          speechRatio: vad.speechRatio,
+          asrEngine: qwenRes.engine,
+          voiceprint: voiceprintResult,
+          acousticWake,
+          timings: { ...timingsBase, totalMs: Math.round(performance.now() - totalStart) },
+          updatedAt: Date.now(),
+        };
+
+        if (!qwenRes.text.trim()) {
+          if (autoDispatch) {
+            this._noteNonConversationSegment("ambient_noise");
+          }
+          return {
+            ok: true,
+            text: "",
+            speechDetected: false,
+            denoiseEngine: cvRes.engine,
+            vadEngine: vadLabel,
+            asrEngine: qwenRes.engine,
+            inputSnrDb: cvRes.inputSnrDb,
+            outputSnrDb: cvRes.outputSnrDb,
+            snrGainDb: cvRes.snrGainDb,
+            speechRatio: vad.speechRatio,
+            acousticEvent: qwenRes.event,
+            voiceprint: voiceprintResult,
+            acousticWake,
+            matched: false,
+            wokeOnly: false,
+            command: "",
+            timings: { ...timingsBase, totalMs: Math.round(performance.now() - totalStart) },
+            voiceState: this.snapshot(),
+          };
+        }
+
+        if (!autoDispatch) {
+          return {
+            ok: true,
+            text: qwenRes.text,
+            speechDetected: true,
+            denoiseEngine: cvRes.engine,
+            vadEngine: vadLabel,
+            asrEngine: qwenRes.engine,
+            inputSnrDb: cvRes.inputSnrDb,
+            outputSnrDb: cvRes.outputSnrDb,
+            snrGainDb: cvRes.snrGainDb,
+            speechRatio: vad.speechRatio,
+            acousticEvent: qwenRes.event,
+            voiceprint: voiceprintResult,
+            acousticWake,
+            matched: false,
+            wokeOnly: false,
+            command: "",
+            timings: { ...timingsBase, totalMs: Math.round(performance.now() - totalStart) },
+            voiceState: this.snapshot(),
+          };
+        }
+
+        const dispatched = await this.handleTranscript(qwenRes.text, {
+          isFinal: true,
+          bypassWakeWord: options.bypassWakeWord,
+          engine: "local",
+          segmentDurationMs: Math.round((pcm16k.length / 16000) * 1000),
+          acousticEvent: qwenRes.event,
+          acousticWake,
+          owwEvaluated,
+          voiceprint: voiceprintResult,
+          snrGainDb: cvRes.snrGainDb,
+          timingsBase,
+          llmAttentionOverride: options.llmAttentionOverride,
+        });
+
+        return {
+          ...dispatched,
+          text: qwenRes.text,
+          speechDetected: true,
+          denoiseEngine: cvRes.engine,
+          vadEngine: vadLabel,
+          asrEngine: qwenRes.engine,
+          inputSnrDb: cvRes.inputSnrDb,
+          outputSnrDb: cvRes.outputSnrDb,
+          snrGainDb: cvRes.snrGainDb,
+          speechRatio: vad.speechRatio,
+          acousticEvent: qwenRes.event,
+          acousticWake,
+        };
+      } catch {
+        // ClearVoice GPU 不可用或单次失败时自动平滑回落原方案，保障语音交互不中断
+      }
+    }
 
     if (
       useLocalPre &&
@@ -1325,6 +1760,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
             }
           : undefined);
 
+      const sepLegacySpoken = this._echoGuard.getLegacyLastSpoken(now);
       const sep = await this._localEngine.sourceSeparator.separateAndRecognize(pcm16k, 16000, {
         mode: cfg.sourceSeparationMode,
         localAsrEngine: cfg.localAsrEngine,
@@ -1337,8 +1773,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         inConversation,
         dialogState: this._dialogState,
         recentTurns: this._agent.recentConversationTurns(5),
-        lastSpokenReply: this._lastSpokenReply,
-        lastSpokenAt: this._lastSpokenAt,
+        lastSpokenReply: sepLegacySpoken.text || this._lastSpokenReply,
+        lastSpokenAt: sepLegacySpoken.at || this._lastSpokenAt,
+        recentSpokenUtterances: this._echoGuard.getRecentUtterances(now),
+        ttsActive: this._echoGuard.isSpeaking,
+        duringTtsPlayback: options.duringTtsPlayback ?? this._echoGuard.isSpeaking,
+        echoCancellationMode: cfg.echoCancellationMode,
         now,
         voiceprint: voiceprintResult,
         voiceprintMode: cfg.voiceprintMode,
@@ -1466,6 +1906,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         timingsBase,
         llmAttentionOverride: options.llmAttentionOverride,
         precomputedAttention: staleConversationDecision ? undefined : sep.attention,
+        asyncDispatch: options.asyncDispatch,
+        duringTtsPlayback: options.duringTtsPlayback,
       });
 
       return {
@@ -1661,6 +2103,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       snrGainDb: denoised.snrGainDb,
       timingsBase,
       llmAttentionOverride: options.llmAttentionOverride,
+      asyncDispatch: options.asyncDispatch,
+      duringTtsPlayback: options.duringTtsPlayback,
     });
 
     return {
@@ -1690,6 +2134,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       bypassWakeWord?: boolean;
       preferredEngine?: "auto" | "local" | "whisper";
       llmAttentionOverride?: AttentionLlmEvaluator;
+      asyncDispatch?: boolean;
+      duringTtsPlayback?: boolean;
     } = {},
   ): Promise<ProcessAudioUploadResult> {
     const totalStart = performance.now();
@@ -1702,6 +2148,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
 
     this._localEngine.setPreferredAsrEngine?.(cfg.localAsrEngine);
     this._localEngine.setQwen3ComputeDevice?.(cfg.qwen3ComputeDevice);
+    this._localEngine.setClearVoiceServiceUrl?.(cfg.clearVoiceServiceUrl);
     const sttAuth = resolveEffectiveSttAuth(cfg);
     const hasCloudStt = Boolean(
       sttAuth.baseUrl && (sttAuth.apiKey || isLocalEndpointUrl(sttAuth.baseUrl)),
@@ -1713,15 +2160,22 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       (pref === "auto" && localReady) ||
       (pref === "whisper" && !hasCloudStt && localReady);
 
+    // 新方案直通：音频已经由 ClearVoice GPU 准实时切片（Silero VAD 双触发 + 0.3s 历史上下文 + 20ms 交叉淡入淡出）降噪，
+    // 直接送交 Qwen3-ASR 做语音转文字，跳过旧版 GTCRN / Spleeter 声源分离链路。
+    const isClearVoiceSegment =
+      segment.pipelineMode === "clearvoice" || segment.denoiseEngine.startsWith("clearvoice");
+
     const precomputedText = (segment.precomputedTranscript ?? "").trim();
     const canReuseStreamingPrecomputed =
       useLocal &&
+      !isClearVoiceSegment &&
       precomputedText.length > 0 &&
       (segment.commitReason === "punctuation_split" ||
         (!segment.forcedRoll && segment.inputSnrDb >= 14));
 
     const sepReady =
       useLocal &&
+      !isClearVoiceSegment &&
       !canReuseStreamingPrecomputed &&
       cfg.sourceSeparationMode !== "off" &&
       this._localEngine.getStatus().readyForSourceSeparation &&
@@ -1804,6 +2258,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
               }
             : undefined);
 
+        const sepDualLegacy = this._echoGuard.getLegacyLastSpoken(now);
         const sep = await this._localEngine.sourceSeparator.separateAndRecognize(
           segment.rawSamples,
           16000,
@@ -1819,8 +2274,13 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
             inConversation,
             dialogState: this._dialogState,
             recentTurns: this._agent.recentConversationTurns(5),
-            lastSpokenReply: this._lastSpokenReply,
-            lastSpokenAt: this._lastSpokenAt,
+            lastSpokenReply: sepDualLegacy.text || this._lastSpokenReply,
+            lastSpokenAt: sepDualLegacy.at || this._lastSpokenAt,
+            recentSpokenUtterances: this._echoGuard.getRecentUtterances(now),
+            ttsActive: this._echoGuard.isSpeaking,
+            duringTtsPlayback:
+              options.duringTtsPlayback ?? segment.duringTtsPlayback ?? this._echoGuard.isSpeaking,
+            echoCancellationMode: cfg.echoCancellationMode,
             now,
             voiceprint: voiceprintResult,
             voiceprintMode: cfg.voiceprintMode,
@@ -1918,6 +2378,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
             staleConversationDecision || Boolean(segment.stripCommittedPrefixHint)
               ? undefined
               : sep.attention,
+          asyncDispatch: options.asyncDispatch,
+          duringTtsPlayback: options.duringTtsPlayback ?? segment.duringTtsPlayback,
         });
 
         return {
@@ -1938,27 +2400,44 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         };
       }
 
-      const sv = await this._localEngine.transcribeDualTrack(
-        segment.rawSamples,
-        segment.denoisedSamples,
-        {
-          voiceLang: lang,
-          wakeWords: cfg.wakeWords,
-          inputSnrDb: segment.inputSnrDb,
-          forceDual: segment.forcedRoll || segment.inputSnrDb < 20,
-          systemOneClient: this._agent.systemOneClient,
-          acousticWake,
-          localAsrEngine: cfg.localAsrEngine,
-        },
-      );
-      transcript = segment.stripCommittedPrefixHint
-        ? stripCommittedPrefix(sv.text, segment.stripCommittedPrefixHint)
-        : sv.text;
-      altText = sv.altText;
-      acousticEvent = sv.event;
-      asrEngine = sv.engine;
-      asrMs = sv.durationMs;
-      runtimeEngine = "local";
+      if (isClearVoiceSegment) {
+        // 新方案：将 ClearVoice GPU（MossFormer2_SE_48K）切片降噪并平滑拼接后的音频直接送交 Qwen3-ASR 转写
+        const cvAudio =
+          segment.denoisedSamples.length >= 1600 ? segment.denoisedSamples : segment.rawSamples;
+        const qwenRes = await this._localEngine.transcribeLocal(cvAudio, 16000, lang, {
+          engine: cfg.localAsrEngine === "sensevoice" ? "sensevoice" : "auto",
+          hotwords: cfg.wakeWords.length > 0 ? cfg.wakeWords : undefined,
+        });
+        transcript = segment.stripCommittedPrefixHint
+          ? stripCommittedPrefix(qwenRes.text, segment.stripCommittedPrefixHint)
+          : qwenRes.text;
+        acousticEvent = qwenRes.event;
+        asrEngine = qwenRes.engine;
+        asrMs = qwenRes.durationMs;
+        runtimeEngine = "local";
+      } else {
+        const sv = await this._localEngine.transcribeDualTrack(
+          segment.rawSamples,
+          segment.denoisedSamples,
+          {
+            voiceLang: lang,
+            wakeWords: cfg.wakeWords,
+            inputSnrDb: segment.inputSnrDb,
+            forceDual: segment.forcedRoll || segment.inputSnrDb < 20,
+            systemOneClient: this._agent.systemOneClient,
+            acousticWake,
+            localAsrEngine: cfg.localAsrEngine,
+          },
+        );
+        transcript = segment.stripCommittedPrefixHint
+          ? stripCommittedPrefix(sv.text, segment.stripCommittedPrefixHint)
+          : sv.text;
+        altText = sv.altText;
+        acousticEvent = sv.event;
+        asrEngine = sv.engine;
+        asrMs = sv.durationMs;
+        runtimeEngine = "local";
+      }
     } else {
       const wavBytes = encodeWavPcm16(vpAudio, 16000);
       const blob = new Blob([wavBytes as unknown as BlobPart], { type: "audio/wav" });
@@ -1969,9 +2448,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       runtimeEngine = "whisper";
     }
 
-    const vadEngineLabel = segment.commitReason
-      ? `silero-stream:${segment.commitReason}`
-      : "silero-stream";
+    const vadEngineLabel = isClearVoiceSegment
+      ? `clearvoice-silero:${segment.clearVoiceMeta?.triggerReason ?? segment.commitReason ?? "silence"}`
+      : segment.commitReason
+        ? `silero-stream:${segment.commitReason}`
+        : "silero-stream";
+    const cvDenoiseMs = segment.clearVoiceMeta?.denoiseMs;
     this._lastMetrics = {
       denoiseEngine: segment.denoiseEngine,
       snrGainDb: segment.snrGainDb,
@@ -2001,7 +2483,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         matched: false,
         wokeOnly: false,
         command: "",
-        timings: { voiceprintMs, asrMs, totalMs: Math.round(performance.now() - totalStart) },
+        timings: {
+          ...(cvDenoiseMs !== undefined ? { denoiseMs: cvDenoiseMs } : {}),
+          voiceprintMs,
+          asrMs,
+          totalMs: Math.round(performance.now() - totalStart),
+        },
         voiceState: this.snapshot(),
       };
     }
@@ -2024,8 +2511,14 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       owwEvaluated,
       voiceprint: voiceprintResult,
       snrGainDb: segment.snrGainDb,
-      timingsBase: { voiceprintMs, asrMs },
+      timingsBase: {
+        ...(cvDenoiseMs !== undefined ? { denoiseMs: cvDenoiseMs } : {}),
+        voiceprintMs,
+        asrMs,
+      },
       llmAttentionOverride: options.llmAttentionOverride,
+      asyncDispatch: options.asyncDispatch,
+      duringTtsPlayback: options.duringTtsPlayback ?? segment.duringTtsPlayback,
     });
     for (let i = 1; i < effectiveSentences.length; i += 1) {
       const follow = await this.handleTranscript(effectiveSentences[i]!, {
@@ -2037,6 +2530,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         voiceprint: voiceprintResult,
         snrGainDb: segment.snrGainDb,
         llmAttentionOverride: options.llmAttentionOverride,
+        asyncDispatch: options.asyncDispatch,
+        duringTtsPlayback: options.duringTtsPlayback ?? segment.duringTtsPlayback,
       });
       if (follow.matched) {
         dispatched = follow;
@@ -2339,6 +2834,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._consecutiveAmbientNoiseCount = 0;
     this._speechGraceSuppressed = false;
     this._lastTransitionReason = "cleared";
+    this._echoGuard.reset();
     this.emit("stateChanged", this.snapshot());
   }
 
@@ -2346,6 +2842,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const cfg = this.config;
     this._localEngine.setPreferredAsrEngine?.(cfg.localAsrEngine);
     this._localEngine.setQwen3ComputeDevice?.(cfg.qwen3ComputeDevice);
+    this._localEngine.setClearVoiceServiceUrl?.(cfg.clearVoiceServiceUrl);
     const now = Date.now();
     const conversationRemainingMs =
       this._dialogState === "conversation"
@@ -2360,6 +2857,37 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const systemOneHealth = this._agent.systemOneClient
       ? this._agent.systemOneClient.getStatus()
       : null;
+    const activeTasks = this._agent.getActiveTasks();
+    const recentTts = this._echoGuard.getRecentUtterances(now);
+    const lanes: VoiceRuntimeLanes = {
+      conversation: {
+        active: this._active,
+        dialogState: this._dialogState,
+        speechActive: this._speechInProgress,
+        fullDuplex: cfg.asyncVoicePipeline !== false,
+      },
+      execution: {
+        active: activeTasks.length > 0,
+        activeCount: activeTasks.length,
+        tasks: activeTasks,
+      },
+      speaking: {
+        active: this._echoGuard.isSpeaking,
+        utteranceId: this._echoGuard.activeUtteranceId,
+        text: this._echoGuard.activeUtteranceText,
+        queueLength: this._echoGuard.clientQueueLength,
+        ducked: this._echoGuard.clientDucked,
+      },
+      echo: {
+        mode: cfg.echoCancellationMode,
+        activeAec: this._echoGuard.aecActive,
+        erleDb: this._echoGuard.erleDb,
+        doubleTalkActive: this._echoGuard.doubleTalkActive,
+        suppressedCount: this._echoGuard.suppressedCount,
+        strippedCount: this._echoGuard.strippedCount,
+        activeTtsUtterances: recentTts.length,
+      },
+    };
     return {
       active: this._active,
       mode: this._mode,
@@ -2373,9 +2901,15 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       consecutiveSidetalkCount: this._consecutiveSidetalkCount,
       lastTransitionReason: this._lastTransitionReason,
       engine: this._engine,
+      voicePipelineMode: cfg.voicePipelineMode,
+      clearVoiceServiceUrl: cfg.clearVoiceServiceUrl,
       localAsrEngine: cfg.localAsrEngine,
       qwen3ComputeDevice: cfg.qwen3ComputeDevice,
       qwen3StreamingEnabled: cfg.qwen3StreamingEnabled,
+      asyncVoicePipeline: cfg.asyncVoicePipeline,
+      echoCancellationMode: cfg.echoCancellationMode,
+      bargeInDuckingEnabled: cfg.bargeInDuckingEnabled,
+      lanes,
       interimTranscript: this._interimTranscript,
       lastTranscript: this._lastTranscript,
       lastCommand: this._lastCommand,
@@ -2425,6 +2959,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._speechActivityStartedAt = null;
     this._speechGraceSuppressed = false;
     this._consecutiveAmbientNoiseCount = 0;
+    this._echoGuard.reset();
     this.clear();
   }
 }

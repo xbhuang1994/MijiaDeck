@@ -493,18 +493,19 @@ describe("PiAgentService Smart Immediate Ack via SystemOne", () => {
       });
       h.agent.on("speakChunk", (c) => spoken.push(c.text));
 
-      const p1 = h.agent.prompt("给我讲个笑话", { source: "voice" });
+      const sub1 = h.agent.submitPrompt("给我讲个笑话", { source: "voice" });
       await Bun.sleep(25);
-      // Barge-in with a new prompt while Turn 1's SystemOne call is still pending
-      const p2 = h.agent.prompt("空调设置的多少度", { source: "voice" });
+      // Explicitly abort Task 1 while its SystemOne ack call is still pending, and run Task 2 concurrently
+      expect(h.agent.abortTask(sub1.taskId)).toBe(true);
+      const sub2 = h.agent.submitPrompt("空调设置的多少度", { source: "voice" });
 
-      const [r1, r2] = await Promise.all([p1, p2]);
+      const [r1, r2] = await Promise.all([sub1.promise, sub2.promise]);
       expect(r1.ok).toBe(false);
       expect(r1.ack).toBe("");
       expect(r2.ok).toBe(true);
       expect(r2.ack).toBe("稍等我看一下");
       expect(r2.ackSource).toBe("systemone");
-      // Only Turn 2 emitted task_ack & spoken ack; SystemOne circuit breaker stayed closed
+      // Only Task 2 emitted task_ack & spoken ack; SystemOne circuit breaker stayed closed
       expect(ackEvents).toEqual(["稍等我看一下"]);
       expect(spoken[0]).toBe("稍等我看一下");
       expect(h.agent.systemOneClient?.getStatus().circuitState).toBe("closed");

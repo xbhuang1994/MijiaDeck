@@ -25,6 +25,7 @@ export type AgentProviderMode =
   | "openai-compatible";
 
 export type VoiceEngineMode = "auto" | "local" | "browser" | "whisper";
+export type VoicePipelineMode = "legacy" | "clearvoice";
 export type LocalAsrEngineMode = "auto" | "qwen3-asr" | "sensevoice";
 export type Qwen3ComputeDeviceMode = "auto" | "gpu" | "cpu";
 export type TtsEngineMode = "auto" | "local" | "browser";
@@ -35,6 +36,7 @@ export type VadEngineMode = "silero" | "adaptive";
 export type VadSensitivityMode = "aggressive" | "default" | "relaxed";
 export type VoiceprintPolicyMode = "off" | "tag" | "strict";
 export type AttentionMode = "smart" | "strict" | "off";
+export type EchoCancellationMode = "auto" | "aggressive" | "standard" | "off";
 export type SystemOneMode = "auto" | "on" | "off";
 export type CavemanReplyMode = "ultra" | "full" | "lite" | "off";
 export type AgentThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -150,6 +152,19 @@ export const PROVIDER_PRESETS: ReadonlyArray<ProviderPreset> = [
 
 const VALID_PROVIDERS = new Set<string>(PROVIDER_PRESETS.map((p) => p.id));
 const VALID_VOICE_ENGINES = new Set<string>(["auto", "local", "browser", "whisper"]);
+const VALID_VOICE_PIPELINE_MODES = new Set<string>(["legacy", "clearvoice"]);
+const VOICE_PIPELINE_MODE_ALIASES: Readonly<Record<string, VoicePipelineMode>> = {
+  legacy: "legacy",
+  original: "legacy",
+  old: "legacy",
+  default: "legacy",
+  sherpa: "legacy",
+  gtcrn: "legacy",
+  clearvoice: "clearvoice",
+  "clearvoice-gpu": "clearvoice",
+  mossformer2: "clearvoice",
+  new: "clearvoice",
+};
 const VALID_LOCAL_ASR_ENGINES = new Set<string>(["auto", "qwen3-asr", "sensevoice"]);
 const LOCAL_ASR_ENGINE_ALIASES: Readonly<Record<string, LocalAsrEngineMode>> = {
   auto: "auto",
@@ -180,6 +195,7 @@ const VALID_VAD_MODES = new Set<string>(["silero", "adaptive"]);
 const VALID_VAD_SENSITIVITIES = new Set<string>(["aggressive", "default", "relaxed"]);
 const VALID_VOICEPRINT_MODES = new Set<string>(["off", "tag", "strict"]);
 const VALID_ATTENTION_MODES = new Set<string>(["smart", "strict", "off"]);
+const VALID_ECHO_MODES = new Set<string>(["auto", "aggressive", "standard", "off"]);
 const VALID_SYSTEMONE_MODES = new Set<string>(["auto", "on", "off"]);
 const VALID_CAVEMAN_MODES = new Set<string>(["ultra", "full", "lite", "off"]);
 const CAVEMAN_MODE_ALIASES: Readonly<Record<string, CavemanReplyMode>> = {
@@ -232,6 +248,7 @@ const VALID_CUSTOM_APIS = new Set<string>([
 export const DEFAULT_WAKE_WORDS = ["小派", "小湃", "小π", "派派", "pi", "米家助手"] as const;
 export const DEFAULT_WAKE_ACK_PHRASE = "嗯?";
 export const DEFAULT_LOCAL_ASR_ENGINE: LocalAsrEngineMode = "auto";
+export const DEFAULT_VOICE_PIPELINE_MODE: VoicePipelineMode = "legacy";
 export const DEFAULT_QWEN3_COMPUTE_DEVICE: Qwen3ComputeDeviceMode = "auto";
 export const DEFAULT_QWEN3_STREAMING_ENABLED = true;
 export const DEFAULT_TTS_ENGINE: TtsEngineMode = "auto";
@@ -250,6 +267,10 @@ export interface AgentVoiceConfig {
   maxHistoryTurns: number;
   voiceEnabled: boolean;
   voiceEngine: VoiceEngineMode;
+  /** 语音前端降噪与切片方案：legacy（原方案 GTCRN/声源分离）/ clearvoice（新方案 ClearVoice GPU 准实时切片 -> Qwen3-ASR） */
+  voicePipelineMode: VoicePipelineMode;
+  /** 可选外部 ClearVoice GPU 服务地址（留空则自动在本地 GPU 启动内置 ClearVoice 服务） */
+  clearVoiceServiceUrl: string;
   /** 本地离线语音转写策略：auto（主用 Qwen3-ASR-0.6B，备用 SenseVoice 自动兜底）/ qwen3-asr / sensevoice */
   localAsrEngine: LocalAsrEngineMode;
   /** Qwen3-ASR-0.6B 计算设备：auto（自动识别 GPU 优先，无 GPU 时回落 CPU）/ gpu / cpu */
@@ -281,6 +302,12 @@ export interface AgentVoiceConfig {
   conversationWindowSec: number;
   maxConsecutiveSidetalk: number;
   bargeInEnabled: boolean;
+  /** 是否启用执行、播报、对话全双工异步分离管线（默认开启，互不阻塞） */
+  asyncVoicePipeline: boolean;
+  /** 回声消除策略：auto（硬件 AEC + 参考信号自适应 AEC + 服务端多语段语义防回声）/ aggressive / standard / off */
+  echoCancellationMode: EchoCancellationMode;
+  /** 双讲/插话检测时是否先平滑降音（Ducking）再决定打断（默认开启，显著降低自回声误打断） */
+  bargeInDuckingEnabled: boolean;
   // SystemOne 决策模型（karpo/karpo-decision-31b）配置
   systemOneMode: SystemOneMode;
   systemOneBaseUrl: string;
@@ -326,6 +353,8 @@ export interface AgentConfigPatch {
   maxHistoryTurns?: unknown;
   voiceEnabled?: unknown;
   voiceEngine?: unknown;
+  voicePipelineMode?: unknown;
+  clearVoiceServiceUrl?: unknown;
   localAsrEngine?: unknown;
   qwen3ComputeDevice?: unknown;
   qwen3StreamingEnabled?: unknown;
@@ -352,6 +381,9 @@ export interface AgentConfigPatch {
   conversationWindowSec?: unknown;
   maxConsecutiveSidetalk?: unknown;
   bargeInEnabled?: unknown;
+  asyncVoicePipeline?: unknown;
+  echoCancellationMode?: unknown;
+  bargeInDuckingEnabled?: unknown;
   systemOneMode?: unknown;
   systemOneBaseUrl?: unknown;
   systemOneApiKey?: unknown;
@@ -382,6 +414,8 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     maxHistoryTurns: 12,
     voiceEnabled: true,
     voiceEngine: "auto",
+    voicePipelineMode: DEFAULT_VOICE_PIPELINE_MODE,
+    clearVoiceServiceUrl: "",
     localAsrEngine: DEFAULT_LOCAL_ASR_ENGINE,
     qwen3ComputeDevice: DEFAULT_QWEN3_COMPUTE_DEVICE,
     qwen3StreamingEnabled: DEFAULT_QWEN3_STREAMING_ENABLED,
@@ -408,6 +442,9 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     conversationWindowSec: 25,
     maxConsecutiveSidetalk: 3,
     bargeInEnabled: true,
+    asyncVoicePipeline: true,
+    echoCancellationMode: "auto",
+    bargeInDuckingEnabled: true,
     systemOneMode: "auto",
     systemOneBaseUrl: "",
     systemOneApiKey: "",
@@ -497,6 +534,15 @@ export function normalizeLocalAsrEngine(
   return LOCAL_ASR_ENGINE_ALIASES[key] ?? fallback;
 }
 
+export function normalizeVoicePipelineMode(
+  value: unknown,
+  fallback: VoicePipelineMode = DEFAULT_VOICE_PIPELINE_MODE,
+): VoicePipelineMode {
+  if (typeof value !== "string") return fallback;
+  const key = value.trim().toLowerCase();
+  return VOICE_PIPELINE_MODE_ALIASES[key] ?? fallback;
+}
+
 export function normalizeQwen3ComputeDevice(
   value: unknown,
   fallback: Qwen3ComputeDeviceMode = DEFAULT_QWEN3_COMPUTE_DEVICE,
@@ -555,6 +601,11 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     : defaults.voiceEngine;
 
   const localAsrEngine = normalizeLocalAsrEngine(raw.localAsrEngine, defaults.localAsrEngine);
+  const voicePipelineMode = normalizeVoicePipelineMode(
+    raw.voicePipelineMode,
+    defaults.voicePipelineMode,
+  );
+  const clearVoiceServiceUrl = normalizeUrl(raw.clearVoiceServiceUrl);
   const qwen3ComputeDevice = normalizeQwen3ComputeDevice(
     raw.qwen3ComputeDevice,
     defaults.qwen3ComputeDevice,
@@ -619,6 +670,14 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     ? (attModeRaw as AttentionMode)
     : defaults.attentionMode;
 
+  const echoModeRaw =
+    typeof raw.echoCancellationMode === "string"
+      ? raw.echoCancellationMode.trim().toLowerCase()
+      : defaults.echoCancellationMode;
+  const echoCancellationMode: EchoCancellationMode = VALID_ECHO_MODES.has(echoModeRaw)
+    ? (echoModeRaw as EchoCancellationMode)
+    : defaults.echoCancellationMode;
+
   const sysOneModeRaw =
     typeof raw.systemOneMode === "string"
       ? raw.systemOneMode.trim().toLowerCase()
@@ -675,6 +734,8 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     maxHistoryTurns: Math.round(clampNumber(raw.maxHistoryTurns, 2, 40, defaults.maxHistoryTurns)),
     voiceEnabled: typeof raw.voiceEnabled === "boolean" ? raw.voiceEnabled : defaults.voiceEnabled,
     voiceEngine,
+    voicePipelineMode,
+    clearVoiceServiceUrl,
     localAsrEngine,
     qwen3ComputeDevice,
     qwen3StreamingEnabled,
@@ -711,6 +772,15 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     ),
     bargeInEnabled:
       typeof raw.bargeInEnabled === "boolean" ? raw.bargeInEnabled : defaults.bargeInEnabled,
+    asyncVoicePipeline:
+      typeof raw.asyncVoicePipeline === "boolean"
+        ? raw.asyncVoicePipeline
+        : defaults.asyncVoicePipeline,
+    echoCancellationMode,
+    bargeInDuckingEnabled:
+      typeof raw.bargeInDuckingEnabled === "boolean"
+        ? raw.bargeInDuckingEnabled
+        : defaults.bargeInDuckingEnabled,
     systemOneMode,
     systemOneBaseUrl: normalizeSystemOneBaseUrl(raw.systemOneBaseUrl),
     systemOneApiKey: typeof raw.systemOneApiKey === "string" ? raw.systemOneApiKey.trim() : "",
@@ -960,6 +1030,21 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
     }
     nextRaw.voiceEngine = eng;
   }
+  if (patch.voicePipelineMode !== undefined) {
+    const rawMode = String(patch.voicePipelineMode).trim().toLowerCase();
+    const mappedMode = VOICE_PIPELINE_MODE_ALIASES[rawMode];
+    if (!mappedMode || !VALID_VOICE_PIPELINE_MODES.has(mappedMode)) {
+      throw new Error(`不支持的语音降噪方案模式: ${rawMode}`);
+    }
+    nextRaw.voicePipelineMode = mappedMode;
+  }
+  if (patch.clearVoiceServiceUrl !== undefined) {
+    const rawUrl = String(patch.clearVoiceServiceUrl).trim();
+    if (rawUrl && !normalizeUrl(rawUrl)) {
+      throw new Error("ClearVoice GPU 服务地址必须是以 http:// 或 https:// 开头的有效地址");
+    }
+    nextRaw.clearVoiceServiceUrl = rawUrl;
+  }
   if (patch.localAsrEngine !== undefined) {
     const rawAsr = String(patch.localAsrEngine).trim().toLowerCase();
     const mappedAsr = LOCAL_ASR_ENGINE_ALIASES[rawAsr];
@@ -1080,6 +1165,19 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
   }
   if (patch.bargeInEnabled !== undefined) {
     nextRaw.bargeInEnabled = Boolean(patch.bargeInEnabled);
+  }
+  if (patch.asyncVoicePipeline !== undefined) {
+    nextRaw.asyncVoicePipeline = Boolean(patch.asyncVoicePipeline);
+  }
+  if (patch.echoCancellationMode !== undefined) {
+    const em = String(patch.echoCancellationMode).trim().toLowerCase();
+    if (!VALID_ECHO_MODES.has(em)) {
+      throw new Error(`不支持的回声消除模式: ${em}`);
+    }
+    nextRaw.echoCancellationMode = em;
+  }
+  if (patch.bargeInDuckingEnabled !== undefined) {
+    nextRaw.bargeInDuckingEnabled = Boolean(patch.bargeInDuckingEnabled);
   }
   if (patch.systemOneMode !== undefined) {
     const sm = String(patch.systemOneMode).trim().toLowerCase();
