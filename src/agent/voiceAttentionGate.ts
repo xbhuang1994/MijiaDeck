@@ -116,6 +116,7 @@ export interface AttentionDecision {
     | "pragmatic-reject"
     | "systemone-attention"
     | "llm-attention"
+    | "noise-track-muted"
     | "no-wake";
   reason: string;
   wakeWord: string | null;
