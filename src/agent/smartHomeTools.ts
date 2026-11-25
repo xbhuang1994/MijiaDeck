@@ -111,6 +111,46 @@ function deviceMatchesCategory(device: DeviceInfo, category: string): boolean {
   return deviceCategoryLabel(device).toLowerCase().includes(cat);
 }
 
+const COMMON_ROOM_KEYWORDS: readonly string[] = [
+  "儿童房",
+  "老人房",
+  "衣帽间",
+  "卫生间",
+  "洗手间",
+  "客厅",
+  "主卧",
+  "次卧",
+  "卧室",
+  "餐厅",
+  "书房",
+  "厨房",
+  "阳台",
+  "浴室",
+  "厕所",
+  "走廊",
+  "过道",
+  "玄关",
+  "门厅",
+  "车库",
+];
+
+function extractRoomHint(normTarget: string, devices: readonly DeviceInfo[]): string | null {
+  const knownRooms = [
+    ...new Set(
+      devices
+        .map((d) => normalizeQuery(d.room_name))
+        .filter((r) => r.length > 0 && r !== "未知" && r !== "未分配" && r !== "未分配房间"),
+    ),
+  ].sort((a, b) => b.length - a.length);
+  for (const room of knownRooms) {
+    if (normTarget.includes(room)) return room;
+  }
+  for (const room of COMMON_ROOM_KEYWORDS) {
+    if (normTarget.includes(room)) return room;
+  }
+  return null;
+}
+
 /**
  * 按 did / 名称 / 房间 / 类别灵活解析目标设备（支持单个精确匹配与多设备筛选）。
  */
@@ -166,6 +206,7 @@ export function resolveDevices(
   }
 
   // 4. “房间名 + 设备关键词” 组合匹配（如“客厅吸顶灯”、“客厅的灯”、“餐厅所有灯”）
+  const targetRoomHint = extractRoomHint(normTarget, devices);
   const scored: Array<{ device: DeviceInfo; score: number }> = [];
   for (const d of pool) {
     const dName = normalizeQuery(d.name);
@@ -181,10 +222,18 @@ export function resolveDevices(
     } else if (normTarget.includes(dName) && dName.length >= 2) {
       score = 80;
     } else {
-      const roomHit = dRoom.length > 0 && normTarget.includes(dRoom);
-      const rest = roomHit ? normTarget.replace(dRoom, "").replace(/^(所有|全部)/, "") : normTarget;
+      const roomHit = dRoom.length > 0 && dRoom !== "未知" && dRoom !== "未分配" && normTarget.includes(dRoom);
+      const hasConflictingRoom = Boolean(
+        targetRoomHint &&
+          !roomHit &&
+          !dName.includes(targetRoomHint) &&
+          !(dRoom && (dRoom.includes(targetRoomHint) || targetRoomHint.includes(dRoom))),
+      );
+      const rest = roomHit
+        ? normTarget.replace(dRoom, "").replace(/^(?:里面|里边|里头|里|中|内)?(?:所有|全部)?/, "")
+        : normTarget;
       const lightHit =
-        (rest === "灯" || rest === "灯光" || rest === "吸顶灯" || rest === "台灯" || rest === "射灯") &&
+        /^(?:灯|灯光|电灯|照明|吸顶灯|吊灯|主灯|台灯|落地灯|射灯|灯带|壁灯|夜灯|筒灯)$/.test(rest) &&
         deviceMatchesCategory(d, "light");
       const speakerHit =
         (rest.includes("音箱") || rest.includes("小爱") || rest.includes("音响")) && isSpeaker(d);
@@ -201,9 +250,9 @@ export function resolveDevices(
         score = 75;
       } else if (roomHit && rest.length >= 1 && dName.includes(rest)) {
         score = 82;
-      } else if (!roomHit && (lightHit || speakerHit || sensorHit || feederHit || cameraHit)) {
+      } else if (!roomHit && !hasConflictingRoom && (lightHit || speakerHit || sensorHit || feederHit || cameraHit)) {
         score = 65;
-      } else if (dCat && (dCat.includes(normTarget) || normTarget.includes(dCat))) {
+      } else if (!hasConflictingRoom && dCat && (dCat.includes(normTarget) || normTarget.includes(dCat))) {
         score = 60;
       }
     }
@@ -822,7 +871,15 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       }
 
       if (candidates.length === 0) {
-        const desc = [params.room, params.target, params.category].filter(Boolean).join(" ") || "指定条件";
+        const categoryLabels: Readonly<Record<string, string>> = {
+          light: "灯具",
+          switch: "开关",
+          appliance: "家电",
+          camera: "摄像头",
+          speaker: "音箱",
+        };
+        const catLabel = params.category ? (categoryLabels[params.category] ?? params.category) : "";
+        const desc = [params.room, params.target, catLabel].filter(Boolean).join("") || "指定条件";
         const msg = `未找到可控设备：${desc}`;
         return textResult(msg, { ok: false, uiSummary: msg }, true);
       }
@@ -937,10 +994,17 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       const blocked = ensureAccessReady(deps);
       if (blocked) return textResult(blocked, { ok: false, error: blocked }, true);
 
-      const device = resolveSingleDevice(
-        deps.mainWindow.allDevices.filter((d) => isLight(d)),
-        params.target,
-      ) ?? resolveSingleDevice(deps.mainWindow.allDevices, params.target);
+      const allDevices = deps.mainWindow.allDevices;
+      const rawTarget = params.target.trim();
+      const normTarget = normalizeQuery(rawTarget);
+      const device = rawTarget
+        ? (resolveSingleDevice(allDevices.filter((d) => isLight(d)), rawTarget) ??
+            resolveSingleDevice(allDevices.filter((d) => deviceMatchesCategory(d, "light")), rawTarget) ??
+            // 仅当调用方按精确 did 或精确名称点名时才允许回退到非灯具设备，避免“客厅”等泛称误命中空气净化器等家电
+            allDevices.find((d) => d.did === rawTarget) ??
+            (normTarget ? allDevices.find((d) => normalizeQuery(d.name) === normTarget) : undefined) ??
+            null)
+        : null;
 
       if (!device) {
         const msg = `未找到灯具：${params.target}`;
@@ -964,6 +1028,34 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         params.color !== undefined ||
         params.mode !== undefined;
 
+      // 在执行任何开关机写操作前，先校验目标设备是否具备所请求的灯具能力，
+      // 防止不支持调光/调色的设备（如普通开关或误传的非灯具家电）先被误开机再报错。
+      const hasAnyLightControl = Boolean(controls.brightness || controls.temperature || controls.color);
+      if (params.on !== false) {
+        if (params.brightness !== undefined && !controls.brightness) {
+          const msg = `${device.name}不支持亮度调节`;
+          return textResult(msg, { ok: false, uiSummary: msg }, true);
+        }
+        if ((params.color_temperature !== undefined || params.temperature_preset !== undefined) && !controls.temperature) {
+          const msg = `${device.name}不支持色温调节`;
+          return textResult(msg, { ok: false, uiSummary: msg }, true);
+        }
+        if (params.color !== undefined) {
+          if (!controls.color) {
+            const msg = `${device.name}不支持颜色调节`;
+            return textResult(msg, { ok: false, uiSummary: msg }, true);
+          }
+          if (parseColorToRgbInt(params.color) === null) {
+            const msg = `无法识别颜色：${params.color}，请使用常见颜色名或 #RRGGBB`;
+            return textResult(msg, { ok: false, uiSummary: msg }, true);
+          }
+        }
+      }
+      if (!deviceMatchesCategory(device, "light") && !hasAnyLightControl) {
+        const msg = `${device.name}不是灯具设备`;
+        return textResult(msg, { ok: false, uiSummary: msg }, true);
+      }
+
       if (params.on === false) {
         await runJob(deps.jobs, () => deps.service.setPowerState(device.did, false), 1);
         deps.mainWindow.applyPowerState(device.did, false);
@@ -982,11 +1074,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
 
       let appliedBrightness: number | undefined;
       if (params.brightness !== undefined) {
-        const bProp = controls.brightness;
-        if (!bProp) {
-          const msg = `${device.name}不支持亮度调节`;
-          return textResult(msg, { ok: false, uiSummary: msg }, true);
-        }
+        const bProp = controls.brightness!;
         const high = bProp.range && bProp.range.length >= 2 ? bProp.range[1] : 100;
         const scaled = high === 100 ? params.brightness : (params.brightness / 100) * high;
         const val = clampToPropRange(bProp, scaled);
@@ -997,11 +1085,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
 
       let appliedColorTemp: number | undefined;
       if (params.color_temperature !== undefined || params.temperature_preset !== undefined) {
-        const tProp = controls.temperature;
-        if (!tProp) {
-          const msg = `${device.name}不支持色温调节`;
-          return textResult(msg, { ok: false, uiSummary: msg }, true);
-        }
+        const tProp = controls.temperature!;
         const low = tProp.range && tProp.range.length >= 2 ? tProp.range[0] : 2700;
         const high = tProp.range && tProp.range.length >= 2 ? tProp.range[1] : 6500;
         let targetK = params.color_temperature;
@@ -1018,16 +1102,8 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
 
       let appliedColor: string | undefined;
       if (params.color !== undefined) {
-        const cProp = controls.color;
-        if (!cProp) {
-          const msg = `${device.name}不支持颜色调节`;
-          return textResult(msg, { ok: false, uiSummary: msg }, true);
-        }
-        const rgb = parseColorToRgbInt(params.color);
-        if (rgb === null) {
-          const msg = `无法识别颜色：${params.color}，请使用常见颜色名或 #RRGGBB`;
-          return textResult(msg, { ok: false, uiSummary: msg }, true);
-        }
+        const cProp = controls.color!;
+        const rgb = parseColorToRgbInt(params.color)!;
         await runJob(deps.jobs, () => deps.service.writeProp(device.did, cProp.name, rgb), 1);
         appliedColor = params.color;
         changes.push(`颜色 ${params.color}`);

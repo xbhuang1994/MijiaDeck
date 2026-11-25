@@ -10,18 +10,22 @@ import {
   fauxProvider,
   fauxToolCall,
 } from "@earendil-works/pi-ai";
+import { planDeterministicLocalCalls } from "../src/agent/localPlannerStream.ts";
 import { fetchProviderModels } from "../src/agent/modelDiscovery.ts";
 import { PiAgentService } from "../src/agent/piAgentService.ts";
+import { resolveDevices } from "../src/agent/smartHomeTools.ts";
 import { evaluateVoiceAttention } from "../src/agent/voiceAttentionGate.ts";
 import {
   defaultAgentVoiceConfig,
   loadAgentVoiceConfig,
+  normalizeAgentVoiceConfig,
   toPublicAgentVoiceConfig,
   updateAgentVoiceConfig,
 } from "../src/core/agentConfigStore.ts";
 import { setDataPathOverrides } from "../src/core/jsonStore.ts";
 import { NetworkMonitor } from "../src/core/availability.ts";
 import { JobExecutor } from "../src/core/jobs.ts";
+import { createDeviceInfo } from "../src/core/models.ts";
 import { MijiaService } from "../src/core/service.ts";
 import * as settingsStore from "../src/core/settingsStore.ts";
 import { VirtualDemoService } from "../src/core/virtualLightService.ts";
@@ -704,5 +708,471 @@ describe("ModelDiscovery (Auto-fetch from Provider API)", () => {
     expect(aRes.ok).toBe(true);
     expect(anthHeader).toBe("sk-ant-test-key");
     expect(aRes.models[0]?.id).toBe("claude-sonnet-4-5");
+  });
+});
+
+describe("Light Target Isolation & Non-Light Recent-Target Regression", () => {
+  function createNoLightHomeService() {
+    const powerWrites: Array<{ did: string; state: boolean }> = [];
+    const purifierSpec: FlattenedSpec = {
+      name: "Air Purifier",
+      properties: [
+        {
+          name: "on",
+          description: "Switch Status / 开关",
+          type: "bool",
+          rw: "rw",
+          range: null,
+          "value-list": null,
+          method: { siid: 2, piid: 1 },
+          service: "air-purifier",
+        },
+        {
+          name: "mode",
+          description: "Mode / 模式",
+          type: "uint",
+          rw: "rw",
+          range: null,
+          "value-list": [
+            { value: 0, description: "Auto", desc_zh_cn: "自动" },
+            { value: 1, description: "Sleep", desc_zh_cn: "睡眠" },
+          ],
+          method: { siid: 2, piid: 4 },
+          service: "air-purifier",
+        },
+      ],
+      actions: [],
+    };
+
+    const purifierState: Record<string, boolean> = { "972364835": true };
+    const mockApi = {
+      authDataPath: path.join(tmpDir, "auth-no-light.json"),
+      apiBaseUrl: "https://api.io.mi.com/app",
+      available: true,
+      authData: { userId: "test-user" },
+      getHomesList: mock(async () => [
+        {
+          name: "方寸别院",
+          roomlist: [
+            { name: "客厅", dids: ["972364835", "router-1", "lock-1"] },
+            { name: "房间", dids: ["504337266"] },
+            { name: "阳台", dids: ["2178322672"] },
+          ],
+        },
+      ]),
+      getDevicesList: mock(async () => [
+        {
+          did: "972364835",
+          name: "米家空气净化器 4 Lite",
+          model: "zhimi.airp.rma3",
+          spec_type: "urn:miot-spec-v2:device:air-purifier:0000A007:zhimi-rma3:1",
+          isOnline: true,
+        },
+        {
+          did: "919221385",
+          name: "米家空气净化器 4 Lite 2",
+          model: "zhimi.airp.rma3",
+          spec_type: "urn:miot-spec-v2:device:air-purifier:0000A007:zhimi-rma3:1",
+          isOnline: false,
+        },
+        {
+          did: "504337266",
+          name: "小爱音箱Play",
+          model: "xiaomi.wifispeaker.l05b",
+          spec_type: "urn:miot-spec-v2:device:speaker:0000A015:xiaomi-l05b:1",
+          isOnline: true,
+        },
+        {
+          did: "router-1",
+          name: "orangegrin",
+          model: "xiaomi.router.ra80",
+          spec_type: "urn:miot-spec-v2:device:router:0000A036:xiaomi-ra80:1",
+          isOnline: true,
+        },
+        {
+          did: "lock-1",
+          name: "门锁",
+          model: "lumi.lock.mcn01",
+          spec_type: "urn:miot-spec-v2:device:lock:0000A038:lumi-mcn01:1",
+          isOnline: false,
+        },
+      ]),
+      getSharedDevicesList: mock(async () => []),
+      getScenesList: mock(async () => []),
+      getDevicesProp: mock(async (items: Array<{ did: string; siid: number; piid: number }>) =>
+        items.map((it) => ({
+          did: it.did,
+          siid: it.siid,
+          piid: it.piid,
+          code: 0,
+          value: it.did === "972364835" && it.siid === 2 && it.piid === 1 ? purifierState["972364835"] : null,
+        })),
+      ),
+      setDevicesProp: mock(async (items: Array<{ did: string; siid: number; piid: number; value: unknown }>) =>
+        items.map((it) => {
+          if (it.did === "972364835" && it.siid === 2 && it.piid === 1 && typeof it.value === "boolean") {
+            purifierState["972364835"] = it.value;
+            powerWrites.push({ did: it.did, state: it.value });
+          }
+          return { did: it.did, siid: it.siid, piid: it.piid, code: 0 };
+        }),
+      ),
+      runAction: mock(async () => ({ code: 0 })),
+    };
+
+    const service = new MijiaService({
+      api: mockApi as unknown as MijiaApiClient,
+      specFetcher: async () => purifierSpec,
+    });
+    return { service, powerWrites, purifierState };
+  }
+
+  test("never routes '把客厅里面的灯光调暗一点' to previous air purifier or powers it back on (local engine)", async () => {
+    const { service, powerWrites, purifierState } = createNoLightHomeService();
+    const jobs = new JobExecutor();
+    applyTheme("dark", "green");
+    const themeCtrl = new ThemeController("dark");
+    const networkMonitor = new NetworkMonitor({ initialReachability: "online", autoStart: false });
+    const mainWindow = new MainWindowController({
+      service,
+      jobs,
+      themeCtrl,
+      networkMonitor,
+      autoStartTimers: false,
+      cacheLoader: () => null,
+      cacheSaver: () => {},
+    });
+    const agent = new PiAgentService({
+      deps: { service, jobs, mainWindow, settingsStore, broadcastState: () => {} },
+    });
+
+    try {
+      mainWindow.start();
+      const deadline = Date.now() + 2000;
+      while (Date.now() < deadline && mainWindow.allDevices.length === 0) {
+        await Bun.sleep(15);
+      }
+
+      // Turn 1: turn off air purifier
+      const r1 = await agent.prompt("关闭空气净化器", { source: "voice" });
+      expect(r1.ok).toBe(true);
+      expect(r1.toolCalls[0]?.name).toBe("set_device_power");
+      expect(purifierState["972364835"]).toBe(false);
+      expect(powerWrites).toEqual([{ did: "972364835", state: false }]);
+
+      // Turn 2: dim living room light when no light exists -> must NOT target 972364835 or hardcode 客厅吸顶灯
+      const r2 = await agent.prompt("把客厅里面的灯光调暗一点", { source: "voice" });
+      expect(r2.ok).toBe(true);
+      expect(r2.toolCalls[0]?.name).toBe("control_light");
+      expect(r2.toolCalls[0]?.args.target).toBe("客厅灯光");
+      expect(r2.reply).toContain("未找到灯具");
+      expect(r2.reply).not.toContain("空气净化器");
+      expect(r2.reply).not.toContain("客厅吸顶灯");
+      expect(purifierState["972364835"]).toBe(false);
+      expect(powerWrites).toEqual([{ did: "972364835", state: false }]);
+
+      // Turn 3: user corrects "我说的是把客厅里面的灯光调暗" -> still must NOT target 972364835
+      const r3 = await agent.prompt("我说的是把客厅里面的灯光调暗", { source: "voice" });
+      expect(r3.ok).toBe(true);
+      expect(r3.toolCalls[0]?.args.target).toBe("客厅灯光");
+      expect(r3.reply).not.toContain("空气净化器");
+      expect(purifierState["972364835"]).toBe(false);
+      expect(powerWrites).toEqual([{ did: "972364835", state: false }]);
+
+      // Unmatched non-light device in living room ("关闭客厅空调") must NOT toggle the living room air purifier
+      const rAc = await agent.prompt("打开客厅空调", { source: "voice" });
+      expect(rAc.ok).toBe(true);
+      expect(rAc.toolCalls[0]?.name).toBe("set_device_power");
+      expect(rAc.toolCalls[0]?.status).toBe("error");
+      expect(purifierState["972364835"]).toBe(false);
+      expect(powerWrites).toEqual([{ did: "972364835", state: false }]);
+    } finally {
+      agent.dispose();
+      networkMonitor.stop();
+      mainWindow.dispose();
+      await jobs.shutdown();
+    }
+  });
+
+  test("falls through to cloud LLM under preferLocalIntents when light target is missing or user corrects", async () => {
+    const { service, powerWrites, purifierState } = createNoLightHomeService();
+    const cloudRequests: Array<{ lastUser: string }> = [];
+    const mockCloudServer = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const body = (await req.json()) as {
+          messages?: Array<{ role?: string; content?: string | Array<{ type?: string; text?: string }> }>;
+        };
+        const userMsgs = (body.messages ?? []).filter((m) => m.role === "user");
+        const last = userMsgs[userMsgs.length - 1];
+        const lastUser =
+          typeof last?.content === "string"
+            ? last.content
+            : Array.isArray(last?.content)
+              ? last.content.map((c) => c.text ?? "").join(" ")
+              : "";
+        cloudRequests.push({ lastUser });
+        const reply = "当前设备清单里客厅还没有同步到灯光设备。";
+        const sse = [
+          `data: ${JSON.stringify({
+            id: "chatcmpl-fallback",
+            object: "chat.completion.chunk",
+            created: 1700000000,
+            model: "mock-cloud-model",
+            choices: [{ index: 0, delta: { role: "assistant", content: reply }, finish_reason: null }],
+          })}`,
+          `data: ${JSON.stringify({
+            id: "chatcmpl-fallback",
+            object: "chat.completion.chunk",
+            created: 1700000000,
+            model: "mock-cloud-model",
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          })}`,
+          "data: [DONE]",
+          "",
+        ].join("\n\n");
+        return new Response(sse, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      },
+    });
+
+    const jobs = new JobExecutor();
+    applyTheme("dark", "green");
+    const themeCtrl = new ThemeController("dark");
+    const networkMonitor = new NetworkMonitor({ initialReachability: "online", autoStart: false });
+    const mainWindow = new MainWindowController({
+      service,
+      jobs,
+      themeCtrl,
+      networkMonitor,
+      autoStartTimers: false,
+      cacheLoader: () => null,
+      cacheSaver: () => {},
+    });
+    const agent = new PiAgentService({
+      deps: { service, jobs, mainWindow, settingsStore, broadcastState: () => {} },
+      initialConfig: normalizeAgentVoiceConfig({
+        ...defaultAgentVoiceConfig(),
+        provider: "openai-compatible",
+        baseUrl: `http://127.0.0.1:${mockCloudServer.port}/v1`,
+        apiKey: "sk-test-cloud-fallback",
+        modelId: "mock-cloud-model",
+        preferLocalIntents: true,
+      }),
+    });
+
+    try {
+      mainWindow.start();
+      const deadline = Date.now() + 2000;
+      while (Date.now() < deadline && mainWindow.allDevices.length === 0) {
+        await Bun.sleep(15);
+      }
+
+      // Turn 1: deterministic known device still uses 0ms local fast-path (0 cloud calls)
+      const r1 = await agent.prompt("关闭空气净化器", { source: "voice" });
+      expect(r1.ok).toBe(true);
+      expect(cloudRequests.length).toBe(0);
+      expect(purifierState["972364835"]).toBe(false);
+
+      // Turn 2: no living room light exists -> must fall through to cloud LLM instead of calling control_light on 972364835
+      const r2 = await agent.prompt("把客厅里面的灯光调暗一点", { source: "voice" });
+      expect(r2.ok).toBe(true);
+      expect(cloudRequests.length).toBe(1);
+      expect(r2.toolCalls.length).toBe(0);
+      expect(r2.reply).toContain("客厅");
+      expect(purifierState["972364835"]).toBe(false);
+      expect(powerWrites).toEqual([{ did: "972364835", state: false }]);
+
+      // Turn 3: conversational correction -> also falls through to cloud LLM
+      const r3 = await agent.prompt("我说的是把客厅里面的灯光调暗", { source: "voice" });
+      expect(r3.ok).toBe(true);
+      expect(cloudRequests.length).toBe(2);
+      expect(r3.toolCalls.length).toBe(0);
+      expect(purifierState["972364835"]).toBe(false);
+    } finally {
+      mockCloudServer.stop(true);
+      agent.dispose();
+      networkMonitor.stop();
+      mainWindow.dispose();
+      await jobs.shutdown();
+    }
+  });
+
+  test("enforces room isolation, capability pre-check before power-on, and locative light matching", async () => {
+    const livingPurifier = createDeviceInfo({
+      did: "972364835",
+      name: "米家空气净化器 4 Lite",
+      model: "zhimi.airp.rma3",
+      home_name: "方寸别院",
+      room_name: "客厅",
+      online: true,
+      spec_type: "urn:miot-spec-v2:device:air-purifier:0000A007:zhimi-rma3:1",
+    });
+    const bedroomLight = createDeviceInfo({
+      did: "bedroom-light-1",
+      name: "卧室吸顶灯",
+      model: "yeelink.light.ceiling1",
+      home_name: "方寸别院",
+      room_name: "卧室",
+      online: true,
+      spec_type: "urn:miot-spec-v2:device:light:0000A001:yeelink-ceiling1:1",
+      light_features: ["brightness", "temperature"],
+    });
+    const livingLight = createDeviceInfo({
+      did: "living-light-1",
+      name: "客厅吸顶灯",
+      model: "yeelink.light.ceiling1",
+      home_name: "方寸别院",
+      room_name: "客厅",
+      online: true,
+      spec_type: "urn:miot-spec-v2:device:light:0000A001:yeelink-ceiling1:1",
+      light_features: ["brightness", "temperature"],
+    });
+
+    // 1. resolveDevices understands "客厅里面的灯光" and enforces room isolation
+    expect(resolveDevices([livingPurifier, livingLight], { target: "客厅里面的灯光" }).map((d) => d.did)).toEqual([
+      "living-light-1",
+    ]);
+    expect(resolveDevices([livingPurifier, bedroomLight], { target: "客厅里面的灯光" })).toEqual([]);
+    expect(resolveDevices([livingPurifier, bedroomLight], { target: "客厅灯光" })).toEqual([]);
+
+    // 2. planDeterministicLocalCalls respects explicit room even when another room has a light or recentTarget
+    expect(
+      planDeterministicLocalCalls(
+        "把客厅里面的灯光调暗一点",
+        { getDevices: () => [livingPurifier, bedroomLight], getScenes: () => [] },
+        "bedroom-light-1",
+      ),
+    ).toBeNull();
+    expect(
+      planDeterministicLocalCalls(
+        "把卧室灯光调暗一点",
+        { getDevices: () => [livingLight], getScenes: () => [] },
+        "living-light-1",
+      ),
+    ).toBeNull();
+    expect(
+      planDeterministicLocalCalls(
+        "关闭卧室灯",
+        { getDevices: () => [livingLight], getScenes: () => [] },
+        "living-light-1",
+      ),
+    ).toBeNull();
+
+    // 3. After air purifier turn, dimming an existing living room light (or bare "调暗一点") picks the light, never the purifier
+    expect(
+      planDeterministicLocalCalls(
+        "把客厅里面的灯光调暗一点",
+        { getDevices: () => [livingPurifier, livingLight], getScenes: () => [] },
+        "972364835",
+      ),
+    ).toEqual([{ name: "control_light", arguments: { target: "living-light-1", brightness: 35 } }]);
+    expect(
+      planDeterministicLocalCalls(
+        "调暗一点",
+        { getDevices: () => [livingPurifier, livingLight], getScenes: () => [] },
+        "972364835",
+      ),
+    ).toEqual([{ name: "control_light", arguments: { target: "living-light-1", brightness: 35 } }]);
+
+    // 4. Multi-turn light follow-up still stays on the recent light when no room is specified
+    expect(
+      planDeterministicLocalCalls(
+        "再调暗一点",
+        { getDevices: () => [livingLight, bedroomLight], getScenes: () => [] },
+        "bedroom-light-1",
+      ),
+    ).toEqual([{ name: "control_light", arguments: { target: "bedroom-light-1", brightness: 35 } }]);
+
+    // 5. Conversational correction always hands off to cloud LLM under preferLocalIntents
+    expect(
+      planDeterministicLocalCalls(
+        "我说的是把客厅里面的灯光调暗",
+        { getDevices: () => [livingLight], getScenes: () => [] },
+        "972364835",
+      ),
+    ).toBeNull();
+
+    // 6. control_light validates brightness capability BEFORE powering on a switch-controlled light or non-light
+    const h = createTestHarness();
+    try {
+      await h.ready();
+      await h.service.setPowerState("demo-switch-bar.s2", false);
+      h.mainWindow.applyPowerState("demo-switch-bar.s2", false);
+      expect(await h.service.powerState("demo-switch-bar.s2")).toBe(false);
+
+      const res = await h.agent.prompt("把餐厅主灯调暗一点");
+      expect(res.ok).toBe(true);
+      expect(res.toolCalls[0]?.name).toBe("control_light");
+      expect(res.toolCalls[0]?.status).toBe("error");
+      expect(res.reply).toContain("不支持亮度调节");
+      // Crucial: must NOT have powered on 餐厅主灯 before failing!
+      expect(await h.service.powerState("demo-switch-bar.s2")).toBe(false);
+    } finally {
+      await h.cleanup();
+    }
+
+    // 7. Even if a cloud LLM calls control_light directly with target="客厅" or an air purifier's exact did,
+    //    control_light MUST NOT match or power on the air purifier!
+    const { service: noLightService, powerWrites, purifierState } = createNoLightHomeService();
+    const jobs2 = new JobExecutor();
+    const themeCtrl2 = new ThemeController("dark");
+    const networkMonitor2 = new NetworkMonitor({ initialReachability: "online", autoStart: false });
+    const mw2 = new MainWindowController({
+      service: noLightService,
+      jobs: jobs2,
+      themeCtrl: themeCtrl2,
+      networkMonitor: networkMonitor2,
+      autoStartTimers: false,
+      cacheLoader: () => null,
+      cacheSaver: () => {},
+    });
+    const faux = fauxProvider({
+      models: [{ id: "faux-light-guard", name: "Faux Light Guard" }],
+    });
+    faux.setResponses([
+      fauxAssistantMessage(
+        [
+          fauxToolCall("control_light", { target: "客厅", brightness: 35 }),
+          fauxToolCall("control_light", { target: "972364835", brightness: 35 }),
+        ],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage("客厅里没有可调光的灯具。", { stopReason: "stop" }),
+    ]);
+    const guardAgent = new PiAgentService({
+      deps: { service: noLightService, jobs: jobs2, mainWindow: mw2, settingsStore, broadcastState: () => {} },
+      customModel: faux.getModel(),
+      customStreamFn: (m, ctx, opts) => faux.provider.streamSimple(m, ctx, opts),
+    });
+
+    try {
+      mw2.start();
+      const deadline = Date.now() + 2000;
+      while (Date.now() < deadline && mw2.allDevices.length === 0) {
+        await Bun.sleep(15);
+      }
+      await noLightService.setPowerState("972364835", false);
+      mw2.applyPowerState("972364835", false);
+      powerWrites.length = 0;
+
+      const rGuard = await guardAgent.prompt("把客厅里面的灯光调暗一点");
+      expect(rGuard.ok).toBe(true);
+      expect(rGuard.toolCalls.length).toBe(2);
+      expect(rGuard.toolCalls[0]?.status).toBe("error");
+      expect(rGuard.toolCalls[0]?.summary).toContain("未找到灯具");
+      expect(rGuard.toolCalls[1]?.status).toBe("error");
+      expect(rGuard.toolCalls[1]?.summary).toContain("不支持亮度调节");
+      // Air purifier MUST remain OFF with ZERO power writes!
+      expect(purifierState["972364835"]).toBe(false);
+      expect(powerWrites).toEqual([]);
+    } finally {
+      guardAgent.dispose();
+      networkMonitor2.stop();
+      mw2.dispose();
+      await jobs2.shutdown();
+    }
   });
 });

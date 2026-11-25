@@ -28,6 +28,7 @@ import {
 import type { DeviceInfo, PropInfo, SceneInfo } from "../core/models.ts";
 import { isLight } from "../core/deviceControls.ts";
 import { isSpeaker } from "../core/models.ts";
+import { resolveDevices } from "./smartHomeTools.ts";
 import {
   DEFAULT_CAVEMAN_MODE,
   normalizeCavemanMode,
@@ -63,11 +64,66 @@ export interface PlannedCall {
 const SMART_HOME_FAST_ENTITY_RE =
   /(?:设备|吸顶灯|吊灯|主灯|射灯|灯带|台灯|照明|电灯|灯光|灯|空调|风扇|窗帘|插座|开关|音箱|音响|小爱|电视|净化器|加湿器|除湿|扫地|摄像头|摄像机|监控|温湿度|温度|湿度|传感|喂食|出粮|场景|模式|房间|客厅|卧室|主卧|次卧|餐厅|书房|厨房|阳台|走廊|玄关|卫生间|浴室|家里|全屋|全部|所有|音量|声音|亮度|色温|音乐|歌曲|light|lamp|speaker|music|volume|device|room)/i;
 
+const RE_LIGHT_KEYWORD =
+  /(吸顶灯|吊灯|主灯|射灯|灯带|台灯|落地灯|壁灯|夜灯|筒灯|照明|电灯|灯光|灯|\blights?\b|\blamps?\b)/i;
+
+const RE_NON_LIGHT_DEVICE_HINT =
+  /(?:电视|屏幕|显示器|投影|净化器|空调|风扇|窗帘|插座|开关|音箱|音响|小爱|加湿器|除湿|扫地|摄像头|摄像机|监控|门锁|路由器|喂食器|温湿度)/;
+
+const RE_CONVERSATIONAL_CORRECTION =
+  /^(?:我说的是|我是说|我刚才说的是|我指的是|不是那个|不对[，,\s]|你搞错了|搞错了|弄错了|理解错了)/;
+
+const COMMON_ROOM_NAMES: readonly string[] = [
+  "儿童房",
+  "老人房",
+  "衣帽间",
+  "卫生间",
+  "洗手间",
+  "客厅",
+  "主卧",
+  "次卧",
+  "卧室",
+  "餐厅",
+  "书房",
+  "厨房",
+  "阳台",
+  "浴室",
+  "厕所",
+  "走廊",
+  "过道",
+  "玄关",
+  "门厅",
+  "车库",
+];
+
+function isLightLike(device: DeviceInfo): boolean {
+  return isLight(device) || (device.switch_channels.length === 0 && /灯/.test(device.name));
+}
+
+function detectCommonRoom(clause: string): string | undefined {
+  for (const room of COMMON_ROOM_NAMES) {
+    if (clause.includes(room)) {
+      return room;
+    }
+  }
+  return undefined;
+}
+
+function roomMatchesDevice(device: DeviceInfo, room: string): boolean {
+  const dr = device.room_name.trim();
+  if (dr && dr !== "未知" && dr !== "未分配" && dr !== "未分配房间") {
+    if (dr === room || dr.includes(room) || room.includes(dr)) {
+      return true;
+    }
+  }
+  return device.name.includes(room);
+}
+
 /**
  * 借鉴 Home Assistant `assist_pipeline` `prefer_local_intents` 设计：
  * 在调用云端大模型前先以零延迟判断该指令是否可由确定性本地智能家居规则完整覆盖。
  * - 若所有子句均可确定性执行（开关、调光、音箱控制、喂食、场景、设备查询等），直接返回工具调用列表；
- * - 若包含任何非确定性/口语隐式/开放式问答子句，返回 null 交由云端大模型处理。
+ * - 若包含任何非确定性/口语隐式/纠正澄清/未命中已同步目标设备/开放式问答子句，返回 null 交由云端大模型处理。
  */
 export function planDeterministicLocalCalls(
   userText: string,
@@ -75,7 +131,7 @@ export function planDeterministicLocalCalls(
   recentTarget: string | null = null,
 ): PlannedCall[] | null {
   const trimmed = userText.trim();
-  if (!trimmed || trimmed.length > 48 || isGreetingOrHelp(trimmed)) {
+  if (!trimmed || trimmed.length > 48 || isGreetingOrHelp(trimmed) || RE_CONVERSATIONAL_CORRECTION.test(trimmed)) {
     return null;
   }
 
@@ -87,26 +143,62 @@ export function planDeterministicLocalCalls(
   }
 
   const planned: PlannedCall[] = [];
+  let activeRecentTarget = recentTarget;
   for (const clause of clauses) {
-    const call = planSingleClause(clause, devices, scenes, recentTarget);
+    const call = planSingleClause(clause, devices, scenes, activeRecentTarget);
     if (!call) {
       return null;
     }
-    // 防止开放式中文问句（如“今天天气怎么样”）误落入 list_devices 或未知 target 的 set_device_power
+    // 防止开放式中文问句（如“今天天气怎么样”）误落入 list_devices
     if (call.name === "list_devices" && !SMART_HOME_FAST_ENTITY_RE.test(clause)) {
       return null;
     }
-    if (call.name === "set_device_power") {
-      const hasKnownRoom = Boolean(call.arguments.room);
-      const hasKnownCategory = Boolean(call.arguments.category);
+    // 仅当目标确实命中已同步灯具时走本地调光快路径；否则交由云端大模型结合完整设备清单说明或规划
+    if (call.name === "control_light") {
       const targetStr = typeof call.arguments.target === "string" ? call.arguments.target : "";
-      const matchedKnownDevice =
-        Boolean(targetStr) &&
-        (targetStr === recentTarget ||
-          devices.some((d) => d.did === targetStr || d.name === targetStr));
-      if (!matchedKnownDevice && !hasKnownRoom && !hasKnownCategory && !SMART_HOME_FAST_ENTITY_RE.test(clause)) {
+      const matchedRealLight = Boolean(
+        targetStr && devices.some((d) => isLight(d) && (d.did === targetStr || d.name === targetStr)),
+      );
+      if (!matchedRealLight) {
         return null;
       }
+    }
+    if (call.name === "set_device_power") {
+      const targetStr = typeof call.arguments.target === "string" ? call.arguments.target : undefined;
+      const roomStr = typeof call.arguments.room === "string" ? call.arguments.room : undefined;
+      const catStr = typeof call.arguments.category === "string" ? call.arguments.category : undefined;
+      let matched = resolveDevices(devices, {
+        target: targetStr,
+        room: roomStr,
+        category: catStr,
+        controllableOnly: true,
+      });
+      if (matched.length === 0 && (targetStr || catStr === "speaker")) {
+        matched = resolveDevices(devices, {
+          target: targetStr,
+          room: roomStr,
+          category: "speaker",
+        }).filter((d) => isSpeaker(d));
+      }
+      if (matched.length === 0) {
+        return null;
+      }
+    }
+    if (call.name === "control_speaker" && !devices.some((d) => isSpeaker(d))) {
+      return null;
+    }
+    if (call.name === "run_device_action" || call.name === "get_device_detail") {
+      const targetStr = typeof call.arguments.target === "string" ? call.arguments.target : "";
+      const matchedKnownDevice = Boolean(
+        targetStr && devices.some((d) => d.did === targetStr || d.name === targetStr),
+      );
+      if (!matchedKnownDevice) {
+        return null;
+      }
+    }
+    const callTarget = typeof call.arguments.target === "string" ? call.arguments.target : "";
+    if (callTarget && devices.some((d) => d.did === callTarget)) {
+      activeRecentTarget = callTarget;
     }
     planned.push(call);
   }
@@ -180,8 +272,15 @@ function normalize(s: string): string {
 function findRecentDeviceFromTranscript(messages: readonly Message[]): string | null {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const msg = messages[i]!;
-    if (msg.role === "toolResult" && !msg.isError && msg.details && typeof msg.details === "object") {
+    if (
+      msg.role === "toolResult" &&
+      !msg.isError &&
+      msg.toolName !== "run_scene" &&
+      msg.details &&
+      typeof msg.details === "object"
+    ) {
       const details = msg.details as Record<string, unknown>;
+      if (typeof details.scene_id === "string") continue;
       if (typeof details.did === "string" && details.did) return details.did;
       if (typeof details.name === "string" && details.name) return details.name;
       if (Array.isArray(details.succeeded) && details.succeeded.length > 0) {
@@ -208,9 +307,13 @@ function splitCompoundClauses(input: string): string[] {
 }
 
 function detectRoom(clause: string, devices: readonly DeviceInfo[]): string | undefined {
-  const rooms = [...new Set(devices.map((d) => d.room_name).filter(Boolean))].sort(
-    (a, b) => b.length - a.length,
-  );
+  const rooms = [
+    ...new Set(
+      devices
+        .map((d) => d.room_name.trim())
+        .filter((r) => Boolean(r) && r !== "未知" && r !== "未分配" && r !== "未分配房间"),
+    ),
+  ].sort((a, b) => b.length - a.length);
   for (const room of rooms) {
     if (clause.includes(room)) {
       return room;
@@ -219,7 +322,15 @@ function detectRoom(clause: string, devices: readonly DeviceInfo[]): string | un
   return undefined;
 }
 
-function detectNamedDevice(clause: string, devices: readonly DeviceInfo[]): DeviceInfo | undefined {
+function detectExplicitRoom(clause: string, devices: readonly DeviceInfo[]): string | undefined {
+  return detectRoom(clause, devices) ?? detectCommonRoom(clause);
+}
+
+function detectNamedDevice(
+  clause: string,
+  devices: readonly DeviceInfo[],
+  explicitRoom?: string,
+): DeviceInfo | undefined {
   const normClause = normalize(clause);
   const sorted = [...devices].sort((a, b) => b.name.length - a.name.length);
   for (const d of sorted) {
@@ -229,12 +340,10 @@ function detectNamedDevice(clause: string, devices: readonly DeviceInfo[]): Devi
     }
   }
   // 常见简称匹配（如“客厅灯” -> “客厅吸顶灯”、“喂食器” -> “智能宠物喂食器”、“温湿度” -> “卧室米家温湿度计”）
-  const room = detectRoom(clause, devices);
-  if (/(吸顶灯|吊灯|主灯|射灯|灯带|台灯|照明|电灯|灯光|灯)/.test(clause)) {
+  const room = explicitRoom ?? detectExplicitRoom(clause, devices);
+  if (RE_LIGHT_KEYWORD.test(clause)) {
     const roomLights = devices.filter(
-      (d) =>
-        (!room || d.room_name === room) &&
-        (isLight(d) || (d.switch_channels.length === 0 && /灯/.test(d.name))),
+      (d) => (!room || roomMatchesDevice(d, room)) && isLightLike(d),
     );
     if (roomLights.length === 1) return roomLights[0];
     const specific = roomLights.find((d) => {
@@ -242,6 +351,8 @@ function detectNamedDevice(clause: string, devices: readonly DeviceInfo[]): Devi
       if (clause.includes("主灯") && d.name.includes("主灯")) return true;
       if (clause.includes("射灯") && d.name.includes("射灯")) return true;
       if (clause.includes("灯带") && d.name.includes("灯带")) return true;
+      if (clause.includes("台灯") && d.name.includes("台灯")) return true;
+      if (clause.includes("吊灯") && d.name.includes("吊灯")) return true;
       return false;
     });
     if (specific) return specific;
@@ -257,7 +368,7 @@ function detectNamedDevice(clause: string, devices: readonly DeviceInfo[]): Devi
   if (/(温湿度|温度计|湿度计|几度|温度|湿度)/.test(clause)) {
     const sensors = devices.filter(
       (d) =>
-        (!room || d.room_name === room) &&
+        (!room || roomMatchesDevice(d, room)) &&
         ((Array.isArray(d.metric_features) && d.metric_features.length > 0) ||
           d.model.includes("sensor") ||
           d.name.includes("温湿度")),
@@ -267,13 +378,13 @@ function detectNamedDevice(clause: string, devices: readonly DeviceInfo[]): Devi
   if (/(音箱|小爱|音响|音量|声音|静音|上一首|上一曲|下一首|下一曲|切歌|换一首|换首歌|暂停|播放|播报|朗读|音乐|歌曲|放歌)/.test(clause)) {
     const speakers = devices.filter((d) => isSpeaker(d));
     if (speakers.length > 0) {
-      return speakers.find((d) => (!room || d.room_name === room) && d.online) ?? speakers[0];
+      return speakers.find((d) => (!room || roomMatchesDevice(d, room)) && d.online) ?? speakers[0];
     }
   }
   if (/(摄像头|摄像机|监控)/.test(clause)) {
     const cams = devices.filter(
       (d) =>
-        (!room || d.room_name === room) &&
+        (!room || roomMatchesDevice(d, room)) &&
         (d.model.includes("camera") || d.spec_type.includes("camera") || d.name.includes("摄像")),
     );
     if (cams.length > 0) return cams[0];
@@ -332,17 +443,15 @@ function pickTargetLight(
   recentTarget: string | null,
   preferState?: boolean,
 ): DeviceInfo | undefined {
-  const lights = devices.filter(
-    (d) => isLight(d) || (d.switch_channels.length === 0 && /灯/.test(d.name)),
-  );
+  const lights = devices.filter((d) => isLightLike(d));
   if (lights.length === 0) return undefined;
 
-  const named = detectNamedDevice(clause, lights);
+  const explicitRoom = detectExplicitRoom(clause, devices);
+  const named = detectNamedDevice(clause, lights, explicitRoom);
   if (named) return named;
 
-  const room = detectRoom(clause, lights);
-  const roomPool = room ? lights.filter((d) => d.room_name === room) : lights;
-  const pool = roomPool.length > 0 ? roomPool : lights;
+  const pool = explicitRoom ? lights.filter((d) => roomMatchesDevice(d, explicitRoom)) : lights;
+  if (pool.length === 0) return undefined;
 
   if (recentTarget) {
     const recent = pool.find((d) => (d.did === recentTarget || d.name === recentTarget) && d.online);
@@ -493,6 +602,41 @@ const RE_GENERIC_MUSIC_TARGET = /^(?:音乐|歌曲|歌|一下)?(?:吧|呀|哦|�
 
 const RE_NEGATIVE_BEFORE_PLAY =
   /(?:停止|暂停|终止|结束|停掉|停了|关闭|关掉|不要|别|不再|不用|不想|不).{0,8}(?:播放|放一首|点一首|放首|来一首|放歌|放音乐|播音乐)/;
+
+function buildFallbackLightTarget(clause: string, explicitRoom: string | undefined): string {
+  const specificLightMatch = /(吸顶灯|吊灯|主灯|射灯|灯带|台灯|落地灯|壁灯|夜灯|筒灯|灯光|电灯|照明|灯)/.exec(
+    clause,
+  );
+  const lightNoun = specificLightMatch?.[1];
+  if (explicitRoom && lightNoun) {
+    return `${explicitRoom}${lightNoun}`;
+  }
+  if (explicitRoom) {
+    return `${explicitRoom}灯光`;
+  }
+  if (lightNoun) {
+    return lightNoun;
+  }
+  return "灯光";
+}
+
+function stripPowerTargetPhrase(clause: string, explicitRoom?: string): string {
+  let out = clause
+    .replace(
+      /^(?:请|帮我|麻烦|把|将|给|我要|我想)?(?:打开|开启|关闭|关掉|关上|关了|切换|点亮|熄灭|休眠|turn\s+on|turn\s+off|switch\s+on|switch\s+off)\s*/i,
+      "",
+    )
+    .replace(/(?:打开|开启|关闭|关掉|关上|关了|切换|点亮|熄灭|休眠|一下|吧|哦|呀)+$/g, "")
+    .trim();
+  if (explicitRoom) {
+    out = out
+      .replace(explicitRoom, "")
+      .replace(/^(?:里面|里边|里头|里|中|内)?(?:的)?/, "")
+      .replace(/(?:的)?$/, "")
+      .trim();
+  }
+  return out;
+}
 
 function planSingleClause(
   clause: string,
@@ -649,13 +793,42 @@ function planSingleClause(
   const modeMatch = /(日光|月光|阅读|影院)(?:模式)?/.exec(clause);
 
   if (hasBrightness || hasTemp || colorMatch || modeMatch) {
-    const lightDev =
-      detectNamedDevice(clause, devices.filter((d) => isLight(d))) ??
-      detectNamedDevice(clause, devices) ??
-      (recentTarget ? devices.find((d) => d.did === recentTarget || d.name === recentTarget) : undefined) ??
-      devices.find((d) => isLight(d) && d.online);
+    const explicitRoom = detectExplicitRoom(clause, devices);
+    const realLights = devices.filter((d) => isLight(d));
+    const lightCandidates = devices.filter((d) => isLightLike(d));
+    const mentionsLight = RE_LIGHT_KEYWORD.test(clause);
 
-    const args: JsonObject = { target: lightDev?.did ?? lightDev?.name ?? "客厅吸顶灯" };
+    // 1. 优先在灯具（先可调光灯具，再灯类开关子路）中按名称或房间匹配
+    let lightDev: DeviceInfo | undefined =
+      detectNamedDevice(clause, realLights, explicitRoom) ??
+      detectNamedDevice(clause, lightCandidates, explicitRoom);
+
+    // 2. 若未提及“灯”且明确说出了某非灯具设备的完整名称，仅做精确名称匹配
+    if (!lightDev && !mentionsLight && !explicitRoom) {
+      const normClause = normalize(clause);
+      const sortedAll = [...devices].sort((a, b) => b.name.length - a.name.length);
+      lightDev = sortedAll.find((d) => {
+        const normName = normalize(d.name);
+        return normName.length >= 2 && normClause.includes(normName);
+      });
+    }
+
+    // 3. 仅当用户未限定具体房间且未提及非灯具设备时，才沿用上一轮“灯具”或回退到在线灯具；
+    //    绝不把上一轮非灯具设备（如空气净化器、音箱）误匹配为灯光控制目标，也不跨房间误控。
+    if (!lightDev && !explicitRoom && (mentionsLight || !RE_NON_LIGHT_DEVICE_HINT.test(clause))) {
+      const recentLight = recentTarget
+        ? (realLights.find((d) => d.did === recentTarget || d.name === recentTarget) ??
+           lightCandidates.find((d) => d.did === recentTarget || d.name === recentTarget))
+        : undefined;
+      lightDev =
+        recentLight ??
+        realLights.find((d) => d.online) ??
+        lightCandidates.find((d) => d.online);
+    }
+
+    const args: JsonObject = {
+      target: lightDev?.did ?? lightDev?.name ?? buildFallbackLightTarget(clause, explicitRoom),
+    };
 
     if (hasBrightness) {
       const pctMatch = /(?:亮度|调到|调至|设为|设置为|到|至)\s*(\d{1,3})\s*%?/.exec(clause) ?? /(\d{1,3})\s*%/.exec(clause);
@@ -702,12 +875,12 @@ function planSingleClause(
     if (dev) {
       return { name: "get_device_detail", arguments: { target: dev.did } };
     }
-    const room = detectRoom(clause, devices);
+    const room = detectExplicitRoom(clause, devices);
     return { name: "list_devices", arguments: room ? { room } : {} };
   }
 
   if (/(有哪些设备|设备列表|查看设备|列出设备|所有设备|家里有什么|看看.*设备)/.test(clause)) {
-    const room = detectRoom(clause, devices);
+    const room = detectExplicitRoom(clause, devices);
     const args: JsonObject = {};
     if (room) args.room = room;
     if (/(灯|照明)/.test(clause)) args.category = "light";
@@ -723,39 +896,42 @@ function planSingleClause(
 
   if (isTurnOff || isTurnOn || isToggle) {
     const state = isTurnOff ? "off" : isTurnOn ? "on" : "toggle";
-    const room = detectRoom(clause, devices);
+    const explicitRoom = detectExplicitRoom(clause, devices);
     const isBatchAll = /(全部|所有|全屋|都)/.test(clause);
-    const mentionsLight = /(灯光?|电灯|照明|射灯|灯带|\blights?\b)/i.test(clause);
+    const mentionsLight = RE_LIGHT_KEYWORD.test(clause);
 
     // 批量控制：如“关闭餐厅所有灯”、“打开全部灯”、“关闭全屋设备”
     if (isBatchAll) {
       const args: JsonObject = { state };
-      if (room) args.room = room;
+      if (explicitRoom) args.room = explicitRoom;
       if (mentionsLight) args.category = "light";
       return { name: "set_device_power", arguments: args };
     }
 
     // 指代上一轮设备（“把它关了”/“打开它”）
-    if (/(把它|将它|它)/.test(clause) && recentTarget) {
+    if (/(?:把它|将它|(?<!其)它)/.test(clause) && recentTarget) {
       return { name: "set_device_power", arguments: { target: recentTarget, state } };
     }
 
-    const dev = detectNamedDevice(clause, devices);
+    const dev = detectNamedDevice(clause, devices, explicitRoom);
     if (dev) {
       return { name: "set_device_power", arguments: { target: dev.did, state } };
     }
 
-    if (room) {
-      const args: JsonObject = { state, room };
-      if (mentionsLight) args.category = "light";
-      return { name: "set_device_power", arguments: args };
+    if (explicitRoom) {
+      if (mentionsLight) {
+        return { name: "set_device_power", arguments: { state, room: explicitRoom, category: "light" } };
+      }
+      // 若指定了具体设备名词（如“关闭客厅空调”），保留 target 过滤，避免误开关整个房间的所有设备
+      const strippedTarget = stripPowerTargetPhrase(clause, explicitRoom);
+      if (strippedTarget && !/^(?:设备|电器|家电|开关)$/.test(strippedTarget)) {
+        return { name: "set_device_power", arguments: { state, room: explicitRoom, target: strippedTarget } };
+      }
+      return { name: "set_device_power", arguments: { state, room: explicitRoom } };
     }
 
     // 提取残余目标名称交由 set_device_power 模糊解析
-    const stripped = clause
-      .replace(/^(?:请|帮我|麻烦|把|将|给|我要|我想)?(?:打开|开启|关闭|关掉|关上|关了|切换|点亮|熄灭|turn\s+on|turn\s+off)\s*/i, "")
-      .replace(/(?:打开|开启|关闭|关掉|关上|关了|一下|吧|哦|呀)$/g, "")
-      .trim();
+    const stripped = stripPowerTargetPhrase(clause);
     if (stripped) {
       return { name: "set_device_power", arguments: { target: stripped, state } };
     }
@@ -1516,10 +1692,15 @@ export function createLocalSmartHomeStreamFn(
         const clauses = splitCompoundClauses(userText);
         const planned: PlannedCall[] = [];
         let sawNeedsLlm = false;
+        let activeRecentTarget = recentTarget;
 
         for (const clause of clauses) {
-          const call = planSingleClause(clause, devices, scenes, recentTarget);
+          const call = planSingleClause(clause, devices, scenes, activeRecentTarget);
           if (call) {
+            const callTarget = typeof call.arguments.target === "string" ? call.arguments.target : "";
+            if (callTarget && devices.some((d) => d.did === callTarget)) {
+              activeRecentTarget = callTarget;
+            }
             planned.push(call);
             continue;
           }
@@ -1541,9 +1722,13 @@ export function createLocalSmartHomeStreamFn(
                 clause,
                 devices,
                 knownPower,
-                recentTarget,
+                activeRecentTarget,
               );
               if (mapped) {
+                const mappedTarget = typeof mapped.arguments.target === "string" ? mapped.arguments.target : "";
+                if (mappedTarget && devices.some((d) => d.did === mappedTarget)) {
+                  activeRecentTarget = mappedTarget;
+                }
                 planned.push(mapped);
               }
             }
