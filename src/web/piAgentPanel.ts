@@ -179,7 +179,12 @@ export interface UiLocalVoiceStatus {
   readyForVoxlock?: boolean;
   readyForVad: boolean;
   readyForVoiceprint: boolean;
+  readyForQwen3Asr?: boolean;
+  readyForSenseVoice?: boolean;
   readyForLocalAsr: boolean;
+  primaryAsrEngine?: "qwen3-asr" | "sensevoice" | null;
+  fallbackAsrEngine?: "sensevoice" | null;
+  activeLocalAsrMode?: "auto" | "qwen3-asr" | "sensevoice";
   readyForWakeWord?: boolean;
   readyForLocalTts?: boolean;
   tts?: {
@@ -201,6 +206,7 @@ export interface UiLocalVoiceStatus {
     voxlock?: boolean;
     sileroVad: boolean;
     speakerCampp: boolean;
+    qwen3Asr?: boolean;
     senseVoice: boolean;
     openWakeWord?: boolean;
     localTts?: boolean;
@@ -220,6 +226,7 @@ export interface UiVoiceSnapshot {
   active: boolean;
   mode: ClientVoiceMode;
   engine: "local" | "browser" | "whisper" | "manual";
+  localAsrEngine?: "auto" | "qwen3-asr" | "sensevoice";
   interimTranscript: string;
   lastTranscript: string;
   lastCommand: string;
@@ -1440,9 +1447,18 @@ export class PiAgentPanelController {
         : "对话模式中，请直接说指令";
       subEl.textContent = interim ? `${interim}` : "可直接连续追问，无需重复喊唤醒词";
     } else if (isListening) {
+      const localEngine = this.voiceState?.localEngine;
+      const localAsrLabel =
+        localEngine?.primaryAsrEngine === "qwen3-asr"
+          ? "本地 Qwen3-ASR 0.6B"
+          : localEngine?.primaryAsrEngine === "sensevoice"
+            ? localEngine.activeLocalAsrMode === "sensevoice"
+              ? "本地 SenseVoice (备用)"
+              : "本地 SenseVoice (兜底)"
+            : "本地离线语音";
       const engineLabel =
         this.localClientState.engine === "local"
-          ? "本地 SenseVoice"
+          ? localAsrLabel
           : this.localClientState.engine === "whisper"
             ? "Whisper 降噪转写"
             : "浏览器实时识别";
@@ -1453,11 +1469,21 @@ export class PiAgentPanelController {
           ? `说出“${firstWake}，打开客厅吸顶灯”即可唤醒`
           : "免唤醒已开启，直接说出设备控制指令即可执行";
     } else {
-      const readyHint = this.voiceState?.localEngine?.readyForLocalAsr
-        ? "本地 SenseVoice · openWakeWord · 降噪 · SystemOne 已就绪"
-        : wakeEnabled
-          ? `点击「进入对话」或「开启持续监听」（唤醒词：${wakeWords.slice(0, 3).join(" / ")}）`
-          : "点击「进入对话」或按 Alt+V 即可语音操控 Pi Agent";
+      const le = this.voiceState?.localEngine;
+      const asrReadyPrefix =
+        le?.primaryAsrEngine === "qwen3-asr"
+          ? le.readyForSenseVoice
+            ? "本地 Qwen3-ASR 0.6B (主) · SenseVoice (备用)"
+            : "本地 Qwen3-ASR 0.6B (CPU)"
+          : le?.primaryAsrEngine === "sensevoice"
+            ? "本地 SenseVoice (备用)"
+            : "";
+      const readyHint =
+        le?.readyForLocalAsr && asrReadyPrefix
+          ? `${asrReadyPrefix} · openWakeWord · 降噪已就绪`
+          : wakeEnabled
+            ? `点击「进入对话」或「开启持续监听」（唤醒词：${wakeWords.slice(0, 3).join(" / ")}）`
+            : "点击「进入对话」或按 Alt+V 即可语音操控 Pi Agent";
       statusEl.textContent = "语音监听待机中";
       subEl.textContent = readyHint;
     }
@@ -1473,7 +1499,26 @@ export class PiAgentPanelController {
     const tags: Array<{ label: string; warn?: boolean; title?: string }> = [];
 
     if (vs?.localEngine?.readyForLocalAsr) {
-      tags.push({ label: "离线 SenseVoice" });
+      if (vs.localEngine.primaryAsrEngine === "qwen3-asr") {
+        tags.push({
+          label: "Qwen3-ASR 0.6B",
+          title: vs.localEngine.readyForSenseVoice
+            ? "主方案 Qwen3-ASR-0.6B (CPU) 已就绪 · SenseVoice 备用热待命"
+            : "主方案 Qwen3-ASR-0.6B (CPU) 已就绪",
+        });
+      } else {
+        tags.push({
+          label:
+            vs.localEngine.activeLocalAsrMode === "sensevoice"
+              ? "SenseVoice 备用"
+              : "SenseVoice 兜底",
+          warn: vs.localEngine.activeLocalAsrMode === "auto" && !vs.localEngine.readyForQwen3Asr,
+          title:
+            vs.localEngine.activeLocalAsrMode === "sensevoice"
+              ? "当前已手动切换至 SenseVoice 备用方案"
+              : "Qwen3-ASR 主模型尚未就绪，当前自动使用 SenseVoice 储备方案",
+        });
+      }
     }
     const owwOn = (vs?.owwEnabled ?? cfg?.owwEnabled ?? true) !== false;
     const owwReady = Boolean(vs?.localEngine?.readyForWakeWord ?? vs?.localEngine?.models?.openWakeWord);

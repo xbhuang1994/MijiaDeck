@@ -163,6 +163,8 @@ const NOISE_ONLY_WAKE_ALIASES: Readonly<Record<string, readonly string[]>> = {
     "你给",
     "你欧",
     "你哦",
+    "你偶",
+    "黑牛",
     "妞",
     "牛",
     "纽",

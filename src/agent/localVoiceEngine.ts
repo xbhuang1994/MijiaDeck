@@ -8,14 +8,21 @@
  *   VoxLock 目标说话人声纹锁定人声提取（sherpa-onnx-voxlock-int8），无模型时自动降级纯 TS 频谱减法
  * - 语音活动检测：Silero VAD 神经端点检测（支持离线与连续流式检测），无模型时自动降级自适应能量+过零率 VAD
  * - 声纹识别：阿里 3D-Speaker CAM++（192 维中文说话人嵌入），无模型时自动降级声学指纹
- * - 本地离线 ASR：FunAudioLLM SenseVoiceSmall int8（异步非阻塞 decodeAsync）+ 抗音乐/强噪双轨融合识别
+ * - 本地离线 ASR：
+ *   - 主方案：Qwen3-ASR-0.6B int8（CPU ONNX 异步非阻塞 decodeAsync，高精度中英双语转写）
+ *   - 备用/储备方案：FunAudioLLM SenseVoiceSmall int8（主模型未就绪或异常时自动无缝降级，亦可手动切换）
  */
 
 import { existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import type { NoiseSuppressionMode, VadEngineMode } from "../core/agentConfigStore.ts";
+import {
+  DEFAULT_LOCAL_ASR_ENGINE,
+  type LocalAsrEngineMode,
+  type NoiseSuppressionMode,
+  type VadEngineMode,
+} from "../core/agentConfigStore.ts";
 import { projectRoot } from "../core/appMeta.ts";
 import {
   adaptiveEnergyVad,
@@ -54,7 +61,7 @@ import {
 } from "./voiceAttentionGate.ts";
 import { getPrimaryOwnerRefWavPath } from "./voiceprintStore.ts";
 
-export type { NoiseSuppressionMode, VadEngineMode };
+export type { LocalAsrEngineMode, NoiseSuppressionMode, VadEngineMode };
 
 export interface LocalVoiceModelPaths {
   modelsDir: string;
@@ -65,6 +72,11 @@ export interface LocalVoiceModelPaths {
   voxlockChunk: string;
   sileroVad: string;
   speakerCampp: string;
+  qwen3AsrDir: string;
+  qwen3AsrConvFrontend: string;
+  qwen3AsrEncoder: string;
+  qwen3AsrDecoder: string;
+  qwen3AsrTokenizer: string;
   senseVoiceDir: string;
   senseVoiceModel: string;
   senseVoiceTokens: string;
@@ -88,6 +100,7 @@ export interface LocalVoiceEngineStatus {
     voxlock: boolean;
     sileroVad: boolean;
     speakerCampp: boolean;
+    qwen3Asr: boolean;
     senseVoice: boolean;
     openWakeWord: boolean;
     cedAudioTagging?: boolean;
@@ -100,7 +113,12 @@ export interface LocalVoiceEngineStatus {
   readyForVoxlock: boolean;
   readyForVad: boolean;
   readyForVoiceprint: boolean;
+  readyForQwen3Asr: boolean;
+  readyForSenseVoice: boolean;
   readyForLocalAsr: boolean;
+  primaryAsrEngine: "qwen3-asr" | "sensevoice" | null;
+  fallbackAsrEngine: "sensevoice" | null;
+  activeLocalAsrMode: LocalAsrEngineMode;
   readyForWakeWord: boolean;
   readyForSourceSeparation?: boolean;
   readyForLocalTts?: boolean;
@@ -135,17 +153,35 @@ export interface SpeakerEmbeddingOutput {
   durationMs: number;
 }
 
+export type LocalAsrResultEngine =
+  | "qwen3-asr-local"
+  | "qwen3-asr-dual-raw"
+  | "qwen3-asr-dual-denoised"
+  | "sensevoice-local"
+  | "sensevoice-fallback"
+  | "sensevoice-dual-raw"
+  | "sensevoice-dual-denoised";
+
+export interface LocalAsrTranscribeOptions {
+  engine?: LocalAsrEngineMode;
+  hotwords?: readonly string[];
+  maxNewTokens?: number;
+  allowFallback?: boolean;
+}
+
 export interface LocalAsrOutput {
   text: string;
   rawText: string;
   lang: string;
   emotion: string;
   event: string;
-  engine: "sensevoice-local" | "sensevoice-dual-raw" | "sensevoice-dual-denoised";
+  engine: LocalAsrResultEngine;
   durationMs: number;
   altText?: string;
   enHeadText?: string;
   scoreMargin?: number;
+  fallbackUsed?: boolean;
+  fallbackReason?: string;
 }
 
 export interface OnlineDenoiserHandleLike {
@@ -194,6 +230,7 @@ interface SherpaModuleLike {
     createAsync(cfg: Record<string, unknown>): Promise<{
       createStream(): {
         acceptWaveform(req: { samples: Float32Array; sampleRate: number }): void;
+        setOption?(key: string, value: string): void;
       };
       decodeAsync(stream: unknown): Promise<{
         text?: string;
@@ -214,6 +251,8 @@ const MODEL_URLS = {
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
   speakerCampp:
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
+  qwen3AsrTar:
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2",
   senseVoiceTar:
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2",
   cedTinyTar:
@@ -224,8 +263,10 @@ const MODEL_URLS = {
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/source-separation-models/sherpa-onnx-spleeter-2stems-fp16.tar.bz2",
 } as const;
 
-const SENSE_VOICE_DIR_NAME = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17";
+export const QWEN3_ASR_DIR_NAME = "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25";
+export const SENSE_VOICE_DIR_NAME = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17";
 const VOXLOCK_DIR_NAME = "sherpa-onnx-voxlock-int8";
+const QWEN3_ASR_INIT_RETRY_COOLDOWN_MS = 30_000;
 
 let cachedSherpa: SherpaModuleLike | null | undefined;
 
@@ -252,6 +293,7 @@ export function resolveVoiceModelPaths(modelsDirOverride?: string): LocalVoiceMo
   const modelsDir = path.resolve(
     modelsDirOverride || envDir || path.join(projectRoot(), "voice_models"),
   );
+  const qwen3AsrDir = path.join(modelsDir, QWEN3_ASR_DIR_NAME);
   const senseVoiceDir = path.join(modelsDir, SENSE_VOICE_DIR_NAME);
   const voxlockDir = path.join(modelsDir, VOXLOCK_DIR_NAME);
   const openWakeWordDir = path.join(modelsDir, "openwakeword");
@@ -265,6 +307,11 @@ export function resolveVoiceModelPaths(modelsDirOverride?: string): LocalVoiceMo
     voxlockChunk: path.join(voxlockDir, "chunk_int8.onnx"),
     sileroVad: path.join(modelsDir, "silero_vad.onnx"),
     speakerCampp: path.join(modelsDir, "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"),
+    qwen3AsrDir,
+    qwen3AsrConvFrontend: path.join(qwen3AsrDir, "conv_frontend.onnx"),
+    qwen3AsrEncoder: path.join(qwen3AsrDir, "encoder.int8.onnx"),
+    qwen3AsrDecoder: path.join(qwen3AsrDir, "decoder.int8.onnx"),
+    qwen3AsrTokenizer: path.join(qwen3AsrDir, "tokenizer"),
     senseVoiceDir,
     senseVoiceModel: path.join(senseVoiceDir, "model.int8.onnx"),
     senseVoiceTokens: path.join(senseVoiceDir, "tokens.txt"),
@@ -289,6 +336,18 @@ export function cleanSenseVoiceText(raw: string): string {
     .trim();
 }
 
+/**
+ * 清洗 Qwen3-ASR 输出中可能残留的语言脚手架前缀（如 `language Chinese<asr_text>`）与特殊控制标签。
+ */
+export function cleanQwen3AsrText(raw: string): string {
+  return raw
+    .replace(/^\s*language\s+[A-Za-z_-]+\s*<asr_text>\s*/i, "")
+    .replace(/<asr_text>/gi, " ")
+    .replace(/<\|[^|>]+\|>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function mapSenseVoiceLang(voiceLang?: string): string {
   const lower = (voiceLang ?? "").trim().toLowerCase();
   if (!lower || lower === "auto") return "auto";
@@ -298,6 +357,20 @@ function mapSenseVoiceLang(voiceLang?: string): string {
   if (lower.startsWith("ja")) return "ja";
   if (lower.startsWith("ko")) return "ko";
   return "auto";
+}
+
+/**
+ * 将 UI 识别语言映射为 Qwen3-ASR `stream.setOption("language", ...)` 支持的语种名。
+ * 中文（zh-CN）与 auto 保持空字符串以启用 Qwen3-ASR 原生中英混说自动识别。
+ */
+export function mapQwen3AsrLang(voiceLang?: string): string {
+  const lower = (voiceLang ?? "").trim().toLowerCase();
+  if (!lower || lower === "auto" || lower === "zh" || lower.startsWith("zh-cn")) return "";
+  if (lower.startsWith("zh-hk") || lower.includes("yue")) return "Cantonese";
+  if (lower.startsWith("en")) return "English";
+  if (lower.startsWith("ja")) return "Japanese";
+  if (lower.startsWith("ko")) return "Korean";
+  return "";
 }
 
 /**
@@ -364,17 +437,23 @@ export function chooseBestAsrCandidate(
   const scoreMargin = Number(Math.abs(rawScore - denScore).toFixed(2));
 
   if (rawScore >= denScore) {
+    const engine: LocalAsrResultEngine = rawAsr.engine.startsWith("qwen3-asr")
+      ? "qwen3-asr-dual-raw"
+      : "sensevoice-dual-raw";
     return {
       ...rawAsr,
-      engine: "sensevoice-dual-raw",
+      engine,
       durationMs: rawAsr.durationMs + denoisedAsr.durationMs,
       altText: denoisedAsr.text,
       scoreMargin,
     };
   }
+  const engine: LocalAsrResultEngine = denoisedAsr.engine.startsWith("qwen3-asr")
+    ? "qwen3-asr-dual-denoised"
+    : "sensevoice-dual-denoised";
   return {
     ...denoisedAsr,
-    engine: "sensevoice-dual-denoised",
+    engine,
     durationMs: rawAsr.durationMs + denoisedAsr.durationMs,
     altText: rawAsr.text,
     scoreMargin,
@@ -385,6 +464,7 @@ export class LocalVoiceEngine {
   private readonly _modelsDirOverride?: string;
   private readonly _oww: OpenWakeWordEngine;
   private readonly _tts: LocalTtsEngine;
+  private _preferredAsrEngine: LocalAsrEngineMode = DEFAULT_LOCAL_ASR_ENGINE;
   private _sourceSeparator: AudioSourceSeparator | null = null;
   private _gtcrnDenoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
   private _dpdfnetDenoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
@@ -394,6 +474,11 @@ export class LocalVoiceEngine {
   } | null = null;
   private _speakerExtractor: InstanceType<SherpaModuleLike["SpeakerEmbeddingExtractor"]> | null =
     null;
+  private _qwen3AsrRecognizer: Promise<
+    Awaited<ReturnType<SherpaModuleLike["OfflineRecognizer"]["createAsync"]>>
+  > | null = null;
+  private _qwen3AsrInitFailedAt = 0;
+  private _qwen3AsrInitError: string | null = null;
   private _recognizers = new Map<
     string,
     Promise<Awaited<ReturnType<SherpaModuleLike["OfflineRecognizer"]["createAsync"]>>>
@@ -401,11 +486,29 @@ export class LocalVoiceEngine {
   private _downloading = false;
   private _lastError: string | null = null;
 
-  constructor(options: { modelsDir?: string } = {}) {
+  constructor(options: { modelsDir?: string; preferredAsrEngine?: LocalAsrEngineMode } = {}) {
     this._modelsDirOverride = options.modelsDir;
+    this._preferredAsrEngine = options.preferredAsrEngine ?? DEFAULT_LOCAL_ASR_ENGINE;
     const p = resolveVoiceModelPaths(options.modelsDir);
     this._oww = new OpenWakeWordEngine({ modelsDir: p.modelsDir });
     this._tts = new LocalTtsEngine({ modelsDir: p.modelsDir });
+  }
+
+  get preferredAsrEngine(): LocalAsrEngineMode {
+    return this._preferredAsrEngine;
+  }
+
+  set preferredAsrEngine(mode: LocalAsrEngineMode) {
+    if (this._preferredAsrEngine !== mode) {
+      this._preferredAsrEngine = mode;
+      // 切换策略时重置 Qwen3-ASR 失败冷却以便立即重检
+      this._qwen3AsrInitFailedAt = 0;
+      this._qwen3AsrInitError = null;
+    }
+  }
+
+  setPreferredAsrEngine(mode: LocalAsrEngineMode): void {
+    this.preferredAsrEngine = mode;
   }
 
   get paths(): LocalVoiceModelPaths {
@@ -448,6 +551,20 @@ export class LocalVoiceEngine {
     return this._oww.scoreClip(pcm16k, wakeWords, opts);
   }
 
+  private _hasQwen3AsrModels(p: LocalVoiceModelPaths = this.paths): boolean {
+    return (
+      existsSync(p.qwen3AsrConvFrontend) &&
+      existsSync(p.qwen3AsrEncoder) &&
+      existsSync(p.qwen3AsrDecoder) &&
+      existsSync(p.qwen3AsrTokenizer) &&
+      existsSync(path.join(p.qwen3AsrTokenizer, "vocab.json"))
+    );
+  }
+
+  private _hasSenseVoiceModels(p: LocalVoiceModelPaths = this.paths): boolean {
+    return existsSync(p.senseVoiceModel) && existsSync(p.senseVoiceTokens);
+  }
+
   getStatus(): LocalVoiceEngineStatus {
     const sherpa = loadSherpaModule();
     const p = this.paths;
@@ -456,13 +573,33 @@ export class LocalVoiceEngine {
     const voxlock = existsSync(p.voxlockEnroll) && existsSync(p.voxlockChunk);
     const sileroVad = existsSync(p.sileroVad);
     const speakerCampp = existsSync(p.speakerCampp);
-    const senseVoice = existsSync(p.senseVoiceModel) && existsSync(p.senseVoiceTokens);
+    const qwen3Asr = this._hasQwen3AsrModels(p);
+    const senseVoice = this._hasSenseVoiceModels(p);
     const openWakeWord = existsSync(p.openWakeWordMel) && existsSync(p.openWakeWordEmbedding);
     const cedAudioTagging = existsSync(p.cedModel) && existsSync(p.cedLabels);
     const pyannoteDiarization = existsSync(p.pyannoteSegmentation) && speakerCampp;
     const spleeterSeparation = existsSync(p.spleeterVocals) && existsSync(p.spleeterAccompaniment);
     const ttsStatus = this._tts.getStatus();
     const addonAvailable = sherpa !== null;
+    const readyForQwen3Asr = addonAvailable && qwen3Asr;
+    const readyForSenseVoice = addonAvailable && senseVoice;
+    const readyForLocalAsr =
+      this._preferredAsrEngine === "qwen3-asr"
+        ? readyForQwen3Asr
+        : this._preferredAsrEngine === "sensevoice"
+          ? readyForSenseVoice
+          : readyForQwen3Asr || readyForSenseVoice;
+    const primaryAsrEngine: "qwen3-asr" | "sensevoice" | null =
+      this._preferredAsrEngine === "sensevoice"
+        ? readyForSenseVoice
+          ? "sensevoice"
+          : null
+        : readyForQwen3Asr
+          ? "qwen3-asr"
+          : this._preferredAsrEngine === "auto" && readyForSenseVoice
+            ? "sensevoice"
+            : null;
+    const fallbackAsrEngine: "sensevoice" | null = readyForSenseVoice ? "sensevoice" : null;
     return {
       addonAvailable,
       addonVersion: sherpa?.version ?? null,
@@ -473,6 +610,7 @@ export class LocalVoiceEngine {
         voxlock,
         sileroVad,
         speakerCampp,
+        qwen3Asr,
         senseVoice,
         openWakeWord,
         cedAudioTagging,
@@ -485,10 +623,15 @@ export class LocalVoiceEngine {
       readyForVoxlock: addonAvailable && voxlock,
       readyForVad: addonAvailable && sileroVad,
       readyForVoiceprint: addonAvailable && speakerCampp,
-      readyForLocalAsr: addonAvailable && senseVoice,
+      readyForQwen3Asr,
+      readyForSenseVoice,
+      readyForLocalAsr,
+      primaryAsrEngine,
+      fallbackAsrEngine,
+      activeLocalAsrMode: this._preferredAsrEngine,
       readyForWakeWord: this._oww.getStatus().ready,
       readyForSourceSeparation:
-        addonAvailable && senseVoice && (cedAudioTagging || pyannoteDiarization || spleeterSeparation),
+        readyForLocalAsr && (cedAudioTagging || pyannoteDiarization || spleeterSeparation),
       readyForLocalTts: ttsStatus.ready,
       tts: ttsStatus,
       downloading: this._downloading || ttsStatus.downloading,
@@ -501,19 +644,27 @@ export class LocalVoiceEngine {
   }
 
   /**
+   * Qwen3-ASR-0.6B int8 CPU 推理线程数：取物理核数（上限 6），兼顾大矩阵乘吞吐与事件循环平滑响应。
+   */
+  private _qwen3AsrThreads(): number {
+    return Math.min(6, Math.max(2, Math.floor(os.cpus().length / 2)));
+  }
+
+  /**
    * 帧级递归降噪模型（GTCRN / DPDFNet4）实测在单线程下省去每帧线程栅栏开销，速度提升约 10%~25%
-   * 且不与并行 SenseVoice/Spleeter 争抢线程池。
+   * 且不与并行 ASR/Spleeter 争抢线程池。
    */
   private _denoiserThreads(): number {
     return 1;
   }
 
   /**
-   * 后台异步分阶段预热本地 ONNX 模型（GTCRN / CAM++ / SenseVoice / openWakeWord），
-   * 每步让出事件循环避免启动/开麦瞬间卡顿；若配置了英文唤醒词（如 Neo）可按需预加载 en 实例。
+   * 后台异步分阶段预热本地 ONNX 模型（GTCRN / CAM++ / Qwen3-ASR 主方案或 SenseVoice 备用 / openWakeWord），
+   * 每步让出事件循环避免启动/开麦瞬间卡顿。
    */
-  async warmup(options: { preloadEnglish?: boolean } = {}): Promise<void> {
+  async warmup(options: { preloadEnglish?: boolean; localAsrEngine?: LocalAsrEngineMode } = {}): Promise<void> {
     const yieldTick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const mode = options.localAsrEngine ?? this._preferredAsrEngine;
     try {
       this._oww.ensureLoaded();
       await yieldTick();
@@ -521,6 +672,20 @@ export class LocalVoiceEngine {
       await yieldTick();
       this._ensureSpeakerExtractor();
       await yieldTick();
+      if (mode !== "sensevoice" && this._hasQwen3AsrModels()) {
+        try {
+          await this._ensureQwen3AsrRecognizer();
+          // 若主方案就绪且用户配置了英文唤醒词，同时预热轻量 SenseVoice en 供极速句首探针按需使用
+          if (options.preloadEnglish && this._hasSenseVoiceModels()) {
+            await yieldTick();
+            await this._ensureRecognizer("en");
+          }
+          return;
+        } catch {
+          // 主方案预热失败时按 auto 策略降级预热 SenseVoice 储备模型
+          if (mode === "qwen3-asr") return;
+        }
+      }
       await this._ensureRecognizer("auto");
       if (options.preloadEnglish) {
         await yieldTick();
@@ -723,12 +888,60 @@ export class LocalVoiceEngine {
     }
   }
 
+  private async _ensureQwen3AsrRecognizer(): Promise<
+    Awaited<ReturnType<SherpaModuleLike["OfflineRecognizer"]["createAsync"]>> | null
+  > {
+    const sherpa = loadSherpaModule();
+    const p = this.paths;
+    if (!sherpa || !this._hasQwen3AsrModels(p)) {
+      return null;
+    }
+    if (this._qwen3AsrRecognizer) {
+      return this._qwen3AsrRecognizer;
+    }
+    const promise = sherpa.OfflineRecognizer.createAsync({
+      featConfig: { sampleRate: 16000, featureDim: 80 },
+      modelConfig: {
+        qwen3Asr: {
+          convFrontend: p.qwen3AsrConvFrontend,
+          encoder: p.qwen3AsrEncoder,
+          decoder: p.qwen3AsrDecoder,
+          tokenizer: p.qwen3AsrTokenizer,
+          hotwords: "",
+          maxTotalLen: 512,
+          maxNewTokens: 128,
+          temperature: 1e-6,
+          topP: 0.8,
+          seed: 42,
+        },
+        tokens: "",
+        numThreads: this._qwen3AsrThreads(),
+        debug: false,
+        provider: "cpu",
+      },
+    })
+      .then((rec) => {
+        this._qwen3AsrInitFailedAt = 0;
+        this._qwen3AsrInitError = null;
+        return rec;
+      })
+      .catch((err) => {
+        this._qwen3AsrRecognizer = null;
+        this._qwen3AsrInitFailedAt = Date.now();
+        this._qwen3AsrInitError = err instanceof Error ? err.message : String(err);
+        this._lastError = this._qwen3AsrInitError;
+        throw err;
+      });
+    this._qwen3AsrRecognizer = promise;
+    return promise;
+  }
+
   private async _ensureRecognizer(
     langKey: string,
   ): Promise<Awaited<ReturnType<SherpaModuleLike["OfflineRecognizer"]["createAsync"]>> | null> {
     const sherpa = loadSherpaModule();
     const p = this.paths;
-    if (!sherpa || !existsSync(p.senseVoiceModel) || !existsSync(p.senseVoiceTokens)) {
+    if (!sherpa || !this._hasSenseVoiceModels(p)) {
       return null;
     }
     const existing = this._recognizers.get(langKey);
@@ -965,12 +1178,71 @@ export class LocalVoiceEngine {
   }
 
   /**
-   * 本地离线高精度多语种 ASR（FunAudioLLM SenseVoiceSmall int8，异步非阻塞解码）。
+   * 主方案：本地离线 Qwen3-ASR-0.6B int8（CPU ONNX 异步非阻塞解码）。
    */
-  async transcribeLocal(
+  async transcribeWithQwen3Asr(
     input: Float32Array,
     sampleRate = 16000,
     voiceLang = "zh-CN",
+    options: Pick<LocalAsrTranscribeOptions, "hotwords" | "maxNewTokens"> = {},
+  ): Promise<LocalAsrOutput> {
+    const t0 = performance.now();
+    const pcm16k = sampleRate === 16000 ? input : resampleLinear(input, sampleRate, 16000);
+    const recognizer = await this._ensureQwen3AsrRecognizer();
+    if (!recognizer) {
+      throw new Error(
+        "本地离线 Qwen3-ASR-0.6B 语音识别模型尚未就绪，请在「设置 → 语音与 Pi Agent」中点击一键补齐本地语音模型，或切换备用 SenseVoice 方案。",
+      );
+    }
+
+    const stream = recognizer.createStream();
+    const qwenLang = mapQwen3AsrLang(voiceLang);
+    if (qwenLang && typeof stream.setOption === "function") {
+      stream.setOption("language", qwenLang);
+    }
+    if (options.hotwords && options.hotwords.length > 0 && typeof stream.setOption === "function") {
+      const csv = options.hotwords
+        .map((w) => w.replace(/,/g, " ").trim())
+        .filter((w) => w.length > 0)
+        .slice(0, 12)
+        .join(",");
+      if (csv) {
+        stream.setOption("hotwords", csv);
+      }
+    }
+    if (
+      typeof options.maxNewTokens === "number" &&
+      Number.isFinite(options.maxNewTokens) &&
+      options.maxNewTokens > 0 &&
+      typeof stream.setOption === "function"
+    ) {
+      stream.setOption("max_new_tokens", String(Math.round(options.maxNewTokens)));
+    }
+    stream.acceptWaveform({ samples: pcm16k, sampleRate: 16000 });
+    const rawResult = await recognizer.decodeAsync(stream);
+    const rawText = String(rawResult?.text ?? "");
+    const text = cleanQwen3AsrText(rawText);
+
+    return {
+      text,
+      rawText,
+      lang: String(rawResult?.lang ?? qwenLang),
+      emotion: String(rawResult?.emotion ?? ""),
+      event: String(rawResult?.event ?? ""),
+      engine: "qwen3-asr-local",
+      durationMs: Math.round(performance.now() - t0),
+      fallbackUsed: false,
+    };
+  }
+
+  /**
+   * 储备/备用方案：本地离线 FunAudioLLM SenseVoiceSmall int8（异步非阻塞解码）。
+   */
+  async transcribeWithSenseVoice(
+    input: Float32Array,
+    sampleRate = 16000,
+    voiceLang = "zh-CN",
+    meta: { asFallback?: boolean; fallbackReason?: string } = {},
   ): Promise<LocalAsrOutput> {
     const t0 = performance.now();
     const pcm16k = sampleRate === 16000 ? input : resampleLinear(input, sampleRate, 16000);
@@ -978,7 +1250,7 @@ export class LocalVoiceEngine {
     const recognizer = await this._ensureRecognizer(svLang);
     if (!recognizer) {
       throw new Error(
-        "本地离线 SenseVoice 语音识别模型尚未就绪，请在「设置 → 语音与 Pi Agent」中点击一键下载本地语音模型，或配置 STT 接口。",
+        "本地离线 SenseVoice 备用语音识别模型尚未就绪，请在「设置 → 语音与 Pi Agent」中点击一键下载本地语音模型，或配置 STT 接口。",
       );
     }
 
@@ -994,17 +1266,78 @@ export class LocalVoiceEngine {
       lang: String(rawResult?.lang ?? ""),
       emotion: String(rawResult?.emotion ?? ""),
       event: String(rawResult?.event ?? ""),
-      engine: "sensevoice-local",
+      engine: meta.asFallback ? "sensevoice-fallback" : "sensevoice-local",
       durationMs: Math.round(performance.now() - t0),
+      fallbackUsed: Boolean(meta.asFallback),
+      ...(meta.fallbackReason ? { fallbackReason: meta.fallbackReason } : {}),
     };
   }
 
   /**
+   * 本地离线多语种 ASR 统一入口：
+   * - `auto`（默认）：主用 Qwen3-ASR-0.6B (CPU)，若主模型缺失或运行异常则自动无缝降级至备用 SenseVoiceSmall int8
+   * - `qwen3-asr`：显式指定 Qwen3-ASR-0.6B (CPU)
+   * - `sensevoice`：显式切换至备用 SenseVoiceSmall int8
+   */
+  async transcribeLocal(
+    input: Float32Array,
+    sampleRate = 16000,
+    voiceLang = "zh-CN",
+    options: LocalAsrTranscribeOptions = {},
+  ): Promise<LocalAsrOutput> {
+    const mode: LocalAsrEngineMode = options.engine ?? this._preferredAsrEngine;
+    if (mode === "sensevoice") {
+      return this.transcribeWithSenseVoice(input, sampleRate, voiceLang);
+    }
+
+    const hasQwen3 = this._hasQwen3AsrModels();
+    const hasSenseVoice = this._hasSenseVoiceModels();
+    const allowFallback = options.allowFallback ?? mode === "auto";
+    const inInitCooldown =
+      this._qwen3AsrInitFailedAt > 0 &&
+      Date.now() - this._qwen3AsrInitFailedAt < QWEN3_ASR_INIT_RETRY_COOLDOWN_MS;
+
+    if (hasQwen3 && !inInitCooldown) {
+      try {
+        return await this.transcribeWithQwen3Asr(input, sampleRate, voiceLang, {
+          hotwords: options.hotwords,
+          maxNewTokens: options.maxNewTokens,
+        });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        this._lastError = reason;
+        if (allowFallback && hasSenseVoice) {
+          return this.transcribeWithSenseVoice(input, sampleRate, voiceLang, {
+            asFallback: true,
+            fallbackReason: `qwen3-asr-error: ${reason}`,
+          });
+        }
+        throw err;
+      }
+    }
+
+    if (allowFallback && hasSenseVoice) {
+      return this.transcribeWithSenseVoice(input, sampleRate, voiceLang, {
+        asFallback: true,
+        fallbackReason: hasQwen3
+          ? `qwen3-asr-cooldown: ${this._qwen3AsrInitError || "init failed"}`
+          : "qwen3-asr-model-missing",
+      });
+    }
+
+    throw new Error(
+      mode === "qwen3-asr"
+        ? "本地离线 Qwen3-ASR-0.6B 模型尚未就绪，请在「设置 → 语音与 Pi Agent」中点击一键补齐模型，或将本地语音识别方案设为「自动（主用 Qwen3-ASR · 备用 SenseVoice）」。"
+        : "本地离线语音识别模型（Qwen3-ASR-0.6B 主方案 / SenseVoice 备用方案）均未就绪，请在「设置 → 语音与 Pi Agent」中点击一键下载本地语音模型，或配置 STT 接口。",
+    );
+  }
+
+  /**
    * 抗音乐/强噪双轨本地识别 + 中英混说唤醒词句首英文探针恢复：
-   * - 高信噪比安静环境（SNR >= 24dB 且已命中唤醒词或无唤醒词要求）：单轨极速解码（~140ms）
-   * - 嘈杂环境/音乐播放，或降噪单轨未检出唤醒词：同时解码「高通原始轨」与「神经降噪轨」融合择优；
-   * - 若配置了英文唤醒词（如 Neo / Jarvis / Luna / Nova / pi）且中文 auto 模式下 SenseVoice 将句首英文吞掉或误判为日韩假名（如 "2お" / "ニ요"），
-   *   自动对句首 1.35 秒执行 ~55ms 英文语种提示探针（en），在不误触纯中文日常对话的前提下精准恢复中英混说唤醒词！
+   * - 默认使用 Qwen3-ASR-0.6B（CPU）主方案，未就绪/异常时自动降级 SenseVoice 备用方案；
+   * - 高信噪比安静环境优先单轨极速解码；
+   * - 嘈杂环境/音乐播放，或降噪单轨未检出唤醒词：融合「高通原始轨」与「神经降噪轨」择优（Qwen3-ASR 在 CPU 上采用顺序双轨避免 0.6B 模型争抢内存带宽，且首轨精确命中唤醒指令时自动早退）；
+   * - 若配置了英文唤醒词且主解码仍未命中，按需触发句首英文探针恢复。
    */
   async transcribeDualTrack(
     rawPcm16k: Float32Array,
@@ -1016,12 +1349,20 @@ export class LocalVoiceEngine {
       forceDual?: boolean;
       systemOneClient?: SystemOneClient | null;
       acousticWake?: WakeWordAcousticHit | null;
+      localAsrEngine?: LocalAsrEngineMode;
+      hotwords?: readonly string[];
     } = {},
   ): Promise<LocalAsrOutput> {
     const lang = options.voiceLang || "zh-CN";
     const wakeWords = options.wakeWords ?? [];
     const inputSnrDb = options.inputSnrDb ?? estimateSnrDb(rawPcm16k, 16000);
     const hasAsciiWake = wakeWords.some((w) => /^[a-z][a-z0-9\s-]*$/i.test(w.trim()));
+    const asrMode = options.localAsrEngine ?? this._preferredAsrEngine;
+    const asrOpts: LocalAsrTranscribeOptions = {
+      engine: asrMode,
+      hotwords: options.hotwords ?? (wakeWords.length > 0 ? wakeWords : undefined),
+    };
+    const usingQwen3Primary = asrMode !== "sensevoice" && this._hasQwen3AsrModels();
 
     let best: LocalAsrOutput;
     let dualRawRes: LocalAsrOutput | null = null;
@@ -1030,8 +1371,9 @@ export class LocalVoiceEngine {
 
     // 非常安静的环境：若无需唤醒词检查或降噪单轨已精确命中唤醒词且无模糊误听，直接单轨返回保持最低延迟
     const acousticWake = options.acousticWake ?? null;
-    if (!options.forceDual && inputSnrDb >= 24 && denoisedPcm16k.length > 0) {
-      const single = await this.transcribeLocal(denoisedPcm16k, 16000, lang);
+    const cleanSnrThreshold = usingQwen3Primary ? 18 : 24;
+    if (!options.forceDual && inputSnrDb >= cleanSnrThreshold && denoisedPcm16k.length > 0) {
+      const single = await this.transcribeLocal(denoisedPcm16k, 16000, lang, asrOpts);
       const singleSpan = wakeWords.length > 0 ? findWakeWordSpan(single.text, wakeWords) : null;
       const singleExactWake = wakeWords.length === 0 || Boolean(singleSpan && !singleSpan.fuzzy);
       if (
@@ -1042,15 +1384,32 @@ export class LocalVoiceEngine {
         return single;
       }
       // 降噪轨未精确检出唤醒词时补跑一次高通原始轨（避免 GTCRN 削弱句首短英文音节如快速说的 "Neo关灯" / "嘿Neo"）
-      const rawRes = await this.transcribeLocal(hpRaw, 16000, lang);
+      const rawRes = await this.transcribeLocal(hpRaw, 16000, lang, asrOpts);
       dualRawRes = rawRes;
       dualDenRes = single;
       best = chooseBestAsrCandidate(rawRes, single, { wakeWords, inputSnrDb, acousticWake });
+    } else if (usingQwen3Primary) {
+      // Qwen3-ASR-0.6B 在 CPU 上采用顺序单轨优先 + 按需补跑双轨，避免两个 0.6B 解码器同时争抢内存带宽与核间缓存
+      const primaryAudio = denoisedPcm16k.length > 0 ? denoisedPcm16k : hpRaw;
+      const denRes = await this.transcribeLocal(primaryAudio, 16000, lang, asrOpts);
+      const denSpan = wakeWords.length > 0 ? findWakeWordSpan(denRes.text, wakeWords) : null;
+      const denStrongHit =
+        denRes.text.length > 0 &&
+        (wakeWords.length === 0 ||
+          (denSpan !== null && !denSpan.fuzzy && (!denSpan.afterText || looksLikeDirectDeviceCommand(denSpan.afterText))));
+      if (denStrongHit || primaryAudio === hpRaw) {
+        best = denRes;
+      } else {
+        const rawRes = await this.transcribeLocal(hpRaw, 16000, lang, asrOpts);
+        dualRawRes = rawRes;
+        dualDenRes = denRes;
+        best = chooseBestAsrCandidate(rawRes, denRes, { wakeWords, inputSnrDb, acousticWake });
+      }
     } else {
       const [rawRes, denRes] = await Promise.all([
-        this.transcribeLocal(hpRaw, 16000, lang),
+        this.transcribeLocal(hpRaw, 16000, lang, asrOpts),
         denoisedPcm16k.length > 0
-          ? this.transcribeLocal(denoisedPcm16k, 16000, lang)
+          ? this.transcribeLocal(denoisedPcm16k, 16000, lang, asrOpts)
           : Promise.resolve<LocalAsrOutput>({
               text: "",
               rawText: "",
@@ -1092,17 +1451,23 @@ export class LocalVoiceEngine {
               };
             }
           } else if (sel.choice === "track_a") {
+            const rawDualEngine: LocalAsrResultEngine = dualRawRes.engine.startsWith("qwen3-asr")
+              ? "qwen3-asr-dual-raw"
+              : "sensevoice-dual-raw";
             best = {
               ...dualRawRes,
-              engine: "sensevoice-dual-raw",
+              engine: rawDualEngine,
               durationMs: dualRawRes.durationMs + dualDenRes.durationMs + sel.latencyMs,
               altText: dualDenRes.text,
               scoreMargin: best.scoreMargin,
             };
           } else if (sel.choice === "track_b") {
+            const denDualEngine: LocalAsrResultEngine = dualDenRes.engine.startsWith("qwen3-asr")
+              ? "qwen3-asr-dual-denoised"
+              : "sensevoice-dual-denoised";
             best = {
               ...dualDenRes,
-              engine: "sensevoice-dual-denoised",
+              engine: denDualEngine,
               durationMs: dualRawRes.durationMs + dualDenRes.durationMs + sel.latencyMs,
               altText: dualRawRes.text,
               scoreMargin: best.scoreMargin,
@@ -1155,7 +1520,13 @@ export class LocalVoiceEngine {
     const langLower = lang.toLowerCase();
     const isBilingualZhMode = !langLower || langLower === "auto" || langLower.startsWith("zh");
     if (hasAsciiWake && isBilingualZhMode && !findWakeWordSpan(best.text, wakeWords)) {
-      const recovered = await this._recoverBilingualEnglishWake(hpRaw, denoisedPcm16k, best, wakeWords);
+      const recovered = await this._recoverBilingualEnglishWake(
+        hpRaw,
+        denoisedPcm16k,
+        best,
+        wakeWords,
+        asrMode,
+      );
       if (recovered) {
         return recovered;
       }
@@ -1165,15 +1536,16 @@ export class LocalVoiceEngine {
   }
 
   /**
-   * 针对 SenseVoice CTC 在中英混说时的单语种偏移问题（例如 "Neo" 单独说被识别成 "2お"/"ニ요"，
-   * 或 "Neo关灯" / "Neo, 把小米音响音量调到30" 中句首英文 "Neo" 被 <|zh|> 吞掉或误听成 "你好关灯"）：
+   * 针对中英混说时的句首英文唤醒词恢复（例如快速连读 "Neo关灯" 或强噪下句首英文被吞掉）：
    * 对句首 0.65s~1.35s 音频做轻量 en 语种提示解码，并严格校验避免纯中文对话误唤醒。
+   * 当备用 SenseVoice 可用时，极短句首英文探针优先复用轻量 SenseVoice en（~55ms）避免阻塞 CPU。
    */
   private async _recoverBilingualEnglishWake(
     hpRaw16k: Float32Array,
     denoised16k: Float32Array,
     best: LocalAsrOutput,
     wakeWords: readonly string[],
+    asrMode: LocalAsrEngineMode = this._preferredAsrEngine,
   ): Promise<LocalAsrOutput | null> {
     const asciiWakes = wakeWords.filter((w) => /^[a-z][a-z0-9\s-]*$/i.test(w.trim()));
     if (asciiWakes.length === 0) return null;
@@ -1200,6 +1572,8 @@ export class LocalVoiceEngine {
       return null;
     }
 
+    const probeEngine: LocalAsrEngineMode =
+      asrMode !== "qwen3-asr" && this._hasSenseVoiceModels() ? "sensevoice" : asrMode;
     let extraMs = 0;
     const probeClip = async (
       clip: Float32Array,
@@ -1208,7 +1582,10 @@ export class LocalVoiceEngine {
       enRes: LocalAsrOutput;
       hit: { wakeWord: string; matchedSurface: string; fuzzy: boolean } | null;
     }> => {
-      const enRes = await this.transcribeLocal(clip, 16000, "en-US");
+      const enRes = await this.transcribeLocal(clip, 16000, "en-US", {
+        engine: probeEngine,
+        maxNewTokens: 24,
+      });
       extraMs += enRes.durationMs;
       const hit = matchEnglishHeadWakeWord(enRes.text, asciiWakes, {
         allowCommandGatedAliases: allowCommandGated,
@@ -1274,7 +1651,8 @@ export class LocalVoiceEngine {
   }
 
   /**
-   * 一键补齐下载缺失的本地 ONNX 模型（GTCRN / DPDFNet4 / Silero VAD / 3D-Speaker CAM++ / SenseVoiceSmall int8 / openWakeWord）。
+   * 一键补齐下载缺失的本地 ONNX 模型（GTCRN / DPDFNet4 / Silero VAD / 3D-Speaker CAM++ /
+   * Qwen3-ASR-0.6B int8 主方案 / SenseVoiceSmall int8 备用方案 / openWakeWord）。
    */
   async downloadMissingModels(): Promise<LocalVoiceEngineStatus> {
     if (this._downloading) {
@@ -1295,9 +1673,55 @@ export class LocalVoiceEngine {
         if (!res.ok) {
           throw new Error(`下载模型失败 (${res.status}): ${path.basename(dest)}`);
         }
-        const buf = await res.arrayBuffer();
-        await Bun.write(part, buf);
+        if (res.body) {
+          const writer = Bun.file(part).writer();
+          try {
+            const reader = res.body.getReader();
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              if (value && value.byteLength > 0) {
+                writer.write(value);
+              }
+            }
+            await writer.end();
+          } catch (err) {
+            try {
+              await writer.end();
+            } catch {
+              // ignore
+            }
+            try {
+              if (existsSync(part)) unlinkSync(part);
+            } catch {
+              // ignore
+            }
+            throw err;
+          }
+        } else {
+          const buf = await res.arrayBuffer();
+          await Bun.write(part, buf);
+        }
         renameSync(part, dest);
+      };
+
+      const fetchAndExtractTar = async (url: string, archiveName: string, label: string) => {
+        const tarPath = path.join(p.modelsDir, archiveName);
+        await fetchFile(url, tarPath);
+        const proc = Bun.spawn(["tar", "-xjf", tarPath, "-C", p.modelsDir], {
+          stdout: "ignore",
+          stderr: "pipe",
+        });
+        const exitCode = await proc.exited;
+        try {
+          if (existsSync(tarPath)) unlinkSync(tarPath);
+        } catch {
+          // ignore
+        }
+        if (exitCode !== 0) {
+          const errText = await new Response(proc.stderr).text();
+          throw new Error(`解压 ${label} 模型失败: ${errText.trim() || exitCode}`);
+        }
       };
 
       await fetchFile(MODEL_URLS.gtcrn, p.gtcrn);
@@ -1308,23 +1732,16 @@ export class LocalVoiceEngine {
       await fetchFile(OPEN_WAKEWORD_MODEL_URLS.embedding, p.openWakeWordEmbedding);
       this._oww.ensureLoaded();
 
-      if (!existsSync(p.senseVoiceModel) || !existsSync(p.senseVoiceTokens)) {
-        const tarPath = path.join(p.modelsDir, "sensevoice.tar.bz2");
-        await fetchFile(MODEL_URLS.senseVoiceTar, tarPath);
-        const proc = Bun.spawn(["tar", "-xjf", tarPath, "-C", p.modelsDir], {
-          stdout: "ignore",
-          stderr: "pipe",
-        });
-        const exitCode = await proc.exited;
-        try {
-          unlinkSync(tarPath);
-        } catch {
-          // ignore
-        }
-        if (exitCode !== 0) {
-          const errText = await new Response(proc.stderr).text();
-          throw new Error(`解压 SenseVoice 模型失败: ${errText.trim() || exitCode}`);
-        }
+      // 1. 先补齐 SenseVoice 储备/备用模型（体积小，先保底离线识别可用）
+      if (!this._hasSenseVoiceModels(p)) {
+        await fetchAndExtractTar(MODEL_URLS.senseVoiceTar, "sensevoice.tar.bz2", "SenseVoice");
+      }
+
+      // 2. 补齐 Qwen3-ASR-0.6B int8 主方案模型（CPU 高精度多语种 ASR，流式落盘零大内存占用）
+      if (!this._hasQwen3AsrModels(p)) {
+        await fetchAndExtractTar(MODEL_URLS.qwen3AsrTar, "qwen3-asr-0.6B-int8.tar.bz2", "Qwen3-ASR-0.6B");
+        this._qwen3AsrInitFailedAt = 0;
+        this._qwen3AsrInitError = null;
       }
 
       const fetchAndExtractOptionalTar = async (url: string, checkFile: string, archiveName: string) => {
@@ -1375,6 +1792,9 @@ export class LocalVoiceEngine {
     this._dpdfnetDenoiser = null;
     this._voxlockDenoiser = null;
     this._speakerExtractor = null;
+    this._qwen3AsrRecognizer = null;
+    this._qwen3AsrInitFailedAt = 0;
+    this._qwen3AsrInitError = null;
     this._recognizers.clear();
   }
 }

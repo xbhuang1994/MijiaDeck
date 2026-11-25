@@ -723,17 +723,18 @@
 
           <div class="setting-card setting-card-wrap" id="voice-pipeline-status-card">
             <div class="setting-info">
-              <div class="setting-label">本地离线语音 AI 引擎状态（Sherpa-ONNX）</div>
-              <div class="setting-desc" id="voice-pipeline-status-desc">本地离线运行 GTCRN 神经降噪、Silero VAD、3D-Speaker 中文声纹、openWakeWord 唤醒与 SenseVoice 多语种识别，国内无需联网即可稳定识别</div>
+              <div class="setting-label">本地离线语音 AI 引擎状态（Sherpa-ONNX · CPU）</div>
+              <div class="setting-desc" id="voice-pipeline-status-desc">本地离线运行 Qwen3-ASR-0.6B（主）与 SenseVoice（备用）多语种识别、GTCRN 降噪、Silero VAD、3D-Speaker 声纹与 openWakeWord 唤醒，国内无需联网即可高精度转写</div>
             </div>
             <div class="voice-status-row">
               <div class="voice-status-badges" id="voice-model-badges">
+                <span class="voice-badge-pill" id="badge-model-qwen3-asr">Qwen3-ASR 0.6B (主)</span>
+                <span class="voice-badge-pill" id="badge-model-asr">SenseVoice (备用)</span>
                 <span class="voice-badge-pill" id="badge-model-gtcrn">GTCRN 降噪</span>
                 <span class="voice-badge-pill" id="badge-model-dpdfnet">DPDFNet4 强噪</span>
                 <span class="voice-badge-pill" id="badge-model-voxlock">VoxLock 声纹提取</span>
                 <span class="voice-badge-pill" id="badge-model-vad">Silero VAD</span>
                 <span class="voice-badge-pill" id="badge-model-vp">3D-Speaker 声纹</span>
-                <span class="voice-badge-pill" id="badge-model-asr">SenseVoice 识别</span>
                 <span class="voice-badge-pill" id="badge-model-oww">openWakeWord 唤醒</span>
                 <span class="voice-badge-pill" id="badge-model-tts">Matcha 温柔女声</span>
               </div>
@@ -744,20 +745,32 @@
           <div class="setting-card">
             <div class="setting-info">
               <div class="setting-label">语音识别引擎</div>
-              <div class="setting-desc">「自动」优先本地离线 SenseVoice + GTCRN 降噪 + 声纹管线，未就绪时自动降级云端 STT 或浏览器原生识别</div>
+              <div class="setting-desc">「自动」优先本地离线 Qwen3-ASR-0.6B（主）/ SenseVoice（备用）+ GTCRN 降噪 + 声纹管线，未就绪时自动降级云端 STT 或浏览器原生识别</div>
             </div>
             <select id="set-voice-engine" class="md-select" aria-label="语音识别引擎">
-              <option value="auto">自动（优先本地离线 SenseVoice）</option>
-              <option value="local">本地离线引擎（SenseVoice + 降噪 + 声纹）</option>
+              <option value="auto">自动（优先本地 Qwen3-ASR 主方案）</option>
+              <option value="local">本地离线引擎（Qwen3-ASR 主 / SenseVoice 备用）</option>
               <option value="whisper">云端/本地 Whisper 兼容 STT（含降噪）</option>
               <option value="browser">浏览器原生实时语音识别</option>
+            </select>
+          </div>
+
+          <div class="setting-card" id="setting-row-local-asr-engine">
+            <div class="setting-info">
+              <div class="setting-label">本地语音转写方案（CPU）</div>
+              <div class="setting-desc">默认使用 Qwen3-ASR-0.6B（CPU）作为主方案提升中英转写准确率，主模型未就绪或异常时自动无缝切换至 SenseVoice 储备方案</div>
+            </div>
+            <select id="set-voice-local-asr-engine" class="md-select" aria-label="本地语音转写方案">
+              <option value="auto">自动：Qwen3-ASR-0.6B 主用 · SenseVoice 备用（推荐）</option>
+              <option value="qwen3-asr">仅主方案：Qwen3-ASR-0.6B（CPU 高精度）</option>
+              <option value="sensevoice">切换备用：SenseVoiceSmall（轻量极速）</option>
             </select>
           </div>
 
           <div class="setting-card">
             <div class="setting-info">
               <div class="setting-label">识别语言</div>
-              <div class="setting-desc">用于本地 SenseVoice、Whisper 转写与浏览器语音识别</div>
+              <div class="setting-desc">用于本地 Qwen3-ASR / SenseVoice、Whisper 转写与浏览器语音识别</div>
             </div>
             <select id="set-voice-lang" class="md-select" aria-label="语音识别语言">
               <option value="zh-CN">中文（普通话 · 兼容中英混合）</option>

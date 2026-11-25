@@ -22,7 +22,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import type { SourceSeparationMode } from "../core/agentConfigStore.ts";
+import type { LocalAsrEngineMode, SourceSeparationMode } from "../core/agentConfigStore.ts";
 import {
   applyHighPassFilter,
   computeRms,
@@ -99,6 +99,7 @@ export interface SeparatedAudioStreamInfo {
 
 export interface SourceSeparationRunOptions {
   mode?: SourceSeparationMode;
+  localAsrEngine?: LocalAsrEngineMode;
   voiceLang?: string;
   wakeWordEnabled?: boolean;
   wakeWords?: readonly string[];
@@ -1340,7 +1341,15 @@ export class AudioSourceSeparator {
         (aCmd ? 50 : 0) +
         (isValidSmartHomeActionCommand(altText) ? 25 : 0) -
         (altText.match(/[\u3040-\u30ff\uac00-\ud7af]/g)?.length ?? 0) * 15;
-      if (aScore > pScore) {
+      if (
+        aScore > pScore ||
+        (aScore === pScore &&
+          isTseOrMusicSeparated &&
+          !pSpan &&
+          aCmd.length >= 2 &&
+          aCmd.length >= pCmd.length &&
+          altText.length <= primaryText.length + 4)
+      ) {
         bestText = altText;
         bestEvent = altZhRes?.event || bestEvent;
       }
@@ -1479,9 +1488,16 @@ export class AudioSourceSeparator {
         }
       }
 
+      const probeAsrEngine: LocalAsrEngineMode | undefined =
+        opts.localAsrEngine !== "qwen3-asr" && this._engine.getStatus().readyForSenseVoice
+          ? "sensevoice"
+          : opts.localAsrEngine;
       for (const win of probeWindows) {
         if (win.length < 1600) continue;
-        const enRes = await this._engine.transcribeLocal(win, SR, "en-US");
+        const enRes = await this._engine.transcribeLocal(win, SR, "en-US", {
+          engine: probeAsrEngine,
+          maxNewTokens: 24,
+        });
         const enHit = matchSafeEnWake(enRes.text, wakeWords, looksLikeCmdForWake);
         if (enHit) {
           enHeadMatched = true;
@@ -1719,6 +1735,28 @@ export class AudioSourceSeparator {
       });
     }
 
+    const engineStatusInit = this._engine.getStatus();
+    let activeAsrPrefix: "qwen3-asr" | "sensevoice" =
+      opts.localAsrEngine !== "sensevoice" && engineStatusInit.primaryAsrEngine === "qwen3-asr"
+        ? "qwen3-asr"
+        : "sensevoice";
+    const transcribeMain = async (pcm: Float32Array, lang = voiceLang): Promise<LocalAsrOutput> => {
+      const res = await this._engine.transcribeLocal(pcm, SR, lang, {
+        engine: opts.localAsrEngine,
+        hotwords: wakeWords.length > 0 ? wakeWords : undefined,
+      });
+      if (res.engine.startsWith("qwen3-asr")) {
+        activeAsrPrefix = "qwen3-asr";
+      } else if (res.engine.startsWith("sensevoice")) {
+        activeAsrPrefix = "sensevoice";
+      }
+      return res;
+    };
+    const slideProbeAsrEngine: LocalAsrEngineMode | undefined =
+      opts.localAsrEngine !== "qwen3-asr" && engineStatusInit.readyForSenseVoice
+        ? "sensevoice"
+        : opts.localAsrEngine;
+
     const buildReturn = (p: {
       speechDetected: boolean;
       text: string;
@@ -1734,6 +1772,9 @@ export class AudioSourceSeparator {
       bestSpeechPcm?: Float32Array;
     }): SourceSeparationPipelineResult => ({
       ...p,
+      asrEngine: p.asrEngine.startsWith("sensevoice-sep")
+        ? `${activeAsrPrefix}${p.asrEngine.slice("sensevoice".length)}`
+        : p.asrEngine,
       inputSnrDb,
       snrGainDb: Number((p.outputSnrDb - inputSnrDb).toFixed(2)),
       detectedSoundTypes: soundSet.size > 0 ? [...soundSet] : [p.speechDetected ? "speech" : "noise"],
@@ -1973,7 +2014,7 @@ export class AudioSourceSeparator {
         });
         for (const seg of voxSegs.slice(0, 3)) {
           if (computeRms(seg.samples) < 0.009) continue;
-          const zhVox = await this._engine.transcribeLocal(seg.samples, SR, voiceLang);
+          const zhVox = await transcribeMain(seg.samples, voiceLang);
           if (zhVox.text.trim()) {
             soundSet.add("speech");
           }
@@ -2004,6 +2045,9 @@ export class AudioSourceSeparator {
           });
           if (cand.decision.accept && !cand.decision.wokeOnly) {
             anyVoxHit = true;
+            if (cand.hasSmartHome && cand.hasActionVerb) {
+              break;
+            }
           }
         }
       }
@@ -2045,7 +2089,10 @@ export class AudioSourceSeparator {
             const maxScanEnd = Math.min(srcAudio.length, Math.round(SR * 2.0));
             for (let off = 0; off + Math.round(SR * 0.62) <= maxScanEnd; off += Math.round(SR * 0.35)) {
               const win = srcAudio.subarray(off, Math.min(srcAudio.length, off + Math.round(SR * 0.80)));
-              const enRes = await this._engine.transcribeLocal(win, SR, "en-US");
+              const enRes = await this._engine.transcribeLocal(win, SR, "en-US", {
+                engine: slideProbeAsrEngine,
+                maxNewTokens: 24,
+              });
               const hit = matchSafeEnWake(enRes.text, wakeWords, true);
               if (hit) {
                 recoveredWake = hit.wakeWord;
@@ -2135,13 +2182,13 @@ export class AudioSourceSeparator {
         const segDurSec = seg.samples.length / SR;
         soundSet.add("speech");
         const rawSeg = cleanBase.samples === rawHp ? seg.samples : slicePcmBySec(rawHp, seg.startSec, seg.endSec, 0.08);
-        const zhPrimary = await this._engine.transcribeLocal(seg.samples, SR, voiceLang);
+        const zhPrimary = await transcribeMain(seg.samples, voiceLang);
         globalTranscriptParts.push(zhPrimary.text);
 
         const quickSpan = findWakeWordSpan(zhPrimary.text, wakeWords);
         let zhAlt: LocalAsrOutput | null = null;
         if (cleanBase.samples !== rawHp && (!quickSpan || quickSpan.fuzzy)) {
-          zhAlt = await this._engine.transcribeLocal(rawSeg, SR, voiceLang);
+          zhAlt = await transcribeMain(rawSeg, voiceLang);
         }
 
         const evalRes = await this._evaluateTurnCandidate({
@@ -2339,7 +2386,7 @@ export class AudioSourceSeparator {
           const altTrack = streamGtcrnTrack ?? rawHp;
           const altSlice = slicePcmBySec(altTrack, probeStartSec, turn.endSec, 0.06);
 
-          const zhVoc = await this._engine.transcribeLocal(turn.samples, SR, voiceLang);
+          const zhVoc = await transcribeMain(turn.samples, voiceLang);
           if (zhVoc.text.trim()) {
             if (mergedScene.speechProb >= 0.14 || zhVoc.text.trim().length >= 3) {
               soundSet.add("speech");
@@ -2348,13 +2395,23 @@ export class AudioSourceSeparator {
           }
 
           const quickSpan = findWakeWordSpan(zhVoc.text, wakeWords);
+          const quickExactOrStrongCmd = Boolean(
+            quickSpan &&
+              (!quickSpan.fuzzy ||
+                (quickSpan.afterText.length >= 2 && isValidSmartHomeActionCommand(quickSpan.afterText))),
+          );
+          const zhVocCleanChars = zhVoc.text.replace(/[^\u4e00-\u9fffA-Za-z0-9]/g, "");
+          const zhVocHasEmbeddedCmd = extractEmbeddedSmartHomeCommand(zhVoc.text).length >= 2;
+          const zhVocHasWeird = /[\u3040-\u30ff\uac00-\ud7af]/.test(zhVoc.text);
           const zhVocIsFluentNonCmd =
             !quickSpan &&
-            extractEmbeddedSmartHomeCommand(zhVoc.text).length < 2 &&
-            (HOUSEHOLD_SIDETALK_RE.test(zhVoc.text) || DESCRIPTIVE_NON_COMMAND_RE.test(zhVoc.text));
+            !zhVocHasEmbeddedCmd &&
+            (HOUSEHOLD_SIDETALK_RE.test(zhVoc.text) ||
+              DESCRIPTIVE_NON_COMMAND_RE.test(zhVoc.text) ||
+              (activeAsrPrefix === "qwen3-asr" && !zhVocHasWeird && zhVocCleanChars.length >= 4));
           let zhAlt: LocalAsrOutput | null = null;
-          if ((!quickSpan || quickSpan.fuzzy) && !zhVocIsFluentNonCmd) {
-            zhAlt = await this._engine.transcribeLocal(altSlice, SR, voiceLang);
+          if (!quickExactOrStrongCmd && !zhVocIsFluentNonCmd) {
+            zhAlt = await transcribeMain(altSlice, voiceLang);
             if (zhAlt.text.trim() && mergedScene.speechProb >= 0.14) {
               soundSet.add("speech");
             }
@@ -2387,6 +2444,12 @@ export class AudioSourceSeparator {
             endSec: turn.endSec,
             transcript: cand.rawText,
           });
+          if (
+            cand.decision.exitConversation === true ||
+            (cand.decision.accept && !cand.decision.wokeOnly && cand.hasSmartHome && cand.hasActionVerb)
+          ) {
+            break;
+          }
         }
 
         const bridgedMusic = this._bridgeAdjacentWakeAndCommand(splCandidates, wakeWords);
@@ -2675,7 +2738,7 @@ export class AudioSourceSeparator {
       const probeClean = slicePcmBySec(primaryCleanTrack, probeStartSec, turn.endSec, 0.06);
       const rawTurn = slicePcmBySec(rawHp, probeStartSec, turn.endSec, 0.06);
 
-      const zhClean = await this._engine.transcribeLocal(turn.samples, SR, voiceLang);
+      const zhClean = await transcribeMain(turn.samples, voiceLang);
       if (zhClean.text.trim()) {
         if (scene.speechProb >= 0.14 || !hasStrongMusic || zhClean.text.trim().length >= 3) {
           soundSet.add("speech");
@@ -2684,13 +2747,23 @@ export class AudioSourceSeparator {
       }
 
       const quickSpan = findWakeWordSpan(zhClean.text, wakeWords);
+      const quickExactOrStrongCmd = Boolean(
+        quickSpan &&
+          (!quickSpan.fuzzy ||
+            (quickSpan.afterText.length >= 2 && isValidSmartHomeActionCommand(quickSpan.afterText))),
+      );
+      const zhCleanChars = zhClean.text.replace(/[^\u4e00-\u9fffA-Za-z0-9]/g, "");
+      const zhCleanHasEmbeddedCmd = extractEmbeddedSmartHomeCommand(zhClean.text).length >= 2;
+      const zhCleanHasWeird = /[\u3040-\u30ff\uac00-\ud7af]/.test(zhClean.text);
       const zhCleanIsFluentNonCmd =
         !quickSpan &&
-        extractEmbeddedSmartHomeCommand(zhClean.text).length < 2 &&
-        (HOUSEHOLD_SIDETALK_RE.test(zhClean.text) || DESCRIPTIVE_NON_COMMAND_RE.test(zhClean.text));
+        !zhCleanHasEmbeddedCmd &&
+        (HOUSEHOLD_SIDETALK_RE.test(zhClean.text) ||
+          DESCRIPTIVE_NON_COMMAND_RE.test(zhClean.text) ||
+          (activeAsrPrefix === "qwen3-asr" && !hasStrongMusic && !zhCleanHasWeird && zhCleanChars.length >= 5));
       let zhAlt: LocalAsrOutput | null = null;
-      if (primaryCleanTrack !== rawHp && (!quickSpan || quickSpan.fuzzy || hasStrongMusic) && !zhCleanIsFluentNonCmd) {
-        zhAlt = await this._engine.transcribeLocal(rawTurn, SR, voiceLang);
+      if (primaryCleanTrack !== rawHp && (!quickExactOrStrongCmd || hasStrongMusic) && !zhCleanIsFluentNonCmd) {
+        zhAlt = await transcribeMain(rawTurn, voiceLang);
         if (zhAlt.text.trim() && (scene.speechProb >= 0.14 || !hasStrongMusic)) {
           soundSet.add("speech");
         }
@@ -2723,6 +2796,12 @@ export class AudioSourceSeparator {
         endSec: turn.endSec,
         transcript: cand.rawText,
       });
+      if (
+        cand.decision.exitConversation === true ||
+        (cand.decision.accept && !cand.decision.wokeOnly && cand.hasSmartHome && cand.hasActionVerb)
+      ) {
+        break;
+      }
     }
 
     const hasOnlyWokeInMulti =
@@ -2732,10 +2811,10 @@ export class AudioSourceSeparator {
 
     if (hasOnlyWokeInMulti && vadSegs.length > 0) {
       for (const vs of vadSegs.slice(0, 2)) {
-        const zhFull = await this._engine.transcribeLocal(vs.samples, SR, voiceLang);
+        const zhFull = await transcribeMain(vs.samples, voiceLang);
         const rawFull = slicePcmBySec(rawHp, vs.startSec, vs.endSec, 0.08);
         const zhRawFull =
-          primaryCleanTrack === rawHp ? null : await this._engine.transcribeLocal(rawFull, SR, voiceLang);
+          primaryCleanTrack === rawHp ? null : await transcribeMain(rawFull, voiceLang);
         const fullCand = await this._evaluateTurnCandidate({
           branch: "stage1_vad_intact",
           startSec: vs.startSec,
@@ -2937,7 +3016,7 @@ export class AudioSourceSeparator {
       for (const seg of dpdfVad.slice(0, 3)) {
         const probeStartSec = Math.max(0, seg.startSec - 0.35);
         const gtcrnSlice = slicePcmBySec(primaryCleanTrack, probeStartSec, seg.endSec, 0.06);
-        const zhDpdf = await this._engine.transcribeLocal(seg.samples, SR, voiceLang);
+        const zhDpdf = await transcribeMain(seg.samples, voiceLang);
         const cand = await this._evaluateTurnCandidate({
           branch: "stage2_dpdfnet",
           startSec: seg.startSec,

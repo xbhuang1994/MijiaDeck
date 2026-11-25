@@ -25,6 +25,7 @@ export type AgentProviderMode =
   | "openai-compatible";
 
 export type VoiceEngineMode = "auto" | "local" | "browser" | "whisper";
+export type LocalAsrEngineMode = "auto" | "qwen3-asr" | "sensevoice";
 export type TtsEngineMode = "auto" | "local" | "browser";
 export type TtsVoicePreset = "gentle-zh-en" | "warm-zh-baker";
 export type NoiseSuppressionMode = "auto" | "neural" | "dpdfnet" | "voxlock" | "dsp" | "off";
@@ -147,6 +148,17 @@ export const PROVIDER_PRESETS: ReadonlyArray<ProviderPreset> = [
 
 const VALID_PROVIDERS = new Set<string>(PROVIDER_PRESETS.map((p) => p.id));
 const VALID_VOICE_ENGINES = new Set<string>(["auto", "local", "browser", "whisper"]);
+const VALID_LOCAL_ASR_ENGINES = new Set<string>(["auto", "qwen3-asr", "sensevoice"]);
+const LOCAL_ASR_ENGINE_ALIASES: Readonly<Record<string, LocalAsrEngineMode>> = {
+  auto: "auto",
+  "qwen3-asr": "qwen3-asr",
+  "qwen3-asr-0.6b": "qwen3-asr",
+  qwen3: "qwen3-asr",
+  qwen: "qwen3-asr",
+  sensevoice: "sensevoice",
+  "sense-voice": "sensevoice",
+  sv: "sensevoice",
+};
 const VALID_TTS_ENGINES = new Set<string>(["auto", "local", "browser"]);
 const VALID_TTS_VOICES = new Set<string>(["gentle-zh-en", "warm-zh-baker"]);
 const VALID_NOISE_MODES = new Set<string>(["auto", "neural", "dpdfnet", "voxlock", "dsp", "off"]);
@@ -179,6 +191,7 @@ const VALID_CUSTOM_APIS = new Set<string>([
 
 export const DEFAULT_WAKE_WORDS = ["小派", "小湃", "小π", "派派", "pi", "米家助手"] as const;
 export const DEFAULT_WAKE_ACK_PHRASE = "嗯?";
+export const DEFAULT_LOCAL_ASR_ENGINE: LocalAsrEngineMode = "auto";
 export const DEFAULT_TTS_ENGINE: TtsEngineMode = "auto";
 export const DEFAULT_TTS_VOICE: TtsVoicePreset = "gentle-zh-en";
 export const DEFAULT_TTS_SPEED = 0.98;
@@ -195,6 +208,8 @@ export interface AgentVoiceConfig {
   maxHistoryTurns: number;
   voiceEnabled: boolean;
   voiceEngine: VoiceEngineMode;
+  /** 本地离线语音转写策略：auto（主用 Qwen3-ASR-0.6B CPU，备用 SenseVoice 自动兜底）/ qwen3-asr / sensevoice */
+  localAsrEngine: LocalAsrEngineMode;
   voiceLang: string;
   wakeWordEnabled: boolean;
   wakeWords: string[];
@@ -263,6 +278,7 @@ export interface AgentConfigPatch {
   maxHistoryTurns?: unknown;
   voiceEnabled?: unknown;
   voiceEngine?: unknown;
+  localAsrEngine?: unknown;
   voiceLang?: unknown;
   wakeWordEnabled?: unknown;
   wakeWords?: unknown;
@@ -315,6 +331,7 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     maxHistoryTurns: 12,
     voiceEnabled: true,
     voiceEngine: "auto",
+    localAsrEngine: DEFAULT_LOCAL_ASR_ENGINE,
     voiceLang: "zh-CN",
     wakeWordEnabled: true,
     wakeWords: [...DEFAULT_WAKE_WORDS],
@@ -417,6 +434,15 @@ function normalizeUrl(value: unknown): string {
   }
 }
 
+export function normalizeLocalAsrEngine(
+  value: unknown,
+  fallback: LocalAsrEngineMode = DEFAULT_LOCAL_ASR_ENGINE,
+): LocalAsrEngineMode {
+  if (typeof value !== "string") return fallback;
+  const key = value.trim().toLowerCase();
+  return LOCAL_ASR_ENGINE_ALIASES[key] ?? fallback;
+}
+
 export function normalizeCavemanMode(
   value: unknown,
   fallback: CavemanReplyMode = DEFAULT_CAVEMAN_MODE,
@@ -455,6 +481,8 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
   const voiceEngine: VoiceEngineMode = VALID_VOICE_ENGINES.has(voiceEngineRaw)
     ? (voiceEngineRaw as VoiceEngineMode)
     : defaults.voiceEngine;
+
+  const localAsrEngine = normalizeLocalAsrEngine(raw.localAsrEngine, defaults.localAsrEngine);
 
   const voiceLangRaw = typeof raw.voiceLang === "string" ? raw.voiceLang.trim() : "";
   const voiceLang = voiceLangRaw || defaults.voiceLang;
@@ -566,6 +594,7 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     maxHistoryTurns: Math.round(clampNumber(raw.maxHistoryTurns, 2, 40, defaults.maxHistoryTurns)),
     voiceEnabled: typeof raw.voiceEnabled === "boolean" ? raw.voiceEnabled : defaults.voiceEnabled,
     voiceEngine,
+    localAsrEngine,
     voiceLang,
     wakeWordEnabled:
       typeof raw.wakeWordEnabled === "boolean" ? raw.wakeWordEnabled : defaults.wakeWordEnabled,
@@ -846,6 +875,14 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
       throw new Error(`不支持的语音识别引擎: ${eng}`);
     }
     nextRaw.voiceEngine = eng;
+  }
+  if (patch.localAsrEngine !== undefined) {
+    const rawAsr = String(patch.localAsrEngine).trim().toLowerCase();
+    const mappedAsr = LOCAL_ASR_ENGINE_ALIASES[rawAsr];
+    if (!mappedAsr || !VALID_LOCAL_ASR_ENGINES.has(mappedAsr)) {
+      throw new Error(`不支持的本地语音识别方案: ${rawAsr}`);
+    }
+    nextRaw.localAsrEngine = mappedAsr;
   }
   if (patch.voiceLang !== undefined) {
     nextRaw.voiceLang = String(patch.voiceLang).trim();

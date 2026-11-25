@@ -121,6 +121,7 @@ export interface VoiceListenerSnapshot {
   consecutiveSidetalkCount: number;
   lastTransitionReason: string | null;
   engine: VoiceRuntimeEngine;
+  localAsrEngine: AgentVoiceConfig["localAsrEngine"];
   interimTranscript: string;
   lastTranscript: string;
   lastCommand: string;
@@ -314,6 +315,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._agent = agent;
     this._fetcher = options.fetcher ?? globalThis.fetch;
     this._localEngine = options.localEngine ?? new LocalVoiceEngine();
+    this._localEngine.setPreferredAsrEngine?.(this.config.localAsrEngine);
     this._engine = this._localEngine.getStatus().readyForLocalAsr ? "local" : "browser";
 
     // 转发 Pi Agent 流式分句语音播报事件，并记录用于自回声抑制
@@ -712,6 +714,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     interimTranscript?: string;
     error?: string | null;
   }): VoiceListenerSnapshot {
+    this._localEngine.setPreferredAsrEngine?.(this.config.localAsrEngine);
     if (patch.active !== undefined) {
       this._active = Boolean(patch.active);
       if (!this._active) {
@@ -742,7 +745,10 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         // 开启监听时预连接 SystemOne 网关，并异步分片预热本地 ONNX 模型（含主声纹 VoxLock）、温柔女声 TTS 与 openWakeWord 零样本原型
         this._agent.systemOneClient?.preconnect();
         const hasAsciiWake = this.config.wakeWords.some((w) => /^[a-z][a-z0-9\s-]*$/i.test(w.trim()));
-        void this._localEngine.warmup({ preloadEnglish: hasAsciiWake });
+        void this._localEngine.warmup({
+          preloadEnglish: hasAsciiWake,
+          localAsrEngine: this.config.localAsrEngine,
+        });
         if (this.config.sourceSeparationMode !== "off") {
           void this._localEngine.sourceSeparator.warmupAsync().catch(() => {});
         }
@@ -1252,6 +1258,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         : resampleLinear(decoded.samples, decoded.sampleRate, 16000);
 
     // ---- Stage 1.5: 本地自适应多级声源分离与说话人隔离主通道（S_Fused 最终方案） ----
+    this._localEngine.setPreferredAsrEngine?.(cfg.localAsrEngine);
     const sttAuthPre = resolveEffectiveSttAuth(cfg);
     const hasCloudSttPre = Boolean(
       sttAuthPre.baseUrl && (sttAuthPre.apiKey || isLocalEndpointUrl(sttAuthPre.baseUrl)),
@@ -1307,6 +1314,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
 
       const sep = await this._localEngine.sourceSeparator.separateAndRecognize(pcm16k, 16000, {
         mode: cfg.sourceSeparationMode,
+        localAsrEngine: cfg.localAsrEngine,
         voiceLang: lang,
         wakeWordEnabled: cfg.wakeWordEnabled,
         wakeWords: cfg.wakeWords,
@@ -1541,7 +1549,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       this._lastWakeHit = { ...acousticWake, timestamp: Date.now() };
     }
 
-    // ---- Stage 5: 语音识别（优先本地离线 SenseVoiceSmall int8，降级云端 Whisper） ----
+    // ---- Stage 5: 语音识别（优先本地离线 Qwen3-ASR-0.6B 主方案 / SenseVoice 备用方案，降级云端 Whisper） ----
     const sttAuth = resolveEffectiveSttAuth(cfg);
     const hasCloudStt = Boolean(sttAuth.baseUrl && (sttAuth.apiKey || isLocalEndpointUrl(sttAuth.baseUrl)));
     const localReady = this._localEngine.getStatus().readyForLocalAsr;
@@ -1550,7 +1558,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     let transcript = "";
     let altText: string | undefined;
     let acousticEvent = "";
-    let asrEngine = "sensevoice-local";
+    let asrEngine = "qwen3-asr-local";
     let asrMs = 0;
     let runtimeEngine: VoiceRuntimeEngine = "local";
 
@@ -1558,13 +1566,14 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       pref === "local" || (pref === "auto" && localReady) || (pref === "whisper" && !hasCloudStt && localReady);
 
     if (useLocal) {
-      // 双轨抗音乐/强噪融合识别：同时参考高通原始轨（零降噪伪影）与神经降噪轨，并结合 openWakeWord 与 SystemOne！
+      // 双轨抗音乐/强噪融合识别：主用 Qwen3-ASR-0.6B (CPU)，备用 SenseVoice 自动兜底，并结合 openWakeWord 与 SystemOne
       const sv = await this._localEngine.transcribeDualTrack(pcm16k, vad.speechSamples, {
         voiceLang: lang,
         wakeWords: cfg.wakeWords,
         inputSnrDb: denoised.inputSnrDb,
         systemOneClient: this._agent.systemOneClient,
         acousticWake,
+        localAsrEngine: cfg.localAsrEngine,
       });
       transcript = sv.text;
       altText = sv.altText;
@@ -1678,6 +1687,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const vpAudio =
       segment.denoisedSamples.length >= 4000 ? segment.denoisedSamples : segment.rawSamples;
 
+    this._localEngine.setPreferredAsrEngine?.(cfg.localAsrEngine);
     const sttAuth = resolveEffectiveSttAuth(cfg);
     const hasCloudStt = Boolean(
       sttAuth.baseUrl && (sttAuth.apiKey || isLocalEndpointUrl(sttAuth.baseUrl)),
@@ -1772,6 +1782,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           16000,
           {
             mode: cfg.sourceSeparationMode,
+            localAsrEngine: cfg.localAsrEngine,
             voiceLang: lang,
             wakeWordEnabled: cfg.wakeWordEnabled,
             wakeWords: cfg.wakeWords,
@@ -1903,6 +1914,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           forceDual: segment.forcedRoll || segment.inputSnrDb < 20,
           systemOneClient: this._agent.systemOneClient,
           acousticWake,
+          localAsrEngine: cfg.localAsrEngine,
         },
       );
       transcript = sv.text;
@@ -2201,7 +2213,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const stt = resolveEffectiveSttAuth(cfg);
     if (!stt.baseUrl) {
       throw new Error(
-        "尚未配置语音转写 STT 服务地址，请在「设置 → 语音与 Pi Agent」中使用本地离线 SenseVoice 引擎或填写 OpenAI 兼容 STT 接口地址。",
+        "尚未配置语音转写 STT 服务地址，请在「设置 → 语音与 Pi Agent」中使用本地离线 Qwen3-ASR / SenseVoice 引擎或填写 OpenAI 兼容 STT 接口地址。",
       );
     }
     const localUrl = isLocalEndpointUrl(stt.baseUrl);
@@ -2271,6 +2283,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
 
   snapshot(): VoiceListenerSnapshot {
     const cfg = this.config;
+    this._localEngine.setPreferredAsrEngine?.(cfg.localAsrEngine);
     const now = Date.now();
     const conversationRemainingMs =
       this._dialogState === "conversation"
@@ -2298,6 +2311,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       consecutiveSidetalkCount: this._consecutiveSidetalkCount,
       lastTransitionReason: this._lastTransitionReason,
       engine: this._engine,
+      localAsrEngine: cfg.localAsrEngine,
       interimTranscript: this._interimTranscript,
       lastTranscript: this._lastTranscript,
       lastCommand: this._lastCommand,

@@ -3709,6 +3709,7 @@ export class MijiaDeckWebApp {
     el<HTMLTextAreaElement>("set-agent-system-prompt").value = cfg?.systemPromptExtra || "";
 
     el<HTMLSelectElement>("set-voice-engine").value = cfg?.voiceEngine || "auto";
+    el<HTMLSelectElement>("set-voice-local-asr-engine").value = cfg?.localAsrEngine || "auto";
     el<HTMLSelectElement>("set-voice-lang").value = cfg?.voiceLang || "zh-CN";
     el<HTMLSelectElement>("set-voice-noise-mode").value = cfg?.noiseSuppressionMode || "auto";
     el<HTMLSelectElement>("set-voice-vad-mode").value = cfg?.vadMode || "silero";
@@ -3775,21 +3776,24 @@ export class MijiaDeckWebApp {
     const voxOk = Boolean(status?.readyForVoxlock);
     const vadOk = Boolean(status?.readyForVad);
     const vpOk = Boolean(status?.readyForVoiceprint);
+    const qwen3Ok = Boolean(status?.readyForQwen3Asr ?? status?.models?.qwen3Asr);
+    const senseVoiceOk = Boolean(status?.readyForSenseVoice ?? status?.models?.senseVoice);
     const asrOk = Boolean(status?.readyForLocalAsr);
     const owwOk = Boolean(status?.readyForWakeWord ?? status?.models?.openWakeWord);
     const ttsOk = Boolean(status?.readyForLocalTts ?? status?.models?.localTts);
 
+    setBadge("badge-model-qwen3-asr", "Qwen3-ASR 0.6B (主)", qwen3Ok);
+    setBadge("badge-model-asr", "SenseVoice (备用)", senseVoiceOk);
     setBadge("badge-model-gtcrn", "GTCRN 降噪", gtcrnOk);
     setBadge("badge-model-dpdfnet", "DPDFNet4 强噪", dpdfOk);
     setBadge("badge-model-voxlock", "VoxLock 声纹提取", voxOk);
     setBadge("badge-model-vad", "Silero VAD", vadOk);
     setBadge("badge-model-vp", "3D-Speaker 声纹", vpOk);
-    setBadge("badge-model-asr", "SenseVoice 识别", asrOk);
     setBadge("badge-model-oww", "openWakeWord 唤醒", owwOk);
     setBadge("badge-model-tts", "Matcha 温柔女声", ttsOk);
 
     const coreReady = gtcrnOk && vadOk && vpOk && asrOk;
-    const allReady = coreReady && owwOk && ttsOk;
+    const allReady = coreReady && qwen3Ok && senseVoiceOk && owwOk && ttsOk;
     const dlBtn = document.getElementById("voice-download-models-btn") as HTMLButtonElement | null;
     if (dlBtn) {
       dlBtn.hidden = allReady || !status?.addonAvailable;
@@ -3799,10 +3803,12 @@ export class MijiaDeckWebApp {
     const desc = document.getElementById("voice-pipeline-status-desc");
     if (desc) {
       desc.textContent = allReady
-        ? "本地流式语音 AI 管线已就绪（WebSocket 连续流 + openWakeWord 唤醒 + 双轨抗音乐/强噪融合 + Silero VAD + 3D-Speaker 声纹 + SenseVoice 离线识别）"
-        : coreReady
-          ? "核心离线语音模型已就绪（openWakeWord 声学唤醒模型未下载时将自动使用 SenseVoice 唤醒兜底，可一键补齐）"
-          : "本地离线语音模型尚未完全就绪，可点击「一键补齐模型」自动下载，未就绪项将自动使用 DSP/云端降级";
+        ? "本地离线语音 AI 管线已全面就绪（主方案 Qwen3-ASR-0.6B CPU + 备用方案 SenseVoice + openWakeWord 唤醒 + GTCRN 降噪 + Silero VAD + 3D-Speaker 声纹）"
+        : coreReady && !qwen3Ok
+          ? "当前由 SenseVoice 储备方案兜底离线识别（Qwen3-ASR-0.6B 主方案模型未下载，点击「一键补齐模型」即可启用更高精度 CPU 转写）"
+          : coreReady
+            ? "核心离线语音模型已就绪（Qwen3-ASR-0.6B 主方案可用，可一键补齐备用 SenseVoice / openWakeWord / 本地女声模型）"
+            : "本地离线语音模型尚未完全就绪，可点击「一键补齐模型」自动下载，未就绪项将自动使用 DSP/云端降级";
     }
   }
 
@@ -4612,6 +4618,7 @@ export class MijiaDeckWebApp {
       cavemanMode: el<HTMLSelectElement>("set-agent-caveman-mode").value,
       systemPromptExtra: el<HTMLTextAreaElement>("set-agent-system-prompt").value.trim(),
       voiceEngine: el<HTMLSelectElement>("set-voice-engine").value,
+      localAsrEngine: el<HTMLSelectElement>("set-voice-local-asr-engine").value,
       voiceLang: el<HTMLSelectElement>("set-voice-lang").value,
       noiseSuppressionMode: el<HTMLSelectElement>("set-voice-noise-mode").value,
       vadMode: el<HTMLSelectElement>("set-voice-vad-mode").value,
