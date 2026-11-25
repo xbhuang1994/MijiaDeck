@@ -237,6 +237,8 @@ function handleWsMessage(
             lang,
             bypassWakeWord,
             preferredEngine,
+            asyncDispatch: vl.config.asyncVoicePipeline !== false,
+            duringTtsPlayback: seg.duringTtsPlayback,
           });
           try {
             ws.send(
@@ -246,6 +248,9 @@ function handleWsMessage(
                 text: result.text,
                 matched: result.matched,
                 wokeOnly: result.wokeOnly,
+                dispatchedAsync: result.dispatchedAsync === true,
+                taskId: result.taskId,
+                entryId: result.entryId,
                 command: result.command,
                 reply: result.reply,
                 attention: result.attention,
@@ -287,7 +292,7 @@ function handleWsMessage(
       runtime.voiceListener?.setSpeechInProgress(false);
       if (ws.data.ttsSpeaking) {
         ws.data.ttsSpeaking = false;
-        runtime.voiceListener?.setTtsSpeaking(false);
+        runtime.voiceListener?.handleTtsClientState({ speaking: false, phase: "cancel" });
       }
     } else if (parsed.type === "voice_dialog_control") {
       const vl = runtime.voiceListener;
@@ -304,10 +309,44 @@ function handleWsMessage(
     } else if (parsed.type === "voice_tts_state") {
       const vl = runtime.voiceListener;
       if (!vl) return;
-      if (typeof parsed.speaking === "boolean") {
-        ws.data.ttsSpeaking = parsed.speaking;
-        vl.setTtsSpeaking(parsed.speaking);
-        ws.data.voiceStream?.resetAfterTts();
+      const speaking = typeof parsed.speaking === "boolean" ? parsed.speaking : undefined;
+      const phaseRaw = typeof parsed.phase === "string" ? parsed.phase.trim() : undefined;
+      const phase =
+        phaseRaw === "start" ||
+        phaseRaw === "end" ||
+        phaseRaw === "cancel" ||
+        phaseRaw === "duck" ||
+        phaseRaw === "unduck" ||
+        phaseRaw === "telemetry"
+          ? phaseRaw
+          : undefined;
+      if (speaking !== undefined) {
+        ws.data.ttsSpeaking = speaking;
+      }
+      vl.handleTtsClientState({
+        speaking,
+        phase,
+        utteranceId: typeof parsed.utteranceId === "string" ? parsed.utteranceId : undefined,
+        text: typeof parsed.text === "string" ? parsed.text : undefined,
+        queueLength: typeof parsed.queueLength === "number" ? parsed.queueLength : undefined,
+        ducked: typeof parsed.ducked === "boolean" ? parsed.ducked : undefined,
+        aecActive: typeof parsed.aecActive === "boolean" ? parsed.aecActive : undefined,
+        erleDb: typeof parsed.erleDb === "number" ? parsed.erleDb : undefined,
+        doubleTalk: typeof parsed.doubleTalk === "boolean" ? parsed.doubleTalk : undefined,
+      });
+      if (speaking !== undefined) {
+        if (vl.config.asyncVoicePipeline !== false) {
+          ws.data.voiceStream?.notifyTtsState(speaking);
+        } else {
+          ws.data.voiceStream?.resetAfterTts();
+        }
+      }
+    } else if (parsed.type === "voice_cancel_task") {
+      const taskId = typeof parsed.taskId === "string" ? parsed.taskId.trim() : "";
+      if (taskId) {
+        runtime.piAgent?.abortTask(taskId);
+      } else {
+        runtime.piAgent?.abort();
       }
     }
   } catch {
@@ -497,19 +536,38 @@ export async function startMijiaDeckServer(
         data: voiceSnapshot,
       });
     }),
-    voiceListener.on("speakRequested", (text) => {
+    voiceListener.on("speakRequested", (text, meta) => {
       broadcaster.broadcast({
         type: "agent_speak",
         text,
-        data: { text },
+        ...(meta?.utteranceId ? { utteranceId: meta.utteranceId } : {}),
+        ...(meta?.priority ? { priority: meta.priority } : {}),
+        ...(meta?.taskId ? { taskId: meta.taskId } : {}),
+        ...(meta?.interrupt !== undefined ? { interrupt: meta.interrupt } : {}),
+        data: {
+          text,
+          ...(meta?.utteranceId ? { utteranceId: meta.utteranceId } : {}),
+          ...(meta?.priority ? { priority: meta.priority } : {}),
+          ...(meta?.taskId ? { taskId: meta.taskId } : {}),
+          ...(meta?.interrupt !== undefined ? { interrupt: meta.interrupt } : {}),
+        },
       });
     }),
-    voiceListener.on("speakChunkRequested", ({ text, final }) => {
+    voiceListener.on("speakChunkRequested", ({ text, final, utteranceId, priority, taskId }) => {
       broadcaster.broadcast({
         type: "agent_speak_chunk",
         text,
         final,
-        data: { text, final },
+        ...(utteranceId ? { utteranceId } : {}),
+        ...(priority ? { priority } : {}),
+        ...(taskId ? { taskId } : {}),
+        data: {
+          text,
+          final,
+          ...(utteranceId ? { utteranceId } : {}),
+          ...(priority ? { priority } : {}),
+          ...(taskId ? { taskId } : {}),
+        },
       });
     }),
   ];
@@ -572,7 +630,7 @@ export async function startMijiaDeckServer(
         }
         if (ws.data.ttsSpeaking) {
           ws.data.ttsSpeaking = false;
-          runtime.voiceListener?.setTtsSpeaking(false);
+          runtime.voiceListener?.handleTtsClientState({ speaking: false, phase: "cancel" });
         }
         broadcaster.remove(ws);
       },

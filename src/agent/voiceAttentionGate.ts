@@ -12,7 +12,13 @@
  * 只有确定是在与助手对话/叫助手操作时，才放行进入 Pi Agent 工具执行！
  */
 
+import type { EchoCancellationMode } from "../core/agentConfigStore.ts";
 import { isCustomInstructionVoiceCommand } from "./customInstructionStore.ts";
+import {
+  computeEnhancedEchoOverlap,
+  evaluateTtsEcho,
+  type EchoUtteranceRecord,
+} from "./echoGuard.ts";
 import type { WakeWordAcousticHit } from "./openWakeWordEngine.ts";
 import type { CommandIntentChoice, SystemOneClient } from "./systemOneClient.ts";
 import type { VoiceprintIdentifyResult } from "./voiceprintStore.ts";
@@ -52,6 +58,14 @@ export interface EvaluateAttentionInput {
   recentTurns?: readonly ConversationTurnContext[];
   lastSpokenReply?: string;
   lastSpokenAt?: number;
+  /** 多语段实时 TTS 播报账本快照（由 TtsEchoGuard 维护，支持队列排队与活跃播放精准匹配） */
+  recentSpokenUtterances?: ReadonlyArray<EchoUtteranceRecord>;
+  /** 当前扬声器是否正在播报 TTS */
+  ttsActive?: boolean;
+  /** 该音频段是否在 TTS 播报期间或刚结束尾窗内采集 */
+  duringTtsPlayback?: boolean;
+  /** 回声消除策略 */
+  echoCancellationMode?: EchoCancellationMode;
   now?: number;
   acousticEvent?: string;
   voiceprint?: VoiceprintIdentifyResult | null;
@@ -87,6 +101,8 @@ export interface AttentionDecision {
   intent?: CommandIntentChoice;
   intentConfidence?: number;
   selectedText?: string;
+  /** 双讲场景下从识别文本中自动剥离了混入的 TTS 回声残片 */
+  echoStripped?: boolean;
 }
 
 export interface WakeSpanMatch {
@@ -643,34 +659,11 @@ function escapeRegExp(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function normalizeForEcho(text: string): string {
-  return text
-    .toLowerCase()
-    .replace(/[\s,，。．.、!！?？:：;；\-—~～"'“”‘’()（）[\]【】]/g, "");
-}
-
 /**
- * 计算当前识别文本与 MijiaDeck 刚刚播报的 TTS 文本的字符重叠度（用于抑制扬声器自回声）。
+ * 计算当前识别文本与 MijiaDeck 刚刚播报的 TTS 文本的字符重叠度（用于抑制扬声器自回声，支持口语数字/单位对齐）。
  */
 export function computeEchoOverlap(transcript: string, lastSpoken: string): number {
-  const a = normalizeForEcho(transcript);
-  const b = normalizeForEcho(lastSpoken);
-  if (!a || !b || a.length < 2) return 0;
-  if (b.includes(a)) return 1;
-  if (a.includes(b) && b.length >= 4) return b.length / a.length;
-
-  // Bigram 重叠率
-  const bigramsB = new Set<string>();
-  for (let i = 0; i < b.length - 1; i += 1) {
-    bigramsB.add(b.slice(i, i + 2));
-  }
-  if (bigramsB.size === 0) return 0;
-  let hits = 0;
-  const totalA = Math.max(1, a.length - 1);
-  for (let i = 0; i < a.length - 1; i += 1) {
-    if (bigramsB.has(a.slice(i, i + 2))) hits += 1;
-  }
-  return hits / totalA;
+  return computeEnhancedEchoOverlap(transcript, lastSpoken);
 }
 
 /**
@@ -1004,13 +997,15 @@ export async function evaluateVoiceAttention(
 ): Promise<AttentionDecision> {
   const t0 = performance.now();
   const now = input.now ?? Date.now();
-  const cleaned = input.rawText.trim();
+  let cleaned = input.rawText.trim();
   const inConversationEffective =
     input.dialogState === "conversation" || Boolean(input.inConversation) || Boolean(input.awakeActive);
+  let echoStripped = false;
   const wrap = (
     partial: Omit<AttentionDecision, "latencyMs">,
   ): AttentionDecision => ({
     ...partial,
+    ...(echoStripped ? { echoStripped: true, selectedText: partial.selectedText ?? cleaned } : {}),
     latencyMs: Math.round(performance.now() - t0),
   });
 
@@ -1052,50 +1047,53 @@ export async function evaluateVoiceAttention(
     });
   }
 
-  const wakeSpan = findWakeWordSpan(cleaned, input.wakeWords);
+  let wakeSpan = findWakeWordSpan(cleaned, input.wakeWords);
 
-  // 0B. TTS 自回声防护（避免电脑扬声器朗读的回复被麦克风重新收进当成指令）
-  // 注意：若用户刚刚关闭了“客厅吸顶灯”（助手播报“已关闭客厅吸顶灯”），随后立刻说“打开客厅吸顶灯”，
-  // 设备名重叠率约 0.67，绝不能把明确反向控制指令或带唤醒词的语句误判为自回声！
-  if (
-    !input.bypassWakeWord &&
-    input.lastSpokenReply &&
-    input.lastSpokenAt &&
-    now >= input.lastSpokenAt &&
-    now - input.lastSpokenAt <= 4500
-  ) {
-    const overlap = computeEchoOverlap(cleaned, input.lastSpokenReply);
-    const looksDirect = DIRECT_COMMAND_START_RE.test(cleaned);
-    const echoThreshold = wakeSpan || looksDirect ? 0.88 : 0.6;
-    const normHeard = normalizeForEcho(cleaned);
-    const normSpoken = normalizeForEcho(input.lastSpokenReply);
-    // Caveman 极短应答（如“在呢” / “已待机”）在 2.5s 内可能只回收到 1~2 字残片
-    const shortCavemanEcho =
-      now - input.lastSpokenAt <= 2500 &&
-      normHeard.length >= 1 &&
-      normHeard.length <= 2 &&
-      normSpoken.length > 0 &&
-      (normHeard === normSpoken || (normSpoken.length <= 6 && normSpoken.includes(normHeard)));
+  // 0B. 多语段实时 TTS 自回声防护 + 双讲回声残片剥离（兼容多条排队播报、口语数字单位对齐与声纹加权）
+  // 注意：绝不把用户紧跟其后说出的反向控制指令或明确唤醒词指令误杀为自回声！
+  const hasEchoContext = Boolean(
+    (input.recentSpokenUtterances && input.recentSpokenUtterances.length > 0) ||
+      (input.lastSpokenReply && input.lastSpokenAt),
+  );
+  if (!input.bypassWakeWord && hasEchoContext) {
+    const echoEval = evaluateTtsEcho({
+      transcript: cleaned,
+      now,
+      mode: input.echoCancellationMode ?? "auto",
+      duringTtsPlayback: input.duringTtsPlayback,
+      ttsActive: input.ttsActive,
+      hasWakeWord: Boolean(wakeSpan),
+      looksDirectCommand: DIRECT_COMMAND_START_RE.test(cleaned),
+      voiceprint: input.voiceprint,
+      recentUtterances: input.recentSpokenUtterances,
+      legacyLastSpokenReply: input.lastSpokenReply,
+      legacyLastSpokenAt: input.lastSpokenAt,
+    });
 
-    if (shortCavemanEcho || overlap >= echoThreshold) {
+    if (echoEval.isEcho) {
       return wrap({
         accept: false,
         wokeOnly: false,
         addressed: false,
         inConversation: inConversationEffective,
-        confidence: shortCavemanEcho ? 0.95 : overlap,
+        confidence: Math.max(0.75, echoEval.score),
         stage: "echo",
-        reason: "检测到系统语音播报回声，已自动抑制",
+        reason: echoEval.reason || "检测到系统语音播报回声，已自动抑制",
         wakeWord: null,
         command: "",
         usedLlm: false,
       });
     }
 
-    // 灰区（0.40 <= overlap < echoThreshold）：调用 SystemOne 判别是回声残片还是用户反向新指令
-    if (overlap >= 0.4 && overlap < echoThreshold && input.systemOneClient?.enabled) {
+    // 双讲混入播报残片：剥离前后回声残片后，用干净的用户指令继续后续唤醒与注意力门控
+    if (echoEval.strippedTranscript && echoEval.strippedTranscript !== cleaned) {
+      cleaned = echoEval.strippedTranscript;
+      echoStripped = true;
+      wakeSpan = findWakeWordSpan(cleaned, input.wakeWords);
+    } else if (echoEval.grayZone && input.systemOneClient?.enabled) {
+      // 灰区：调用 SystemOne 判别是回声残片还是用户反向新指令
       const echoVerdict = await input.systemOneClient.classifyEchoOrCommand({
-        lastSpoken: input.lastSpokenReply,
+        lastSpoken: echoEval.matchedUtterance || input.lastSpokenReply || "",
         heard: cleaned,
       });
       if (echoVerdict?.isEcho) {

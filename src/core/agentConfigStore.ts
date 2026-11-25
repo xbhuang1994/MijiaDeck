@@ -35,6 +35,7 @@ export type VadEngineMode = "silero" | "adaptive";
 export type VadSensitivityMode = "aggressive" | "default" | "relaxed";
 export type VoiceprintPolicyMode = "off" | "tag" | "strict";
 export type AttentionMode = "smart" | "strict" | "off";
+export type EchoCancellationMode = "auto" | "aggressive" | "standard" | "off";
 export type SystemOneMode = "auto" | "on" | "off";
 export type CavemanReplyMode = "ultra" | "full" | "lite" | "off";
 export type CustomApiType =
@@ -179,6 +180,7 @@ const VALID_VAD_MODES = new Set<string>(["silero", "adaptive"]);
 const VALID_VAD_SENSITIVITIES = new Set<string>(["aggressive", "default", "relaxed"]);
 const VALID_VOICEPRINT_MODES = new Set<string>(["off", "tag", "strict"]);
 const VALID_ATTENTION_MODES = new Set<string>(["smart", "strict", "off"]);
+const VALID_ECHO_MODES = new Set<string>(["auto", "aggressive", "standard", "off"]);
 const VALID_SYSTEMONE_MODES = new Set<string>(["auto", "on", "off"]);
 const VALID_CAVEMAN_MODES = new Set<string>(["ultra", "full", "lite", "off"]);
 const CAVEMAN_MODE_ALIASES: Readonly<Record<string, CavemanReplyMode>> = {
@@ -253,6 +255,12 @@ export interface AgentVoiceConfig {
   conversationWindowSec: number;
   maxConsecutiveSidetalk: number;
   bargeInEnabled: boolean;
+  /** 是否启用执行、播报、对话全双工异步分离管线（默认开启，互不阻塞） */
+  asyncVoicePipeline: boolean;
+  /** 回声消除策略：auto（硬件 AEC + 参考信号自适应 AEC + 服务端多语段语义防回声）/ aggressive / standard / off */
+  echoCancellationMode: EchoCancellationMode;
+  /** 双讲/插话检测时是否先平滑降音（Ducking）再决定打断（默认开启，显著降低自回声误打断） */
+  bargeInDuckingEnabled: boolean;
   // SystemOne 决策模型（karpo/karpo-decision-31b）配置
   systemOneMode: SystemOneMode;
   systemOneBaseUrl: string;
@@ -322,6 +330,9 @@ export interface AgentConfigPatch {
   conversationWindowSec?: unknown;
   maxConsecutiveSidetalk?: unknown;
   bargeInEnabled?: unknown;
+  asyncVoicePipeline?: unknown;
+  echoCancellationMode?: unknown;
+  bargeInDuckingEnabled?: unknown;
   systemOneMode?: unknown;
   systemOneBaseUrl?: unknown;
   systemOneApiKey?: unknown;
@@ -377,6 +388,9 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     conversationWindowSec: 25,
     maxConsecutiveSidetalk: 3,
     bargeInEnabled: true,
+    asyncVoicePipeline: true,
+    echoCancellationMode: "auto",
+    bargeInDuckingEnabled: true,
     systemOneMode: "auto",
     systemOneBaseUrl: "",
     systemOneApiKey: "",
@@ -578,6 +592,14 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     ? (attModeRaw as AttentionMode)
     : defaults.attentionMode;
 
+  const echoModeRaw =
+    typeof raw.echoCancellationMode === "string"
+      ? raw.echoCancellationMode.trim().toLowerCase()
+      : defaults.echoCancellationMode;
+  const echoCancellationMode: EchoCancellationMode = VALID_ECHO_MODES.has(echoModeRaw)
+    ? (echoModeRaw as EchoCancellationMode)
+    : defaults.echoCancellationMode;
+
   const sysOneModeRaw =
     typeof raw.systemOneMode === "string"
       ? raw.systemOneMode.trim().toLowerCase()
@@ -669,6 +691,15 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     ),
     bargeInEnabled:
       typeof raw.bargeInEnabled === "boolean" ? raw.bargeInEnabled : defaults.bargeInEnabled,
+    asyncVoicePipeline:
+      typeof raw.asyncVoicePipeline === "boolean"
+        ? raw.asyncVoicePipeline
+        : defaults.asyncVoicePipeline,
+    echoCancellationMode,
+    bargeInDuckingEnabled:
+      typeof raw.bargeInDuckingEnabled === "boolean"
+        ? raw.bargeInDuckingEnabled
+        : defaults.bargeInDuckingEnabled,
     systemOneMode,
     systemOneBaseUrl: normalizeSystemOneBaseUrl(raw.systemOneBaseUrl),
     systemOneApiKey: typeof raw.systemOneApiKey === "string" ? raw.systemOneApiKey.trim() : "",
@@ -1037,6 +1068,19 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
   }
   if (patch.bargeInEnabled !== undefined) {
     nextRaw.bargeInEnabled = Boolean(patch.bargeInEnabled);
+  }
+  if (patch.asyncVoicePipeline !== undefined) {
+    nextRaw.asyncVoicePipeline = Boolean(patch.asyncVoicePipeline);
+  }
+  if (patch.echoCancellationMode !== undefined) {
+    const em = String(patch.echoCancellationMode).trim().toLowerCase();
+    if (!VALID_ECHO_MODES.has(em)) {
+      throw new Error(`不支持的回声消除模式: ${em}`);
+    }
+    nextRaw.echoCancellationMode = em;
+  }
+  if (patch.bargeInDuckingEnabled !== undefined) {
+    nextRaw.bargeInDuckingEnabled = Boolean(patch.bargeInDuckingEnabled);
   }
   if (patch.systemOneMode !== undefined) {
     const sm = String(patch.systemOneMode).trim().toLowerCase();

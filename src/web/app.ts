@@ -2078,7 +2078,17 @@ export class MijiaDeckWebApp {
         const p = asRecord(payload) ?? msg;
         const text = readStr(p, "text", "message");
         if (text) {
-          this.piAgentPanel.handleSpeakEvent(text);
+          const priorityRaw = readStr(p, "priority");
+          const priority =
+            priorityRaw === "ack" || priorityRaw === "normal" || priorityRaw === "result" || priorityRaw === "system"
+              ? priorityRaw
+              : undefined;
+          this.piAgentPanel.handleSpeakEvent(text, {
+            utteranceId: readStr(p, "utteranceId"),
+            priority,
+            taskId: readStr(p, "taskId"),
+            interrupt: readBool(p, "interrupt"),
+          });
         }
         break;
       }
@@ -2086,7 +2096,17 @@ export class MijiaDeckWebApp {
         const p = asRecord(payload) ?? msg;
         const text = readStr(p, "text", "message");
         if (text) {
-          this.piAgentPanel.handleSpeakChunkEvent(text);
+          const priorityRaw = readStr(p, "priority");
+          const priority =
+            priorityRaw === "ack" || priorityRaw === "normal" || priorityRaw === "result" || priorityRaw === "system"
+              ? priorityRaw
+              : undefined;
+          this.piAgentPanel.handleSpeakChunkEvent(text, {
+            utteranceId: readStr(p, "utteranceId"),
+            priority,
+            taskId: readStr(p, "taskId"),
+            interrupt: readBool(p, "interrupt"),
+          });
         }
         break;
       }
@@ -3788,6 +3808,9 @@ export class MijiaDeckWebApp {
     el<HTMLSelectElement>("set-voice-tts-engine").value = cfg?.ttsEngine || "auto";
     el<HTMLSelectElement>("set-voice-tts-voice").value = cfg?.ttsVoice || "gentle-zh-en";
     el<HTMLInputElement>("set-voice-tts-speed").value = (cfg?.ttsSpeed ?? 0.98).toFixed(2);
+    el<HTMLInputElement>("set-voice-async-pipeline").checked = cfg?.asyncVoicePipeline !== false;
+    el<HTMLSelectElement>("set-voice-echo-mode").value = cfg?.echoCancellationMode || "auto";
+    el<HTMLInputElement>("set-voice-barge-in-ducking").checked = cfg?.bargeInDuckingEnabled !== false;
 
     el<HTMLInputElement>("set-stt-base-url").value = cfg?.sttBaseUrl || "";
     el<HTMLInputElement>("set-stt-model").value = cfg?.sttModel || "whisper-1";
@@ -5014,6 +5037,9 @@ export class MijiaDeckWebApp {
       ttsEngine: el<HTMLSelectElement>("set-voice-tts-engine").value,
       ttsVoice: el<HTMLSelectElement>("set-voice-tts-voice").value,
       ttsSpeed,
+      asyncVoicePipeline: el<HTMLInputElement>("set-voice-async-pipeline").checked,
+      echoCancellationMode: el<HTMLSelectElement>("set-voice-echo-mode").value,
+      bargeInDuckingEnabled: el<HTMLInputElement>("set-voice-barge-in-ducking").checked,
       sttBaseUrl: el<HTMLInputElement>("set-stt-base-url").value.trim(),
       sttModel: el<HTMLInputElement>("set-stt-model").value.trim(),
     };

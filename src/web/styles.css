@@ -5438,6 +5438,118 @@ body.pi-drawer-open .voice-fab {
   background: var(--c-warn-text);
 }
 
+/* 3-Lane Async Status Strip (Conversation / Execution / Speaking) */
+.pi-voice-lanes {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.pi-lane-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 8px;
+  border: 1px solid var(--c-line);
+  background: var(--c-card);
+  color: var(--c-text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease;
+}
+
+.pi-lane-chip:hover {
+  border-color: var(--c-accent-border);
+  background: var(--c-btn-hover);
+}
+
+.pi-lane-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--c-text-secondary);
+  opacity: 0.45;
+  flex-shrink: 0;
+}
+
+.pi-lane-label {
+  font-weight: 600;
+  color: var(--c-text-secondary);
+  flex-shrink: 0;
+}
+
+.pi-lane-val {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;
+  font-weight: 500;
+}
+
+.pi-lane-chip.is-active,
+.pi-lane-chip.is-conv {
+  border-color: var(--c-accent-border);
+  background: color-mix(in srgb, var(--c-accent-surface) 75%, var(--c-card));
+  color: var(--c-theme-dim);
+}
+
+.pi-lane-chip.is-active .pi-lane-dot,
+.pi-lane-chip.is-conv .pi-lane-dot {
+  background: var(--c-theme);
+  opacity: 1;
+}
+
+.pi-lane-chip.is-active .pi-lane-label,
+.pi-lane-chip.is-conv .pi-lane-label {
+  color: var(--c-theme-dim);
+}
+
+.pi-lane-chip.is-exec {
+  border-color: var(--c-warn-border);
+  background: var(--c-warn-bg);
+  color: var(--c-warn-text);
+}
+
+.pi-lane-chip.is-exec .pi-lane-dot {
+  background: var(--c-warn-text);
+  opacity: 1;
+}
+
+.pi-lane-chip.is-exec .pi-lane-label {
+  color: var(--c-warn-text);
+}
+
+.pi-lane-chip.is-speak {
+  border-color: rgba(59, 130, 246, 0.42);
+  background: rgba(59, 130, 246, 0.12);
+  color: #60a5fa;
+}
+
+.pi-lane-chip.is-speak .pi-lane-dot {
+  background: #60a5fa;
+  opacity: 1;
+}
+
+.pi-lane-chip.is-speak .pi-lane-label {
+  color: #60a5fa;
+}
+
+.pi-lane-chip.is-ducked {
+  border-color: var(--c-warn-border);
+  background: color-mix(in srgb, var(--c-warn-bg) 80%, rgba(59, 130, 246, 0.1));
+  color: var(--c-warn-text);
+}
+
+.pi-lane-chip.is-ducked .pi-lane-dot {
+  background: var(--c-warn-text);
+  opacity: 1;
+}
+
 .pi-voice-top {
   display: flex;
   align-items: center;
@@ -6187,10 +6299,15 @@ body.pi-drawer-open .voice-fab {
   border-color: var(--c-theme);
 }
 
-.pi-send-btn {
+.pi-send-btn,
+.pi-stop-btn {
   height: 36px;
   padding: 0 14px;
   flex-shrink: 0;
+}
+
+.pi-stop-btn {
+  padding: 0 11px;
 }
 
 /* Settings Voice & Pi Agent Tab Helpers */

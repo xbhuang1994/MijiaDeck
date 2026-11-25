@@ -258,6 +258,23 @@
           <div id="pi-dialog-timer-fill" class="pi-dialog-timer-fill"></div>
         </div>
       </div>
+      <div id="pi-voice-lanes" class="pi-voice-lanes" aria-label="对话、执行与播报异步通道状态">
+        <button type="button" id="pi-lane-conv" class="pi-lane-chip" title="对话通道：独立持续收音与唤醒，不被执行或播报阻塞（点击切换对话模式）">
+          <span class="pi-lane-dot" aria-hidden="true"></span>
+          <span class="pi-lane-label">对话</span>
+          <span id="pi-lane-conv-val" class="pi-lane-val">待机</span>
+        </button>
+        <button type="button" id="pi-lane-exec" class="pi-lane-chip" title="执行通道：后台并发执行设备控制任务，互不打断（执行中点击可中止）">
+          <span class="pi-lane-dot" aria-hidden="true"></span>
+          <span class="pi-lane-label">执行</span>
+          <span id="pi-lane-exec-val" class="pi-lane-val">空闲</span>
+        </button>
+        <button type="button" id="pi-lane-speak" class="pi-lane-chip" title="播报通道：独立排队播报并启用回声消除（播报中点击仅静音播报）">
+          <span class="pi-lane-dot" aria-hidden="true"></span>
+          <span class="pi-lane-label">播报</span>
+          <span id="pi-lane-speak-val" class="pi-lane-val">静音</span>
+        </button>
+      </div>
       <div class="pi-voice-top">
         <div id="pi-voice-wave" class="pi-voice-wave" aria-hidden="true">
           <span class="pi-wave-bar"></span>
@@ -319,6 +336,7 @@
     <!-- Bottom Prompt Composer -->
     <div class="pi-composer">
       <input type="text" id="pi-agent-input" class="pi-composer-input" placeholder="输入设备控制指令，如“把客厅吸顶灯调到暖光 80%”…" autocomplete="off" spellcheck="false" aria-label="输入 Pi Agent 控制指令">
+      <button type="button" id="pi-agent-stop-btn" class="danger-button btn-compact pi-stop-btn" hidden title="中止正在后台执行的任务">停止执行</button>
       <button type="button" id="pi-agent-send-btn" class="primary-button btn-compact pi-send-btn">发送</button>
     </div>
   </aside>
@@ -1000,6 +1018,35 @@
                   <input type="number" id="set-voice-tts-speed" class="md-num-input" min="0.70" max="1.40" step="0.02" value="0.98" aria-label="语音播报语速">
                 </div>
                 <button type="button" id="set-voice-tts-preview-btn" class="secondary-button btn-compact" title="用当前选择的女声音色试听播报效果">试听女声</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="setting-card setting-card-wrap" id="setting-row-async-echo">
+            <div class="tts-settings-stack">
+              <div class="tts-settings-head">
+                <div class="setting-info">
+                  <div class="setting-label">全双工异步分离与回声消除（AEC）</div>
+                  <div class="setting-desc">对话监听、任务执行与语音播报三轨独立异步运行，互不阻塞；启用自适应回声消除与服务端多句回声过滤，播报时仍可随时自然插话</div>
+                </div>
+                <div class="voice-toggle-pair">
+                  <label class="voice-mini-check" title="播报期间检测到你开口时先平滑压低播报音量，确认持续说话后再打断播报">
+                    <input type="checkbox" id="set-voice-barge-in-ducking" checked>
+                    <span>插话降音避让</span>
+                  </label>
+                  <label class="md-switch" title="开启对话、执行与播报全双工异步解耦">
+                    <input type="checkbox" id="set-voice-async-pipeline" checked aria-label="开启全双工异步分离">
+                    <span class="md-switch-track"></span>
+                  </label>
+                </div>
+              </div>
+              <div class="tts-voice-grid">
+                <select id="set-voice-echo-mode" class="md-select" aria-label="回声消除策略">
+                  <option value="auto">回声消除：自动（硬件 AEC + 自适应滤波 + 语义过滤）</option>
+                  <option value="aggressive">回声消除：强效（近距外放音箱推荐）</option>
+                  <option value="standard">回声消除：标准（仅硬件 AEC + 语义过滤）</option>
+                  <option value="off">回声消除：关闭</option>
+                </select>
               </div>
             </div>
           </div>

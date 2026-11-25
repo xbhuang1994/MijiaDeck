@@ -64,6 +64,8 @@ export interface VoiceStreamSegmentPayload {
   stripCommittedPrefixHint?: string;
   /** 流式智能断句触发原因 */
   commitReason?: StreamingCommitReason;
+  /** 该分段是否在 TTS 播报活跃期或刚结束尾窗内采集（供服务端回声防护增强判定） */
+  duringTtsPlayback?: boolean;
 }
 
 export interface VoiceStreamSessionOptions {
@@ -159,6 +161,8 @@ export class VoiceStreamSession {
   private _lastDenOverlap = new Float32Array(0);
   private _lastMatchedStartSec = -1;
   private _lastMatchedEndSec = -1;
+  private _ttsSpeaking = false;
+  private _ttsLastEndedAt = 0;
 
   // 无 Silero VAD 时的纯 TS 兜底窗口缓冲
   private _fallbackChunks: Float32Array[] = [];
@@ -319,7 +323,7 @@ export class VoiceStreamSession {
   }
 
   /**
-   * TTS 播报开始/结束切换时清理挂起状态与残余 VAD 缓冲，防止播报前后残留帧拼接触发误识别。
+   * TTS 播报开始/结束切换时清理挂起状态与残余 VAD 缓冲（兼容传统半双工模式与单测调用）。
    */
   resetAfterTts(): void {
     if (this._disposed) return;
@@ -334,6 +338,30 @@ export class VoiceStreamSession {
     this._resetStreamingState(true);
     this._oww?.resetSegmentTracking();
     this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, this._rawTotalSamples);
+  }
+
+  /**
+   * 全双工异步模式下的非破坏性 TTS 播报状态同步：
+   * - 绝不强行清空正在进行中的用户说话（VAD 活跃 / 已命中唤醒锚点），保障播报与对话完全并行不截断；
+   * - 仅更新播报时间标记以便给后续切段打上 `duringTtsPlayback` 标记，并在无说话时清除滚窗噪声重叠。
+   */
+  notifyTtsState(speaking: boolean): void {
+    if (this._disposed) return;
+    const now = Date.now();
+    this._ttsSpeaking = Boolean(speaking);
+    if (!speaking) {
+      this._ttsLastEndedAt = now;
+    }
+    const userCurrentlySpeaking = this._vadDetected || this._wakeAnchorSample !== null;
+    if (!userCurrentlySpeaking) {
+      this._lastRawOverlap = new Float32Array(0);
+      this._lastDenOverlap = new Float32Array(0);
+    }
+  }
+
+  private _isDuringTtsWindow(): boolean {
+    if (this._ttsSpeaking) return true;
+    return this._ttsLastEndedAt > 0 && Date.now() - this._ttsLastEndedAt <= 900;
   }
 
   /**
@@ -1181,21 +1209,25 @@ export class VoiceStreamSession {
 
   private _enqueueSegment(payload: VoiceStreamSegmentPayload): void {
     if (this._disposed) return;
-    const isPriorityWake = Boolean(payload.wakeAnchored || payload.acousticWake?.matched);
+    const enrichedPayload: VoiceStreamSegmentPayload =
+      payload.duringTtsPlayback !== undefined
+        ? payload
+        : { ...payload, duringTtsPlayback: this._isDuringTtsWindow() };
+    const isPriorityWake = Boolean(enrichedPayload.wakeAnchored || enrichedPayload.acousticWake?.matched);
     if (isPriorityWake) {
       if (this._pendingWake.length >= 2) {
         this._pendingWake.shift();
         this._droppedStaleCount += 1;
       }
-      this._pendingWake.push(payload);
+      this._pendingWake.push(enrichedPayload);
     } else {
       // 有界反压：非唤醒待处理队列最多保留最新 2 段（流式多句切分放宽至 6 句防吞掉连续指令），彻底防止持续背景音乐下队列无限积压！
-      const maxQueue = payload.precomputedTranscript ? 6 : 2;
+      const maxQueue = enrichedPayload.precomputedTranscript ? 6 : 2;
       if (this._pendingNormalQueue.length >= maxQueue) {
         this._pendingNormalQueue.shift();
         this._droppedStaleCount += 1;
       }
-      this._pendingNormalQueue.push(payload);
+      this._pendingNormalQueue.push(enrichedPayload);
     }
     this._pumpQueue();
   }
