@@ -319,6 +319,12 @@ export interface AgentTimelineEntry {
   role: "user" | "assistant";
   source: "text" | "voice";
   text: string;
+  /** ClearVoice 多轨分离时产生该指令的独立音轨编号与信息（仅语音来源） */
+  trackIndex?: number;
+  trackCount?: number;
+  trackId?: string;
+  speakerName?: string | null;
+  speakerScore?: number;
   /** 模型思考/推理过程（仅在对话框展示，绝不进行语音播报） */
   thinking?: string;
   /** 是否正在流式接收思考过程 */
@@ -376,6 +382,9 @@ export interface VoicePromptMeta {
   wakeWord?: string | null;
   attentionReason?: string;
   intent?: CommandIntentChoice;
+  trackIndex?: number;
+  trackCount?: number;
+  trackId?: string;
 }
 
 export interface PiAgentRunResult {
@@ -2676,6 +2685,19 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       role: "user",
       source,
       text,
+      ...(typeof options.voiceMeta?.trackIndex === "number"
+        ? { trackIndex: options.voiceMeta.trackIndex }
+        : {}),
+      ...(typeof options.voiceMeta?.trackCount === "number"
+        ? { trackCount: options.voiceMeta.trackCount }
+        : {}),
+      ...(options.voiceMeta?.trackId ? { trackId: options.voiceMeta.trackId } : {}),
+      ...(options.voiceMeta?.speakerName !== undefined
+        ? { speakerName: options.voiceMeta.speakerName }
+        : {}),
+      ...(typeof options.voiceMeta?.speakerScore === "number"
+        ? { speakerScore: options.voiceMeta.speakerScore }
+        : {}),
       timestamp: now,
       status: "done",
       toolCalls: [],

@@ -24,6 +24,13 @@ export type StreamingCommitReason =
   | "max_duration"
   | "manual_flush";
 
+export interface StreamingPartialTrack {
+  trackId: string;
+  trackIndex: number;
+  text: string;
+  energyRatio?: number;
+}
+
 export interface StreamingPartialUpdate {
   /** 当前展示的完整实时文本（稳定部分 + 未稳定尾部） */
   text: string;
@@ -33,6 +40,8 @@ export interface StreamingPartialUpdate {
   unstableText: string;
   engine: string;
   latencyMs: number;
+  /** ClearVoice 多轨盲源分离场景下的各轨独立实时字幕（绝不混杂成一条音轨） */
+  tracks?: StreamingPartialTrack[];
 }
 
 export interface StreamingSentenceSplitResult {

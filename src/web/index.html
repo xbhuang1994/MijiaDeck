@@ -306,6 +306,17 @@
         </select>
       </div>
       <div id="pi-voice-telemetry" class="pi-voice-telemetry" hidden></div>
+      <div id="pi-voice-tracks-panel" class="pi-voice-tracks-panel" hidden aria-label="ClearVoice 多轨分离音频识别输出">
+        <div class="pi-tracks-header">
+          <div class="pi-tracks-header-left">
+            <span class="pi-tracks-title">ClearVoice 分轨输出</span>
+            <span id="pi-tracks-count-badge" class="pi-tracks-count-badge">0 轨</span>
+            <span id="pi-tracks-engine-badge" class="pi-tracks-engine-badge" hidden></span>
+          </div>
+          <button type="button" id="pi-tracks-toggle-btn" class="pi-tracks-toggle-btn" aria-expanded="true" title="展开或收起多轨输出明细">收起</button>
+        </div>
+        <div id="pi-tracks-list" class="pi-tracks-list" role="list"></div>
+      </div>
     </div>
 
     <!-- Precipitated Agent Skills Bar (auto-shown once skills are learned) -->
@@ -825,7 +836,8 @@
               <div class="voice-status-badges" id="voice-model-badges">
                 <span class="voice-badge-pill" id="badge-model-qwen3-asr">Qwen3-ASR 0.6B (主)</span>
                 <span class="voice-badge-pill" id="badge-model-qwen3-gpu">GPU 加速</span>
-                <span class="voice-badge-pill" id="badge-model-clearvoice">ClearVoice GPU</span>
+                <span class="voice-badge-pill" id="badge-model-clearvoice">ClearVoice SE 降噪</span>
+                <span class="voice-badge-pill" id="badge-model-clearvoice-ss">ClearVoice BSS 分离</span>
                 <span class="voice-badge-pill" id="badge-model-asr">SenseVoice (备用)</span>
                 <span class="voice-badge-pill" id="badge-model-gtcrn">GTCRN 降噪</span>
                 <span class="voice-badge-pill" id="badge-model-dpdfnet">DPDFNet4 强噪</span>
@@ -889,8 +901,8 @@
 
           <div class="setting-card" id="setting-row-clearvoice-pipeline">
             <div class="setting-info">
-              <div class="setting-label">ClearVoice GPU 准实时切片降噪方案（MossFormer2 → Qwen3-ASR）</div>
-              <div class="setting-desc" id="set-voice-clearvoice-desc">开启后切换为新方案：32ms 采集 + Silero VAD 双触发切片（280ms 静音优先 / 2.0s 超时兜底）+ 0.3s 历史上下文 GPU MossFormer2 降噪 + 20ms 交叉淡入淡出，处理后直接送入 Qwen3-ASR 转文字；关闭则使用原方案</div>
+              <div class="setting-label">ClearVoice GPU 多轨盲源分离与降噪方案（MossFormer2 BSS+SE → 分轨独立处理）</div>
+              <div class="setting-desc" id="set-voice-clearvoice-desc">开启后先由 ClearVoice（MossFormer2_SS_16K 盲源分离 + 分轨 MossFormer2_SE_48K 降噪与剔除背景音）产出独立多轨音频，每条音轨独立执行声纹识别、Qwen3-ASR 转文字、逻辑判定与后续流程，并在界面分轨展示（严禁混杂成单轨）；关闭则使用原方案</div>
             </div>
             <label class="md-switch">
               <input type="checkbox" id="set-voice-clearvoice-enabled" aria-label="切换 ClearVoice GPU 新方案或原方案">

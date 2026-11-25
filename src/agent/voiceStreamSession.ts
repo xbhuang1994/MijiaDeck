@@ -20,8 +20,8 @@
 import type { VadSensitivityMode, VoicePipelineMode } from "../core/agentConfigStore.ts";
 import { computeRms, estimateSnrDb, resampleLinear } from "./audioPcm.ts";
 import {
+  ClearVoiceMultiTrackAssembler,
   ClearVoiceRealtimeChunker,
-  ClearVoiceSliceAssembler,
   type ClearVoiceChunkDescriptor,
   type ClearVoiceTriggerReason,
 } from "./clearVoiceChunker.ts";
@@ -49,9 +49,23 @@ import {
 import type { ProcessAudioUploadResult } from "./voiceListenerController.ts";
 import { listVoiceprintRefWavPaths } from "./voiceprintStore.ts";
 
+export interface VoiceStreamSeparatedTrack {
+  trackId: string;
+  trackIndex: number;
+  sourceSlot: number;
+  samples: Float32Array;
+  sampleRate: number;
+  rms: number;
+  energyRatio: number;
+  outputSnrDb: number;
+  snrGainDb: number;
+}
+
 export interface VoiceStreamSegmentPayload {
   rawSamples: Float32Array;
   denoisedSamples: Float32Array;
+  /** ClearVoice 盲源分离 + 分轨降噪去背景音产出的独立多轨音频（严禁混回单轨！） */
+  separatedTracks?: VoiceStreamSeparatedTrack[];
   denoiseEngine: string;
   inputSnrDb: number;
   outputSnrDb: number;
@@ -72,14 +86,19 @@ export interface VoiceStreamSegmentPayload {
   stripCommittedPrefixHint?: string;
   /** 流式智能断句触发原因 */
   commitReason?: StreamingCommitReason;
-  /** 产出该分段的语音前端方案：legacy（原方案）或 clearvoice（新方案 GPU 准实时切片） */
+  /** 产出该分段的语音前端方案：legacy（原方案）或 clearvoice（新方案 GPU 盲源分离 + 分轨降噪） */
   pipelineMode?: VoicePipelineMode;
-  /** ClearVoice 准实时切片元数据（切片数、20ms 交叉淡入淡出次数、降噪耗时等） */
+  /** ClearVoice 准实时切片与盲源分离元数据（切片数、20ms 交叉淡入淡出次数、轨数、PIT 换轨次数等） */
   clearVoiceMeta?: {
     sliceCount: number;
     crossfadeCount: number;
     triggerReason: ClearVoiceTriggerReason;
     denoiseMs: number;
+    ssMs?: number;
+    seMs?: number;
+    trackCount?: number;
+    bssUsed?: boolean;
+    permutationSwaps?: number;
     gpuName?: string | null;
   };
   /** 该分段是否在 TTS 播报活跃期或刚结束尾窗内采集（供服务端回声防护增强判定） */
@@ -223,14 +242,18 @@ export class VoiceStreamSession {
   private _heldSegment: HeldLegacySegment | null = null;
   private _streamLastDecodeFullWindow = true;
 
-  // ClearVoice GPU 准实时切片管线状态（按需惰性初始化，支持运行期无缝热切换）
+  // ClearVoice GPU 多轨盲源分离 + 分轨降噪准实时切片管线状态（按需惰性初始化，支持运行期无缝热切换）
   private _cvChunker: ClearVoiceRealtimeChunker | null = null;
-  private _cvAssembler: ClearVoiceSliceAssembler | null = null;
+  private _cvAssembler: ClearVoiceMultiTrackAssembler | null = null;
   private _cvSliceQueue: ClearVoiceQueuedSlice[] = [];
   private _cvInFlight = false;
   private _cvIdleResolvers: Array<() => void> = [];
   private _cvRawChunks: Float32Array[] = [];
   private _cvTotalDenoiseMs = 0;
+  private _cvTotalSsMs = 0;
+  private _cvTotalSeMs = 0;
+  private _cvBssUsed = false;
+  private _cvServerSwaps = 0;
   private _cvLastEngine = "clearvoice-mossformer2-gpu";
   private _cvLastGpuName: string | null = null;
   private _cvUtteranceStartSample: number | null = null;
@@ -1047,9 +1070,10 @@ export class VoiceStreamSession {
       });
     }
     if (!this._cvAssembler) {
-      this._cvAssembler = new ClearVoiceSliceAssembler({
+      this._cvAssembler = new ClearVoiceMultiTrackAssembler({
         sampleRate: TARGET_SR,
         crossfadeMs: this._opts.clearVoiceCrossfadeMs ?? 20,
+        lookbackMs: this._opts.clearVoiceLookbackMs ?? 300,
       });
     }
   }
@@ -1059,6 +1083,10 @@ export class VoiceStreamSession {
     this._cvSliceQueue = [];
     this._cvRawChunks = [];
     this._cvTotalDenoiseMs = 0;
+    this._cvTotalSsMs = 0;
+    this._cvTotalSeMs = 0;
+    this._cvBssUsed = false;
+    this._cvServerSwaps = 0;
     this._cvUtteranceStartSample = null;
     this._cvPendingEmitCount = 0;
     this._cvChunker?.setIncompleteUtteranceHint(false);
@@ -1103,7 +1131,7 @@ export class VoiceStreamSession {
         this._ensureClearVoicePipeline();
         const assembler = this._cvAssembler!;
 
-        // 整句静默观察期结束信号（音频已在 280ms 切片时完成 GPU 降噪与拼接，零额外 GPU 推理开销直接交付）
+        // 整句静默观察期结束信号（音频已在 280ms 切片时完成 GPU 盲源分离与分轨降噪拼接，零额外 GPU 推理开销直接交付）
         if (next.rawNewSamples.length === 0 && next.utteranceEnded) {
           this._emitClearVoiceUtterance(next.triggerReason, item.utteranceMeta);
           return;
@@ -1113,22 +1141,40 @@ export class VoiceStreamSession {
           this._cvUtteranceStartSample = item.startGlobalSample;
         }
 
-        // 阶段 3：带 0.3s 历史上下文送入 GPU ClearVoice (MossFormer2_SE_48K) 推理
-        let enhancedWithContext: Float32Array;
+        // 阶段 3：带 0.3s 历史上下文送入 GPU ClearVoice（MossFormer2_SS_16K 多轨盲源分离 + 分轨 MossFormer2_SE_48K 降噪去背景音）
+        // 绝不将多轨音轨混回单轨！流式切片阶段保留全部槽位（pruneTracks=false），由多轨装配器执行 PIT 置换对齐。
+        let separatedSliceTracks: Float32Array[];
         let sliceDenoiseMs = 0;
+        let sliceSsMs = 0;
+        let sliceSeMs = 0;
+        let sliceSwaps = 0;
         const cvGpu = this._opts.localEngine.clearVoiceGpu;
         const canUseCvGpu = cvGpu.getStatus().ready && !cvGpu.isInFailureCooldown();
 
         if (canUseCvGpu) {
           try {
-            const res = await cvGpu.denoiseSlice(next.rawWithContext, {
+            const res = await cvGpu.separateSlice(next.rawWithContext, {
               inputSampleRate: TARGET_SR,
               outputSampleRate: TARGET_SR,
+              pruneTracks: false,
+              applyDenoise: true,
             });
-            enhancedWithContext = res.samples;
+            separatedSliceTracks =
+              res.tracks.length > 0 ? res.tracks.map((t) => t.samples) : [next.rawWithContext];
             sliceDenoiseMs = res.durationMs;
-            this._cvLastEngine =
-              res.device === "gpu" ? "clearvoice-mossformer2-gpu" : "clearvoice-mossformer2-cpu";
+            sliceSsMs = res.ssMs;
+            sliceSeMs = res.seMs;
+            sliceSwaps = res.swaps;
+            if (res.ssUsed) {
+              this._cvBssUsed = true;
+              this._cvLastEngine =
+                res.device === "gpu"
+                  ? "clearvoice-mossformer2-bss-se-gpu"
+                  : "clearvoice-mossformer2-bss-se-cpu";
+            } else {
+              this._cvLastEngine =
+                res.device === "gpu" ? "clearvoice-mossformer2-gpu" : "clearvoice-mossformer2-cpu";
+            }
             this._cvLastGpuName = res.gpuName;
           } catch {
             // GPU ClearVoice 服务临时失败时优雅回退本地降噪，保证语音链路不断流
@@ -1137,7 +1183,7 @@ export class VoiceStreamSession {
               TARGET_SR,
               this._opts.noiseMode,
             );
-            enhancedWithContext = fb.samples;
+            separatedSliceTracks = [fb.samples];
             sliceDenoiseMs = fb.durationMs;
             this._cvLastEngine = `clearvoice-fallback-${fb.engine}`;
           }
@@ -1147,58 +1193,108 @@ export class VoiceStreamSession {
             TARGET_SR,
             this._opts.noiseMode,
           );
-          enhancedWithContext = fb.samples;
+          separatedSliceTracks = [fb.samples];
           sliceDenoiseMs = fb.durationMs;
           this._cvLastEngine = `clearvoice-fallback-${fb.engine}`;
         }
 
         if (this._disposed || gen !== this._cvGen) return;
         this._cvTotalDenoiseMs += sliceDenoiseMs;
+        this._cvTotalSsMs += sliceSsMs;
+        this._cvTotalSeMs += sliceSeMs;
+        this._cvServerSwaps += sliceSwaps;
         this._cvRawChunks.push(next.rawNewSamples);
 
-        // 阶段 3（裁掉前 0.3s 历史输出）+ 阶段 4（20ms 线性交叉淡入淡出 Overlap-Add）
-        assembler.appendEnhancedSlice({
-          enhancedWithContext,
+        // 阶段 3（跨切片 PIT 置换对齐 + 裁掉前 0.3s 历史输出）+ 阶段 4（每轨独立 20ms 线性交叉淡入淡出 Overlap-Add）
+        assembler.appendSeparatedSlice({
+          tracksWithContext: separatedSliceTracks,
           lookbackSamples: next.lookbackSamples,
           newSamples: next.rawNewSamples.length,
           applyCrossfade: next.needsCrossfade,
         });
 
-        const stitchedClean = assembler.getStitchedAudio();
-
         // 若话语仍在继续（2.0s 增量切片或 280ms 短停顿增量降噪切片）：
-        // 1) 仅在已唤醒/授权态且 GPU 就绪或无积压时刷新实时流式字幕，并回传语义未闭合提示以防慢语速句中停顿被截断；
+        // 1) 仅在已唤醒/授权态且 GPU 就绪或无积压时，对每条有效分离音轨独立做实时流式字幕预览（严禁混轨！），并回传语义未闭合提示以防慢语速句中停顿被截断；
         // 2) 仅当累计超长达到 30s 安全上限时才兜底提交，绝不中途腰斩正常长语音。
         if (!next.utteranceEnded) {
           const previewAllowed =
             this._streamingAsrEnabled &&
             (!this._wakeGatedAsr || item.wakeAuthorized || this.isAwake);
-          if (previewAllowed && stitchedClean.length >= TARGET_SR * 0.4) {
+          if (previewAllowed && assembler.totalSamples >= TARGET_SR * 0.4) {
             try {
               const status = this._opts.localEngine.getStatus();
               const allowPreview =
                 status.readyForLocalAsr &&
                 (status.activeQwen3Device === "gpu" || this._cvSliceQueue.length === 0);
               if (allowPreview) {
-                const asrRes = await this._opts.localEngine.transcribeLocal(
-                  stitchedClean,
-                  TARGET_SR,
-                  this.lang,
-                  {
-                    hotwords: this._wakeWords.length > 0 ? this._wakeWords : undefined,
-                  },
-                );
-                if (!this._disposed && gen === this._cvGen && asrRes.text) {
-                  const ingested = this._streamTracker.ingestHypothesis(asrRes.text, {
-                    engine: asrRes.engine,
-                    latencyMs: asrRes.durationMs,
-                  });
-                  this._cvChunker?.setIncompleteUtteranceHint(
-                    this._streamTracker.isLatestIncomplete,
+                const prunedPreview = assembler.getTracks({ prune: true });
+                const previewTracks: Array<{
+                  trackId: string;
+                  trackIndex: number;
+                  text: string;
+                  energyRatio?: number;
+                }> = [];
+                let primaryPartial: StreamingPartialUpdate | null = null;
+                let anyIncomplete = false;
+                let previewEngine = "qwen3-asr-stream";
+                let previewLatencyMs = 0;
+
+                for (const tr of prunedPreview.tracks) {
+                  if (tr.samples.length < TARGET_SR * 0.35) continue;
+                  const asrRes = await this._opts.localEngine.transcribeLocal(
+                    tr.samples,
+                    TARGET_SR,
+                    this.lang,
+                    {
+                      hotwords: this._wakeWords.length > 0 ? this._wakeWords : undefined,
+                    },
                   );
-                  if (ingested.partial) {
-                    this._opts.onPartialTranscript?.(ingested.partial);
+                  if (this._disposed || gen !== this._cvGen) return;
+                  previewEngine = asrRes.engine;
+                  previewLatencyMs += asrRes.durationMs;
+                  const cleanedText = asrRes.text.trim();
+                  if (!cleanedText) continue;
+                  previewTracks.push({
+                    trackId: `cv_track_${tr.trackIndex}`,
+                    trackIndex: tr.trackIndex,
+                    text: cleanedText,
+                    energyRatio: tr.energyRatio,
+                  });
+                  if (looksLikeIncompleteUtterance(cleanedText, this._wakeWords)) {
+                    anyIncomplete = true;
                   }
+                  if (primaryPartial === null) {
+                    const ingested = this._streamTracker.ingestHypothesis(cleanedText, {
+                      engine: asrRes.engine,
+                      latencyMs: asrRes.durationMs,
+                    });
+                    if (this._streamTracker.isLatestIncomplete) {
+                      anyIncomplete = true;
+                    }
+                    if (ingested.partial) {
+                      primaryPartial = ingested.partial;
+                    }
+                  }
+                }
+
+                this._cvChunker?.setIncompleteUtteranceHint(anyIncomplete);
+                if (previewTracks.length > 0) {
+                  const lead = previewTracks[0]!;
+                  const partialPayload: StreamingPartialUpdate = primaryPartial
+                    ? {
+                        ...primaryPartial,
+                        latencyMs: previewLatencyMs || primaryPartial.latencyMs,
+                        tracks: previewTracks,
+                      }
+                    : {
+                        text: lead.text,
+                        stableText: "",
+                        unstableText: lead.text,
+                        engine: previewEngine,
+                        latencyMs: previewLatencyMs,
+                        tracks: previewTracks,
+                      };
+                  this._opts.onPartialTranscript?.(partialPayload);
                 }
               }
             } catch {
@@ -1206,8 +1302,8 @@ export class VoiceStreamSession {
             }
           }
 
-          // 安全上限：单条连续话语达到上限（默认 30s）时自动提交已降噪平滑音频给 Qwen3-ASR
-          if (stitchedClean.length >= this._clearVoiceMaxUtteranceSamples) {
+          // 安全上限：单条连续话语达到上限（默认 30s）时自动提交独立多轨音频
+          if (assembler.totalSamples >= this._clearVoiceMaxUtteranceSamples) {
             const timeoutMeta: ClearVoiceUtteranceMeta = {
               wakeAnchored: this._cvWakeAnchored || this._wakeAnchorSample !== null,
               acousticWake: this._cvWakeHit ?? this._wakeAnchorHit ?? null,
@@ -1222,7 +1318,7 @@ export class VoiceStreamSession {
           return;
         }
 
-        // 整句静音判停或 flush：将无缝拼接后的完整纯净音频一次性送交 Qwen3-ASR 做语音转文字
+        // 整句静音判停或 flush：将每条独立拼接完成的纯净音轨分别送交后续独立声纹/ASR/逻辑判定
         this._emitClearVoiceUtterance(next.triggerReason, item.utteranceMeta);
       })
       .catch(() => {
@@ -1251,12 +1347,16 @@ export class VoiceStreamSession {
       this._cvAssembler?.reset();
       this._cvRawChunks = [];
       this._cvTotalDenoiseMs = 0;
+      this._cvTotalSsMs = 0;
+      this._cvTotalSeMs = 0;
+      this._cvBssUsed = false;
+      this._cvServerSwaps = 0;
       this._cvUtteranceStartSample = null;
       this._streamTracker.reset();
       return;
     }
 
-    const cleanSlice = assembler.getStitchedAudio();
+    const pruned = assembler.getTracks({ prune: true });
     const rawLen = this._cvRawChunks.reduce((acc, c) => acc + c.length, 0);
     const rawSlice = new Float32Array(rawLen);
     let rawOff = 0;
@@ -1267,29 +1367,58 @@ export class VoiceStreamSession {
 
     const sliceCount = assembler.sliceCount;
     const crossfadeCount = assembler.crossfadeCount;
+    const permutationSwaps = assembler.permutationSwaps + this._cvServerSwaps;
     const denoiseMs = Math.round(this._cvTotalDenoiseMs);
+    const ssMs = Math.round(this._cvTotalSsMs);
+    const seMs = Math.round(this._cvTotalSeMs);
+    const bssUsed = this._cvBssUsed;
     const startSample = this._cvUtteranceStartSample ?? 0;
     const endGlobalSample = utteranceMeta?.endGlobalSample ?? startSample + rawSlice.length;
 
     assembler.reset();
     this._cvRawChunks = [];
     this._cvTotalDenoiseMs = 0;
+    this._cvTotalSsMs = 0;
+    this._cvTotalSeMs = 0;
+    this._cvBssUsed = false;
+    this._cvServerSwaps = 0;
     this._cvUtteranceStartSample = null;
     this._streamTracker.reset();
     this._oww?.resetSegmentTracking();
     this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, endGlobalSample);
 
+    if (pruned.tracks.length === 0) {
+      return;
+    }
+
     const inputSnrDb = estimateSnrDb(rawSlice, TARGET_SR);
-    const outputSnrDb = estimateSnrDb(cleanSlice, TARGET_SR);
+    const separatedTracks: VoiceStreamSeparatedTrack[] = pruned.tracks.map((tr) => {
+      const outSnr = estimateSnrDb(tr.samples, TARGET_SR);
+      return {
+        trackId: `cv_track_${tr.trackIndex}`,
+        trackIndex: tr.trackIndex,
+        sourceSlot: tr.sourceSlot,
+        samples: tr.samples,
+        sampleRate: TARGET_SR,
+        rms: tr.rms,
+        energyRatio: tr.energyRatio,
+        outputSnrDb: outSnr,
+        snrGainDb: Number((outSnr - inputSnrDb).toFixed(2)),
+      };
+    });
+
+    // denoisedSamples 严格仅指向第 1 条独立音轨以兼容单轨消费者，绝不将多轨音轨相加混杂！
+    const primaryTrack = separatedTracks[0]!;
     const payload: VoiceStreamSegmentPayload = {
       rawSamples: rawSlice,
-      denoisedSamples: cleanSlice,
+      denoisedSamples: primaryTrack.samples,
+      separatedTracks,
       denoiseEngine: this._cvLastEngine,
       inputSnrDb,
-      outputSnrDb,
-      snrGainDb: Number((outputSnrDb - inputSnrDb).toFixed(2)),
+      outputSnrDb: primaryTrack.outputSnrDb,
+      snrGainDb: primaryTrack.snrGainDb,
       startSec: Number((startSample / TARGET_SR).toFixed(2)),
-      durationSec: Number((cleanSlice.length / TARGET_SR).toFixed(2)),
+      durationSec: Number((primaryTrack.samples.length / TARGET_SR).toFixed(2)),
       forcedRoll: triggerReason === "timeout",
       acousticWake: utteranceMeta?.acousticWake ?? null,
       wakeAnchored: Boolean(utteranceMeta?.wakeAnchored),
@@ -1305,6 +1434,11 @@ export class VoiceStreamSession {
         crossfadeCount,
         triggerReason,
         denoiseMs,
+        ssMs,
+        seMs,
+        trackCount: separatedTracks.length,
+        bssUsed,
+        permutationSwaps,
         gpuName: this._cvLastGpuName,
       },
     };

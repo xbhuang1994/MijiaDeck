@@ -155,6 +155,11 @@ export interface UiAgentTimelineEntry {
   role: "user" | "assistant";
   source: "text" | "voice";
   text: string;
+  trackIndex?: number;
+  trackCount?: number;
+  trackId?: string;
+  speakerName?: string | null;
+  speakerScore?: number;
   thinking?: string;
   thinkingActive?: boolean;
   thinkingLevel?: UiThinkingLevel;
@@ -313,6 +318,7 @@ export interface UiLocalVoiceStatus {
   readyForDpdfnet?: boolean;
   readyForVoxlock?: boolean;
   readyForClearVoiceGpu?: boolean;
+  readyForClearVoiceBss?: boolean;
   clearVoice?: {
     gpuDetected: boolean;
     gpuName: string | null;
@@ -320,15 +326,20 @@ export interface UiLocalVoiceStatus {
     vramFreeMb: number | null;
     runtimeReady: boolean;
     modelReady: boolean;
+    ssModelReady?: boolean;
     scriptReady: boolean;
     customServiceUrl: string;
     ready: boolean;
+    multiTrackReady?: boolean;
     serverRunning: boolean;
     provider: "cuda" | "cpu" | "remote" | "none";
+    ssProvider?: "cuda" | "cpu" | "remote" | "none";
     modelName: string;
+    ssModelName?: string;
     serviceUrl: string | null;
     lastLatencyMs: number | null;
     lastInferMs: number | null;
+    lastSeparateMs?: number | null;
     lastError: string | null;
   };
   readyForVad: boolean;
@@ -382,7 +393,76 @@ export interface UiLocalVoiceStatus {
     openWakeWord?: boolean;
     localTts?: boolean;
     clearVoiceMossformer2?: boolean;
+    clearVoiceMossformer2Ss?: boolean;
   };
+}
+
+export interface UiStreamingPartialTrack {
+  trackId: string;
+  trackIndex: number;
+  text: string;
+  energyRatio?: number;
+}
+
+export interface UiVoiceTrackResult {
+  trackId: string;
+  trackIndex: number;
+  trackCount: number;
+  batchId: string;
+  rms?: number;
+  energyRatio?: number;
+  speechDetected: boolean;
+  speechRatio?: number;
+  durationSec?: number;
+  denoiseEngine?: string;
+  snrGainDb?: number;
+  asrEngine?: string;
+  text: string;
+  acousticEvent?: string;
+  voiceprint?: {
+    evaluated?: boolean;
+    matched?: boolean;
+    speakerId?: string | null;
+    speakerName?: string | null;
+    role?: string | null;
+    score?: number;
+  } | null;
+  attention?: {
+    accept?: boolean;
+    stage?: string;
+    reason?: string;
+    command?: string;
+    wokeOnly?: boolean;
+    passSource?: string;
+    matchedCapability?: string;
+  } | null;
+  matched: boolean;
+  wokeOnly: boolean;
+  command: string;
+  reply?: string;
+  taskId?: string;
+  entryId?: string;
+  dispatchedAsync?: boolean;
+  error?: string;
+  timings?: {
+    totalMs?: number;
+    asrMs?: number;
+    denoiseMs?: number;
+    voiceprintMs?: number;
+    attentionMs?: number;
+  } | null;
+  timestamp: number;
+}
+
+export interface UiVoiceTrackBatch {
+  batchId: string;
+  timestamp: number;
+  engine: string;
+  bssUsed: boolean;
+  trackCount: number;
+  acceptedCount: number;
+  totalMs: number;
+  tracks: UiVoiceTrackResult[];
 }
 
 export interface UiVoiceprintProfile {
@@ -439,11 +519,15 @@ export interface UiVoiceSnapshot {
   lanes?: UiVoiceRuntimeLanes;
   localEngine?: UiLocalVoiceStatus;
   voiceprints?: UiVoiceprintProfile[];
+  lastTrackBatch?: UiVoiceTrackBatch | null;
+  recentTrackBatches?: UiVoiceTrackBatch[];
   lastMetrics?: {
     denoiseEngine?: string;
     snrGainDb?: number;
     vadEngine?: string;
     asrEngine?: string;
+    tracks?: UiVoiceTrackResult[];
+    trackBatch?: UiVoiceTrackBatch | null;
     voiceprint?: {
       evaluated?: boolean;
       matched?: boolean;
@@ -564,6 +648,8 @@ export class PiAgentPanelController {
   private skillsExpanded = false;
   private instructionsExpanded = false;
   private memoriesExpanded = false;
+  private tracksExpanded = true;
+  private livePartialTracks: UiStreamingPartialTrack[] = [];
   private resolvingConfirmIds = new Set<string>();
   private thinkingCollapsed = new Map<string, boolean>();
   private agentState: UiPiAgentSnapshot | null = null;
@@ -768,11 +854,36 @@ export class PiAgentPanelController {
       return;
     }
 
+    if (kind === "partial") {
+      const rawTracks = Array.isArray(ev.tracks) ? ev.tracks : [];
+      const parsedTracks: UiStreamingPartialTrack[] = [];
+      for (const item of rawTracks) {
+        const rec = asRec(item);
+        if (!rec) continue;
+        const tText = typeof rec.text === "string" ? rec.text.trim() : "";
+        if (!tText) continue;
+        const idx = typeof rec.trackIndex === "number" ? rec.trackIndex : parsedTracks.length + 1;
+        parsedTracks.push({
+          trackId: typeof rec.trackId === "string" ? rec.trackId : `cv_track_${idx}`,
+          trackIndex: idx,
+          text: tText,
+          ...(typeof rec.energyRatio === "number" ? { energyRatio: rec.energyRatio } : {}),
+        });
+      }
+      this.livePartialTracks = parsedTracks;
+      this.voiceClient.handleStreamServerEvent({ kind, text, matched });
+      this.renderVoiceTracksPanel();
+      this.renderLivePill();
+      return;
+    }
+
     this.voiceClient.handleStreamServerEvent({ kind, text, matched });
 
     if (kind === "result") {
+      this.livePartialTracks = [];
       if (ev.agent) this.applyAgentSnapshot(ev.agent);
       if (ev.voiceState) this.applyVoiceSnapshot(ev.voiceState);
+      this.renderVoiceTracksPanel();
       if (matched && wokeOnly) {
         this.flashLivePill(
           reply ? `已唤醒「${reply}」` : "已唤醒，静默持续监听中…",
@@ -910,6 +1021,12 @@ export class PiAgentPanelController {
       this.memoriesExpanded = !this.memoriesExpanded;
       this.renderMemoriesBar();
       this.scrollTimelineToBottom();
+    });
+
+    const tracksToggleBtn = document.getElementById("pi-tracks-toggle-btn");
+    tracksToggleBtn?.addEventListener("click", () => {
+      this.tracksExpanded = !this.tracksExpanded;
+      this.renderVoiceTracksPanel();
     });
 
     const input = node<HTMLInputElement>("pi-agent-input");
@@ -1120,7 +1237,7 @@ export class PiAgentPanelController {
       if (res.voice) this.applyVoiceSnapshot(res.voice);
       this.deps.showToast(
         next === "clearvoice"
-          ? "已切换新方案：ClearVoice GPU 准实时切片 → Qwen3-ASR"
+          ? "已切换新方案：ClearVoice 多轨盲源分离 + 降噪 → 分轨独立声纹/ASR/判定"
           : "已切回原方案（GTCRN + 声源分离）",
         2400,
       );
@@ -2351,6 +2468,7 @@ export class PiAgentPanelController {
 
     this.renderVoiceLanes();
     this.renderVoiceTelemetry();
+    this.renderVoiceTracksPanel();
   }
 
   private renderVoiceLanes(): void {
@@ -2449,6 +2567,7 @@ export class PiAgentPanelController {
     if (pipelineMode === "clearvoice") {
       const cvStatus = vs?.localEngine?.clearVoice;
       const cvReady = Boolean(vs?.localEngine?.readyForClearVoiceGpu ?? cvStatus?.ready);
+      const cvBssReady = Boolean(vs?.localEngine?.readyForClearVoiceBss ?? cvStatus?.multiTrackReady);
       const provTag =
         cvStatus?.provider === "cuda"
           ? "CUDA GPU"
@@ -2458,10 +2577,12 @@ export class PiAgentPanelController {
               ? "CPU"
               : "未就绪";
       tags.push({
-        label: `ClearVoice · ${provTag}`,
+        label: cvBssReady ? `ClearVoice BSS+SE · ${provTag}` : `ClearVoice · ${provTag}`,
         warn: !cvReady,
         title: cvReady
-          ? `ClearVoice MossFormer2_SE_48K 准实时切片降噪 (${cvStatus?.gpuName || provTag} · 280ms 静音 / 2.0s 超时 / 0.3s 上下文 / 20ms 淡入淡出) → Qwen3-ASR`
+          ? cvBssReady
+            ? `ClearVoice 多轨盲源分离 (MossFormer2_SS_16K) + 分轨降噪去背景音 (MossFormer2_SE_48K · ${cvStatus?.gpuName || provTag}) → 分轨独立声纹/ASR/逻辑判定`
+            : `ClearVoice MossFormer2_SE_48K 准实时切片降噪 (${cvStatus?.gpuName || provTag}) → 独立声纹/Qwen3-ASR/逻辑判定`
           : "ClearVoice GPU 运行时或 MossFormer2 模型尚未就绪（自动兜底本地降噪）",
       });
     } else if (vs?.noiseSuppressionMode !== "off") {
@@ -2623,6 +2744,180 @@ export class PiAgentPanelController {
     }
   }
 
+  private renderVoiceTracksPanel(): void {
+    const panel = document.getElementById("pi-voice-tracks-panel");
+    const list = document.getElementById("pi-tracks-list");
+    const countBadge = document.getElementById("pi-tracks-count-badge");
+    const engineBadge = document.getElementById("pi-tracks-engine-badge");
+    const toggleBtn = document.getElementById("pi-tracks-toggle-btn");
+    if (!panel || !list || !countBadge || !engineBadge || !toggleBtn) return;
+
+    const livePartials = this.livePartialTracks;
+    const batch = this.voiceState?.lastTrackBatch ?? this.voiceState?.lastMetrics?.trackBatch ?? null;
+
+    const hasLive = livePartials.length > 0;
+    const hasBatch = Boolean(batch && Array.isArray(batch.tracks) && batch.tracks.length > 0);
+    if (!hasLive && !hasBatch) {
+      panel.hidden = true;
+      list.replaceChildren();
+      return;
+    }
+
+    panel.hidden = false;
+    toggleBtn.setAttribute("aria-expanded", String(this.tracksExpanded));
+    toggleBtn.textContent = this.tracksExpanded ? "收起" : "展开";
+    list.hidden = !this.tracksExpanded;
+    list.replaceChildren();
+
+    if (hasLive) {
+      countBadge.textContent = `${livePartials.length} 轨实时转写中`;
+      countBadge.classList.add("is-live");
+      countBadge.classList.toggle("is-multi", livePartials.length > 1);
+      engineBadge.hidden = false;
+      engineBadge.textContent = "分轨流式预览";
+
+      if (!this.tracksExpanded) return;
+
+      for (const pt of livePartials) {
+        const card = document.createElement("div");
+        const colorIdx = ((pt.trackIndex - 1) % 3) + 1;
+        card.className = `pi-track-card is-streaming track-color-${colorIdx}`;
+        card.setAttribute("role", "listitem");
+        card.dataset.trackIndex = String(pt.trackIndex);
+
+        const head = document.createElement("div");
+        head.className = "pi-track-head";
+
+        const trackPill = document.createElement("span");
+        trackPill.className = `pi-track-badge track-color-${colorIdx}`;
+        trackPill.textContent = `音轨 ${pt.trackIndex}`;
+
+        const verdict = document.createElement("span");
+        verdict.className = "pi-track-verdict is-streaming";
+        verdict.textContent = "… 识别中";
+
+        head.append(trackPill, verdict);
+
+        const body = document.createElement("div");
+        body.className = "pi-track-text";
+        body.textContent = pt.text;
+
+        card.append(head, body);
+        list.appendChild(card);
+      }
+      return;
+    }
+
+    if (!batch) return;
+    const tracks = batch.tracks;
+    countBadge.classList.remove("is-live");
+    countBadge.classList.toggle("is-multi", tracks.length > 1);
+    countBadge.textContent =
+      tracks.length > 1
+        ? `${tracks.length} 轨独立 · ${batch.acceptedCount} 命中`
+        : batch.acceptedCount > 0
+          ? "1 轨 · 已命中"
+          : "1 轨";
+
+    engineBadge.hidden = false;
+    const engineLabel = batch.bssUsed ? "BSS+SE" : "SE";
+    engineBadge.textContent =
+      batch.totalMs > 0 ? `${engineLabel} ${Math.round(batch.totalMs)}ms` : engineLabel;
+
+    if (!this.tracksExpanded) return;
+
+    for (const tr of tracks) {
+      const card = document.createElement("div");
+      const colorIdx = ((tr.trackIndex - 1) % 3) + 1;
+      const verdictClass = !tr.speechDetected
+        ? "is-silent"
+        : tr.matched && tr.wokeOnly
+          ? "is-woke"
+          : tr.matched
+            ? "is-accepted"
+            : "is-rejected";
+      card.className = `pi-track-card ${verdictClass} track-color-${colorIdx}`;
+      card.setAttribute("role", "listitem");
+      card.dataset.trackIndex = String(tr.trackIndex);
+      card.dataset.trackId = tr.trackId;
+
+      const head = document.createElement("div");
+      head.className = "pi-track-head";
+
+      const leftGroup = document.createElement("div");
+      leftGroup.className = "pi-track-head-left";
+
+      const trackPill = document.createElement("span");
+      trackPill.className = `pi-track-badge track-color-${colorIdx}`;
+      trackPill.textContent = `音轨 ${tr.trackIndex}`;
+      leftGroup.appendChild(trackPill);
+
+      const vp = tr.voiceprint;
+      if (vp?.evaluated) {
+        const vpPill = document.createElement("span");
+        const vpMatched = Boolean(vp.matched && vp.speakerName);
+        vpPill.className = `pi-track-vp-badge${vpMatched ? " is-matched" : ""}`;
+        const pct = typeof vp.score === "number" ? ` ${Math.round(vp.score * 100)}%` : "";
+        vpPill.textContent = vpMatched ? `声纹: ${vp.speakerName}${pct}` : `未知声纹${pct}`;
+        leftGroup.appendChild(vpPill);
+      }
+
+      const verdict = document.createElement("span");
+      verdict.className = `pi-track-verdict ${verdictClass}`;
+      if (!tr.speechDetected) {
+        verdict.textContent = "无有效语音";
+      } else if (tr.matched && tr.wokeOnly) {
+        verdict.textContent = "⚡ 已唤醒";
+      } else if (tr.matched) {
+        verdict.textContent = tr.dispatchedAsync ? "✓ 已派发执行" : "✓ 已执行";
+      } else if (tr.attention?.stage === "echo") {
+        verdict.textContent = "⊘ 回声过滤";
+      } else if (tr.attention?.stage === "voiceprint") {
+        verdict.textContent = "⊘ 声纹拦截";
+      } else if (tr.attention?.stage === "exit") {
+        verdict.textContent = "↪ 退出对话";
+      } else {
+        verdict.textContent = "⊘ 已忽略";
+      }
+      if (tr.attention?.reason) {
+        verdict.title = tr.attention.reason;
+      }
+
+      head.append(leftGroup, verdict);
+
+      const body = document.createElement("div");
+      body.className = `pi-track-text${!tr.text ? " is-empty" : ""}`;
+      body.textContent = tr.text || "（该音轨未检测到有效语音文字）";
+
+      const footParts: string[] = [];
+      if (tr.matched && tr.command) {
+        footParts.push(`指令：“${tr.command}”`);
+      } else if (tr.attention?.reason && tr.speechDetected) {
+        footParts.push(`判定：${tr.attention.reason}`);
+      }
+      if (tr.reply) {
+        const shortReply = tr.reply.length > 34 ? `${tr.reply.slice(0, 34)}…` : tr.reply;
+        footParts.push(`回复：${shortReply}`);
+      }
+      if (typeof tr.energyRatio === "number" && tracks.length > 1) {
+        footParts.push(`能量 ${Math.round(tr.energyRatio * 100)}%`);
+      }
+      if (typeof tr.snrGainDb === "number" && tr.snrGainDb > 0) {
+        footParts.push(`降噪 +${tr.snrGainDb.toFixed(1)}dB`);
+      }
+
+      card.append(head, body);
+      if (footParts.length > 0) {
+        const foot = document.createElement("div");
+        foot.className = "pi-track-foot";
+        foot.textContent = footParts.join(" · ");
+        card.appendChild(foot);
+      }
+
+      list.appendChild(card);
+    }
+  }
+
   private renderTimeline(): void {
     const list = node("pi-agent-timeline");
     const emptyBox = node("pi-agent-empty");
@@ -2658,10 +2953,23 @@ export class PiAgentPanelController {
       } else {
         roleSpan.textContent = "π Pi Agent";
       }
+      meta.appendChild(roleSpan);
+      if (entry.role === "user" && entry.source === "voice" && typeof entry.trackIndex === "number") {
+        const trTag = document.createElement("span");
+        const colorIdx = ((entry.trackIndex - 1) % 3) + 1;
+        trTag.className = `pi-msg-track-badge track-color-${colorIdx}`;
+        const countSuffix =
+          typeof entry.trackCount === "number" && entry.trackCount > 1
+            ? `/${entry.trackCount}`
+            : "";
+        const spkSuffix = entry.speakerName ? ` · ${entry.speakerName}` : "";
+        trTag.textContent = `音轨 ${entry.trackIndex}${countSuffix}${spkSuffix}`;
+        meta.appendChild(trTag);
+      }
       const timeSpan = document.createElement("span");
       timeSpan.className = "pi-msg-time";
       timeSpan.textContent = formatTime(entry.timestamp);
-      meta.append(roleSpan, timeSpan);
+      meta.appendChild(timeSpan);
       item.appendChild(meta);
 
       // Immediate task acknowledgement ("好的") rendered BEFORE execution & verification
@@ -3012,7 +3320,11 @@ export class PiAgentPanelController {
       pill.classList.toggle("is-awake", mode === "awake");
       pill.classList.toggle("is-processing", mode === "processing");
       pill.classList.toggle("is-conversation", isConv && !interim && mode !== "processing");
-      if (interim) {
+      if (this.livePartialTracks.length > 1) {
+        textEl.textContent = this.livePartialTracks
+          .map((t) => `[轨${t.trackIndex}] ${t.text}`)
+          .join("  |  ");
+      } else if (interim) {
         textEl.textContent = interim.startsWith("⚡") ? interim : `🎤 ${interim}`;
       } else if (mode === "processing") {
         textEl.textContent = `π Pi Agent 正在执行：${this.voiceState?.lastCommand || "设备控制…"}`;

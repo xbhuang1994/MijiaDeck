@@ -129,11 +129,13 @@ export interface LocalVoiceEngineStatus {
     spleeterSeparation?: boolean;
     localTts?: boolean;
     clearVoiceMossformer2?: boolean;
+    clearVoiceMossformer2Ss?: boolean;
   };
   readyForDenoise: boolean;
   readyForDpdfnet: boolean;
   readyForVoxlock: boolean;
   readyForClearVoiceGpu: boolean;
+  readyForClearVoiceBss?: boolean;
   clearVoice: ClearVoiceGpuStatus;
   readyForVad: boolean;
   readyForVoiceprint: boolean;
@@ -718,11 +720,13 @@ export class LocalVoiceEngine {
         spleeterSeparation,
         localTts: ttsStatus.ready,
         clearVoiceMossformer2: clearVoiceStatus.modelReady,
+        clearVoiceMossformer2Ss: clearVoiceStatus.ssModelReady,
       },
       readyForDenoise: addonAvailable && gtcrn,
       readyForDpdfnet: addonAvailable && dpdfnet4,
       readyForVoxlock: addonAvailable && voxlock,
       readyForClearVoiceGpu: clearVoiceStatus.ready,
+      readyForClearVoiceBss: clearVoiceStatus.multiTrackReady,
       clearVoice: clearVoiceStatus,
       readyForVad: addonAvailable && sileroVad,
       readyForVoiceprint: addonAvailable && speakerCampp,
@@ -1979,8 +1983,11 @@ export class LocalVoiceEngine {
         }
       }
 
-      // 2.6 若已就绪 ClearVoice 运行时但缺失 MossFormer2_SE_48K 模型，顺带补齐
-      if (this._clearVoiceGpu.hasRuntime() && !this._clearVoiceGpu.hasModel()) {
+      // 2.6 若已就绪 ClearVoice 运行时但缺失 MossFormer2_SE_48K 或 MossFormer2_SS_16K 模型，顺带补齐
+      if (
+        this._clearVoiceGpu.hasRuntime() &&
+        (!this._clearVoiceGpu.hasModel() || !this._clearVoiceGpu.hasSsModel())
+      ) {
         try {
           await this._clearVoiceGpu.downloadMissingModel();
         } catch {

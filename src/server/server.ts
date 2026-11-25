@@ -195,6 +195,7 @@ function handleWsMessage(
                 unstableText: partial.unstableText,
                 engine: partial.engine,
                 latencyMs: partial.latencyMs,
+                ...(partial.tracks && partial.tracks.length > 0 ? { tracks: partial.tracks } : {}),
               }),
             );
           } catch {
@@ -264,6 +265,8 @@ function handleWsMessage(
                 detectedSoundTypes: result.detectedSoundTypes,
                 detectedSpeakerCount: result.detectedSpeakerCount,
                 separatedStreams: result.separatedStreams,
+                ...(result.tracks ? { tracks: result.tracks } : {}),
+                ...(result.trackBatch ? { trackBatch: result.trackBatch } : {}),
                 timings: result.timings,
                 agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
                 voiceState: result.voiceState,
