@@ -1625,8 +1625,12 @@ export class AudioSourceSeparator {
     });
 
     let finalDecision = decision;
+    const isBgmOrMusicContext = Boolean(
+      isNoisyOrMusic || isTseOrMusicSeparated || bestEvent.toUpperCase().includes("BGM"),
+    );
     if (decision.accept && !decision.wokeOnly && decision.command) {
-      let cleanedCmd = trimTrailingMusicLyrics(stripLeadingVocativeOrFragment(decision.command));
+      const strippedLead = stripLeadingVocativeOrFragment(decision.command);
+      let cleanedCmd = isBgmOrMusicContext ? trimTrailingMusicLyrics(strippedLead) : strippedLead;
       const matchedCapCmd = matchesCapabilityAffordance(cleanedCmd, opts.capabilityDigest);
       const isPendingReply = decision.stage === "pending-confirm";
       if (
@@ -1641,9 +1645,11 @@ export class AudioSourceSeparator {
           return makeRejected("pragmatic-reject", "提取文本为非设备控制日常对话，已拦截", acousticWake);
         }
       }
-      const embCmd = extractEmbeddedSmartHomeCommand(cleanedCmd);
-      if (embCmd && embCmd.length < cleanedCmd.length && cleanedCmd.length > 16) {
-        cleanedCmd = embCmd;
+      if (isBgmOrMusicContext || !inConv) {
+        const embCmd = extractEmbeddedSmartHomeCommand(cleanedCmd);
+        if (embCmd && embCmd.length < cleanedCmd.length && cleanedCmd.length > 16) {
+          cleanedCmd = embCmd;
+        }
       }
       if (
         !opts.bypassWakeWord &&

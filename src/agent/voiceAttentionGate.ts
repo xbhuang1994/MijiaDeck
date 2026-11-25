@@ -684,6 +684,58 @@ export function isNoiseOrGarbledFragment(rawText: string, acousticEvent?: string
 const OBVIOUS_SIDETALK_RE =
   /^(?:(?:嗯+|啊+|哦+|呃+|哈哈+|呵呵+)[\s,，。！!？?]*$|(?:晚饭|午饭|早饭|吃什么|吃饭|喝水|拿一下|递一下|我去|你去|他去|待会出去|出门|快递|外卖|睡觉了吗|几点回来|明天上班))/i;
 
+// 助手回复中包含待用户作答的开放问题/选项/澄清请求（用于 SystemOne 离线或不可用时的兜底判定）
+const OPEN_ASSISTANT_QUESTION_RE =
+  /(?:[?？]\s*$|请问|选哪个|选哪一个|选哪种|方案一[\s\S]{0,40}方案二|哪一台|哪个房间|哪个设备|要开吗|要关吗|需要我.{0,16}吗|是否需要|要不要|想选|你想.{0,12}吗|你希望|请确认|确认一下|告诉我|which\s+one|would\s+you\s+like|do\s+you\s+want|please\s+confirm)/i;
+
+const POLITE_CLOSING_PROMPT_RE =
+  /^(?:还有(?:什么|其他|别的)?(?:需要|可以)?(?:帮|协助).{0,10}[?？]?|还需要(?:什么|别的)吗[?？]?|anything\s+else\??)$/i;
+
+const SHORT_QUESTION_REPLY_RE =
+  /^(?:好|嗯|对|是|行|要|开|关|一|二|三|1|2|3|ok|yes|no)$/i;
+
+/**
+ * 判断助手最新一句回复是否明确包含等待用户作答的问题/选项/澄清。
+ */
+export function assistantReplyExpectsUserResponse(reply: string | undefined): boolean {
+  const trimmed = (reply ?? "").trim();
+  if (!trimmed) return false;
+  const clauses = trimmed
+    .split(/[。！!\n]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const tailClause = clauses[clauses.length - 1] ?? trimmed;
+  if (POLITE_CLOSING_PROMPT_RE.test(tailClause)) {
+    return false;
+  }
+  return OPEN_ASSISTANT_QUESTION_RE.test(trimmed);
+}
+
+/**
+ * 当 SystemOne 不可用或被关闭时的确定性对话结束兜底判定：
+ * - 存在未完成任务或待确认槽位 -> continue
+ * - 助手刚提出需要用户作答的明确问题且静默未超时 -> continue
+ * - 其余闭环回复或静默完成 -> ready_to_end（可开始退出倒计时）
+ */
+export function inferConversationEndFallback(input: {
+  lastAssistantReply?: string;
+  silentCompleted?: boolean;
+  hasPendingConfirmation?: boolean;
+  activeTaskCount?: number;
+  idleSeconds?: number;
+}): "continue" | "ready_to_end" {
+  if ((input.activeTaskCount ?? 0) > 0) return "continue";
+  if (input.hasPendingConfirmation) return "continue";
+  if (typeof input.idleSeconds === "number" && input.idleSeconds >= 30) {
+    return "ready_to_end";
+  }
+  if (input.silentCompleted) return "ready_to_end";
+  if (assistantReplyExpectsUserResponse(input.lastAssistantReply)) {
+    return "continue";
+  }
+  return "ready_to_end";
+}
+
 function escapeRegExp(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -1673,8 +1725,19 @@ export async function evaluateVoiceAttention(
     }
 
     // B2. 明显是旁白/噪声幻觉碎片 -> 0ms 忽略并保留剩余对话窗口
+    // 注意：若助手上一句刚刚向用户提出明确问题/选项，允许“好/嗯/对/一/二”等极短作答进入后续决策（绝不误杀为噪声）
     const isBgmConv = Boolean(input.acousticEvent?.toUpperCase().includes("BGM"));
-    if (isNoiseOrGarbledFragment(cmd, input.acousticEvent)) {
+    const latestTurn =
+      input.recentTurns && input.recentTurns.length > 0
+        ? input.recentTurns[input.recentTurns.length - 1]
+        : null;
+    const isShortReplyToAssistantQuestion = Boolean(
+      !isBgmConv &&
+        latestTurn?.role === "assistant" &&
+        assistantReplyExpectsUserResponse(latestTurn.text) &&
+        SHORT_QUESTION_REPLY_RE.test(cmd),
+    );
+    if (!isShortReplyToAssistantQuestion && isNoiseOrGarbledFragment(cmd, input.acousticEvent)) {
       return wrap({
         accept: false,
         wokeOnly: false,
@@ -1688,7 +1751,7 @@ export async function evaluateVoiceAttention(
         usedLlm: false,
       });
     }
-    if (OBVIOUS_SIDETALK_RE.test(cmd)) {
+    if (!isShortReplyToAssistantQuestion && OBVIOUS_SIDETALK_RE.test(cmd)) {
       return wrap({
         accept: false,
         wokeOnly: false,
@@ -1959,8 +2022,8 @@ export async function evaluateVoiceAttention(
       }
     }
 
-    // 离线降级：严禁在无云端语义判别时因 awakeActive 盲目放行歌词/电视/咖啡馆杂音，仅放行明确设备/助手指令或家庭专能能力指令
-    if (isClearDeviceCmd || strongImplicitCap) {
+    // 离线降级：严禁在无云端语义判别时因 awakeActive 盲目放行歌词/电视/咖啡馆杂音，仅放行明确设备/助手指令、家庭专能能力指令或对助手提问的直接短答
+    if (isClearDeviceCmd || strongImplicitCap || isShortReplyToAssistantQuestion) {
       return wrap({
         accept: true,
         wokeOnly: false,
@@ -1972,9 +2035,11 @@ export async function evaluateVoiceAttention(
         matchedCapability: convCapMatch?.matchedCapabilityLabel,
         reason: strongImplicitCap && convCapMatch
           ? `命中设备能力「${convCapMatch.matchedCapabilityLabel}」`
-          : input.awakeActive
-            ? "唤醒窗口内明确控制指令"
-            : "连续对话续聊指令",
+          : isShortReplyToAssistantQuestion
+            ? "对助手提问的简短回复"
+            : input.awakeActive
+              ? "唤醒窗口内明确控制指令"
+              : "连续对话续聊指令",
         wakeWord: input.acousticWake?.matched ? input.acousticWake.wakeWord : null,
         command: cmd,
         usedLlm: false,

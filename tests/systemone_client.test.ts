@@ -1296,3 +1296,84 @@ describe("SystemOneClient negative LRU cache", () => {
     expect(fetchCount).toBe(66);
   });
 });
+
+describe("SystemOneClient (h) evaluateConversationEnd", () => {
+  test("evaluates continue vs ready_to_end with confidence gating, tail-preserving truncation, and zero LRU caching", async () => {
+    let nextChoice: "continue" | "ready_to_end" = "continue";
+    let nextConfidence = 0.89;
+    const { fetcher, requests } = createMockFetcher(() =>
+      jsonResponse({
+        model: DEFAULT_SYSTEMONE_MODEL,
+        answers: {
+          conv_end: makeChoiceAnswer(nextChoice, nextConfidence, ["continue", "ready_to_end"] as const),
+        },
+        usage: { input_tokens: 95, output_tokens: 10 },
+      }),
+    );
+
+    const client = new SystemOneClient({
+      baseUrl: "https://karpo.example.com/v1",
+      apiKey: "sk-conv-end-123456",
+      fetcher,
+    });
+
+    const longReply =
+      "好的，我为你查到了洗衣机的所有参数。" +
+      "这是一段比较长的中间说明文字，用来确保即使回复很长，末尾的关键问题也不会被截断。".repeat(4) +
+      "请问你想选择方案一还是方案二？";
+
+    // 1. continue verdict -> shouldStartExitCountdown = false
+    const res1 = await client.evaluateConversationEnd({
+      recentHistory: [
+        { role: "user", text: "帮我看看洗衣机怎么洗深色衣服" },
+        { role: "assistant", text: longReply },
+      ],
+      lastUserUtterance: "帮我看看洗衣机怎么洗深色衣服",
+      lastAssistantReply: longReply,
+    });
+    expect(res1).not.toBeNull();
+    expect(res1!.decision).toBe("continue");
+    expect(res1!.shouldStartExitCountdown).toBe(false);
+    const state1 = requests[0]!.body.state as Record<string, unknown>;
+    expect(String(state1.last_assistant)).toContain("请问你想选择方案一还是方案二？");
+
+    // 2. ready_to_end with low confidence (< 0.6) -> conservatively keeps conversation alive
+    nextChoice = "ready_to_end";
+    nextConfidence = 0.52;
+    const res2 = await client.evaluateConversationEnd({
+      recentHistory: [{ role: "user", text: "打开客厅灯" }],
+      lastUserUtterance: "打开客厅灯",
+      silentCompleted: true,
+    });
+    expect(res2!.decision).toBe("ready_to_end");
+    expect(res2!.shouldStartExitCountdown).toBe(false);
+
+    // 3. ready_to_end with high confidence (>= 0.6) -> starts exit countdown, never cached
+    nextChoice = "ready_to_end";
+    nextConfidence = 0.91;
+    const res3 = await client.evaluateConversationEnd({
+      recentHistory: [{ role: "user", text: "打开客厅灯" }],
+      lastUserUtterance: "打开客厅灯",
+      silentCompleted: true,
+      idleSeconds: 35,
+      nonAddressedCount: 1,
+      lastNonAddressedUtterance: "晚饭吃什么",
+    });
+    expect(res3!.decision).toBe("ready_to_end");
+    expect(res3!.shouldStartExitCountdown).toBe(true);
+    const state3 = requests[2]!.body.state as Record<string, unknown>;
+    expect(state3.silent_completed).toBe(true);
+    expect(state3.idle_seconds).toBe(35);
+    expect(state3.non_addressed_count).toBe(1);
+    expect(state3.last_non_addressed).toBe("晚饭吃什么");
+
+    // Calling again with identical input hits network freshly (never cached)
+    await client.evaluateConversationEnd({
+      recentHistory: [{ role: "user", text: "打开客厅灯" }],
+      lastUserUtterance: "打开客厅灯",
+      silentCompleted: true,
+      idleSeconds: 35,
+    });
+    expect(requests.length).toBe(4);
+  });
+});

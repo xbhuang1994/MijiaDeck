@@ -183,6 +183,7 @@ function handleWsMessage(
         streamingAsrEnabled: cfg.qwen3StreamingEnabled,
         voicePipelineMode: cfg.voicePipelineMode,
         onPartialTranscript: (partial) => {
+          vl.noteLiveSpeechActivity(partial.text);
           try {
             ws.send(
               JSON.stringify({
