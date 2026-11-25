@@ -16,7 +16,14 @@ import {
 } from "../core/agentConfigStore.ts";
 import { TypedEmitter } from "../core/contracts.ts";
 import { createBoundedFetch, type FetchLike } from "../core/httpTimeout.ts";
-import { decodeWavPcm, encodeWavPcm16, isWavBuffer, resampleLinear } from "./audioPcm.ts";
+import {
+  computeRms,
+  decodeWavPcm,
+  encodeWavPcm16,
+  estimateSnrDb,
+  isWavBuffer,
+  resampleLinear,
+} from "./audioPcm.ts";
 import type { SeparatedAudioStreamInfo, SoundTypeTag } from "./audioSourceSeparator.ts";
 import {
   formatExitConversationAck,
@@ -92,6 +99,10 @@ export interface VoiceTranscriptEntry {
   timestamp: number;
   speakerName?: string | null;
   speakerScore?: number;
+  trackIndex?: number;
+  trackCount?: number;
+  trackId?: string;
+  batchId?: string;
   attentionStage?: AttentionDecision["stage"];
   attentionReason?: string;
   passSource?: AttentionDecision["passSource"];
@@ -100,6 +111,53 @@ export interface VoiceTranscriptEntry {
   acousticWakeScore?: number;
   snrGainDb?: number;
   timings?: VoicePipelineTimings;
+}
+
+export interface VoiceTrackProcessingResult {
+  trackId: string;
+  /** 1-based 独立音轨编号 */
+  trackIndex: number;
+  /** 本批次总独立音轨数 */
+  trackCount: number;
+  batchId: string;
+  rms: number;
+  energyRatio: number;
+  speechDetected: boolean;
+  speechRatio: number;
+  durationSec: number;
+  denoiseEngine: string;
+  snrGainDb: number;
+  asrEngine: string;
+  /** 本音轨独立识别出的完整转写文字（绝不与其他音轨混杂） */
+  text: string;
+  acousticEvent?: string;
+  /** 本音轨独立 3D-Speaker CAM++ 声纹识别结果 */
+  voiceprint: VoiceprintIdentifyResult | null;
+  /** 本音轨独立声学唤醒打分 */
+  acousticWake?: WakeWordAcousticHit | null;
+  /** 本音轨独立逻辑判定结果 */
+  attention: AttentionDecision | null;
+  matched: boolean;
+  wokeOnly: boolean;
+  command: string;
+  reply?: string;
+  taskId?: string;
+  entryId?: string;
+  dispatchedAsync?: boolean;
+  error?: string;
+  timings?: VoicePipelineTimings;
+  timestamp: number;
+}
+
+export interface VoiceTrackBatchSnapshot {
+  batchId: string;
+  timestamp: number;
+  engine: string;
+  bssUsed: boolean;
+  trackCount: number;
+  acceptedCount: number;
+  totalMs: number;
+  tracks: VoiceTrackProcessingResult[];
 }
 
 export interface VoiceLastMetrics {
@@ -111,6 +169,8 @@ export interface VoiceLastMetrics {
   detectedSoundTypes?: SoundTypeTag[];
   detectedSpeakerCount?: number;
   separatedStreams?: SeparatedAudioStreamInfo[];
+  tracks?: VoiceTrackProcessingResult[];
+  trackBatch?: VoiceTrackBatchSnapshot | null;
   voiceprint?: VoiceprintIdentifyResult | null;
   acousticWake?: WakeWordAcousticHit | null;
   intent?: CommandIntentChoice;
@@ -198,6 +258,8 @@ export interface VoiceListenerSnapshot {
   systemOne: SystemOneHealthSnapshot | null;
   voiceprints: PublicVoiceprintProfile[];
   lastMetrics: VoiceLastMetrics | null;
+  lastTrackBatch: VoiceTrackBatchSnapshot | null;
+  recentTrackBatches: VoiceTrackBatchSnapshot[];
   history: VoiceTranscriptEntry[];
 }
 
@@ -228,6 +290,13 @@ export interface HandleTranscriptOptions {
   asyncDispatch?: boolean;
   /** 音频是否在 TTS 播报期间或刚结束的回声尾窗内采集 */
   duringTtsPlayback?: boolean;
+  /** ClearVoice 独立分轨元数据（供历史记录、Pi Agent 面板与 UI 分轨标注） */
+  trackIndex?: number;
+  trackCount?: number;
+  trackId?: string;
+  batchId?: string;
+  /** 同批多轨中已有有效音轨被采纳时，避免同批旁白音轨误伤连续对话计数 */
+  suppressSidetalkPenalty?: boolean;
 }
 
 export interface HandleTranscriptResult {
@@ -262,6 +331,8 @@ export interface ProcessAudioUploadResult extends HandleTranscriptResult {
   detectedSoundTypes?: SoundTypeTag[];
   detectedSpeakerCount?: number;
   separatedStreams?: SeparatedAudioStreamInfo[];
+  tracks?: VoiceTrackProcessingResult[];
+  trackBatch?: VoiceTrackBatchSnapshot | null;
 }
 
 export interface SpeakRequestMeta {
@@ -377,6 +448,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   private _error: string | null = null;
   private _history: VoiceTranscriptEntry[] = [];
   private _lastMetrics: VoiceLastMetrics | null = null;
+  private _lastTrackBatch: VoiceTrackBatchSnapshot | null = null;
+  private _recentTrackBatches: VoiceTrackBatchSnapshot[] = [];
   private _lastDispatchedText = "";
   private _lastDispatchedNormText = "";
   private _lastDispatchedAt = 0;
@@ -1168,6 +1241,10 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       timestamp: now,
       speakerName: options.voiceprint?.speakerName ?? null,
       speakerScore: options.voiceprint?.evaluated ? options.voiceprint.score : undefined,
+      ...(typeof options.trackIndex === "number" ? { trackIndex: options.trackIndex } : {}),
+      ...(typeof options.trackCount === "number" ? { trackCount: options.trackCount } : {}),
+      ...(options.trackId ? { trackId: options.trackId } : {}),
+      ...(options.batchId ? { batchId: options.batchId } : {}),
       attentionStage: decision.stage,
       attentionReason: decision.reason,
       ...(decision.passSource ? { passSource: decision.passSource } : {}),
@@ -1251,7 +1328,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
 
     // 注意力门控拒绝（非定向提及/旁白/回声/声纹未通过/声学否决/旧轮次已过期）
     if (staleFollowupAfterExit || !decision.accept || !decision.command) {
-      if (this._dialogState === "conversation") {
+      if (this._dialogState === "conversation" && !options.suppressSidetalkPenalty) {
         if (decision.stage !== "echo") {
           this._consecutiveSidetalkCount += 1;
           if (this._consecutiveSidetalkCount >= cfg.maxConsecutiveSidetalk) {
@@ -1386,6 +1463,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         wakeWord: decision.wakeWord,
         attentionReason: decision.reason,
         ...(decision.intent ? { intent: decision.intent } : {}),
+        ...(typeof options.trackIndex === "number" ? { trackIndex: options.trackIndex } : {}),
+        ...(typeof options.trackCount === "number" ? { trackCount: options.trackCount } : {}),
+        ...(options.trackId ? { trackId: options.trackId } : {}),
       },
     });
     this.emit("stateChanged", this.snapshot());
@@ -1614,7 +1694,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       (prefPre === "auto" && engineStatusPre.readyForLocalAsr) ||
       (prefPre === "whisper" && !hasCloudSttPre && engineStatusPre.readyForLocalAsr);
 
-    // ---- Stage 1.2 (新方案): ClearVoice GPU 准实时滑窗降噪（2.0s 切片 + 0.3s 历史上下文 + 20ms 交叉淡入淡出）-> Qwen3-ASR ----
+    // ---- Stage 1.2 (新方案): ClearVoice GPU 多轨盲源分离 + 分轨独立降噪去背景音 -> 分轨独立声纹/ASR/逻辑判定 ----
     if (
       useLocalPre &&
       cfg.voicePipelineMode === "clearvoice" &&
@@ -1622,171 +1702,42 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       !this._localEngine.clearVoiceGpu.isInFailureCooldown()
     ) {
       try {
-        const cvRes = await this._localEngine.clearVoiceGpu.enhanceOfflineWithChunking(pcm16k, 16000);
-        const vad = this._localEngine.detectSpeechSegments(cvRes.samples, 16000, {
-          mode: cfg.vadMode,
-        });
-        const speechSamples =
-          vad.hasSpeech && vad.speechSamples.length >= 1600 ? vad.speechSamples : cvRes.samples;
-
-        if (!vad.hasSpeech && cvRes.samples.length >= 3200) {
-          if (autoDispatch) {
-            this._noteNonConversationSegment("ambient_noise");
-          }
-          const timings: VoicePipelineTimings = {
-            denoiseMs: cvRes.durationMs,
-            vadMs: vad.durationMs,
-            totalMs: Math.round(performance.now() - totalStart),
-          };
-          this._lastMetrics = {
-            denoiseEngine: cvRes.engine,
-            snrGainDb: cvRes.snrGainDb,
-            vadEngine: `clearvoice-${vad.engine}`,
-            speechRatio: vad.speechRatio,
-            asrEngine: "skipped-no-speech",
-            timings,
-            updatedAt: Date.now(),
-          };
-          return {
-            ok: true,
-            text: "",
-            speechDetected: false,
-            denoiseEngine: cvRes.engine,
-            vadEngine: `clearvoice-${vad.engine}`,
-            asrEngine: "skipped-no-speech",
-            inputSnrDb: cvRes.inputSnrDb,
-            outputSnrDb: cvRes.outputSnrDb,
-            snrGainDb: cvRes.snrGainDb,
-            speechRatio: vad.speechRatio,
-            matched: false,
-            wokeOnly: false,
-            command: "",
-            timings,
-            voiceState: this.snapshot(),
-          };
+        const cvRes = await this._localEngine.clearVoiceGpu.separateAndEnhanceOfflineWithChunking(
+          pcm16k,
+          16000,
+        );
+        if (cvRes.tracks.length > 0) {
+          return await this.processClearVoiceSeparatedTracks(
+            cvRes.tracks.map((tr) => ({
+              trackId: tr.trackId,
+              trackIndex: tr.trackIndex,
+              samples: tr.samples,
+              rms: tr.rms,
+              energyRatio: tr.energyRatio,
+              outputSnrDb: tr.outputSnrDb,
+              snrGainDb: tr.snrGainDb,
+            })),
+            {
+              denoiseEngine: cvRes.engine,
+              bssUsed: cvRes.ssUsed,
+              inputSnrDb: cvRes.inputSnrDb,
+              denoiseMs: cvRes.durationMs,
+              vadLabelPrefix: "clearvoice",
+              rawDurationMs: Math.round((pcm16k.length / 16000) * 1000),
+              preVadSegmented: false,
+            },
+            {
+              lang,
+              bypassWakeWord: options.bypassWakeWord,
+              autoDispatch,
+              useLocal: useLocalPre,
+              llmAttentionOverride: options.llmAttentionOverride,
+              asyncDispatch: options.asyncDispatch,
+              duringTtsPlayback: options.duringTtsPlayback,
+              totalStart,
+            },
+          );
         }
-
-        let voiceprintResult: VoiceprintIdentifyResult | null = null;
-        let voiceprintMs = 0;
-        const profiles = listPublicVoiceprints();
-        if (cfg.voiceprintMode !== "off" && profiles.length > 0 && speechSamples.length >= 4000) {
-          const emb = this._localEngine.extractSpeakerEmbedding(speechSamples, 16000);
-          voiceprintMs = emb.durationMs;
-          voiceprintResult = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
-        }
-
-        const owwEvaluated = Boolean(cfg.owwEnabled && this._localEngine.openWakeWord.isReady);
-        const acousticWake = owwEvaluated
-          ? this._localEngine.scoreWakeWordAudio(speechSamples, cfg.wakeWords, {
-              threshold: cfg.owwThreshold,
-              headOnlySec: 2.0,
-            })
-          : null;
-        if (acousticWake?.matched) {
-          this._lastWakeHit = { ...acousticWake, timestamp: Date.now() };
-        }
-
-        const qwenRes = await this._localEngine.transcribeLocal(speechSamples, 16000, lang, {
-          engine: cfg.localAsrEngine === "sensevoice" ? "sensevoice" : "auto",
-          hotwords: cfg.wakeWords.length > 0 ? cfg.wakeWords : undefined,
-        });
-
-        const timingsBase: Partial<VoicePipelineTimings> = {
-          denoiseMs: cvRes.durationMs,
-          vadMs: vad.durationMs,
-          voiceprintMs,
-          asrMs: qwenRes.durationMs,
-        };
-        const vadLabel = `clearvoice-${vad.engine}`;
-        this._lastMetrics = {
-          denoiseEngine: cvRes.engine,
-          snrGainDb: cvRes.snrGainDb,
-          vadEngine: vadLabel,
-          speechRatio: vad.speechRatio,
-          asrEngine: qwenRes.engine,
-          voiceprint: voiceprintResult,
-          acousticWake,
-          timings: { ...timingsBase, totalMs: Math.round(performance.now() - totalStart) },
-          updatedAt: Date.now(),
-        };
-
-        if (!qwenRes.text.trim()) {
-          if (autoDispatch) {
-            this._noteNonConversationSegment("ambient_noise");
-          }
-          return {
-            ok: true,
-            text: "",
-            speechDetected: false,
-            denoiseEngine: cvRes.engine,
-            vadEngine: vadLabel,
-            asrEngine: qwenRes.engine,
-            inputSnrDb: cvRes.inputSnrDb,
-            outputSnrDb: cvRes.outputSnrDb,
-            snrGainDb: cvRes.snrGainDb,
-            speechRatio: vad.speechRatio,
-            acousticEvent: qwenRes.event,
-            voiceprint: voiceprintResult,
-            acousticWake,
-            matched: false,
-            wokeOnly: false,
-            command: "",
-            timings: { ...timingsBase, totalMs: Math.round(performance.now() - totalStart) },
-            voiceState: this.snapshot(),
-          };
-        }
-
-        if (!autoDispatch) {
-          return {
-            ok: true,
-            text: qwenRes.text,
-            speechDetected: true,
-            denoiseEngine: cvRes.engine,
-            vadEngine: vadLabel,
-            asrEngine: qwenRes.engine,
-            inputSnrDb: cvRes.inputSnrDb,
-            outputSnrDb: cvRes.outputSnrDb,
-            snrGainDb: cvRes.snrGainDb,
-            speechRatio: vad.speechRatio,
-            acousticEvent: qwenRes.event,
-            voiceprint: voiceprintResult,
-            acousticWake,
-            matched: false,
-            wokeOnly: false,
-            command: "",
-            timings: { ...timingsBase, totalMs: Math.round(performance.now() - totalStart) },
-            voiceState: this.snapshot(),
-          };
-        }
-
-        const dispatched = await this.handleTranscript(qwenRes.text, {
-          isFinal: true,
-          bypassWakeWord: options.bypassWakeWord,
-          engine: "local",
-          segmentDurationMs: Math.round((pcm16k.length / 16000) * 1000),
-          acousticEvent: qwenRes.event,
-          acousticWake,
-          owwEvaluated,
-          voiceprint: voiceprintResult,
-          snrGainDb: cvRes.snrGainDb,
-          timingsBase,
-          llmAttentionOverride: options.llmAttentionOverride,
-        });
-
-        return {
-          ...dispatched,
-          text: qwenRes.text,
-          speechDetected: true,
-          denoiseEngine: cvRes.engine,
-          vadEngine: vadLabel,
-          asrEngine: qwenRes.engine,
-          inputSnrDb: cvRes.inputSnrDb,
-          outputSnrDb: cvRes.outputSnrDb,
-          snrGainDb: cvRes.snrGainDb,
-          speechRatio: vad.speechRatio,
-          acousticEvent: qwenRes.event,
-          acousticWake,
-        };
       } catch {
         // ClearVoice GPU 不可用或单次失败时自动平滑回落原方案，保障语音交互不中断
       }
@@ -2237,10 +2188,70 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       (pref === "auto" && localReady) ||
       (pref === "whisper" && !hasCloudStt && localReady);
 
-    // 新方案直通：音频已经由 ClearVoice GPU 准实时切片（Silero VAD 双触发 + 0.3s 历史上下文 + 20ms 交叉淡入淡出）降噪，
-    // 直接送交 Qwen3-ASR 做语音转文字，跳过旧版 GTCRN / Spleeter 声源分离链路。
+    // 新方案直通：音频已经由 ClearVoice GPU 盲源分离 + 分轨降噪去背景音产出独立多轨音频，
+    // 每条音轨独立运行声纹识别、ASR 语音转文字、逻辑判定与后续流程（严禁将多轨混杂成单轨！）。
     const isClearVoiceSegment =
       segment.pipelineMode === "clearvoice" || segment.denoiseEngine.startsWith("clearvoice");
+
+    if (isClearVoiceSegment) {
+      const cvTracks =
+        segment.separatedTracks && segment.separatedTracks.length > 0
+          ? segment.separatedTracks.map((tr) => ({
+              trackId: tr.trackId,
+              trackIndex: tr.trackIndex,
+              samples: tr.samples,
+              rms: tr.rms,
+              energyRatio: tr.energyRatio,
+              outputSnrDb: tr.outputSnrDb,
+              snrGainDb: tr.snrGainDb,
+            }))
+          : [
+              {
+                trackId: "cv_track_1",
+                trackIndex: 1,
+                samples:
+                  segment.denoisedSamples.length >= 1600
+                    ? segment.denoisedSamples
+                    : segment.rawSamples,
+                rms: Number(
+                  computeRms(
+                    segment.denoisedSamples.length >= 1600
+                      ? segment.denoisedSamples
+                      : segment.rawSamples,
+                  ).toFixed(5),
+                ),
+                energyRatio: 1,
+                outputSnrDb: segment.outputSnrDb,
+                snrGainDb: segment.snrGainDb,
+              },
+            ];
+
+      const vadLabel = `clearvoice-silero:${segment.clearVoiceMeta?.triggerReason ?? segment.commitReason ?? "silence"}`;
+      return await this.processClearVoiceSeparatedTracks(
+        cvTracks,
+        {
+          denoiseEngine: segment.denoiseEngine,
+          bssUsed: Boolean(segment.clearVoiceMeta?.bssUsed || cvTracks.length > 1),
+          inputSnrDb: segment.inputSnrDb,
+          denoiseMs: segment.clearVoiceMeta?.denoiseMs ?? 0,
+          vadLabelOverride: vadLabel,
+          rawDurationMs: Math.round(segment.durationSec * 1000),
+          preVadSegmented: true,
+          stripCommittedPrefixHint:
+            cvTracks.length === 1 ? segment.stripCommittedPrefixHint : undefined,
+        },
+        {
+          lang,
+          bypassWakeWord: options.bypassWakeWord,
+          autoDispatch: true,
+          useLocal,
+          llmAttentionOverride: options.llmAttentionOverride,
+          asyncDispatch: options.asyncDispatch,
+          duringTtsPlayback: options.duringTtsPlayback ?? segment.duringTtsPlayback,
+          totalStart,
+        },
+      );
+    }
 
     const precomputedText = (segment.precomputedTranscript ?? "").trim();
     const canReuseStreamingPrecomputed =
@@ -2611,6 +2622,551 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   }
 
   /**
+   * ClearVoice 多轨盲源分离 + 分轨降噪去背景音后统一独立管线：
+   * 严禁将多轨音频或文字混杂合并！对每条独立音轨分别执行：
+   * 1) 独立 VAD 端点检测与有效人声提取；
+   * 2) 独立 3D-Speaker CAM++ 声纹识别；
+   * 3) 独立 openWakeWord 声学唤醒打分；
+   * 4) 独立 Qwen3-ASR / SenseVoice / Whisper 语音转文字；
+   * 5) 独立注意力/逻辑门控判定（evaluateVoiceAttention）；
+   * 6) 独立走后续流程（唤醒/退出/Pi Agent 执行与历史记录），并完整同步多轨批次快照供 UI 分轨展示。
+   */
+  async processClearVoiceSeparatedTracks(
+    tracks: ReadonlyArray<{
+      trackId: string;
+      trackIndex: number;
+      samples: Float32Array;
+      rms?: number;
+      energyRatio?: number;
+      outputSnrDb?: number;
+      snrGainDb?: number;
+    }>,
+    meta: {
+      denoiseEngine: string;
+      bssUsed: boolean;
+      inputSnrDb: number;
+      denoiseMs: number;
+      vadLabelPrefix?: string;
+      vadLabelOverride?: string;
+      rawDurationMs: number;
+      preVadSegmented: boolean;
+      stripCommittedPrefixHint?: string;
+    },
+    options: {
+      lang: string;
+      bypassWakeWord?: boolean;
+      autoDispatch: boolean;
+      useLocal: boolean;
+      llmAttentionOverride?: AttentionLlmEvaluator;
+      asyncDispatch?: boolean;
+      duringTtsPlayback?: boolean;
+      now?: number;
+      totalStart?: number;
+    },
+  ): Promise<ProcessAudioUploadResult> {
+    const totalStart = options.totalStart ?? performance.now();
+    const cfg = this.config;
+    const now = options.now ?? Date.now();
+    const batchId = `cvb_${now}_${++this._seq}`;
+    const trackCount = tracks.length;
+    const profiles = listPublicVoiceprints();
+    const owwEvaluated = Boolean(cfg.owwEnabled && this._localEngine.openWakeWord.isReady);
+
+    // 批前快照统一对话/唤醒态与回声账本，保证同一时刻并行的多条音轨各自独立判定、不互相污染对话上下文
+    const speechStartedAt = Math.max(0, now - Math.min(30_000, meta.rawDurationMs));
+    const awakeActive =
+      this._awakeUntil !== null && (now < this._awakeUntil || speechStartedAt < this._awakeUntil);
+    const convWindowActive =
+      cfg.conversationWindowSec > 0 &&
+      this._conversationUntil !== null &&
+      (now < this._conversationUntil || speechStartedAt < this._conversationUntil);
+    const inConversation =
+      this._dialogState === "conversation" || awakeActive || convWindowActive;
+    const preBatchDialogState = this._dialogState;
+    const preBatchEpoch = this._dialogEpoch;
+    const legacySpoken = this._echoGuard.getLegacyLastSpoken(now);
+    const recentSpokenUtterances = this._echoGuard.getRecentUtterances(now);
+    const ttsActiveNow = this._echoGuard.isSpeaking;
+    const duringTtsPlayback = options.duringTtsPlayback ?? ttsActiveNow;
+    const recentTurns = this._agent.recentConversationTurns(5);
+    const capabilityDigest = this._agent.getCapabilityDigest();
+    const learnedTriggers = this._agent.getLearnedTriggerSamples();
+    const pendingConfirmation = this._agent.getActivePendingConfirmationGateContext();
+
+    const llmEvaluator: AttentionLlmEvaluator | undefined =
+      options.llmAttentionOverride ??
+      (cfg.provider !== "local"
+        ? async (promptText: string) => {
+            const raw = await this._agent.evaluateAttention(promptText, 3500);
+            if (!raw) throw new Error("no llm verdict");
+            return raw;
+          }
+        : undefined);
+
+    interface PreparedTrackEval {
+      trackId: string;
+      trackIndex: number;
+      rms: number;
+      energyRatio: number;
+      outputSnrDb: number;
+      snrGainDb: number;
+      durationSec: number;
+      speechDetected: boolean;
+      speechRatio: number;
+      vadEngine: string;
+      vadMs: number;
+      voiceprint: VoiceprintIdentifyResult | null;
+      voiceprintMs: number;
+      acousticWake: WakeWordAcousticHit | null;
+      text: string;
+      acousticEvent: string;
+      asrEngine: string;
+      asrMs: number;
+      runtimeEngine: VoiceRuntimeEngine;
+      decision: AttentionDecision | null;
+      trackTotalMs: number;
+    }
+
+    const prepared: PreparedTrackEval[] = [];
+    let sumVadMs = 0;
+    let sumVpMs = 0;
+    let sumAsrMs = 0;
+
+    // ---- 阶段 A：每条音轨完全独立执行 VAD -> 声纹识别 -> 声学唤醒 -> 语音转文字 -> 逻辑判定 ----
+    for (let i = 0; i < tracks.length; i += 1) {
+      const tr = tracks[i]!;
+      const tTrackStart = performance.now();
+      const trackIndex = tr.trackIndex || i + 1;
+      const trackId = tr.trackId || `cv_track_${trackIndex}`;
+      const rms = tr.rms ?? Number(computeRms(tr.samples).toFixed(5));
+      const energyRatio =
+        typeof tr.energyRatio === "number"
+          ? tr.energyRatio
+          : Number((1 / Math.max(1, trackCount)).toFixed(4));
+      const outputSnrDb = tr.outputSnrDb ?? estimateSnrDb(tr.samples, 16000);
+      const snrGainDb = tr.snrGainDb ?? Number((outputSnrDb - meta.inputSnrDb).toFixed(2));
+      const durationSec = Number((tr.samples.length / 16000).toFixed(2));
+
+      // A1. 分轨独立 VAD
+      let speechSamples = tr.samples;
+      let speechDetected = tr.samples.length >= 1600;
+      let speechRatio = speechDetected ? 1 : 0;
+      let vadEngine = meta.vadLabelOverride ?? `${meta.vadLabelPrefix ?? "clearvoice"}-silero`;
+      let vadMs = 0;
+
+      if (!meta.preVadSegmented || trackCount > 1) {
+        const vad = this._localEngine.detectSpeechSegments(tr.samples, 16000, {
+          mode: cfg.vadMode,
+        });
+        vadMs = vad.durationMs;
+        sumVadMs += vadMs;
+        speechRatio = vad.speechRatio;
+        vadEngine = meta.vadLabelOverride ?? `${meta.vadLabelPrefix ?? "clearvoice"}-${vad.engine}`;
+        if (!vad.hasSpeech && tr.samples.length >= 3200) {
+          // 流式多轨时仅在 VAD 判无声且能量很低时直接判静音，避免误杀短促清晰指令
+          if (!meta.preVadSegmented || rms < 0.008) {
+            speechDetected = false;
+          }
+        } else if (vad.hasSpeech && vad.speechSamples.length >= 1600) {
+          speechSamples = vad.speechSamples;
+        }
+      }
+
+      if (!speechDetected || speechSamples.length < 1600) {
+        prepared.push({
+          trackId,
+          trackIndex,
+          rms,
+          energyRatio,
+          outputSnrDb,
+          snrGainDb,
+          durationSec,
+          speechDetected: false,
+          speechRatio,
+          vadEngine,
+          vadMs,
+          voiceprint: null,
+          voiceprintMs: 0,
+          acousticWake: null,
+          text: "",
+          acousticEvent: "",
+          asrEngine: "skipped-no-speech",
+          asrMs: 0,
+          runtimeEngine: options.useLocal ? "local" : "whisper",
+          decision: null,
+          trackTotalMs: Math.round(performance.now() - tTrackStart),
+        });
+        continue;
+      }
+
+      // A2. 分轨独立声纹识别（3D-Speaker CAM++，绝不跨轨共享声纹向量）
+      let voiceprint: VoiceprintIdentifyResult | null = null;
+      let voiceprintMs = 0;
+      if (cfg.voiceprintMode !== "off" && profiles.length > 0 && speechSamples.length >= 4000) {
+        const emb = this._localEngine.extractSpeakerEmbedding(speechSamples, 16000);
+        voiceprintMs = emb.durationMs;
+        sumVpMs += voiceprintMs;
+        voiceprint = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
+      }
+
+      // A3. 分轨独立 openWakeWord 声学唤醒打分
+      const acousticWake = owwEvaluated
+        ? this._localEngine.scoreWakeWordAudio(speechSamples, cfg.wakeWords, {
+            threshold: cfg.owwThreshold,
+            headOnlySec: 2.0,
+          })
+        : null;
+      if (acousticWake?.matched) {
+        this._lastWakeHit = { ...acousticWake, timestamp: now };
+      }
+
+      // A4. 分轨独立语音转文字（Qwen3-ASR / SenseVoice / Whisper）
+      let text = "";
+      let acousticEvent = "";
+      let asrEngine = "qwen3-asr-local";
+      let asrMs = 0;
+      let runtimeEngine: VoiceRuntimeEngine = "local";
+
+      if (options.useLocal) {
+        const qwenRes = await this._localEngine.transcribeLocal(speechSamples, 16000, options.lang, {
+          engine: cfg.localAsrEngine === "sensevoice" ? "sensevoice" : "auto",
+          hotwords: cfg.wakeWords.length > 0 ? cfg.wakeWords : undefined,
+        });
+        text =
+          meta.stripCommittedPrefixHint && trackCount === 1
+            ? stripCommittedPrefix(qwenRes.text, meta.stripCommittedPrefixHint)
+            : qwenRes.text;
+        text = text.trim();
+        acousticEvent = qwenRes.event;
+        asrEngine = qwenRes.engine;
+        asrMs = qwenRes.durationMs;
+        runtimeEngine = "local";
+      } else {
+        const wavBytes = encodeWavPcm16(speechSamples, 16000);
+        const blob = new Blob([wavBytes as unknown as BlobPart], { type: "audio/wav" });
+        const tAsr0 = performance.now();
+        text = (
+          await this.transcribeAudio(blob, {
+            filename: `voice-track-${trackIndex}.wav`,
+            lang: options.lang,
+          })
+        ).trim();
+        asrMs = Math.round(performance.now() - tAsr0);
+        asrEngine = "whisper-cloud";
+        runtimeEngine = "whisper";
+      }
+      sumAsrMs += asrMs;
+
+      if (!text) {
+        prepared.push({
+          trackId,
+          trackIndex,
+          rms,
+          energyRatio,
+          outputSnrDb,
+          snrGainDb,
+          durationSec,
+          speechDetected: false,
+          speechRatio,
+          vadEngine,
+          vadMs,
+          voiceprint,
+          voiceprintMs,
+          acousticWake,
+          text: "",
+          acousticEvent,
+          asrEngine,
+          asrMs,
+          runtimeEngine,
+          decision: null,
+          trackTotalMs: Math.round(performance.now() - tTrackStart),
+        });
+        continue;
+      }
+
+      // A5. 分轨独立逻辑判定（注意力门控、声纹门禁、回声过滤、唤醒提取、SystemOne 决策）
+      let decision: AttentionDecision | null = null;
+      if (options.autoDispatch) {
+        const wakeSpanForOww = findWakeWordSpan(text, cfg.wakeWords);
+        const owwActiveForWord = Boolean(
+          owwEvaluated &&
+            wakeSpanForOww &&
+            getPrototypesForWords([wakeSpanForOww.wakeWord]).length > 0,
+        );
+        decision = await evaluateVoiceAttention({
+          rawText: text,
+          wakeWordEnabled: cfg.wakeWordEnabled,
+          wakeWords: cfg.wakeWords,
+          attentionMode: cfg.attentionMode,
+          bypassWakeWord: options.bypassWakeWord,
+          awakeActive,
+          inConversation,
+          dialogState: preBatchDialogState,
+          acousticWake,
+          owwActiveForWord,
+          systemOneClient: this._agent.systemOneClient,
+          recentTurns,
+          lastSpokenReply: legacySpoken.text || this._lastSpokenReply,
+          lastSpokenAt: legacySpoken.at || this._lastSpokenAt,
+          recentSpokenUtterances,
+          ttsActive: ttsActiveNow,
+          duringTtsPlayback,
+          echoCancellationMode: cfg.echoCancellationMode,
+          now,
+          acousticEvent,
+          voiceprint,
+          voiceprintMode: cfg.voiceprintMode,
+          llmEvaluator,
+          capabilityDigest,
+          learnedTriggers,
+          pendingConfirmation,
+        });
+      }
+
+      prepared.push({
+        trackId,
+        trackIndex,
+        rms,
+        energyRatio,
+        outputSnrDb,
+        snrGainDb,
+        durationSec,
+        speechDetected: true,
+        speechRatio,
+        vadEngine,
+        vadMs,
+        voiceprint,
+        voiceprintMs,
+        acousticWake,
+        text,
+        acousticEvent,
+        asrEngine,
+        asrMs,
+        runtimeEngine,
+        decision,
+        trackTotalMs: Math.round(performance.now() - tTrackStart),
+      });
+    }
+
+    // ---- 阶段 B：每条有效音轨独立走后续流程（唤醒 / 退出 / Pi Agent 执行 / 历史记录） ----
+    const speakingPrepared = prepared.filter((p) => p.speechDetected && p.text.length > 0);
+    const anyAcceptedInBatch = speakingPrepared.some((p) => p.decision?.accept === true);
+    const dispatchResults = new Map<string, HandleTranscriptResult>();
+
+    if (options.autoDispatch) {
+      if (speakingPrepared.length === 0) {
+        this._noteNonConversationSegment("ambient_noise");
+      } else {
+        // 先执行被采纳的音轨（保障多轨并发时有效指令先进入对话/执行通道，绝不被同批旁白轨抢先退回待机），
+        // 再记录同批被拒识的旁白音轨（且抑制其旁白惩罚）；同批无采纳音轨时仅按批计一次旁白。
+        const ordered = [
+          ...speakingPrepared.filter((p) => p.decision?.accept === true),
+          ...speakingPrepared.filter((p) => p.decision?.accept !== true),
+        ];
+        let rejectedPenaltyApplied = false;
+
+        for (const p of ordered) {
+          const isAccepted = p.decision?.accept === true;
+          const suppressSidetalkPenalty = anyAcceptedInBatch || (!isAccepted && rejectedPenaltyApplied);
+          if (!isAccepted && !suppressSidetalkPenalty) {
+            rejectedPenaltyApplied = true;
+          }
+
+          const staleAfterExit =
+            inConversation &&
+            this._dialogEpoch !== preBatchEpoch &&
+            this._dialogState === "standby" &&
+            !p.decision?.wakeWord &&
+            !options.bypassWakeWord &&
+            cfg.wakeWordEnabled;
+
+          const perTrackDenoiseMs = Math.round(meta.denoiseMs / Math.max(1, trackCount));
+          const res = await this.handleTranscript(p.text, {
+            isFinal: true,
+            bypassWakeWord: options.bypassWakeWord,
+            engine: p.runtimeEngine,
+            now: staleAfterExit ? Date.now() : now,
+            segmentDurationMs: Math.round(p.durationSec * 1000),
+            acousticEvent: p.acousticEvent,
+            acousticWake: p.acousticWake,
+            owwEvaluated,
+            voiceprint: p.voiceprint,
+            snrGainDb: p.snrGainDb,
+            timingsBase: {
+              denoiseMs: perTrackDenoiseMs,
+              vadMs: p.vadMs,
+              voiceprintMs: p.voiceprintMs,
+              asrMs: p.asrMs,
+            },
+            llmAttentionOverride: options.llmAttentionOverride,
+            precomputedAttention: staleAfterExit ? undefined : (p.decision ?? undefined),
+            asyncDispatch: options.asyncDispatch,
+            duringTtsPlayback,
+            trackIndex: p.trackIndex,
+            trackCount,
+            trackId: p.trackId,
+            batchId,
+            suppressSidetalkPenalty,
+          });
+          dispatchResults.set(p.trackId, res);
+        }
+      }
+    }
+
+    // ---- 阶段 C：汇总各轨独立结构化输出（按原始音轨序号 1..N 保持完全独立，绝不混杂） ----
+    const trackResults: VoiceTrackProcessingResult[] = prepared.map((p) => {
+      const disp = dispatchResults.get(p.trackId);
+      const effectiveDecision = disp?.attention ?? p.decision;
+      const perTrackDenoiseMs = Math.round(meta.denoiseMs / Math.max(1, trackCount));
+      const trackTimings: VoicePipelineTimings = disp?.timings ?? {
+        denoiseMs: perTrackDenoiseMs,
+        vadMs: p.vadMs,
+        voiceprintMs: p.voiceprintMs,
+        asrMs: p.asrMs,
+        ...(effectiveDecision ? { attentionMs: effectiveDecision.latencyMs } : {}),
+        totalMs: p.trackTotalMs,
+      };
+      return {
+        trackId: p.trackId,
+        trackIndex: p.trackIndex,
+        trackCount,
+        batchId,
+        rms: p.rms,
+        energyRatio: p.energyRatio,
+        speechDetected: p.speechDetected,
+        speechRatio: p.speechRatio,
+        durationSec: p.durationSec,
+        denoiseEngine: meta.denoiseEngine,
+        snrGainDb: p.snrGainDb,
+        asrEngine: p.asrEngine,
+        text: p.text,
+        ...(p.acousticEvent ? { acousticEvent: p.acousticEvent } : {}),
+        voiceprint: p.voiceprint,
+        acousticWake: p.acousticWake,
+        attention: effectiveDecision,
+        matched: disp?.matched ?? false,
+        wokeOnly: disp?.wokeOnly ?? false,
+        command: disp?.command ?? (effectiveDecision?.accept ? effectiveDecision.command : ""),
+        ...(disp?.reply ? { reply: disp.reply } : {}),
+        ...(disp?.taskId ? { taskId: disp.taskId } : {}),
+        ...(disp?.entryId ? { entryId: disp.entryId } : {}),
+        ...(disp?.dispatchedAsync ? { dispatchedAsync: true } : {}),
+        ...(disp?.error ? { error: disp.error } : {}),
+        timings: trackTimings,
+        timestamp: now,
+      };
+    });
+
+    const totalMs = Math.round(performance.now() - totalStart);
+    const acceptedTracks = trackResults.filter((t) => t.matched);
+    const speakingTracks = trackResults.filter((t) => t.speechDetected && t.text.length > 0);
+    // 主摘要轨仅用于兼容单字符串旧字段，绝不拼接多轨文字！
+    const primaryTrack = acceptedTracks[0] ?? speakingTracks[0] ?? trackResults[0] ?? null;
+    const primaryDispatch = primaryTrack ? dispatchResults.get(primaryTrack.trackId) : undefined;
+
+    const batchSnapshot: VoiceTrackBatchSnapshot = {
+      batchId,
+      timestamp: now,
+      engine: meta.denoiseEngine,
+      bssUsed: meta.bssUsed,
+      trackCount: trackResults.length,
+      acceptedCount: acceptedTracks.length,
+      totalMs,
+      tracks: trackResults,
+    };
+
+    if (speakingTracks.length > 0 || trackResults.length > 1) {
+      this._lastTrackBatch = batchSnapshot;
+      this._recentTrackBatches.push(batchSnapshot);
+      if (this._recentTrackBatches.length > 8) {
+        this._recentTrackBatches = this._recentTrackBatches.slice(-8);
+      }
+    }
+
+    const separatedStreams: SeparatedAudioStreamInfo[] = trackResults.map((t) => ({
+      streamId: t.trackId,
+      kind: "speaker",
+      speakerId: t.voiceprint?.speakerName ?? `音轨 ${t.trackIndex}`,
+      energyRatio: t.energyRatio,
+      transcript: t.text,
+    }));
+
+    const batchTimings: VoicePipelineTimings = {
+      denoiseMs: meta.denoiseMs,
+      vadMs: sumVadMs,
+      voiceprintMs: sumVpMs,
+      asrMs: sumAsrMs,
+      ...(primaryTrack?.timings?.attentionMs !== undefined
+        ? { attentionMs: primaryTrack.timings.attentionMs }
+        : {}),
+      ...(primaryTrack?.timings?.agentMs !== undefined
+        ? { agentMs: primaryTrack.timings.agentMs }
+        : {}),
+      totalMs,
+    };
+
+    const vadEngineLabel =
+      prepared[0]?.vadEngine ?? meta.vadLabelOverride ?? `${meta.vadLabelPrefix ?? "clearvoice"}-silero`;
+
+    this._lastMetrics = {
+      denoiseEngine: meta.denoiseEngine,
+      snrGainDb: primaryTrack?.snrGainDb ?? 0,
+      vadEngine: vadEngineLabel,
+      speechRatio: primaryTrack?.speechRatio ?? 0,
+      asrEngine: primaryTrack?.asrEngine ?? "skipped-no-speech",
+      detectedSoundTypes:
+        trackResults.length > 1 ? ["speech", "multi_speaker"] : speakingTracks.length > 0 ? ["speech"] : [],
+      detectedSpeakerCount: speakingTracks.length,
+      separatedStreams,
+      tracks: trackResults,
+      trackBatch: batchSnapshot,
+      voiceprint: primaryTrack?.voiceprint ?? null,
+      acousticWake: primaryTrack?.acousticWake ?? null,
+      ...(primaryTrack?.attention?.intent ? { intent: primaryTrack.attention.intent } : {}),
+      attention: primaryTrack?.attention ?? null,
+      timings: batchTimings,
+      updatedAt: Date.now(),
+    };
+
+    const snap = this.snapshot();
+    this.emit("stateChanged", snap);
+
+    return {
+      ok: primaryDispatch?.ok ?? true,
+      matched: acceptedTracks.length > 0,
+      wokeOnly: acceptedTracks.length > 0 && acceptedTracks.every((t) => t.wokeOnly),
+      ...(primaryDispatch?.dispatchedAsync ? { dispatchedAsync: true } : {}),
+      ...(primaryDispatch?.taskId ? { taskId: primaryDispatch.taskId } : {}),
+      ...(primaryDispatch?.entryId ? { entryId: primaryDispatch.entryId } : {}),
+      command: primaryTrack?.command ?? "",
+      ...(primaryTrack?.reply ? { reply: primaryTrack.reply } : {}),
+      ...(primaryDispatch?.toolCalls ? { toolCalls: primaryDispatch.toolCalls } : {}),
+      attention: primaryTrack?.attention ?? undefined,
+      voiceprint: primaryTrack?.voiceprint ?? null,
+      acousticWake: primaryTrack?.acousticWake ?? null,
+      ...(primaryDispatch?.error ? { error: primaryDispatch.error } : {}),
+      timings: batchTimings,
+      voiceState: snap,
+      text: primaryTrack?.text ?? "",
+      speechDetected: speakingTracks.length > 0,
+      denoiseEngine: meta.denoiseEngine,
+      vadEngine: vadEngineLabel,
+      asrEngine: primaryTrack?.asrEngine ?? "skipped-no-speech",
+      inputSnrDb: meta.inputSnrDb,
+      outputSnrDb: primaryTrack ? prepared.find((p) => p.trackId === primaryTrack.trackId)?.outputSnrDb : meta.inputSnrDb,
+      snrGainDb: primaryTrack?.snrGainDb ?? 0,
+      speechRatio: primaryTrack?.speechRatio ?? 0,
+      acousticEvent: primaryTrack?.acousticEvent,
+      detectedSoundTypes:
+        trackResults.length > 1 ? ["speech", "multi_speaker"] : speakingTracks.length > 0 ? ["speech"] : [],
+      detectedSpeakerCount: speakingTracks.length,
+      separatedStreams,
+      tracks: trackResults,
+      trackBatch: batchSnapshot,
+    };
+  }
+
+  /**
    * 声纹注册：先对样本执行环境降噪与 Silero VAD 裁切，再提取 3D-Speaker CAM++ 向量并落盘，同时保存参考 WAV 供 VoxLock 使用。
    */
   async enrollVoiceprintFromAudio(
@@ -2879,6 +3435,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._dialogEpoch += 1;
     this._dialogState = "standby";
     this._history = [];
+    this._lastTrackBatch = null;
+    this._recentTrackBatches = [];
     this._lastTranscript = "";
     this._lastCommand = "";
     this._awakeUntil = null;
@@ -2994,6 +3552,16 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       systemOne: systemOneHealth,
       voiceprints: listPublicVoiceprints(),
       lastMetrics: this._lastMetrics ? { ...this._lastMetrics } : null,
+      lastTrackBatch: this._lastTrackBatch
+        ? {
+            ...this._lastTrackBatch,
+            tracks: this._lastTrackBatch.tracks.map((t) => ({ ...t })),
+          }
+        : null,
+      recentTrackBatches: this._recentTrackBatches.map((b) => ({
+        ...b,
+        tracks: b.tracks.map((t) => ({ ...t })),
+      })),
       history: this._history.map((h) => ({ ...h })),
     };
   }
@@ -3017,6 +3585,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._speechActivityStartedAt = null;
     this._speechGraceSuppressed = false;
     this._consecutiveAmbientNoiseCount = 0;
+    this._lastTrackBatch = null;
+    this._recentTrackBatches = [];
     this._echoGuard.reset();
     this.clear();
   }

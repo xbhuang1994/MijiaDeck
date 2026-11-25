@@ -17,8 +17,9 @@ import { existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs
 import net from "node:net";
 import path from "node:path";
 import { projectRoot } from "../core/appMeta.ts";
-import { estimateSnrDb, resampleLinear } from "./audioPcm.ts";
+import { computeRms, estimateSnrDb, resampleLinear } from "./audioPcm.ts";
 import {
+  ClearVoiceMultiTrackAssembler,
   ClearVoiceSliceAssembler,
   DEFAULT_CLEARVOICE_CHUNKER_CONFIG,
 } from "./clearVoiceChunker.ts";
@@ -28,6 +29,9 @@ export interface ClearVoiceGpuModelPaths {
   modelDir: string;
   modelFp32Path: string;
   modelInt8Path: string;
+  ssModelDir: string;
+  ssModelPath: string;
+  ssModelAltPath: string;
   runtimeDir: string;
   pythonBin: string;
   serverScript: string;
@@ -40,15 +44,20 @@ export interface ClearVoiceGpuStatus {
   vramFreeMb: number | null;
   runtimeReady: boolean;
   modelReady: boolean;
+  ssModelReady: boolean;
   scriptReady: boolean;
   customServiceUrl: string;
   ready: boolean;
+  multiTrackReady: boolean;
   serverRunning: boolean;
   provider: "cuda" | "cpu" | "remote" | "none";
+  ssProvider: "cuda" | "cpu" | "remote" | "none";
   modelName: string;
+  ssModelName: string;
   serviceUrl: string | null;
   lastLatencyMs: number | null;
   lastInferMs: number | null;
+  lastSeparateMs: number | null;
   lastError: string | null;
 }
 
@@ -70,6 +79,68 @@ export interface ClearVoiceDenoiseSliceResult {
   gpuName: string | null;
 }
 
+export interface ClearVoiceSeparateSliceOptions extends ClearVoiceDenoiseSliceOptions {
+  /** 是否在服务端剔除静音残影/镜像串音轨（单次整段处理设为 true，流式多片滑窗设为 false 由装配器统一对齐后剔除） */
+  pruneTracks?: boolean;
+  /** 是否对每条分离出的音轨独立执行 MossFormer2_SE_48K 降噪与剔除背景音（默认 true） */
+  applyDenoise?: boolean;
+}
+
+export interface ClearVoiceSeparatedTrackSlice {
+  trackIndex: number;
+  sourceSlot: number;
+  samples: Float32Array;
+  rms: number;
+  energyRatio: number;
+  seApplied: boolean;
+}
+
+export interface ClearVoiceSeparateSliceResult {
+  tracks: ClearVoiceSeparatedTrackSlice[];
+  sampleRate: number;
+  ssUsed: boolean;
+  durationMs: number;
+  ssMs: number;
+  seMs: number;
+  inferMs: number;
+  provider: string;
+  device: "gpu" | "cpu";
+  model: string;
+  gpuName: string | null;
+  swaps: number;
+  pairWcorr: number;
+  pairEcorr: number;
+}
+
+export interface ClearVoiceOfflineTrackItem {
+  trackIndex: number;
+  trackId: string;
+  sourceSlot: number;
+  samples: Float32Array;
+  sampleRate: number;
+  rms: number;
+  energyRatio: number;
+  inputSnrDb: number;
+  outputSnrDb: number;
+  snrGainDb: number;
+}
+
+export interface ClearVoiceOfflineMultiTrackResult {
+  tracks: ClearVoiceOfflineTrackItem[];
+  rawTrackCount: number;
+  keptTrackCount: number;
+  ssUsed: boolean;
+  engine: string;
+  inputSnrDb: number;
+  durationMs: number;
+  ssMs: number;
+  seMs: number;
+  sliceCount: number;
+  crossfadeCount: number;
+  permutationSwaps: number;
+  gpuName: string | null;
+}
+
 export interface ClearVoiceOfflineChunkResult {
   samples: Float32Array;
   sampleRate: number;
@@ -84,15 +155,22 @@ export interface ClearVoiceOfflineChunkResult {
 }
 
 export const CLEARVOICE_MODEL_DIR_NAME = "clearvoice-mossformer2-se-48k";
+export const CLEARVOICE_SS_MODEL_DIR_NAME = "clearvoice-mossformer2-ss-16k";
 export const CLEARVOICE_RUNTIME_DIR_NAME = "clearvoice-gpu-runtime";
 export const CLEARVOICE_MODEL_FP32_FILENAME = "model.onnx";
 export const CLEARVOICE_MODEL_INT8_FILENAME = "model.int8.onnx";
+export const CLEARVOICE_SS_MODEL_FILENAME = "model.onnx";
+export const CLEARVOICE_SS_MODEL_ALT_FILENAME = "mossformer2_ss_16k.onnx";
 
 export const CLEARVOICE_DOWNLOAD_URLS = {
   modelFp32:
     "https://modelscope.cn/models/manyeyes/mossformer2-se-48k-onnx/resolve/master/model.onnx",
   modelInt8:
     "https://modelscope.cn/models/manyeyes/mossformer2-se-48k-onnx/resolve/master/model.int8.onnx",
+  ssModelMirror:
+    "https://hf-mirror.com/kkk4oru/mossformer2-ss-16k-onnx/resolve/main/model.onnx",
+  ssModelPrimary:
+    "https://huggingface.co/kkk4oru/mossformer2-ss-16k-onnx/resolve/main/model.onnx",
 } as const;
 
 const CLEARVOICE_INIT_RETRY_COOLDOWN_MS = 30_000;
@@ -103,6 +181,7 @@ export function resolveClearVoiceGpuPaths(
 ): ClearVoiceGpuModelPaths {
   const root = path.resolve(modelsDir);
   const modelDir = path.join(root, CLEARVOICE_MODEL_DIR_NAME);
+  const ssModelDir = path.join(root, CLEARVOICE_SS_MODEL_DIR_NAME);
   const runtimeDir = path.join(root, CLEARVOICE_RUNTIME_DIR_NAME);
   const pythonBin =
     process.platform === "win32"
@@ -116,6 +195,9 @@ export function resolveClearVoiceGpuPaths(
     modelDir,
     modelFp32Path: path.join(modelDir, CLEARVOICE_MODEL_FP32_FILENAME),
     modelInt8Path: path.join(modelDir, CLEARVOICE_MODEL_INT8_FILENAME),
+    ssModelDir,
+    ssModelPath: path.join(ssModelDir, CLEARVOICE_SS_MODEL_FILENAME),
+    ssModelAltPath: path.join(ssModelDir, CLEARVOICE_SS_MODEL_ALT_FILENAME),
     runtimeDir,
     pythonBin,
     serverScript,
@@ -204,12 +286,15 @@ export class ClearVoiceGpuRuntime {
   private _baseUrl: string | null = null;
   private _startPromise: Promise<string> | null = null;
   private _activeProvider: "cuda" | "cpu" | "remote" | "none" = "none";
+  private _activeSsProvider: "cuda" | "cpu" | "remote" | "none" = "none";
+  private _remoteSeparateSupported: boolean | null = null;
   private _activeGpuName: string | null = null;
   private _warmedUp = false;
   private _initFailedAt = 0;
   private _lastError: string | null = null;
   private _lastLatencyMs: number | null = null;
   private _lastInferMs: number | null = null;
+  private _lastSeparateMs: number | null = null;
   private _disposed = false;
 
   constructor(options: { modelsDir: string; serviceUrl?: string; serverScript?: string }) {
@@ -232,11 +317,14 @@ export class ClearVoiceGpuRuntime {
     const trimmed = url.trim().replace(/\/+$/, "");
     if (trimmed !== this._customServiceUrl) {
       this._customServiceUrl = trimmed;
+      this._remoteSeparateSupported = null;
       this.resetFailureCooldown();
       if (trimmed) {
         this._activeProvider = "remote";
+        this._activeSsProvider = "remote";
       } else if (!this._proc) {
         this._activeProvider = "none";
+        this._activeSsProvider = "none";
       }
     }
   }
@@ -265,8 +353,23 @@ export class ClearVoiceGpuRuntime {
     return null;
   }
 
+  resolveSsModelPath(): string | null {
+    const p = this.paths;
+    if (existsSync(p.ssModelPath) && statSync(p.ssModelPath).size > 10_000_000) {
+      return p.ssModelPath;
+    }
+    if (existsSync(p.ssModelAltPath) && statSync(p.ssModelAltPath).size > 10_000_000) {
+      return p.ssModelAltPath;
+    }
+    return null;
+  }
+
   hasModel(): boolean {
     return this.resolveModelPath() !== null;
+  }
+
+  hasSsModel(): boolean {
+    return this.resolveSsModelPath() !== null;
   }
 
   hasServerScript(): boolean {
@@ -296,9 +399,13 @@ export class ClearVoiceGpuRuntime {
     const gpu = this._detectGpu(false);
     const runtimeReady = this.hasRuntime();
     const modelReady = this.hasModel();
+    const ssModelReady = this.hasSsModel();
     const scriptReady = this.hasServerScript();
     const hasCustom = this._customServiceUrl.length > 0;
     const ready = hasCustom || (runtimeReady && modelReady && scriptReady);
+    const multiTrackReady = hasCustom
+      ? this._remoteSeparateSupported !== false
+      : runtimeReady && modelReady && ssModelReady && scriptReady;
     const serverRunning = hasCustom || (this._proc !== null && this._baseUrl !== null);
     const provider: ClearVoiceGpuStatus["provider"] = hasCustom
       ? "remote"
@@ -309,6 +416,17 @@ export class ClearVoiceGpuRuntime {
           : ready
             ? "cpu"
             : "none";
+    const ssProvider: ClearVoiceGpuStatus["ssProvider"] = hasCustom
+      ? this._remoteSeparateSupported === false
+        ? "none"
+        : "remote"
+      : this._activeSsProvider !== "none"
+        ? this._activeSsProvider
+        : multiTrackReady && gpu.detected
+          ? "cuda"
+          : multiTrackReady
+            ? "cpu"
+            : "none";
 
     return {
       gpuDetected: gpu.detected,
@@ -317,15 +435,20 @@ export class ClearVoiceGpuRuntime {
       vramFreeMb: gpu.vramFreeMb,
       runtimeReady,
       modelReady,
+      ssModelReady,
       scriptReady,
       customServiceUrl: this._customServiceUrl,
       ready,
+      multiTrackReady,
       serverRunning,
       provider,
+      ssProvider,
       modelName: "MossFormer2_SE_48K",
+      ssModelName: "MossFormer2_SS_16K",
       serviceUrl: hasCustom ? this._customServiceUrl : this._baseUrl,
       lastLatencyMs: this._lastLatencyMs,
       lastInferMs: this._lastInferMs,
+      lastSeparateMs: this._lastSeparateMs,
       lastError: this._lastError,
     };
   }
@@ -349,6 +472,7 @@ export class ClearVoiceGpuRuntime {
 
     const pythonBin = this.resolvePythonBin();
     const modelPath = this.resolveModelPath();
+    const ssModelPath = this.resolveSsModelPath();
     const scriptPath = this.paths.serverScript;
 
     if (!pythonBin) {
@@ -371,6 +495,7 @@ export class ClearVoiceGpuRuntime {
         scriptPath,
         "--model",
         modelPath,
+        ...(ssModelPath ? ["--ss-model", ssModelPath] : []),
         "--host",
         "127.0.0.1",
         "--port",
@@ -418,7 +543,7 @@ export class ClearVoiceGpuRuntime {
         }
       });
 
-      const deadline = Date.now() + 90_000;
+      const deadline = Date.now() + 120_000;
       while (Date.now() < deadline) {
         if (this._disposed) {
           this._killProcess();
@@ -438,12 +563,23 @@ export class ClearVoiceGpuRuntime {
             const info = (await res.json()) as {
               provider?: string;
               device?: string;
+              ssReady?: boolean;
+              ssProvider?: string | null;
+              ssDevice?: string | null;
               gpuName?: string | null;
               warmedUp?: boolean;
             };
             this._baseUrl = baseUrl;
             this._activeProvider =
               info.device === "gpu" || info.provider === "CUDAExecutionProvider" ? "cuda" : "cpu";
+            if (info.ssReady) {
+              this._activeSsProvider =
+                info.ssDevice === "gpu" || info.ssProvider === "CUDAExecutionProvider"
+                  ? "cuda"
+                  : "cpu";
+            } else {
+              this._activeSsProvider = "none";
+            }
             if (typeof info.gpuName === "string" && info.gpuName.trim()) {
               this._activeGpuName = info.gpuName.trim();
             }
@@ -459,7 +595,7 @@ export class ClearVoiceGpuRuntime {
       }
 
       this._killProcess();
-      const timeoutMsg = `ClearVoice GPU 服务启动超时 (90s): ${stderrTail.trim().slice(-240)}`;
+      const timeoutMsg = `ClearVoice GPU 服务启动超时 (120s): ${stderrTail.trim().slice(-240)}`;
       this._initFailedAt = Date.now();
       this._lastError = timeoutMsg;
       throw new Error(timeoutMsg);
@@ -682,45 +818,490 @@ export class ClearVoiceGpuRuntime {
   }
 
   /**
-   * 补齐下载 MossFormer2_SE_48K ONNX 模型文件（流式落盘 + 原子重命名）。
+   * 对单个带历史上下文的音频切片调用 GPU ClearVoice（MossFormer2_SS_16K 盲源分离 + 分轨 MossFormer2_SE_48K 降噪去背景音）。
+   * 绝不将多轨音轨混回单轨；若外部服务仅实现旧版 /denoise 接口（返回 404），自动平滑回退为单轨降噪输出。
+   */
+  async separateSlice(
+    pcmWithContext: Float32Array,
+    options: ClearVoiceSeparateSliceOptions = {},
+  ): Promise<ClearVoiceSeparateSliceResult> {
+    if (options.signal?.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
+    const inSr = options.inputSampleRate ?? 16000;
+    const outSr = options.outputSampleRate ?? inSr;
+    if (pcmWithContext.length === 0) {
+      return {
+        tracks: [],
+        sampleRate: outSr,
+        ssUsed: false,
+        durationMs: 0,
+        ssMs: 0,
+        seMs: 0,
+        inferMs: 0,
+        provider: this._activeProvider,
+        device: this._activeProvider === "cuda" ? "gpu" : "cpu",
+        model: "MossFormer2_SE_48K",
+        gpuName: this._activeGpuName,
+        swaps: 0,
+        pairWcorr: 0,
+        pairEcorr: 0,
+      };
+    }
+
+    // 若已确认远程/Mock 服务不支持 /separate，直接走 /denoise 单轨路径避免多余 404 往返
+    if (this._customServiceUrl && this._remoteSeparateSupported === false) {
+      return this._separateFallbackViaDenoise(pcmWithContext, options);
+    }
+
+    const t0 = performance.now();
+    const baseUrl = await this.ensureStarted();
+    if (options.signal?.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
+
+    const bodyBytes = new Uint8Array(
+      pcmWithContext.buffer.slice(
+        pcmWithContext.byteOffset,
+        pcmWithContext.byteOffset + pcmWithContext.byteLength,
+      ),
+    );
+    const timeoutMs = options.timeoutMs ?? (this._warmedUp ? 25_000 : 45_000);
+    const timeoutCtrl = new AbortController();
+    const timer = setTimeout(() => timeoutCtrl.abort(), timeoutMs);
+    const signal = options.signal
+      ? AbortSignal.any([options.signal, timeoutCtrl.signal])
+      : timeoutCtrl.signal;
+
+    try {
+      const res = await fetch(`${baseUrl}/separate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "X-Audio-Format": "f32le",
+          "X-Sample-Rate": String(inSr),
+          "X-Output-Sample-Rate": String(outSr),
+          "X-Prune-Tracks": options.pruneTracks === false ? "0" : "1",
+          "X-Apply-Denoise": options.applyDenoise === false ? "0" : "1",
+        },
+        body: bodyBytes as unknown as BodyInit,
+        signal,
+      });
+
+      if (res.status === 404 || res.status === 405 || res.status === 501) {
+        clearTimeout(timer);
+        if (this._customServiceUrl) {
+          this._remoteSeparateSupported = false;
+        }
+        return this._separateFallbackViaDenoise(pcmWithContext, options);
+      }
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`ClearVoice GPU 盲源分离失败 (${res.status}): ${errText.slice(0, 200)}`);
+      }
+
+      if (this._customServiceUrl) {
+        this._remoteSeparateSupported = true;
+      }
+
+      const arrBuf = await res.arrayBuffer();
+      const totalFloats = Math.floor(arrBuf.byteLength / 4);
+      const flat = new Float32Array(arrBuf, 0, totalFloats);
+
+      const trackCountHdr = Number.parseInt(res.headers.get("X-ClearVoice-Track-Count") || "1", 10);
+      const trackCount = Number.isFinite(trackCountHdr) && trackCountHdr > 0 ? trackCountHdr : 1;
+      const samplesPerTrackHdr = Number.parseInt(
+        res.headers.get("X-ClearVoice-Samples-Per-Track") || "0",
+        10,
+      );
+      const samplesPerTrack =
+        Number.isFinite(samplesPerTrackHdr) && samplesPerTrackHdr > 0
+          ? samplesPerTrackHdr
+          : Math.floor(totalFloats / Math.max(1, trackCount));
+
+      let parsedMeta: Array<{
+        index?: number;
+        sourceSlot?: number;
+        rms?: number;
+        energyRatio?: number;
+        seApplied?: boolean;
+      }> = [];
+      try {
+        const rawMeta = res.headers.get("X-ClearVoice-Track-Meta");
+        if (rawMeta) {
+          const j = JSON.parse(rawMeta);
+          if (Array.isArray(j)) parsedMeta = j;
+        }
+      } catch {
+        // ignore malformed metadata header
+      }
+
+      let pairWcorr = 0;
+      let pairEcorr = 0;
+      try {
+        const rawCorr = res.headers.get("X-ClearVoice-Pair-Corr");
+        if (rawCorr) {
+          const j = JSON.parse(rawCorr) as { wcorr?: number; ecorr?: number };
+          if (typeof j.wcorr === "number") pairWcorr = j.wcorr;
+          if (typeof j.ecorr === "number") pairEcorr = j.ecorr;
+        }
+      } catch {
+        // ignore
+      }
+
+      const tracks: ClearVoiceSeparatedTrackSlice[] = [];
+      for (let i = 0; i < trackCount; i += 1) {
+        const start = i * samplesPerTrack;
+        const end = Math.min(totalFloats, start + samplesPerTrack);
+        if (end <= start) continue;
+        // 每条音轨分配独立拷贝，绝不共享或混叠底层缓冲区
+        const trackSamples = flat.slice(start, end);
+        const m = parsedMeta[i];
+        const rms = typeof m?.rms === "number" ? m.rms : Number(computeRms(trackSamples).toFixed(5));
+        const energyRatio =
+          typeof m?.energyRatio === "number" ? m.energyRatio : Number((1 / trackCount).toFixed(4));
+        tracks.push({
+          trackIndex: i + 1,
+          sourceSlot: typeof m?.sourceSlot === "number" ? m.sourceSlot : i,
+          samples: trackSamples,
+          rms,
+          energyRatio,
+          seApplied: m?.seApplied !== false,
+        });
+      }
+
+      const ssUsed = res.headers.get("X-ClearVoice-SS-Available") === "1";
+      const provider = res.headers.get("X-ClearVoice-Provider") || this._activeProvider;
+      const deviceHdr = (res.headers.get("X-ClearVoice-Device") || "").toLowerCase();
+      const device: "gpu" | "cpu" =
+        deviceHdr === "gpu" || provider === "CUDAExecutionProvider" ? "gpu" : "cpu";
+      const ssMsRaw = Number(res.headers.get("X-ClearVoice-SS-Ms"));
+      const seMsRaw = Number(res.headers.get("X-ClearVoice-SE-Ms"));
+      const inferMsRaw = Number(res.headers.get("X-ClearVoice-Infer-Ms"));
+      const swapsRaw = Number.parseInt(res.headers.get("X-ClearVoice-Swaps") || "0", 10);
+      const gpuName = res.headers.get("X-ClearVoice-Gpu-Name") || this._activeGpuName;
+      const durationMs = Math.round(performance.now() - t0);
+      const ssMs = Number.isFinite(ssMsRaw) ? Number(ssMsRaw.toFixed(1)) : 0;
+      const seMs = Number.isFinite(seMsRaw) ? Number(seMsRaw.toFixed(1)) : 0;
+      const inferMs = Number.isFinite(inferMsRaw)
+        ? Number(inferMsRaw.toFixed(1))
+        : Number((ssMs + seMs).toFixed(1));
+
+      this._warmedUp = true;
+      this._lastLatencyMs = durationMs;
+      this._lastInferMs = inferMs;
+      this._lastSeparateMs = ssUsed ? ssMs : null;
+      if (gpuName) this._activeGpuName = gpuName;
+      if (!this._customServiceUrl) {
+        this._activeProvider = device === "gpu" ? "cuda" : "cpu";
+        if (ssUsed) {
+          this._activeSsProvider = device === "gpu" ? "cuda" : "cpu";
+        }
+      }
+
+      return {
+        tracks,
+        sampleRate: outSr,
+        ssUsed,
+        durationMs,
+        ssMs,
+        seMs,
+        inferMs,
+        provider,
+        device,
+        model:
+          res.headers.get("X-ClearVoice-Model") ||
+          (ssUsed ? "MossFormer2_SS_16K+MossFormer2_SE_48K" : "MossFormer2_SE_48K"),
+        gpuName,
+        swaps: Number.isFinite(swapsRaw) ? swapsRaw : 0,
+        pairWcorr,
+        pairEcorr,
+      };
+    } catch (err) {
+      if (!(err instanceof DOMException && err.name === "AbortError")) {
+        this._lastError = err instanceof Error ? err.message : String(err);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async _separateFallbackViaDenoise(
+    pcmWithContext: Float32Array,
+    options: ClearVoiceSeparateSliceOptions,
+  ): Promise<ClearVoiceSeparateSliceResult> {
+    const res = await this.denoiseSlice(pcmWithContext, options);
+    const r = Number(computeRms(res.samples).toFixed(5));
+    return {
+      tracks: [
+        {
+          trackIndex: 1,
+          sourceSlot: 0,
+          samples: res.samples,
+          rms: r,
+          energyRatio: 1,
+          seApplied: true,
+        },
+      ],
+      sampleRate: res.sampleRate,
+      ssUsed: false,
+      durationMs: res.durationMs,
+      ssMs: 0,
+      seMs: res.inferMs,
+      inferMs: res.inferMs,
+      provider: res.provider,
+      device: res.device,
+      model: res.model,
+      gpuName: res.gpuName,
+      swaps: 0,
+      pairWcorr: 0,
+      pairEcorr: 0,
+    };
+  }
+
+  /**
+   * 对离线音频执行 ClearVoice 多轨盲源分离 + 分轨独立降噪去背景音（长音频按滑窗 + PIT 置换对齐拼接，绝不混回单轨）。
+   */
+  async separateAndEnhanceOfflineWithChunking(
+    pcm: Float32Array,
+    sampleRate = 16000,
+    options: {
+      singlePassMaxMs?: number;
+      maxChunkMs?: number;
+      lookbackMs?: number;
+      crossfadeMs?: number;
+      signal?: AbortSignal;
+    } = {},
+  ): Promise<ClearVoiceOfflineMultiTrackResult> {
+    const t0 = performance.now();
+    const pcm16k = sampleRate === 16000 ? pcm : resampleLinear(pcm, sampleRate, 16000);
+    const inputSnrDb = estimateSnrDb(pcm16k, 16000);
+    if (pcm16k.length < 320) {
+      return {
+        tracks: [],
+        rawTrackCount: 0,
+        keptTrackCount: 0,
+        ssUsed: false,
+        engine: "clearvoice-mossformer2-gpu",
+        inputSnrDb,
+        durationMs: Math.round(performance.now() - t0),
+        ssMs: 0,
+        seMs: 0,
+        sliceCount: 0,
+        crossfadeCount: 0,
+        permutationSwaps: 0,
+        gpuName: this._activeGpuName,
+      };
+    }
+
+    const singlePassMaxSamples = Math.round(16000 * ((options.singlePassMaxMs ?? 4500) / 1000));
+
+    // 中短音频（<= 4.5s）直接整段单次 BSS+SE，无任何切片跨窗置换风险
+    if (pcm16k.length <= singlePassMaxSamples) {
+      const res = await this.separateSlice(pcm16k, {
+        inputSampleRate: 16000,
+        outputSampleRate: 16000,
+        pruneTracks: true,
+        applyDenoise: true,
+        signal: options.signal,
+      });
+      const engineLabel = res.ssUsed
+        ? res.device === "gpu"
+          ? "clearvoice-mossformer2-bss-se-gpu"
+          : "clearvoice-mossformer2-bss-se-cpu"
+        : res.device === "gpu"
+          ? "clearvoice-mossformer2-gpu"
+          : "clearvoice-mossformer2-cpu";
+      const tracks: ClearVoiceOfflineTrackItem[] = res.tracks.map((tr, idx) => {
+        const outSnr = estimateSnrDb(tr.samples, 16000);
+        return {
+          trackIndex: idx + 1,
+          trackId: `cv_track_${idx + 1}`,
+          sourceSlot: tr.sourceSlot,
+          samples: tr.samples,
+          sampleRate: 16000,
+          rms: tr.rms,
+          energyRatio: tr.energyRatio,
+          inputSnrDb,
+          outputSnrDb: outSnr,
+          snrGainDb: Number((outSnr - inputSnrDb).toFixed(2)),
+        };
+      });
+      return {
+        tracks,
+        rawTrackCount: res.ssUsed ? Math.max(2, tracks.length) : tracks.length,
+        keptTrackCount: tracks.length,
+        ssUsed: res.ssUsed,
+        engine: engineLabel,
+        inputSnrDb,
+        durationMs: Math.round(performance.now() - t0),
+        ssMs: res.ssMs,
+        seMs: res.seMs,
+        sliceCount: 1,
+        crossfadeCount: 0,
+        permutationSwaps: res.swaps,
+        gpuName: res.gpuName,
+      };
+    }
+
+    // 长音频（> 4.5s）：按滑窗 + 0.5s 历史上下文 + PIT 置换对齐 + 每轨独立 20ms Overlap-Add 拼接
+    const maxChunkSamples = Math.round(16000 * ((options.maxChunkMs ?? 3000) / 1000));
+    const lookbackSamples = Math.round(16000 * ((options.lookbackMs ?? 500) / 1000));
+    const crossfadeMs = options.crossfadeMs ?? DEFAULT_CLEARVOICE_CHUNKER_CONFIG.crossfadeMs;
+
+    const assembler = new ClearVoiceMultiTrackAssembler({
+      sampleRate: 16000,
+      crossfadeMs,
+      lookbackMs: options.lookbackMs ?? 500,
+    });
+
+    let lastDevice: "gpu" | "cpu" = "gpu";
+    let lastGpuName: string | null = this._activeGpuName;
+    let ssUsedAny = false;
+    let totalSsMs = 0;
+    let totalSeMs = 0;
+    let serverSwaps = 0;
+
+    let pos = 0;
+    let idx = 0;
+    while (pos < pcm16k.length) {
+      const end = Math.min(pcm16k.length, pos + maxChunkSamples);
+      const ctxStart = Math.max(0, pos - lookbackSamples);
+      const actualLookback = pos - ctxStart;
+      const newLen = end - pos;
+      const sliceWithContext = pcm16k.subarray(ctxStart, end);
+
+      const res = await this.separateSlice(sliceWithContext, {
+        inputSampleRate: 16000,
+        outputSampleRate: 16000,
+        pruneTracks: false,
+        applyDenoise: true,
+        signal: options.signal,
+      });
+      lastDevice = res.device;
+      lastGpuName = res.gpuName;
+      ssUsedAny = ssUsedAny || res.ssUsed;
+      totalSsMs += res.ssMs;
+      totalSeMs += res.seMs;
+      serverSwaps += res.swaps;
+
+      assembler.appendSeparatedSlice({
+        tracksWithContext: res.tracks.map((t) => t.samples),
+        lookbackSamples: actualLookback,
+        newSamples: newLen,
+        applyCrossfade: idx > 0,
+      });
+
+      pos = end;
+      idx += 1;
+    }
+
+    const pruned = assembler.getTracks({ prune: true });
+    const engineLabel = ssUsedAny
+      ? lastDevice === "gpu"
+        ? "clearvoice-mossformer2-bss-se-gpu"
+        : "clearvoice-mossformer2-bss-se-cpu"
+      : lastDevice === "gpu"
+        ? "clearvoice-mossformer2-gpu"
+        : "clearvoice-mossformer2-cpu";
+
+    const tracks: ClearVoiceOfflineTrackItem[] = pruned.tracks.map((tr) => {
+      const outSnr = estimateSnrDb(tr.samples, 16000);
+      return {
+        trackIndex: tr.trackIndex,
+        trackId: `cv_track_${tr.trackIndex}`,
+        sourceSlot: tr.sourceSlot,
+        samples: tr.samples,
+        sampleRate: 16000,
+        rms: tr.rms,
+        energyRatio: tr.energyRatio,
+        inputSnrDb,
+        outputSnrDb: outSnr,
+        snrGainDb: Number((outSnr - inputSnrDb).toFixed(2)),
+      };
+    });
+
+    return {
+      tracks,
+      rawTrackCount: assembler.trackSlotCount,
+      keptTrackCount: tracks.length,
+      ssUsed: ssUsedAny,
+      engine: engineLabel,
+      inputSnrDb,
+      durationMs: Math.round(performance.now() - t0),
+      ssMs: Number(totalSsMs.toFixed(1)),
+      seMs: Number(totalSeMs.toFixed(1)),
+      sliceCount: assembler.sliceCount,
+      crossfadeCount: assembler.crossfadeCount,
+      permutationSwaps: assembler.permutationSwaps + serverSwaps,
+      gpuName: lastGpuName,
+    };
+  }
+
+  /**
+   * 补齐下载 MossFormer2_SE_48K 与 MossFormer2_SS_16K ONNX 模型文件（流式落盘 + 原子重命名）。
    */
   async downloadMissingModel(): Promise<ClearVoiceGpuStatus> {
     const p = this.paths;
     mkdirSync(p.modelDir, { recursive: true });
-    if (!this.hasModel()) {
-      const dest = p.modelFp32Path;
+    mkdirSync(p.ssModelDir, { recursive: true });
+
+    const downloadFile = async (urls: readonly string[], dest: string, label: string) => {
       const part = `${dest}.part`;
-      const res = await fetch(CLEARVOICE_DOWNLOAD_URLS.modelFp32, { redirect: "follow" });
-      if (!res.ok) {
-        throw new Error(`下载 ClearVoice MossFormer2_SE_48K 模型失败 (${res.status})`);
-      }
-      if (res.body) {
-        const writer = Bun.file(part).writer();
+      let lastErr: unknown = null;
+      for (const url of urls) {
         try {
-          const reader = res.body.getReader();
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (value && value.byteLength > 0) writer.write(value);
+          const res = await fetch(url, { redirect: "follow" });
+          if (!res.ok) {
+            lastErr = new Error(`下载 ${label} 失败 (${res.status})`);
+            continue;
           }
-          await writer.end();
+          if (res.body) {
+            const writer = Bun.file(part).writer();
+            try {
+              const reader = res.body.getReader();
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (value && value.byteLength > 0) writer.write(value);
+              }
+              await writer.end();
+            } catch (err) {
+              try {
+                await writer.end();
+              } catch {
+                // ignore
+              }
+              try {
+                if (existsSync(part)) unlinkSync(part);
+              } catch {
+                // ignore
+              }
+              throw err;
+            }
+          } else {
+            await Bun.write(part, await res.arrayBuffer());
+          }
+          renameSync(part, dest);
+          return;
         } catch (err) {
-          try {
-            await writer.end();
-          } catch {
-            // ignore
-          }
-          try {
-            if (existsSync(part)) unlinkSync(part);
-          } catch {
-            // ignore
-          }
-          throw err;
+          lastErr = err;
         }
-      } else {
-        await Bun.write(part, await res.arrayBuffer());
       }
-      renameSync(part, dest);
+      throw lastErr instanceof Error ? lastErr : new Error(`下载 ${label} 失败`);
+    };
+
+    if (!this.hasModel()) {
+      await downloadFile([CLEARVOICE_DOWNLOAD_URLS.modelFp32], p.modelFp32Path, "ClearVoice MossFormer2_SE_48K");
+    }
+    if (!this.hasSsModel()) {
+      await downloadFile(
+        [CLEARVOICE_DOWNLOAD_URLS.ssModelMirror, CLEARVOICE_DOWNLOAD_URLS.ssModelPrimary],
+        p.ssModelPath,
+        "ClearVoice MossFormer2_SS_16K",
+      );
     }
     this.resetFailureCooldown();
     this._detectGpu(true);

@@ -3880,6 +3880,7 @@ export class MijiaDeckWebApp {
     const gpuOk = Boolean(status?.readyForQwen3Gpu ?? gpuInfo?.ready);
     const cvInfo = status?.clearVoice ?? null;
     const cvOk = Boolean(status?.readyForClearVoiceGpu ?? cvInfo?.ready);
+    const cvBssOk = Boolean(status?.readyForClearVoiceBss ?? cvInfo?.multiTrackReady);
     const activeDev = status?.activeQwen3Device ?? null;
     const senseVoiceOk = Boolean(status?.readyForSenseVoice ?? status?.models?.senseVoice);
     const asrOk = Boolean(status?.readyForLocalAsr);
@@ -3901,26 +3902,43 @@ export class MijiaDeckWebApp {
     setBadge("badge-model-qwen3-gpu", gpuBadgeLabel, gpuOk);
     const cvBadgeLabel = cvOk
       ? cvInfo?.provider === "cuda"
-        ? "ClearVoice GPU (CUDA)"
+        ? "ClearVoice SE (CUDA)"
         : cvInfo?.provider === "remote"
-          ? "ClearVoice GPU (远程)"
-          : "ClearVoice (MossFormer2)"
-      : "ClearVoice 待就绪";
+          ? "ClearVoice SE (远程)"
+          : "ClearVoice SE"
+      : "ClearVoice SE 待就绪";
     setBadge("badge-model-clearvoice", cvBadgeLabel, cvOk);
     const cvBadgeEl = document.getElementById("badge-model-clearvoice");
     if (cvBadgeEl) {
       cvBadgeEl.title = cvOk
-        ? `MossFormer2_SE_48K 已就绪${cvInfo?.gpuName ? ` · ${cvInfo.gpuName}` : ""}${typeof cvInfo?.lastInferMs === "number" ? ` · 最近推理 ${cvInfo.lastInferMs}ms` : ""}`
-        : "ClearVoice MossFormer2_SE_48K GPU 服务尚未就绪";
+        ? `MossFormer2_SE_48K 降噪去背景音已就绪${cvInfo?.gpuName ? ` · ${cvInfo.gpuName}` : ""}${typeof cvInfo?.lastInferMs === "number" ? ` · 最近推理 ${cvInfo.lastInferMs}ms` : ""}`
+        : "ClearVoice MossFormer2_SE_48K 降噪模型尚未就绪";
+    }
+    const cvSsBadgeLabel = cvBssOk
+      ? cvInfo?.ssProvider === "cuda"
+        ? "ClearVoice BSS 多轨 (CUDA)"
+        : cvInfo?.ssProvider === "remote"
+          ? "ClearVoice BSS 多轨 (远程)"
+          : "ClearVoice BSS 多轨"
+      : "ClearVoice BSS 待就绪";
+    setBadge("badge-model-clearvoice-ss", cvSsBadgeLabel, cvBssOk);
+    const cvSsBadgeEl = document.getElementById("badge-model-clearvoice-ss");
+    if (cvSsBadgeEl) {
+      cvSsBadgeEl.title = cvBssOk
+        ? `MossFormer2_SS_16K 多轨盲源分离已就绪${typeof cvInfo?.lastSeparateMs === "number" ? ` · 最近分离 ${cvInfo.lastSeparateMs}ms` : ""}`
+        : "ClearVoice MossFormer2_SS_16K 多轨盲源分离模型尚未就绪（可点击一键补齐模型下载）";
     }
     const cvDescEl = document.getElementById("set-voice-clearvoice-desc");
     if (cvDescEl) {
-      if (cvOk) {
+      if (cvOk && cvBssOk) {
         const gpuLabel = cvInfo?.gpuName ? `${cvInfo.gpuName} (${(cvInfo.provider || "cuda").toUpperCase()})` : (cvInfo?.provider || "GPU").toUpperCase();
-        cvDescEl.textContent = `ClearVoice 服务已就绪（MossFormer2_SE_48K · ${gpuLabel}）。开启后启用新方案：32ms 采集 → Silero VAD 双触发切片（280ms 静音优先 / 2.0s 超时）→ 0.3s 历史上下文 GPU 降噪 → 20ms 交叉淡入淡出 → Qwen3-ASR 转文字；关闭则使用原方案`;
+        cvDescEl.textContent = `ClearVoice 多轨盲源分离与降噪服务已全面就绪（MossFormer2_SS_16K + MossFormer2_SE_48K · ${gpuLabel}）。先盲源分离再分轨降噪与剔除背景音，每条音轨独立执行声纹识别、Qwen3-ASR 转文字、逻辑判定与后续流程，界面分轨展示绝不混轨`;
+      } else if (cvOk) {
+        const gpuLabel = cvInfo?.gpuName ? `${cvInfo.gpuName} (${(cvInfo.provider || "cuda").toUpperCase()})` : (cvInfo?.provider || "GPU").toUpperCase();
+        cvDescEl.textContent = `ClearVoice SE 降噪已就绪（MossFormer2_SE_48K · ${gpuLabel}；MossFormer2_SS_16K 盲源分离模型待补齐）。开启后按准实时滑窗降噪并送入独立分轨处理管线；关闭则使用原方案`;
       } else {
         cvDescEl.textContent =
-          "开启后切换为 ClearVoice 准实时切片 → Qwen3-ASR 新方案（当前 ClearVoice GPU 运行时或 MossFormer2 模型未就绪，将自动平滑降级本地降噪）；关闭则使用原方案";
+          "开启后切换为 ClearVoice 多轨盲源分离 + 分轨降噪去背景音 → 分轨独立声纹/Qwen3-ASR/逻辑判定新方案（当前 ClearVoice GPU 运行时或模型未就绪，将自动平滑降级本地降噪）；关闭则使用原方案";
       }
     }
     const gpuBadgeEl = document.getElementById("badge-model-qwen3-gpu");

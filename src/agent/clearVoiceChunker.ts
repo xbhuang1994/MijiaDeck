@@ -280,6 +280,524 @@ export class ClearVoiceSliceAssembler {
   }
 }
 
+/**
+ * 计算两段等长（或取较短段）音频的归一化波形相关性（[-1, 1]）。
+ */
+export function computeNormalizedWaveformCorr(a: Float32Array, b: Float32Array): number {
+  const n = Math.min(a.length, b.length);
+  if (n < 16) return 0;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < n; i += 1) {
+    const x = a[i]!;
+    const y = b[i]!;
+    dot += x * y;
+    na += x * x;
+    nb += y * y;
+  }
+  const denom = Math.sqrt(na * nb);
+  return denom > 1e-10 ? dot / denom : 0;
+}
+
+/**
+ * 计算两段音频的短时 RMS 包络相关性（20ms 窗，用于识别单人说话在双轨 BSS 中的镜像串音残影轨）。
+ */
+export function computeEnvelopeCorr(a: Float32Array, b: Float32Array, windowSamples = 320): number {
+  const win = Math.max(32, windowSamples);
+  const frames = Math.floor(Math.min(a.length, b.length) / win);
+  if (frames < 2) return 0;
+  const ea = new Float64Array(frames);
+  const eb = new Float64Array(frames);
+  let meanA = 0;
+  let meanB = 0;
+  for (let f = 0; f < frames; f += 1) {
+    const off = f * win;
+    let sa = 0;
+    let sb = 0;
+    for (let i = 0; i < win; i += 1) {
+      const va = a[off + i]!;
+      const vb = b[off + i]!;
+      sa += va * va;
+      sb += vb * vb;
+    }
+    ea[f] = Math.sqrt(sa / win);
+    eb[f] = Math.sqrt(sb / win);
+    meanA += ea[f]!;
+    meanB += eb[f]!;
+  }
+  meanA /= frames;
+  meanB /= frames;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let f = 0; f < frames; f += 1) {
+    const da = ea[f]! - meanA;
+    const db = eb[f]! - meanB;
+    dot += da * db;
+    na += da * da;
+    nb += db * db;
+  }
+  const denom = Math.sqrt(na * nb);
+  return denom > 1e-10 ? dot / denom : 0;
+}
+
+/**
+ * 轻量相位无关的多频带短时谱包络相关性（4 频带 × 20ms 窗，零外部依赖）：
+ * 用于识别单说话人经过 BSS+SE 出现微小相位偏移后的镜像串音残影轨，避免把同一人重复拆成两条假音轨，
+ * 同时完整保留不同说话人/人声+歌声的真实多轨分离输出。
+ */
+export function computeSubbandSpectralCorr(a: Float32Array, b: Float32Array, windowSamples = 320): number {
+  const win = Math.max(64, windowSamples);
+  const frames = Math.floor(Math.min(a.length, b.length) / win);
+  if (frames < 2) return 0;
+  // 4 个近似中心频点 DFT 幅度（250Hz / 750Hz / 1600Hz / 3200Hz @ 16kHz）
+  const binFreqs = [5, 15, 32, 64];
+  const bands = binFreqs.length;
+  const fa = new Float64Array(frames * bands);
+  const fb = new Float64Array(frames * bands);
+  let meanA = 0;
+  let meanB = 0;
+  for (let f = 0; f < frames; f += 1) {
+    const off = f * win;
+    for (let bi = 0; bi < bands; bi += 1) {
+      const k = binFreqs[bi]!;
+      const step = (2 * Math.PI * k) / win;
+      let ra = 0;
+      let ia = 0;
+      let rb = 0;
+      let ib = 0;
+      for (let i = 0; i < win; i += 1) {
+        const ang = step * i;
+        const c = Math.cos(ang);
+        const s = Math.sin(ang);
+        const va = a[off + i]!;
+        const vb = b[off + i]!;
+        ra += va * c;
+        ia -= va * s;
+        rb += vb * c;
+        ib -= vb * s;
+      }
+      const ma = Math.log1p(Math.hypot(ra, ia));
+      const mb = Math.log1p(Math.hypot(rb, ib));
+      const idx = f * bands + bi;
+      fa[idx] = ma;
+      fb[idx] = mb;
+      meanA += ma;
+      meanB += mb;
+    }
+  }
+  const total = frames * bands;
+  meanA /= total;
+  meanB /= total;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < total; i += 1) {
+    const da = fa[i]! - meanA;
+    const db = fb[i]! - meanB;
+    dot += da * db;
+    na += da * da;
+    nb += db * db;
+  }
+  const denom = Math.sqrt(na * nb);
+  return denom > 1e-10 ? dot / denom : 0;
+}
+
+/**
+ * 跨切片 PIT 置换对齐（Permutation Invariant Alignment）：
+ * ClearVoice MossFormer2_SS_16K 对不同切片输出的音轨顺序可能发生对调（轨0/轨1互换），
+ * 若不对齐直接拼接会把两名说话人混杂进同一音轨！
+ * 本函数利用当前切片头部 0.3s 历史重叠区与各轨上一段末尾 0.3s 的归一化波形相关性，
+ * 自动找出最优无混叠映射，确保每条音轨始终锁定同一声源、绝不串轨混杂。
+ */
+export function alignSeparatedTracksWithPrevTails(
+  prevTails: ReadonlyArray<Float32Array>,
+  currTracks: ReadonlyArray<Float32Array>,
+  lookbackSamples: number,
+): { aligned: Float32Array[]; swapped: boolean; permutation: number[] } {
+  const count = currTracks.length;
+  if (count <= 1 || prevTails.length < count || lookbackSamples < 32) {
+    return {
+      aligned: currTracks.map((t) => t),
+      swapped: false,
+      permutation: currTracks.map((_, i) => i),
+    };
+  }
+
+  const ovLen = Math.min(
+    lookbackSamples,
+    ...prevTails.slice(0, count).map((p) => p.length),
+    ...currTracks.map((c) => c.length),
+  );
+  if (ovLen < 32) {
+    return {
+      aligned: currTracks.map((t) => t),
+      swapped: false,
+      permutation: currTracks.map((_, i) => i),
+    };
+  }
+
+  const prevSlice = prevTails.slice(0, count).map((p) => p.subarray(p.length - ovLen));
+  const currSlice = currTracks.map((c) => c.subarray(0, ovLen));
+
+  // 双轨精确全局最优匹配（覆盖 MossFormer2_SS_16K 的主场景）
+  if (count === 2) {
+    const scoreSame =
+      computeNormalizedWaveformCorr(prevSlice[0]!, currSlice[0]!) +
+      computeNormalizedWaveformCorr(prevSlice[1]!, currSlice[1]!);
+    const scoreSwap =
+      computeNormalizedWaveformCorr(prevSlice[0]!, currSlice[1]!) +
+      computeNormalizedWaveformCorr(prevSlice[1]!, currSlice[0]!);
+    if (scoreSwap > scoreSame + 1e-4) {
+      return {
+        aligned: [currTracks[1]!, currTracks[0]!],
+        swapped: true,
+        permutation: [1, 0],
+      };
+    }
+    return {
+      aligned: [currTracks[0]!, currTracks[1]!],
+      swapped: false,
+      permutation: [0, 1],
+    };
+  }
+
+  // 多于 2 轨时执行贪心最优匹配
+  const usedCurr = new Set<number>();
+  const permutation = new Array<number>(count).fill(0);
+  const aligned = new Array<Float32Array>(count);
+  let swapped = false;
+  for (let pIdx = 0; pIdx < count; pIdx += 1) {
+    let bestC = -1;
+    let bestScore = -Infinity;
+    for (let cIdx = 0; cIdx < count; cIdx += 1) {
+      if (usedCurr.has(cIdx)) continue;
+      const sc = computeNormalizedWaveformCorr(prevSlice[pIdx]!, currSlice[cIdx]!);
+      if (sc > bestScore) {
+        bestScore = sc;
+        bestC = cIdx;
+      }
+    }
+    const chosen = bestC >= 0 ? bestC : pIdx;
+    usedCurr.add(chosen);
+    permutation[pIdx] = chosen;
+    aligned[pIdx] = currTracks[chosen]!;
+    if (chosen !== pIdx) swapped = true;
+  }
+  return { aligned, swapped, permutation };
+}
+
+export interface PrunedTrackItem {
+  /** 1-based 展示序号 */
+  trackIndex: number;
+  /** 原始分离槽位索引（0-based） */
+  sourceSlot: number;
+  samples: Float32Array;
+  rms: number;
+  energyRatio: number;
+}
+
+export interface PruneTracksOptions {
+  /** 绝对最小 RMS 门限（默认 0.0045） */
+  minAbsoluteRms?: number;
+  /** 相对最强轨最小 RMS 比值（默认 0.12，约 -18.4 dB） */
+  minRelativeRmsRatio?: number;
+  /** 判定镜像串音轨的波形相关性门限（默认 0.58） */
+  duplicateWaveformCorr?: number;
+  /** 判定镜像串音轨的能量包络相关性门限（默认 0.75） */
+  duplicateEnvelopeCorr?: number;
+}
+
+export interface PruneTracksResult {
+  tracks: PrunedTrackItem[];
+  droppedCount: number;
+  pairWcorr: number;
+  pairEcorr: number;
+}
+
+/**
+ * 过滤静音残余轨与单说话人镜像串音轨（严禁将多条独立音轨混杂合并！仅剔除无效空轨/镜像残影）：
+ * - 单说话人输入 -> 保留主轨（1 轨），不产生重复假指令；
+ * - 多说话人或人声+背景歌声 -> 保留全部独立有效音轨（2+ 轨），各自完整保留原始未混叠波形。
+ */
+export function pruneInactiveOrDuplicateTracks(
+  tracks: ReadonlyArray<Float32Array>,
+  options: PruneTracksOptions = {},
+): PruneTracksResult {
+  if (tracks.length === 0) {
+    return { tracks: [], droppedCount: 0, pairWcorr: 0, pairEcorr: 0 };
+  }
+  const minAbsRms = options.minAbsoluteRms ?? 0.0045;
+  const minRelRatio = options.minRelativeRmsRatio ?? 0.12;
+  const dupWcorr = options.duplicateWaveformCorr ?? 0.58;
+  const dupEcorr = options.duplicateEnvelopeCorr ?? 0.75;
+
+  const rmsList = tracks.map((t) => computeRms(t));
+  let strongestIdx = 0;
+  let maxRms = rmsList[0] ?? 0;
+  for (let i = 1; i < rmsList.length; i += 1) {
+    if ((rmsList[i] ?? 0) > maxRms) {
+      maxRms = rmsList[i]!;
+      strongestIdx = i;
+    }
+  }
+
+  let pairWcorr = 0;
+  let pairEcorr = 0;
+  if (tracks.length >= 2) {
+    pairWcorr = Math.abs(computeNormalizedWaveformCorr(tracks[0]!, tracks[1]!));
+    pairEcorr = computeEnvelopeCorr(tracks[0]!, tracks[1]!);
+  }
+
+  const keptSlots: number[] = [];
+  for (let i = 0; i < tracks.length; i += 1) {
+    const tr = tracks[i]!;
+    if (tr.length === 0) continue;
+    const r = rmsList[i] ?? 0;
+    if (i === strongestIdx) {
+      keptSlots.push(i);
+      continue;
+    }
+    if (r < minAbsRms || (maxRms > 1e-6 && r < maxRms * minRelRatio)) {
+      continue;
+    }
+    const wCorr = Math.abs(computeNormalizedWaveformCorr(tracks[strongestIdx]!, tr));
+    const eCorr = computeEnvelopeCorr(tracks[strongestIdx]!, tr);
+    const sCorr = computeSubbandSpectralCorr(tracks[strongestIdx]!, tr);
+    const relRatio = maxRms > 1e-6 ? r / maxRms : 0;
+    if (
+      (wCorr >= dupWcorr && eCorr >= dupEcorr) ||
+      (sCorr >= 0.72 && (wCorr >= 0.22 || eCorr >= 0.55 || relRatio <= 0.55))
+    ) {
+      continue;
+    }
+    keptSlots.push(i);
+  }
+
+  if (keptSlots.length === 0 && tracks[strongestIdx] && tracks[strongestIdx]!.length > 0) {
+    keptSlots.push(strongestIdx);
+  }
+
+  const totalEnergy = keptSlots.reduce((acc, slot) => {
+    const r = rmsList[slot] ?? 0;
+    return acc + r * r;
+  }, 0);
+
+  const items: PrunedTrackItem[] = keptSlots.map((slot, outIdx) => {
+    const r = rmsList[slot] ?? 0;
+    const ratio = totalEnergy > 1e-12 ? (r * r) / totalEnergy : 1 / Math.max(1, keptSlots.length);
+    return {
+      trackIndex: outIdx + 1,
+      sourceSlot: slot,
+      samples: tracks[slot]!,
+      rms: Number(r.toFixed(5)),
+      energyRatio: Number(ratio.toFixed(4)),
+    };
+  });
+
+  return {
+    tracks: items,
+    droppedCount: Math.max(0, tracks.length - items.length),
+    pairWcorr: Number(pairWcorr.toFixed(4)),
+    pairEcorr: Number(pairEcorr.toFixed(4)),
+  };
+}
+
+export interface ClearVoiceMultiTrackSliceInput {
+  /** ClearVoice 盲源分离 + 分轨降噪后的多轨切片（每条长度对应 [lookback, new]） */
+  tracksWithContext: ReadonlyArray<Float32Array>;
+  lookbackSamples: number;
+  newSamples: number;
+  applyCrossfade: boolean;
+}
+
+export interface ClearVoiceMultiTrackSliceResult {
+  trackCount: number;
+  swapped: boolean;
+  crossfadeApplied: boolean;
+  stitchedTotalSamples: number;
+}
+
+/**
+ * 多轨独立切片装配器：
+ * - 为每条盲源分离音轨维护完全独立的 ClearVoiceSliceAssembler（互不混叠、零串轨）；
+ * - 每次追加新切片前，利用 0.3s 历史重叠区执行 PIT 置换对齐，防止 MossFormer2_SS 跨切片换轨；
+ * - 每条音轨各自执行 20ms 线性交叉淡入淡出平滑拼接，绝不将多轨音轨混杂回单轨！
+ */
+export class ClearVoiceMultiTrackAssembler {
+  readonly sampleRate: number;
+  readonly crossfadeMs: number;
+  readonly lookbackTailSamples: number;
+
+  private _assemblers: ClearVoiceSliceAssembler[] = [];
+  private _prevTails: Float32Array[] = [];
+  private _sliceCount = 0;
+  private _crossfadeCount = 0;
+  private _permutationSwaps = 0;
+
+  constructor(
+    options: {
+      sampleRate?: number;
+      crossfadeMs?: number;
+      lookbackMs?: number;
+    } = {},
+  ) {
+    this.sampleRate = options.sampleRate ?? DEFAULT_CLEARVOICE_CHUNKER_CONFIG.sampleRate;
+    this.crossfadeMs = options.crossfadeMs ?? DEFAULT_CLEARVOICE_CHUNKER_CONFIG.crossfadeMs;
+    const lbMs = options.lookbackMs ?? DEFAULT_CLEARVOICE_CHUNKER_CONFIG.lookbackMs;
+    this.lookbackTailSamples = Math.max(320, Math.round((this.sampleRate * Math.max(lbMs, 300)) / 1000));
+  }
+
+  get trackSlotCount(): number {
+    return this._assemblers.length;
+  }
+
+  get sliceCount(): number {
+    return this._sliceCount;
+  }
+
+  get crossfadeCount(): number {
+    return this._crossfadeCount;
+  }
+
+  get permutationSwaps(): number {
+    return this._permutationSwaps;
+  }
+
+  get totalSamples(): number {
+    return this._assemblers.reduce((maxLen, a) => Math.max(maxLen, a.totalSamples), 0);
+  }
+
+  private _ensureSlots(slotCount: number): void {
+    const existingSamples = this.totalSamples;
+    while (this._assemblers.length < slotCount) {
+      const asm = new ClearVoiceSliceAssembler({
+        sampleRate: this.sampleRate,
+        crossfadeMs: this.crossfadeMs,
+      });
+      if (existingSamples > 0) {
+        asm.appendEnhancedSlice({
+          enhancedWithContext: new Float32Array(existingSamples),
+          lookbackSamples: 0,
+          newSamples: existingSamples,
+          applyCrossfade: false,
+        });
+      }
+      this._assemblers.push(asm);
+      this._prevTails.push(new Float32Array(0));
+    }
+  }
+
+  appendSeparatedSlice(input: ClearVoiceMultiTrackSliceInput): ClearVoiceMultiTrackSliceResult {
+    const rawTracks = input.tracksWithContext;
+    if (rawTracks.length === 0) {
+      return {
+        trackCount: this._assemblers.length,
+        swapped: false,
+        crossfadeApplied: false,
+        stitchedTotalSamples: this.totalSamples,
+      };
+    }
+
+    const slotCount = Math.max(this._assemblers.length, rawTracks.length);
+    this._ensureSlots(slotCount);
+
+    // 若本片返回的轨数少于已有槽位数（如某片退回单轨），其余槽位补静音保持时间对齐且不污染主轨
+    const normalizedTracks: Float32Array[] = [];
+    const expectedSliceLen = rawTracks[0]!.length;
+    for (let i = 0; i < slotCount; i += 1) {
+      normalizedTracks.push(rawTracks[i] ?? new Float32Array(expectedSliceLen));
+    }
+
+    let alignedTracks = normalizedTracks;
+    let swapped = false;
+    if (this._sliceCount > 0 && slotCount > 1 && input.lookbackSamples > 0) {
+      const aligned = alignSeparatedTracksWithPrevTails(
+        this._prevTails,
+        normalizedTracks,
+        input.lookbackSamples,
+      );
+      alignedTracks = aligned.aligned;
+      swapped = aligned.swapped;
+      if (swapped) {
+        this._permutationSwaps += 1;
+      }
+    }
+
+    let anyCrossfade = false;
+    let maxTotal = 0;
+    for (let i = 0; i < slotCount; i += 1) {
+      const asm = this._assemblers[i]!;
+      const res = asm.appendEnhancedSlice({
+        enhancedWithContext: alignedTracks[i]!,
+        lookbackSamples: input.lookbackSamples,
+        newSamples: input.newSamples,
+        applyCrossfade: input.applyCrossfade,
+      });
+      if (res.crossfadeApplied) {
+        anyCrossfade = true;
+      }
+      maxTotal = Math.max(maxTotal, res.stitchedTotalSamples);
+
+      // 更新该音轨的最近 lookback 尾部，供下一切片做 PIT 置换对齐
+      const fullTrack = asm.getStitchedAudio();
+      const tailLen = Math.min(this.lookbackTailSamples, fullTrack.length);
+      this._prevTails[i] = tailLen > 0 ? fullTrack.slice(fullTrack.length - tailLen) : new Float32Array(0);
+    }
+
+    if (anyCrossfade) {
+      this._crossfadeCount += 1;
+    }
+    this._sliceCount += 1;
+
+    return {
+      trackCount: slotCount,
+      swapped,
+      crossfadeApplied: anyCrossfade,
+      stitchedTotalSamples: maxTotal,
+    };
+  }
+
+  getRawTracks(): Float32Array[] {
+    return this._assemblers.map((a) => a.getStitchedAudio());
+  }
+
+  getTracks(options: { prune?: boolean } & PruneTracksOptions = {}): PruneTracksResult {
+    const raw = this.getRawTracks();
+    if (options.prune === false) {
+      const rmsList = raw.map((t) => computeRms(t));
+      const totalEnergy = rmsList.reduce((acc, r) => acc + r * r, 0);
+      const tracks: PrunedTrackItem[] = raw.map((samples, idx) => {
+        const r = rmsList[idx] ?? 0;
+        const ratio = totalEnergy > 1e-12 ? (r * r) / totalEnergy : 1 / Math.max(1, raw.length);
+        return {
+          trackIndex: idx + 1,
+          sourceSlot: idx,
+          samples,
+          rms: Number(r.toFixed(5)),
+          energyRatio: Number(ratio.toFixed(4)),
+        };
+      });
+      return {
+        tracks,
+        droppedCount: 0,
+        pairWcorr: raw.length >= 2 ? Number(Math.abs(computeNormalizedWaveformCorr(raw[0]!, raw[1]!)).toFixed(4)) : 0,
+        pairEcorr: raw.length >= 2 ? Number(computeEnvelopeCorr(raw[0]!, raw[1]!).toFixed(4)) : 0,
+      };
+    }
+    return pruneInactiveOrDuplicateTracks(raw, options);
+  }
+
+  reset(): void {
+    this._assemblers = [];
+    this._prevTails = [];
+    this._sliceCount = 0;
+    this._crossfadeCount = 0;
+    this._permutationSwaps = 0;
+  }
+}
+
 export interface ClearVoiceRealtimeChunkerOptions extends Partial<ClearVoiceChunkerConfig> {
   /** 输入音频采样率（默认 16000Hz，非目标采样率将自动重采样） */
   inputSampleRate?: number;
