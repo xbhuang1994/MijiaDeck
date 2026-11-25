@@ -1679,6 +1679,69 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         ? decoded.samples
         : resampleLinear(decoded.samples, decoded.sampleRate, 16000);
 
+    // ---- Stage 1.1: 未唤醒门控（HTTP 兜底上传模式）：未唤醒且 openWakeWord 原型就绪时仅做轻量声学唤醒检测，未命中则不调用 ClearVoice/ASR ----
+    const uploadNow = Date.now();
+    const uploadDurMs = Math.round((pcm16k.length / 16000) * 1000);
+    const uploadSpeechStartedAt = Math.max(0, uploadNow - Math.min(30_000, uploadDurMs));
+    const uploadAwakeActive =
+      this._awakeUntil !== null &&
+      (uploadNow < this._awakeUntil || uploadSpeechStartedAt < this._awakeUntil);
+    const uploadConvActive =
+      cfg.conversationWindowSec > 0 &&
+      this._conversationUntil !== null &&
+      (uploadNow < this._conversationUntil || uploadSpeechStartedAt < this._conversationUntil);
+    const uploadInConversation =
+      this._dialogState === "conversation" || uploadAwakeActive || uploadConvActive;
+    if (
+      autoDispatch &&
+      cfg.wakeWordEnabled &&
+      !options.bypassWakeWord &&
+      !uploadInConversation &&
+      cfg.owwEnabled &&
+      this._localEngine.openWakeWord.isReady &&
+      getPrototypesForWords(cfg.wakeWords).length > 0
+    ) {
+      let gateHit = this._localEngine.scoreWakeWordAudio(pcm16k, cfg.wakeWords, {
+        threshold: cfg.owwThreshold,
+      });
+      if (!gateHit?.matched && cfg.noiseSuppressionMode !== "off") {
+        const quickDen = this._localEngine.denoise(pcm16k, 16000, "auto");
+        const denHit = this._localEngine.scoreWakeWordAudio(quickDen.samples, cfg.wakeWords, {
+          threshold: cfg.owwThreshold,
+        });
+        if (denHit && (!gateHit || denHit.score > gateHit.score)) {
+          gateHit = denHit;
+        }
+      }
+      if (!gateHit?.matched) {
+        const timings: VoicePipelineTimings = {
+          totalMs: Math.round(performance.now() - totalStart),
+        };
+        this._lastMetrics = {
+          denoiseEngine: "oww-standby",
+          vadEngine: "oww-wake-gate",
+          asrEngine: "skipped-unawakened",
+          acousticWake: gateHit,
+          timings,
+          updatedAt: Date.now(),
+        };
+        return {
+          ok: true,
+          text: "",
+          speechDetected: true,
+          denoiseEngine: "oww-standby",
+          vadEngine: "oww-wake-gate",
+          asrEngine: "skipped-unawakened",
+          acousticWake: gateHit,
+          matched: false,
+          wokeOnly: false,
+          command: "",
+          timings,
+          voiceState: this.snapshot(),
+        };
+      }
+    }
+
     // ---- Stage 1.5: 本地自适应多级声源分离与说话人隔离主通道（S_Fused 最终方案） ----
     this._localEngine.setPreferredAsrEngine?.(cfg.localAsrEngine);
     this._localEngine.setQwen3ComputeDevice?.(cfg.qwen3ComputeDevice);

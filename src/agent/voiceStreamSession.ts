@@ -113,6 +113,16 @@ export interface VoiceStreamSessionOptions {
   vadSensitivity?: VadSensitivityMode;
   sampleRate?: number;
   bypassWakeWord?: boolean;
+  /** 是否启用唤醒词门控（未显式传入时，配置了 wakeWords 则默认 true） */
+  wakeWordEnabled?: boolean;
+  /**
+   * 未唤醒时禁用实时语音转文字（默认 true）：
+   * - 未唤醒待机期仅持续写入循环录制缓冲区并运行轻量级 openWakeWord 声学唤醒检测，不执行实时流式 ASR / ClearVoice 切片 / 分段转写；
+   * - 命中唤醒后再将循环录制缓冲区与后续音频统一送入降噪与语音转文字管线。
+   */
+  wakeGatedAsr?: boolean;
+  /** 唤醒后从循环录制缓冲区回溯并转写的历史窗口时长（ms，默认 1800ms，范围 600–6000ms） */
+  wakeRingLookbackMs?: number;
   isInConversation?: () => boolean;
   autoGainEnabled?: boolean;
   wakeWordCooldownMs?: number;
@@ -162,11 +172,26 @@ interface HeldLegacySegment {
   timer: ReturnType<typeof setTimeout> | null;
 }
 
+interface ClearVoiceUtteranceMeta {
+  wakeAnchored: boolean;
+  acousticWake: WakeWordAcousticHit | null;
+  endGlobalSample: number;
+}
+
+interface ClearVoiceQueuedSlice {
+  chunk: ClearVoiceChunkDescriptor;
+  startGlobalSample: number;
+  wakeAuthorized: boolean;
+  utteranceMeta?: ClearVoiceUtteranceMeta;
+}
+
 const TARGET_SR = 16000;
 const RAW_RING_CAPACITY = TARGET_SR * 35; // 35 秒对齐环形缓冲（完整容纳 30s 慢语速长语音）
 const PRE_ROLL_SAMPLES = Math.round(TARGET_SR * 0.32);
 const POST_ROLL_SAMPLES = Math.round(TARGET_SR * 0.16);
 const ROLLING_OVERLAP_SAMPLES = Math.round(TARGET_SR * 1.0); // 持续音乐强制切窗时保留 1.0s 重叠防止切半个唤醒词
+const DEFAULT_WAKE_RING_LOOKBACK_MS = 1800; // 唤醒后回溯循环录制缓冲区的默认窗口（完整覆盖唤醒词、前导呼唤与紧接词首）
+const POST_WAKE_GAP_REPLAY_MAX_SAMPLES = Math.round(TARGET_SR * 1.6);
 const MAX_UTTERANCE_SEC = 30.0; // 正常人声/对话/唤醒锚定单句安全上限（避免 3.8s 强行腰斩长语音）
 const STANDBY_BGM_ROLL_SEC = 4.2; // 仅待机持续高底噪背景音乐时启用滚动切窗防积压
 const LONG_UTTERANCE_THRESHOLD_SEC = 3.0;
@@ -199,6 +224,11 @@ export class VoiceStreamSession {
   private _oww: OpenWakeWordStreamSession | null;
   private _wakeWords: string[];
   private _owwThreshold: number | undefined;
+  private _wakeWordEnabled: boolean;
+  private _owwEnabled: boolean;
+  private readonly _wakeGatedAsr: boolean;
+  private readonly _wakeRingLookbackSamples: number;
+  private _wasAwake = false;
 
   // 实时流式转写与整句保护状态（默认只出实时字幕、不中途强拆多句，等说完统一发送给 Pi Agent）
   private _streamingAsrEnabled: boolean;
@@ -215,7 +245,7 @@ export class VoiceStreamSession {
   // ClearVoice GPU 多轨盲源分离 + 分轨降噪准实时切片管线状态（按需惰性初始化，支持运行期无缝热切换）
   private _cvChunker: ClearVoiceRealtimeChunker | null = null;
   private _cvAssembler: ClearVoiceMultiTrackAssembler | null = null;
-  private _cvSliceQueue: ClearVoiceChunkDescriptor[] = [];
+  private _cvSliceQueue: ClearVoiceQueuedSlice[] = [];
   private _cvInFlight = false;
   private _cvIdleResolvers: Array<() => void> = [];
   private _cvRawChunks: Float32Array[] = [];
@@ -227,7 +257,13 @@ export class VoiceStreamSession {
   private _cvLastEngine = "clearvoice-mossformer2-gpu";
   private _cvLastGpuName: string | null = null;
   private _cvUtteranceStartSample: number | null = null;
+  private _cvWakeAnchored = false;
+  private _cvWakeHit: WakeWordAcousticHit | null = null;
+  private _cvBaseGlobalSample = 0;
+  private _cvFedUpToGlobalSample = 0;
+  private _cvPendingEmitCount = 0;
   private _cvGen = 0;
+  private _legacyFedUpToGlobalSample = 0;
   private _streamSpeechOriginSample: number | null = null;
   private _streamLastDecodedEndSample = 0;
   private _streamDecodeInFlight = false;
@@ -275,6 +311,17 @@ export class VoiceStreamSession {
     this._inputRate = options.sampleRate ?? TARGET_SR;
     this._wakeWords = [...(options.wakeWords ?? [])];
     this._owwThreshold = options.owwThreshold;
+    this._wakeWordEnabled =
+      options.wakeWordEnabled !== undefined
+        ? Boolean(options.wakeWordEnabled)
+        : this._wakeWords.length > 0;
+    this._owwEnabled = options.owwEnabled !== false;
+    this._wakeGatedAsr = options.wakeGatedAsr !== false;
+    const lookbackMs = Math.max(
+      600,
+      Math.min(6000, Math.round(options.wakeRingLookbackMs ?? DEFAULT_WAKE_RING_LOOKBACK_MS)),
+    );
+    this._wakeRingLookbackSamples = Math.round((TARGET_SR * lookbackMs) / 1000);
     this._streamingAsrEnabled = options.streamingAsrEnabled === true;
     this._streamingSentenceSplit = options.streamingSentenceSplit === true;
     this._voicePipelineMode = options.voicePipelineMode === "clearvoice" ? "clearvoice" : "legacy";
@@ -326,12 +373,90 @@ export class VoiceStreamSession {
     });
 
     this._oww =
-      options.owwEnabled !== false
+      this._owwEnabled
         ? options.localEngine.createWakeWordStream(this._wakeWords, {
             threshold: this._owwThreshold,
             onSpot: (hit) => this._handleWakeSpot(hit),
           })
         : null;
+    this._wasAwake = this.isAwake;
+  }
+
+  /**
+   * 当前是否处于已唤醒/免唤醒态（允许执行降噪切片与实时/分段语音转文字）。
+   */
+  get isAwake(): boolean {
+    if (this._opts.bypassWakeWord) return true;
+    if (!this._wakeWordEnabled) return true;
+    if (this._opts.isInConversation?.()) return true;
+    if (this._wakeAnchorSample !== null) return true;
+    if (this._cvWakeAnchored) return true;
+    if (this._heldSegment !== null) return true;
+    return false;
+  }
+
+  get wakeGatedAsr(): boolean {
+    return this._wakeGatedAsr;
+  }
+
+  /**
+   * 循环录制缓冲区当前已保留的 16kHz 样本数（上限 RAW_RING_CAPACITY = 35s）。
+   */
+  get ringBufferedSamples(): number {
+    return Math.min(this._rawTotalSamples, RAW_RING_CAPACITY);
+  }
+
+  private _hasActiveAcousticWake(): boolean {
+    if (!this._oww) return false;
+    const withProtoFlag = this._oww as { hasActivePrototypes?: boolean };
+    if (typeof withProtoFlag.hasActivePrototypes === "boolean") {
+      return withProtoFlag.hasActivePrototypes;
+    }
+    return true;
+  }
+
+  /**
+   * 当前是否处于“未唤醒仅循环录制缓冲 + 声学唤醒检测”待机态：
+   * 该状态下完全跳过 ClearVoice GPU 切片、实时流式转写与分段 ASR，待唤醒后再回放循环录制缓冲区及后续音频。
+   */
+  get isWakeGatedStandby(): boolean {
+    if (!this._wakeGatedAsr) return false;
+    if (this.isAwake) return false;
+    return this._hasActiveAcousticWake();
+  }
+
+  private _isStreamingAsrAllowed(): boolean {
+    if (!this._streamingAsrEnabled) return false;
+    if (this._wakeGatedAsr && !this.isAwake) return false;
+    return true;
+  }
+
+  private _computeWakeReplayStartSample(anchorEnd: number, replayMs?: number): number {
+    const lookbackSamples =
+      replayMs !== undefined && Number.isFinite(replayMs)
+        ? Math.round(TARGET_SR * (Math.max(400, Math.min(10_000, replayMs)) / 1000))
+        : this._wakeRingLookbackSamples;
+    const earliestAvailable = Math.max(0, this._rawTotalSamples - RAW_RING_CAPACITY);
+    const minAfterLastEmitted = this._lastEmittedEndSample > 0 ? this._lastEmittedEndSample : 0;
+    const effectiveEnd =
+      anchorEnd > 0 ? Math.min(anchorEnd, this._rawTotalSamples) : this._rawTotalSamples;
+    const desiredStart = Math.max(0, effectiveEnd - lookbackSamples);
+    return Math.min(
+      this._rawTotalSamples,
+      Math.max(earliestAvailable, minAfterLastEmitted, desiredStart),
+    );
+  }
+
+  /**
+   * 主动唤醒当前会话并立即将循环录制缓冲区（含唤醒前导与已说部分）及后续音频送入语音转文字管线。
+   */
+  triggerWake(options: { hit?: WakeWordAcousticHit; replayMs?: number } = {}): void {
+    if (this._disposed) return;
+    const hit: WakeWordAcousticHit | null = options.hit ?? null;
+    if (hit) {
+      this._opts.onWakeWordSpot?.(hit);
+    }
+    this._activateWakeCapture(hit, options.replayMs);
   }
 
   private _handleWakeSpot(hit: WakeWordAcousticHit): void {
@@ -341,33 +466,53 @@ export class VoiceStreamSession {
     }
     this._opts.onWakeWordSpot?.(hit);
 
-    // 借鉴 Home Assistant WAKE_WORD -> STT 切换：
-    // 命中声学唤醒词后立即锁定唤醒词起止位置并激活滞回指令分段器，
-    // 即便背景音乐持续播放，说完指令停顿 ~550ms 即可立即截断送识别，无需苦等 4 秒滚窗！
-    if (!this._opts.bypassWakeWord && this._wakeAnchorSample === null) {
-      if (this._heldSegment) {
-        this._flushHeldLegacySegment();
-      }
-      const anchorEnd = hit.sampleOffset > 0 ? hit.sampleOffset : this._rawTotalSamples;
-      this._wakeAnchorSample = Math.max(0, anchorEnd - Math.round(TARGET_SR * 0.85));
-      this._wakeAnchorHit = hit;
-      this._lastRawOverlap = new Float32Array(0);
-      this._lastDenOverlap = new Float32Array(0);
-      if (this._vad) {
-        try {
-          while (!this._vad.isEmpty()) {
-            this._vad.pop();
-          }
-        } catch {
-          // ignore
+    if (!this._opts.bypassWakeWord) {
+      this._activateWakeCapture(hit);
+    }
+  }
+
+  private _activateWakeCapture(hit: WakeWordAcousticHit | null, replayMs?: number): void {
+    if (this._disposed) return;
+
+    if (this._voicePipelineMode === "clearvoice") {
+      if (this._cvWakeAnchored && !this._opts.isInConversation?.()) {
+        if (hit && (!this._cvWakeHit || hit.score > this._cvWakeHit.score)) {
+          this._cvWakeHit = hit;
+          this._wakeAnchorHit = hit;
         }
+        return;
       }
-      this._segmenter.forceStartCommand(Math.max(this._lastFrameRms, 0.05));
-      if (this._streamingAsrEnabled) {
-        this._resetStreamingState(true);
-        this._streamSpeechOriginSample = this._wakeAnchorSample;
-        this._streamLastDecodedEndSample = this._wakeAnchorSample ?? this._rawTotalSamples;
+      this._activateClearVoiceFromWake(hit, replayMs);
+      return;
+    }
+
+    // Legacy 方案：命中唤醒后立即从循环录制缓冲区锚定回溯起点、激活滞回分段器，并立刻对缓冲区内容启动流式转写
+    if (this._wakeAnchorSample !== null) {
+      if (hit && (!this._wakeAnchorHit || hit.score > this._wakeAnchorHit.score)) {
+        this._wakeAnchorHit = hit;
       }
+      return;
+    }
+
+    if (this._heldSegment) {
+      this._flushHeldLegacySegment();
+    }
+    const anchorEnd = hit && hit.sampleOffset > 0 ? hit.sampleOffset : this._rawTotalSamples;
+    this._wakeAnchorSample = this._computeWakeReplayStartSample(anchorEnd, replayMs);
+    this._wakeAnchorHit = hit;
+    this._wasAwake = true;
+    this._lastRawOverlap = new Float32Array(0);
+    this._lastDenOverlap = new Float32Array(0);
+    this._denoisedPending = new Float32Array(0);
+    this._legacyFedUpToGlobalSample = this._rawTotalSamples;
+    this._resetVadState();
+    this._segmenter.forceStartCommand(Math.max(this._lastFrameRms, 0.05));
+    if (this._isStreamingAsrAllowed()) {
+      this._resetStreamingState(true);
+      this._streamSpeechOriginSample = this._wakeAnchorSample;
+      this._streamLastDecodedEndSample = this._wakeAnchorSample ?? this._rawTotalSamples;
+      // 唤醒瞬间即刻对循环录制缓冲区中已积累的音频触发转写，无需干等后续帧
+      this._maybeTriggerStreamingDecode();
     }
   }
 
@@ -545,11 +690,347 @@ export class VoiceStreamSession {
     this._resetStreamingState(true);
     this._wakeAnchorSample = null;
     this._wakeAnchorHit = null;
+    this._cvWakeAnchored = false;
+    this._cvWakeHit = null;
     this._activeSegmentStartSample = null;
     this._denoisedPending = new Float32Array(0);
     this._segmenter.reset();
-    if (next === "clearvoice") {
+    this._cvFedUpToGlobalSample = this._rawTotalSamples;
+    this._wasAwake = this.isAwake;
+    if (next === "clearvoice" && !this.isWakeGatedStandby) {
+      this._prepareClearVoiceForLiveInput();
+    }
+  }
+
+  /**
+   * 运行期热更新唤醒词开关（关闭唤醒词后立即放开持续识别；重新开启后回到未唤醒循环缓冲待机）。
+   */
+  setWakeWordEnabled(enabled: boolean): void {
+    if (this._disposed) return;
+    const next = Boolean(enabled);
+    if (this._wakeWordEnabled === next) return;
+    this._wakeWordEnabled = next;
+    const awakeNow = this.isAwake;
+    if (!awakeNow && this._wasAwake) {
+      this._wasAwake = false;
+      this._onEnterStandby();
+    } else if (awakeNow && !this._wasAwake) {
+      this._wasAwake = true;
+      if (this._voicePipelineMode === "clearvoice") {
+        this._prepareClearVoiceForLiveInput();
+      } else {
+        this._denoisedPending = new Float32Array(0);
+        this._resetVadState();
+      }
+    }
+  }
+
+  /**
+   * 运行期热更新 openWakeWord 声学唤醒开关。
+   */
+  setOwwEnabled(enabled: boolean): void {
+    if (this._disposed) return;
+    const next = Boolean(enabled);
+    if (this._owwEnabled === next) return;
+    this._owwEnabled = next;
+    if (!next) {
+      try {
+        this._oww?.reset();
+      } catch {
+        // ignore
+      }
+      this._oww = null;
+      return;
+    }
+    if (!this._oww) {
+      this._oww = this._opts.localEngine.createWakeWordStream(this._wakeWords, {
+        threshold: this._owwThreshold,
+        onSpot: (hit) => this._handleWakeSpot(hit),
+      });
+    }
+  }
+
+  /**
+   * 同步服务端对话状态机跃迁（待机 <-> 连续对话）：
+   * - 退出对话回归待机时，立即中止任何在途实时流式转写并清空挂起状态，回归零 ASR 循环录制待机；
+   * - 唤醒后进入对话时，无缝回放在异步识别间隙内新写入循环录制缓冲区的音频，防止续说首字丢失。
+   */
+  syncDialogState(inConversation: boolean, reason?: string): void {
+    if (this._disposed) return;
+    if (!inConversation) {
+      const keepActiveWake =
+        this._opts.bypassWakeWord ||
+        !this._wakeWordEnabled ||
+        this._wakeAnchorSample !== null ||
+        this._cvWakeAnchored ||
+        Boolean(this._heldSegment?.payload.wakeAnchored);
+      if (!keepActiveWake && (this._wasAwake || this._heldSegment !== null)) {
+        this._wasAwake = false;
+        this._onEnterStandby(true);
+        return;
+      }
+    }
+    const awakeNow = this.isAwake || inConversation;
+    if (!awakeNow && this._wasAwake) {
+      this._wasAwake = false;
+      this._onEnterStandby(true);
+      return;
+    }
+    if (inConversation && !this._wasAwake) {
+      this._wasAwake = true;
+      const isManualEnter = reason === "ws_control" || reason === "manual";
+      if (this._voicePipelineMode === "clearvoice") {
+        const isPostWakeTransition =
+          !isManualEnter &&
+          (reason === "wake_only" ||
+            reason === "command_dispatched_async" ||
+            reason === "command_running" ||
+            reason === "command_done" ||
+            (this._lastEmittedEndSample > 0 &&
+              this._rawTotalSamples - this._lastEmittedEndSample <= POST_WAKE_GAP_REPLAY_MAX_SAMPLES));
+        if (isPostWakeTransition) {
+          this._replayPostWakeGapIfNeeded();
+        } else {
+          this._prepareClearVoiceForLiveInput();
+        }
+      } else {
+        this._denoisedPending = new Float32Array(0);
+        this._resetVadState();
+        if (isManualEnter) {
+          this._legacyFedUpToGlobalSample = this._rawTotalSamples;
+        } else {
+          this._replayPostWakeGapIfNeeded();
+        }
+      }
+      return;
+    }
+    this._wasAwake = awakeNow;
+  }
+
+  private _onEnterStandby(explicitExit = false): void {
+    if (!explicitExit && this._heldSegment) {
+      this._flushHeldLegacySegment();
+    } else {
+      this._clearHeldLegacySegment();
+    }
+    this._resetStreamingState(true);
+    this._wakeAnchorSample = null;
+    this._wakeAnchorHit = null;
+    this._cvWakeAnchored = false;
+    this._cvWakeHit = null;
+    this._activeSegmentStartSample = null;
+    this._denoisedPending = new Float32Array(0);
+    this._lastRawOverlap = new Float32Array(0);
+    this._lastDenOverlap = new Float32Array(0);
+    this._pendingNormalQueue = [];
+    this._fallbackChunks = [];
+    this._fallbackTotal = 0;
+    this._segmenter.reset();
+    this._resetVadState();
+    const hasPendingWakeWork =
+      !explicitExit &&
+      (this._cvPendingEmitCount > 0 || this._inFlight || this._pendingWake.length > 0);
+    if (!hasPendingWakeWork) {
+      this._cvFedUpToGlobalSample = this._rawTotalSamples;
+      this._legacyFedUpToGlobalSample = this._rawTotalSamples;
+      if (explicitExit) {
+        this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, this._rawTotalSamples);
+      }
+    }
+    if (this._cvPendingEmitCount === 0) {
+      this._resetClearVoiceState();
+    } else {
+      this._cvChunker?.setIncompleteUtteranceHint(false);
+      this._cvChunker?.reset();
+    }
+    if (
+      this._cvPendingEmitCount === 0 &&
+      !this._cvInFlight &&
+      this._cvSliceQueue.length === 0 &&
+      !this._inFlight &&
+      this._pendingWake.length === 0 &&
+      this._pendingNormalQueue.length === 0
+    ) {
+      const resolvers = this._idleResolvers;
+      this._idleResolvers = [];
+      for (const r of resolvers) r();
+    }
+  }
+
+  private _prepareClearVoiceForLiveInput(): void {
+    this._ensureClearVoicePipeline();
+    const chunker = this._cvChunker!;
+    if (this._cvPendingEmitCount === 0 && !this._cvInFlight && this._cvSliceQueue.length === 0) {
+      this._resetClearVoiceState();
+    } else if (!chunker.inUtterance) {
+      chunker.setIncompleteUtteranceHint(false);
+      chunker.reset();
+    } else {
+      return;
+    }
+    const lookbackCtxSamples = Math.round(
+      TARGET_SR * ((this._opts.clearVoiceLookbackMs ?? 300) / 1000),
+    );
+    const earliest = Math.max(0, this._rawTotalSamples - RAW_RING_CAPACITY);
+    const preStart = Math.max(earliest, this._rawTotalSamples - lookbackCtxSamples);
+    const preContext =
+      preStart < this._rawTotalSamples
+        ? this._readRingRange(this._rawRing, this._rawTotalSamples, preStart, this._rawTotalSamples)
+        : new Float32Array(0);
+    this._cvBaseGlobalSample = this._rawTotalSamples - preContext.length - chunker.totalSamples;
+    if (preContext.length > 0) {
+      chunker.seedContext(preContext);
+    }
+    this._cvFedUpToGlobalSample = this._rawTotalSamples;
+  }
+
+  private _activateClearVoiceFromWake(
+    hit: WakeWordAcousticHit | null,
+    replayMs?: number,
+  ): void {
+    this._ensureClearVoicePipeline();
+    const chunker = this._cvChunker!;
+    const anchorEnd = hit && hit.sampleOffset > 0 ? hit.sampleOffset : this._rawTotalSamples;
+    const replayStart = this._computeWakeReplayStartSample(anchorEnd, replayMs);
+
+    // 若已处于连续对话态且 ClearVoice 正在持续收音同一话语，仅附加唤醒元数据，不打断已积累切片
+    if (this._opts.isInConversation?.() && chunker.inUtterance) {
+      this._cvWakeAnchored = true;
+      if (hit) this._cvWakeHit = hit;
+      this._wakeAnchorSample = this._wakeAnchorSample ?? replayStart;
+      if (hit) this._wakeAnchorHit = hit;
+      return;
+    }
+
+    if (this._cvPendingEmitCount === 0 && !this._cvInFlight && this._cvSliceQueue.length === 0) {
+      this._resetClearVoiceState();
+    } else {
+      chunker.setIncompleteUtteranceHint(false);
+      chunker.reset();
+    }
+
+    this._cvWakeAnchored = true;
+    this._cvWakeHit = hit;
+    this._wakeAnchorSample = replayStart;
+    this._wakeAnchorHit = hit;
+    this._wasAwake = true;
+
+    const lookbackCtxSamples = Math.round(
+      TARGET_SR * ((this._opts.clearVoiceLookbackMs ?? 300) / 1000),
+    );
+    const earliestAvailable = Math.max(0, this._rawTotalSamples - RAW_RING_CAPACITY);
+    const preContextStart = Math.max(earliestAvailable, replayStart - lookbackCtxSamples);
+    const preContext =
+      preContextStart < replayStart
+        ? this._readRingRange(this._rawRing, this._rawTotalSamples, preContextStart, replayStart)
+        : new Float32Array(0);
+
+    this._cvBaseGlobalSample = replayStart - preContext.length - chunker.totalSamples;
+    if (preContext.length > 0) {
+      chunker.seedContext(preContext);
+    }
+
+    const bufferedAudio = this._readRingRange(
+      this._rawRing,
+      this._rawTotalSamples,
+      replayStart,
+      this._rawTotalSamples,
+    );
+    this._cvFedUpToGlobalSample = this._rawTotalSamples;
+
+    let emittedCount = 0;
+    if (bufferedAudio.length > 0) {
+      const chunks = chunker.pushSamples(bufferedAudio);
+      emittedCount = chunks.length;
+      this._handleClearVoiceChunks(chunks);
+    }
+
+    if (emittedCount === 0 && !chunker.inUtterance && bufferedAudio.length > 0) {
+      chunker.ensureUtteranceActive(bufferedAudio.length);
+    }
+  }
+
+  private _handleClearVoiceChunks(chunks: ClearVoiceChunkDescriptor[]): void {
+    for (const ch of chunks) {
+      const startGlobalSample = Math.max(0, this._cvBaseGlobalSample + ch.startSample);
+      const endGlobalSample = Math.max(startGlobalSample, this._cvBaseGlobalSample + ch.endSample);
+      let utteranceMeta: ClearVoiceUtteranceMeta | undefined;
+      if (ch.utteranceEnded) {
+        utteranceMeta = {
+          wakeAnchored: this._cvWakeAnchored || this._wakeAnchorSample !== null,
+          acousticWake: this._cvWakeHit ?? this._wakeAnchorHit ?? null,
+          endGlobalSample,
+        };
+        this._cvPendingEmitCount += 1;
+        this._cvWakeAnchored = false;
+        this._cvWakeHit = null;
+        this._wakeAnchorSample = null;
+        this._wakeAnchorHit = null;
+      }
+      this._enqueueClearVoiceSlice({
+        chunk: ch,
+        startGlobalSample,
+        wakeAuthorized: this.isAwake || Boolean(utteranceMeta?.wakeAnchored),
+        utteranceMeta,
+      });
+    }
+  }
+
+  private _replayPostWakeGapIfNeeded(): void {
+    if (this._disposed || !this._opts.isInConversation?.()) return;
+    if (this._lastEmittedEndSample <= 0 || this._rawTotalSamples <= this._lastEmittedEndSample) {
+      return;
+    }
+    const gapStart = Math.max(
+      this._lastEmittedEndSample,
+      this._rawTotalSamples - POST_WAKE_GAP_REPLAY_MAX_SAMPLES,
+    );
+    if (this._voicePipelineMode === "clearvoice") {
+      const effectiveStart = Math.max(gapStart, this._cvFedUpToGlobalSample);
+      if (this._rawTotalSamples - effectiveStart < 512) return;
       this._ensureClearVoicePipeline();
+      const chunker = this._cvChunker!;
+      if (!chunker.inUtterance) {
+        const lookbackCtxSamples = Math.round(
+          TARGET_SR * ((this._opts.clearVoiceLookbackMs ?? 300) / 1000),
+        );
+        const earliest = Math.max(0, this._rawTotalSamples - RAW_RING_CAPACITY);
+        const preStart = Math.max(earliest, effectiveStart - lookbackCtxSamples);
+        const preCtx =
+          preStart < effectiveStart
+            ? this._readRingRange(this._rawRing, this._rawTotalSamples, preStart, effectiveStart)
+            : new Float32Array(0);
+        this._cvBaseGlobalSample = effectiveStart - preCtx.length - chunker.totalSamples;
+        if (preCtx.length > 0) {
+          chunker.seedContext(preCtx);
+        }
+      }
+      const gapAudio = this._readRingRange(
+        this._rawRing,
+        this._rawTotalSamples,
+        effectiveStart,
+        this._rawTotalSamples,
+      );
+      this._cvFedUpToGlobalSample = this._rawTotalSamples;
+      if (gapAudio.length > 0) {
+        const chunks = chunker.pushSamples(gapAudio);
+        this._handleClearVoiceChunks(chunks);
+      }
+      return;
+    }
+
+    if (this._vad && !this._vadDetected && this._wakeAnchorSample === null) {
+      const effectiveStart = Math.max(gapStart, this._legacyFedUpToGlobalSample);
+      const gapLen = this._rawTotalSamples - effectiveStart;
+      if (gapLen >= 512 && this._denTotalSamples >= gapLen) {
+        const denGap = this._readRingTail(this._denRing, this._denTotalSamples, gapLen);
+        this._denoisedPending = new Float32Array(0);
+        this._legacyFedUpToGlobalSample = this._rawTotalSamples;
+        this._resetVadState(denGap.length);
+        this._processLegacyVadChunk(denGap);
+      } else {
+        this._legacyFedUpToGlobalSample = this._rawTotalSamples;
+      }
     }
   }
 
@@ -607,6 +1088,7 @@ export class VoiceStreamSession {
     this._cvBssUsed = false;
     this._cvServerSwaps = 0;
     this._cvUtteranceStartSample = null;
+    this._cvPendingEmitCount = 0;
     this._cvChunker?.setIncompleteUtteranceHint(false);
     this._cvChunker?.reset();
     this._cvAssembler?.reset();
@@ -617,25 +1099,29 @@ export class VoiceStreamSession {
     }
   }
 
-  private _enqueueClearVoiceSlice(chunk: ClearVoiceChunkDescriptor): void {
+  private _enqueueClearVoiceSlice(item: ClearVoiceQueuedSlice): void {
     if (this._disposed) return;
     if (this._cvSliceQueue.length >= 16) {
-      this._cvSliceQueue.shift();
+      const dropped = this._cvSliceQueue.shift();
+      if (dropped?.chunk.utteranceEnded) {
+        this._cvPendingEmitCount = Math.max(0, this._cvPendingEmitCount - 1);
+      }
       this._droppedStaleCount += 1;
     }
-    this._cvSliceQueue.push(chunk);
+    this._cvSliceQueue.push(item);
     this._pumpClearVoiceQueue();
   }
 
   private _pumpClearVoiceQueue(): void {
     if (this._cvInFlight || this._disposed) return;
-    const next = this._cvSliceQueue.shift();
-    if (!next) {
+    const item = this._cvSliceQueue.shift();
+    if (!item) {
       const resolvers = this._cvIdleResolvers;
       this._cvIdleResolvers = [];
       for (const r of resolvers) r();
       return;
     }
+    const next = item.chunk;
 
     this._cvInFlight = true;
     const gen = this._cvGen;
@@ -647,12 +1133,12 @@ export class VoiceStreamSession {
 
         // 整句静默观察期结束信号（音频已在 280ms 切片时完成 GPU 盲源分离与分轨降噪拼接，零额外 GPU 推理开销直接交付）
         if (next.rawNewSamples.length === 0 && next.utteranceEnded) {
-          this._emitClearVoiceUtterance(next.triggerReason);
+          this._emitClearVoiceUtterance(next.triggerReason, item.utteranceMeta);
           return;
         }
 
         if (this._cvUtteranceStartSample === null) {
-          this._cvUtteranceStartSample = next.startSample;
+          this._cvUtteranceStartSample = item.startGlobalSample;
         }
 
         // 阶段 3：带 0.3s 历史上下文送入 GPU ClearVoice（MossFormer2_SS_16K 多轨盲源分离 + 分轨 MossFormer2_SE_48K 降噪去背景音）
@@ -728,10 +1214,13 @@ export class VoiceStreamSession {
         });
 
         // 若话语仍在继续（2.0s 增量切片或 280ms 短停顿增量降噪切片）：
-        // 1) 在 GPU 就绪或无积压时，对每条有效分离音轨独立做实时流式字幕预览（严禁混轨！）；
+        // 1) 仅在已唤醒/授权态且 GPU 就绪或无积压时，对每条有效分离音轨独立做实时流式字幕预览（严禁混轨！），并回传语义未闭合提示以防慢语速句中停顿被截断；
         // 2) 仅当累计超长达到 30s 安全上限时才兜底提交，绝不中途腰斩正常长语音。
         if (!next.utteranceEnded) {
-          if (this._streamingAsrEnabled && assembler.totalSamples >= TARGET_SR * 0.4) {
+          const previewAllowed =
+            this._streamingAsrEnabled &&
+            (!this._wakeGatedAsr || item.wakeAuthorized || this.isAwake);
+          if (previewAllowed && assembler.totalSamples >= TARGET_SR * 0.4) {
             try {
               const status = this._opts.localEngine.getStatus();
               const allowPreview =
@@ -815,15 +1304,27 @@ export class VoiceStreamSession {
 
           // 安全上限：单条连续话语达到上限（默认 30s）时自动提交独立多轨音频
           if (assembler.totalSamples >= this._clearVoiceMaxUtteranceSamples) {
-            this._emitClearVoiceUtterance("timeout");
+            const timeoutMeta: ClearVoiceUtteranceMeta = {
+              wakeAnchored: this._cvWakeAnchored || this._wakeAnchorSample !== null,
+              acousticWake: this._cvWakeHit ?? this._wakeAnchorHit ?? null,
+              endGlobalSample: this._rawTotalSamples,
+            };
+            this._cvWakeAnchored = false;
+            this._cvWakeHit = null;
+            this._wakeAnchorSample = null;
+            this._wakeAnchorHit = null;
+            this._emitClearVoiceUtterance("timeout", timeoutMeta, false);
           }
           return;
         }
 
         // 整句静音判停或 flush：将每条独立拼接完成的纯净音轨分别送交后续独立声纹/ASR/逻辑判定
-        this._emitClearVoiceUtterance(next.triggerReason);
+        this._emitClearVoiceUtterance(next.triggerReason, item.utteranceMeta);
       })
       .catch(() => {
+        if (next.utteranceEnded) {
+          this._cvPendingEmitCount = Math.max(0, this._cvPendingEmitCount - 1);
+        }
         // 单个切片异常不中断连续流会话
       })
       .finally(() => {
@@ -832,7 +1333,14 @@ export class VoiceStreamSession {
       });
   }
 
-  private _emitClearVoiceUtterance(triggerReason: ClearVoiceTriggerReason): void {
+  private _emitClearVoiceUtterance(
+    triggerReason: ClearVoiceTriggerReason,
+    utteranceMeta?: ClearVoiceUtteranceMeta,
+    decrementPendingCount = true,
+  ): void {
+    if (decrementPendingCount && utteranceMeta) {
+      this._cvPendingEmitCount = Math.max(0, this._cvPendingEmitCount - 1);
+    }
     const assembler = this._cvAssembler;
     this._cvChunker?.setIncompleteUtteranceHint(false);
     if (!assembler || assembler.totalSamples < Math.round(TARGET_SR * 0.14)) {
@@ -865,6 +1373,7 @@ export class VoiceStreamSession {
     const seMs = Math.round(this._cvTotalSeMs);
     const bssUsed = this._cvBssUsed;
     const startSample = this._cvUtteranceStartSample ?? 0;
+    const endGlobalSample = utteranceMeta?.endGlobalSample ?? startSample + rawSlice.length;
 
     assembler.reset();
     this._cvRawChunks = [];
@@ -875,6 +1384,8 @@ export class VoiceStreamSession {
     this._cvServerSwaps = 0;
     this._cvUtteranceStartSample = null;
     this._streamTracker.reset();
+    this._oww?.resetSegmentTracking();
+    this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, endGlobalSample);
 
     if (pruned.tracks.length === 0) {
       return;
@@ -909,8 +1420,8 @@ export class VoiceStreamSession {
       startSec: Number((startSample / TARGET_SR).toFixed(2)),
       durationSec: Number((primaryTrack.samples.length / TARGET_SR).toFixed(2)),
       forcedRoll: triggerReason === "timeout",
-      acousticWake: null,
-      wakeAnchored: false,
+      acousticWake: utteranceMeta?.acousticWake ?? null,
+      wakeAnchored: Boolean(utteranceMeta?.wakeAnchored),
       commitReason:
         triggerReason === "flush"
           ? "manual_flush"
@@ -944,24 +1455,28 @@ export class VoiceStreamSession {
   }
 
   /**
-   * 完整重置 Silero VAD 内部语音状态与残余队列，并记录采样原点偏移 `_vadSampleBase`，
-   * 彻底杜绝 `vad.clear()` 仅清空已出队段却保留正在进行中的语音缓冲导致“一句话二次识别”！
+   * 完整重置 Silero VAD 内部语音状态与残余队列，并精确同步采样原点偏移 `_vadSampleBase`，
+   * 彻底杜绝 `vad.clear()` 仅清空已出队段却保留正在进行中的语音缓冲导致“一句话二次识别”，
+   * 以及待机跳过 VAD 期间采样时钟偏移问题！
    */
-  private _resetVadState(): void {
+  private _resetVadState(unfedTailSamples = 0): void {
     if (!this._vad) return;
+    const globalOrigin = Math.max(0, this._rawTotalSamples - Math.max(0, unfedTailSamples));
     try {
       while (!this._vad.isEmpty()) {
         this._vad.pop();
       }
       if (typeof this._vad.reset === "function") {
         this._vad.reset();
-        this._vadSampleBase = this._vadSamplesFed;
+        this._vadSampleBase = globalOrigin;
       } else {
         this._vad.clear();
+        this._vadSampleBase = Math.max(0, globalOrigin - this._vadSamplesFed);
       }
     } catch {
       try {
         this._vad.clear();
+        this._vadSampleBase = Math.max(0, globalOrigin - this._vadSamplesFed);
       } catch {
         // ignore
       }
@@ -980,6 +1495,8 @@ export class VoiceStreamSession {
     this._clearHeldLegacySegment();
     this._wakeAnchorSample = null;
     this._wakeAnchorHit = null;
+    this._cvWakeAnchored = false;
+    this._cvWakeHit = null;
     this._activeSegmentStartSample = null;
     this._denoisedPending = new Float32Array(0);
     this._lastRawOverlap = new Float32Array(0);
@@ -988,6 +1505,7 @@ export class VoiceStreamSession {
     this._resetVadState();
     this._resetStreamingState(true);
     this._resetClearVoiceState();
+    this._cvFedUpToGlobalSample = this._rawTotalSamples;
     this._oww?.resetSegmentTracking();
     this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, this._rawTotalSamples);
   }
@@ -1004,7 +1522,8 @@ export class VoiceStreamSession {
     if (!speaking) {
       this._ttsLastEndedAt = now;
     }
-    const userCurrentlySpeaking = this._vadDetected || this._wakeAnchorSample !== null;
+    const userCurrentlySpeaking =
+      this._vadDetected || this._wakeAnchorSample !== null || this._cvWakeAnchored;
     if (!userCurrentlySpeaking) {
       this._lastRawOverlap = new Float32Array(0);
       this._lastDenOverlap = new Float32Array(0);
@@ -1027,7 +1546,7 @@ export class VoiceStreamSession {
     if (threshold !== undefined) {
       this._owwThreshold = threshold;
     }
-    if (this._opts.owwEnabled === false) {
+    if (!this._owwEnabled) {
       this._oww = null;
       return;
     }
@@ -1075,201 +1594,112 @@ export class VoiceStreamSession {
   }
 
   /**
-   * 写入 Float32 PCM 样本并实时驱动软限幅 AGC + 在线降噪 + 流式 openWakeWord + Silero 滞回 VAD。
+   * 写入 Float32 PCM 样本并实时驱动循环录制缓冲区 + 轻量声学唤醒检测（openWakeWord）；
+   * 未唤醒待机期绝不执行实时语音转文字（ClearVoice GPU 切片 / 流式预览 / 分段 ASR 均跳过），
+   * 只有被唤醒后才将循环录制缓冲区与后续音频统一送入降噪与语音转文字管线！
    */
   pushFloat32Samples(samples: Float32Array): void {
     if (this._disposed || samples.length === 0) return;
     const pcm16k =
       this._inputRate === TARGET_SR ? samples : resampleLinear(samples, this._inputRate, TARGET_SR);
 
-    // 新方案：ClearVoice GPU 准实时切片（32ms 帧 -> Silero VAD 双触发 + 环形缓冲 -> 0.3s 历史上下文 GPU MossFormer2 -> 20ms Cross-fade -> Qwen3-ASR）
-    if (this._voicePipelineMode === "clearvoice") {
-      this._ensureClearVoicePipeline();
-      const chunks = this._cvChunker!.pushSamples(pcm16k);
-      for (const ch of chunks) {
-        this._enqueueClearVoiceSlice(ch);
-      }
-      return;
-    }
-
-    // 1. 写入时间对齐的原始 Raw 环形缓冲（零失真）
+    // 1. 无论新旧方案，始终持续写入时间对齐的 16kHz 原始循环录制缓冲区（零失真、供唤醒后完整回放）
+    const chunkStartGlobalSample = this._rawTotalSamples;
     for (let i = 0; i < pcm16k.length; i += 1) {
       this._rawRing[(this._rawTotalSamples + i) % RAW_RING_CAPACITY] = pcm16k[i]!;
     }
     this._rawTotalSamples += pcm16k.length;
 
-    // 1.5 软限幅流式 AGC（拉升远场轻声语音，对高电平音乐保持线性不削波）
-    const enhancedInput = this._agc ? this._agc.process(pcm16k) : pcm16k;
-
-    // 2. 实时在线神经降噪（1 线程 GTCRN，延迟低且不与 ASR 争抢多核）
-    let denoisedChunk: Float32Array;
-    if (this._onlineDenoiser) {
-      try {
-        const res = this._onlineDenoiser.run({ samples: enhancedInput, sampleRate: TARGET_SR });
-        denoisedChunk =
-          res.sampleRate === TARGET_SR
-            ? res.samples
-            : resampleLinear(res.samples, res.sampleRate, TARGET_SR);
-      } catch {
+    // 2. Legacy 方案或启用了 openWakeWord 时，维护轻量流式 AGC + 在线降噪轨与声学唤醒检测
+    const needLightweightFrontEnd = this._voicePipelineMode === "legacy" || this._oww !== null;
+    let denoisedChunk: Float32Array = pcm16k;
+    if (needLightweightFrontEnd) {
+      const enhancedInput = this._agc ? this._agc.process(pcm16k) : pcm16k;
+      const allowOnlineDenoiser =
+        this._onlineDenoiser !== null &&
+        (this._voicePipelineMode === "legacy" || this._denoiseEngine === "gtcrn");
+      if (allowOnlineDenoiser) {
+        try {
+          const res = this._onlineDenoiser!.run({ samples: enhancedInput, sampleRate: TARGET_SR });
+          denoisedChunk =
+            res.sampleRate === TARGET_SR
+              ? res.samples
+              : resampleLinear(res.samples, res.sampleRate, TARGET_SR);
+        } catch {
+          denoisedChunk = enhancedInput;
+        }
+      } else {
         denoisedChunk = enhancedInput;
       }
-    } else {
-      denoisedChunk = enhancedInput;
-    }
 
-    // 2.2 写入同步降噪环形缓冲（供唤醒锚定与预降噪复用）
-    for (let i = 0; i < denoisedChunk.length; i += 1) {
-      this._denRing[(this._denTotalSamples + i) % RAW_RING_CAPACITY] = denoisedChunk[i]!;
-    }
-    this._denTotalSamples += denoisedChunk.length;
+      for (let i = 0; i < denoisedChunk.length; i += 1) {
+        this._denRing[(this._denTotalSamples + i) % RAW_RING_CAPACITY] = denoisedChunk[i]!;
+      }
+      this._denTotalSamples += denoisedChunk.length;
 
-    // 2.5 实时流式 openWakeWord 声学唤醒检测（80ms 步进，静音自动快路径跳过）
-    if (this._oww) {
-      try {
-        this._oww.pushSamples(denoisedChunk, this._rawTotalSamples);
-      } catch {
-        // 声学检测异常不得中断主音频流
+      // 实时流式 openWakeWord 声学唤醒检测（80ms 步进，静音自动快路径跳过，零 ASR 开销）
+      // 注意：若本帧内命中唤醒词，_handleWakeSpot 会同步回放循环录制缓冲区并更新 _cvFedUpToGlobalSample / _wakeAnchorSample
+      if (this._oww) {
+        try {
+          this._oww.pushSamples(denoisedChunk, this._rawTotalSamples);
+        } catch {
+          // 声学检测异常不得中断主音频流
+        }
       }
     }
 
-    // 3. 送入流式 Silero VAD + Home Assistant 风格滞回指令分段器（512 采样窗口 = 32ms）
+    // 3. 同步待机/唤醒状态跃迁，并在未唤醒门控待机期直接返回（零实时转写、零 GPU 切片、零分段 ASR）
+    const awakeNow = this.isAwake;
+    if (!awakeNow && this._wasAwake) {
+      this._wasAwake = false;
+      this._onEnterStandby();
+    } else if (awakeNow && !this._wasAwake) {
+      this._wasAwake = true;
+      if (this._opts.isInConversation?.()) {
+        if (this._voicePipelineMode === "clearvoice") {
+          this._prepareClearVoiceForLiveInput();
+        } else {
+          this._denoisedPending = new Float32Array(0);
+          this._resetVadState(denoisedChunk.length);
+        }
+      }
+    }
+
+    if (this.isWakeGatedStandby) {
+      // 待机期间仅维护轻量环境底噪估值（供唤醒后滞回分段器精准识别背景音乐底噪），绝不运行 VAD/ClearVoice/ASR
+      const frameRms = computeRms(denoisedChunk);
+      this._lastFrameRms = frameRms;
+      this._segmenter.process(denoisedChunk.length / TARGET_SR, 0, frameRms);
+      return;
+    }
+
+    // 4. 新方案（已唤醒或无声学唤醒兜底）：ClearVoice GPU 准实时切片 -> Qwen3-ASR
+    if (this._voicePipelineMode === "clearvoice") {
+      this._ensureClearVoicePipeline();
+      // 若本帧刚触发唤醒并已把循环录制缓冲区（含本帧）完整回放至 _rawTotalSamples，避免重复喂入本帧！
+      if (this._cvFedUpToGlobalSample >= this._rawTotalSamples) {
+        return;
+      }
+      let feedSlice = pcm16k;
+      if (this._cvFedUpToGlobalSample > chunkStartGlobalSample) {
+        feedSlice = pcm16k.subarray(this._cvFedUpToGlobalSample - chunkStartGlobalSample);
+      } else if (this._cvFedUpToGlobalSample === 0 && chunkStartGlobalSample === 0) {
+        this._cvBaseGlobalSample = 0;
+      } else if (this._cvFedUpToGlobalSample < chunkStartGlobalSample && !this._cvChunker!.inUtterance) {
+        this._cvBaseGlobalSample = chunkStartGlobalSample - this._cvChunker!.totalSamples;
+      }
+      this._cvFedUpToGlobalSample = this._rawTotalSamples;
+      if (feedSlice.length > 0) {
+        const chunks = this._cvChunker!.pushSamples(feedSlice);
+        this._handleClearVoiceChunks(chunks);
+      }
+      return;
+    }
+
+    // 5. 原方案（已唤醒或无声学唤醒兜底）：流式 Silero VAD + Home Assistant 滞回分段器 + 流式字幕
     if (this._vad) {
-      const merged = new Float32Array(this._denoisedPending.length + denoisedChunk.length);
-      merged.set(this._denoisedPending, 0);
-      merged.set(denoisedChunk, this._denoisedPending.length);
-
-      let offset = 0;
-      while (offset + 512 <= merged.length) {
-        const frame = merged.subarray(offset, offset + 512);
-        const frameRms = computeRms(frame);
-        this._lastFrameRms = frameRms;
-        this._vad.acceptWaveform(frame);
-        this._vadSamplesFed += 512;
-        const nowDetected = this._vad.isDetected();
-
-        if (nowDetected !== this._vadDetected) {
-          this._vadDetected = nowDetected;
-          this._opts.onSpeechActivity?.(nowDetected);
-          if (nowDetected && this._streamingAsrEnabled && this._streamSpeechOriginSample === null) {
-            this._streamSpeechOriginSample = Math.max(
-              this._lastEmittedEndSample > 0 ? this._lastEmittedEndSample : 0,
-              this._rawTotalSamples - PRE_ROLL_SAMPLES,
-            );
-            this._streamLastDecodedEndSample = this._streamSpeechOriginSample;
-            this._streamTracker.reset();
-          }
-        }
-
-        // 慢语速/未闭合句尾保护：在暂存观察期内若用户继续开口则取消计时等待无缝拼接，
-        // 若持续静音帧达到宽限样本数则确定性立即交付（兼顾实时音频流与同步单测）。
-        if (this._heldSegment) {
-          if (nowDetected) {
-            if (this._heldSegment.timer) {
-              clearTimeout(this._heldSegment.timer);
-              this._heldSegment.timer = null;
-            }
-            this._heldSegment.accumulatedSilenceSamples = 0;
-          } else {
-            this._heldSegment.accumulatedSilenceSamples += 512;
-            if (
-              this._heldSegment.accumulatedSilenceSamples >= this._heldSegment.holdSilenceSamples
-            ) {
-              this._flushHeldLegacySegment();
-            }
-          }
-        }
-
-        // 仅当显式开启 streamingSentenceSplit 时，才按句末强标点+短停顿提前截断收句；
-        // 默认关闭，等待完整尾静音判停以防慢语速句中停顿被提前强拆。
-        if (this._streamingAsrEnabled && this._streamingSentenceSplit) {
-          const punctSilenceFloor = Math.max(0.008, this._segmenter.ambientRmsFloor * 1.45);
-          const frameHasVoice = nowDetected && frameRms >= punctSilenceFloor;
-          const { shouldCommitByPunctPause } = this._streamTracker.advanceFrame(32, frameHasVoice);
-          if (
-            shouldCommitByPunctPause &&
-            !this._streamDecodeInFlight &&
-            (this._wakeAnchorSample !== null || this._streamSpeechOriginSample !== null)
-          ) {
-            this._commitStreamingByPunctPause();
-            offset += 512;
-            continue;
-          }
-        }
-
-        // 安静房间唤醒锚定快路径：Silero VAD 已完成整句尾静音判定并产段时立即收尾发包并 reset VAD，
-        // 避免滞回分段器重复再等一遍 minSilenceSec 且彻底杜绝二次重复出段。
-        if (
-          this._wakeAnchorSample !== null &&
-          !nowDetected &&
-          !this._vad.isEmpty() &&
-          this._segmenter.ambientRmsFloor < 0.015 &&
-          this._rawTotalSamples - this._wakeAnchorSample >= TARGET_SR * 0.65
-        ) {
-          this._emitWakeAnchoredSegment(false);
-          offset += 512;
-          continue;
-        }
-
-        // 0.72 既高于常规 inCommandThreshold(0.48)，又低于高音乐底噪回落门限(0.78)，
-        // 从而让前景说话结束回落到背景音乐电平时立即推进尾静音倒计时；正常安静/对话长语音放宽至 30s 上限。
-        const step = this._segmenter.process(512 / TARGET_SR, nowDetected ? 0.72 : 0.05, frameRms);
-        if (step.justStarted && this._activeSegmentStartSample === null) {
-          // 回溯 speechSeconds(~0.2s) 避免切掉开声首字
-          this._activeSegmentStartSample = Math.max(
-            0,
-            this._rawTotalSamples - Math.round(TARGET_SR * this._segmenter.speechSeconds),
-          );
-        }
-
-        // 仅在待机态且持续高背景音乐底噪时按 4.2s 滚动切窗防队列积压，绝不腰斩正常人声/对话长语音！
-        const isStandbyLoudBgm =
-          !this._opts.bypassWakeWord &&
-          !this._opts.isInConversation?.() &&
-          this._wakeAnchorSample === null &&
-          this._segmenter.ambientRmsFloor >= 0.015;
-        if (
-          step.continuing &&
-          isStandbyLoudBgm &&
-          this._activeSegmentStartSample !== null &&
-          this._rawTotalSamples - this._activeSegmentStartSample >= TARGET_SR * STANDBY_BGM_ROLL_SEC
-        ) {
-          this._segmenter.reset();
-          this._emitSegmenterWindow(true);
-          offset += 512;
-          continue;
-        }
-
-        if (!step.continuing) {
-          if (this._wakeAnchorSample !== null) {
-            this._emitWakeAnchoredSegment(step.timedOut);
-          } else if (this._activeSegmentStartSample !== null) {
-            const activeLen = this._rawTotalSamples - this._activeSegmentStartSample;
-            // 仅在达到安全上限(30s)或高背景音乐中前景长语音回落(>=1.8s)时主动接管切段；
-            // 普通安静环境交由 Silero VAD 自然切段，避免音乐节拍起伏被误切为碎段
-            if (step.timedOut || (activeLen >= TARGET_SR * 1.8 && this._segmenter.ambientRmsFloor >= 0.015)) {
-              this._emitSegmenterWindow(step.timedOut);
-            } else {
-              this._activeSegmentStartSample = null;
-            }
-          }
-        }
-
-        offset += 512;
-      }
-      this._denoisedPending = merged.subarray(offset);
-
-      if (this._wakeAnchorSample === null) {
-        this._drainVadSegments(false);
-      } else {
-        // 唤醒词锚定捕获期间抑制 Silero 提前产出半截段，等待完整指令结束统一发包
-        while (!this._vad.isEmpty()) {
-          this._vad.pop();
-        }
-      }
-
-      if (this._streamingAsrEnabled && (this._vadDetected || this._wakeAnchorSample !== null)) {
-        this._maybeTriggerStreamingDecode();
-      }
+      this._legacyFedUpToGlobalSample = this._rawTotalSamples;
+      this._processLegacyVadChunk(denoisedChunk);
     } else {
       // 无 Silero VAD 模型时按 3.2 秒滚动窗口处理
       this._fallbackChunks.push(pcm16k);
@@ -1280,10 +1710,151 @@ export class VoiceStreamSession {
     }
   }
 
+  private _processLegacyVadChunk(denoisedChunk: Float32Array): void {
+    if (!this._vad) return;
+    const merged = new Float32Array(this._denoisedPending.length + denoisedChunk.length);
+    merged.set(this._denoisedPending, 0);
+    merged.set(denoisedChunk, this._denoisedPending.length);
+
+    let offset = 0;
+    while (offset + 512 <= merged.length) {
+      const frame = merged.subarray(offset, offset + 512);
+      const frameRms = computeRms(frame);
+      this._lastFrameRms = frameRms;
+      this._vad.acceptWaveform(frame);
+      this._vadSamplesFed += 512;
+      const nowDetected = this._vad.isDetected();
+      const remainingAfterFrame = merged.length - (offset + 512);
+
+      if (nowDetected !== this._vadDetected) {
+        this._vadDetected = nowDetected;
+        this._opts.onSpeechActivity?.(nowDetected);
+        if (nowDetected && this._isStreamingAsrAllowed() && this._streamSpeechOriginSample === null) {
+          this._streamSpeechOriginSample = Math.max(
+            this._lastEmittedEndSample > 0 ? this._lastEmittedEndSample : 0,
+            this._rawTotalSamples - remainingAfterFrame - PRE_ROLL_SAMPLES,
+          );
+          this._streamLastDecodedEndSample = this._streamSpeechOriginSample;
+          this._streamTracker.reset();
+        }
+      }
+
+      // 慢语速/未闭合句尾保护：在暂存观察期内若用户继续开口则取消计时等待无缝拼接，
+      // 若持续静音帧达到宽限样本数则确定性立即交付（兼顾实时音频流与同步单测）。
+      if (this._heldSegment) {
+        if (nowDetected) {
+          if (this._heldSegment.timer) {
+            clearTimeout(this._heldSegment.timer);
+            this._heldSegment.timer = null;
+          }
+          this._heldSegment.accumulatedSilenceSamples = 0;
+        } else {
+          this._heldSegment.accumulatedSilenceSamples += 512;
+          if (
+            this._heldSegment.accumulatedSilenceSamples >= this._heldSegment.holdSilenceSamples
+          ) {
+            this._flushHeldLegacySegment();
+          }
+        }
+      }
+
+      // 仅当显式开启 streamingSentenceSplit 且已唤醒授权时，才按句末强标点+短停顿提前截断收句；
+      // 默认关闭，等待完整尾静音判停以防慢语速句中停顿被提前强拆。
+      if (this._isStreamingAsrAllowed() && this._streamingSentenceSplit) {
+        const punctSilenceFloor = Math.max(0.008, this._segmenter.ambientRmsFloor * 1.45);
+        const frameHasVoice = nowDetected && frameRms >= punctSilenceFloor;
+        const { shouldCommitByPunctPause } = this._streamTracker.advanceFrame(32, frameHasVoice);
+        if (
+          shouldCommitByPunctPause &&
+          !this._streamDecodeInFlight &&
+          (this._wakeAnchorSample !== null || this._streamSpeechOriginSample !== null)
+        ) {
+          this._commitStreamingByPunctPause(remainingAfterFrame);
+          offset += 512;
+          continue;
+        }
+      }
+
+      // 安静房间唤醒锚定快路径：Silero VAD 已完成整句尾静音判定并产段时立即收尾发包并 reset VAD，
+      // 避免滞回分段器重复再等一遍 minSilenceSec 且彻底杜绝二次重复出段。
+      if (
+        this._wakeAnchorSample !== null &&
+        !nowDetected &&
+        !this._vad.isEmpty() &&
+        this._segmenter.ambientRmsFloor < 0.015 &&
+        this._rawTotalSamples - this._wakeAnchorSample >= TARGET_SR * 0.65
+      ) {
+        this._emitWakeAnchoredSegment(false, remainingAfterFrame);
+        offset += 512;
+        continue;
+      }
+
+      // 0.72 既高于常规 inCommandThreshold(0.48)，又低于高音乐底噪回落门限(0.78)，
+      // 从而让前景说话结束回落到背景音乐电平时立即推进尾静音倒计时；正常安静/对话长语音放宽至 30s 上限。
+      const step = this._segmenter.process(512 / TARGET_SR, nowDetected ? 0.72 : 0.05, frameRms);
+      if (step.justStarted && this._activeSegmentStartSample === null) {
+        // 回溯 speechSeconds(~0.2s) 避免切掉开声首字
+        this._activeSegmentStartSample = Math.max(
+          0,
+          this._rawTotalSamples - remainingAfterFrame - Math.round(TARGET_SR * this._segmenter.speechSeconds),
+        );
+      }
+
+      // 仅在待机态且持续高背景音乐底噪时按 4.2s 滚动切窗防队列积压，绝不腰斩正常人声/对话长语音！
+      const isStandbyLoudBgm =
+        !this._opts.bypassWakeWord &&
+        !this._opts.isInConversation?.() &&
+        this._wakeAnchorSample === null &&
+        this._segmenter.ambientRmsFloor >= 0.015;
+      if (
+        step.continuing &&
+        isStandbyLoudBgm &&
+        this._activeSegmentStartSample !== null &&
+        this._rawTotalSamples - this._activeSegmentStartSample >= TARGET_SR * STANDBY_BGM_ROLL_SEC
+      ) {
+        this._segmenter.reset();
+        this._emitSegmenterWindow(true, remainingAfterFrame);
+        offset += 512;
+        continue;
+      }
+
+      if (!step.continuing) {
+        if (this._wakeAnchorSample !== null) {
+          this._emitWakeAnchoredSegment(step.timedOut, remainingAfterFrame);
+        } else if (this._activeSegmentStartSample !== null) {
+          const activeLen = this._rawTotalSamples - this._activeSegmentStartSample;
+          // 仅在达到安全上限(30s)或高背景音乐中前景长语音回落(>=1.8s)时主动接管切段；
+          // 普通安静环境交由 Silero VAD 自然切段，避免音乐节拍起伏被误切为碎段
+          if (step.timedOut || (activeLen >= TARGET_SR * 1.8 && this._segmenter.ambientRmsFloor >= 0.015)) {
+            this._emitSegmenterWindow(step.timedOut, remainingAfterFrame);
+          } else {
+            this._activeSegmentStartSample = null;
+          }
+        }
+      }
+
+      offset += 512;
+    }
+    this._denoisedPending = merged.subarray(offset);
+
+    if (this._wakeAnchorSample === null) {
+      this._drainVadSegments(false);
+    } else {
+      // 唤醒词锚定捕获期间抑制 Silero 提前产出半截段，等待完整指令结束统一发包
+      while (!this._vad.isEmpty()) {
+        this._vad.pop();
+      }
+    }
+
+    if (this._isStreamingAsrAllowed() && (this._vadDetected || this._wakeAnchorSample !== null)) {
+      this._maybeTriggerStreamingDecode();
+    }
+  }
+
   /**
    * 标点+短停顿快速断句（例如说出“打开客厅吸顶灯。”后停顿 ~320ms 即刻断句提交，延迟减半）。
    */
-  private _commitStreamingByPunctPause(): void {
+  private _commitStreamingByPunctPause(unfedTailSamples = 0): void {
     const sentences = this._streamTracker.flush();
     const lastEngine = this._streamLastEngine || "qwen3-asr-stream";
     const lastLatencyMs = this._streamLastLatencyMs;
@@ -1296,9 +1867,11 @@ export class VoiceStreamSession {
 
     this._wakeAnchorSample = null;
     this._wakeAnchorHit = null;
+    this._cvWakeAnchored = false;
+    this._cvWakeHit = null;
     this._activeSegmentStartSample = null;
     this._segmenter.reset();
-    this._resetVadState();
+    this._resetVadState(unfedTailSamples);
     this._resetStreamingState(true);
     this._oww?.resetSegmentTracking();
     this._lastRawOverlap = new Float32Array(0);
@@ -1306,7 +1879,7 @@ export class VoiceStreamSession {
 
     if (sentences.length === 0) return;
 
-    const rawStart = Math.max(0, origin - PRE_ROLL_SAMPLES);
+    const rawStart = anchor !== null ? anchor : Math.max(0, origin - PRE_ROLL_SAMPLES);
     const rawEnd = this._rawTotalSamples;
     if (rawEnd - rawStart < TARGET_SR * 0.16) return;
 
@@ -1346,7 +1919,7 @@ export class VoiceStreamSession {
    * 实时推送字幕并在句中检测到多句标点边界时立即切分输出。
    */
   private _maybeTriggerStreamingDecode(): void {
-    if (!this._streamingAsrEnabled || this._disposed || this._streamDecodeInFlight || this._inFlight) {
+    if (!this._isStreamingAsrAllowed() || this._disposed || this._streamDecodeInFlight || this._inFlight) {
       return;
     }
     if (this._opts.engine === "whisper") {
@@ -1395,7 +1968,7 @@ export class VoiceStreamSession {
     originSample: number,
     endSample: number,
   ): Promise<void> {
-    if (this._disposed || !this._streamingAsrEnabled || this._streamDecodeInFlight) return;
+    if (this._disposed || !this._isStreamingAsrAllowed() || this._streamDecodeInFlight) return;
     const clampedOrigin = Math.max(originSample, endSample - TARGET_SR * MAX_UTTERANCE_SEC);
     const sliceLen = endSample - clampedOrigin;
     if (sliceLen < Math.round(TARGET_SR * 0.2)) return;
@@ -1640,17 +2213,19 @@ export class VoiceStreamSession {
     this._enqueueSegment(candidatePayload);
   }
 
-  private _emitWakeAnchoredSegment(timedOut: boolean): void {
+  private _emitWakeAnchoredSegment(timedOut: boolean, unfedTailSamples = 0): void {
     const anchor = this._wakeAnchorSample;
     const anchorHit = this._wakeAnchorHit;
     this._wakeAnchorSample = null;
     this._wakeAnchorHit = null;
+    this._cvWakeAnchored = false;
+    this._cvWakeHit = null;
     this._activeSegmentStartSample = null;
     this._segmenter.reset();
 
     if (anchor === null) return;
 
-    const rawStart = Math.max(0, anchor - PRE_ROLL_SAMPLES);
+    const rawStart = anchor;
     const rawEnd = this._rawTotalSamples;
     const sliceLen = rawEnd - rawStart;
     if (sliceLen < TARGET_SR * 0.25) return;
@@ -1658,7 +2233,7 @@ export class VoiceStreamSession {
     const rawSlice = this._readRingRange(this._rawRing, this._rawTotalSamples, rawStart, rawEnd);
     const denSlice = this._readRingTail(this._denRing, this._denTotalSamples, rawSlice.length);
 
-    this._resetVadState();
+    this._resetVadState(unfedTailSamples);
     this._oww?.resetSegmentTracking();
     this._lastRawOverlap = new Float32Array(0);
     this._lastDenOverlap = new Float32Array(0);
@@ -1689,7 +2264,7 @@ export class VoiceStreamSession {
   /**
    * 由 Home Assistant 滞回分段器驱动的切段（解决持续背景音乐下 Silero VAD 忽略 maxSpeechDuration 堆积 7s+ 长段的问题）。
    */
-  private _emitSegmenterWindow(timedOut: boolean): void {
+  private _emitSegmenterWindow(timedOut: boolean, unfedTailSamples = 0): void {
     const segStart = this._activeSegmentStartSample;
     this._activeSegmentStartSample = null;
     if (segStart === null) return;
@@ -1701,7 +2276,7 @@ export class VoiceStreamSession {
     let rawSlice = this._readRingRange(this._rawRing, this._rawTotalSamples, rawStart, rawEnd);
     let denSlice = this._readRingTail(this._denRing, this._denTotalSamples, rawSlice.length);
 
-    this._resetVadState();
+    this._resetVadState(unfedTailSamples);
 
     if (this._lastRawOverlap.length > 0) {
       const joinedRaw = new Float32Array(this._lastRawOverlap.length + rawSlice.length);
@@ -1760,18 +2335,33 @@ export class VoiceStreamSession {
 
   /**
    * 主动冲刷当前挂起尾音（用于单次说话松开/停止监听时立刻出结果）。
+   * 若处于未唤醒门控待机态，绝不冲刷未唤醒环境音到 ASR，仅等待既有队列完成。
    */
   async flush(): Promise<void> {
     if (this._disposed) return;
+    if (this.isWakeGatedStandby) {
+      await this.waitForIdle();
+      return;
+    }
     if (this._voicePipelineMode === "clearvoice") {
+      const fallbackMeta: ClearVoiceUtteranceMeta = {
+        wakeAnchored: this._cvWakeAnchored || this._wakeAnchorSample !== null,
+        acousticWake: this._cvWakeHit ?? this._wakeAnchorHit ?? null,
+        endGlobalSample: this._rawTotalSamples,
+      };
       const tailChunk = this._cvChunker?.flush();
       if (tailChunk) {
-        this._enqueueClearVoiceSlice(tailChunk);
+        this._handleClearVoiceChunks([tailChunk]);
+      } else {
+        this._cvWakeAnchored = false;
+        this._cvWakeHit = null;
+        this._wakeAnchorSample = null;
+        this._wakeAnchorHit = null;
       }
       await this._waitForClearVoiceIdle();
       // 若之前仅触发了超时切分或静音观察期未收尾，主动提交残余已降噪语音
       if (this._cvAssembler && this._cvAssembler.totalSamples > 0) {
-        this._emitClearVoiceUtterance("flush");
+        this._emitClearVoiceUtterance("flush", fallbackMeta, false);
       }
       await this.waitForIdle();
       return;
@@ -2098,6 +2688,11 @@ export class VoiceStreamSession {
           this._lastMatchedEndSec = next.startSec + next.durationSec;
           this._lastRawOverlap = new Float32Array(0);
           this._lastDenOverlap = new Float32Array(0);
+          // 唤醒段命中并切入连续对话后，立即回放在异步 ASR 间隙内写入循环录制缓冲区的续说音频，防止首字丢失
+          if (this._opts.isInConversation?.()) {
+            this._wasAwake = true;
+            this._replayPostWakeGapIfNeeded();
+          }
         }
       })
       .catch(() => {
@@ -2137,6 +2732,8 @@ export class VoiceStreamSession {
     this._pendingNormalQueue = [];
     this._wakeAnchorSample = null;
     this._wakeAnchorHit = null;
+    this._cvWakeAnchored = false;
+    this._cvWakeHit = null;
     this._activeSegmentStartSample = null;
     this._resetVadState();
     try {

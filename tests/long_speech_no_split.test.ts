@@ -341,6 +341,7 @@ describe("ClearVoice Pipeline Slow & Long Utterance Continuity", () => {
       noiseMode: "auto",
       voicePipelineMode: "clearvoice",
       streamingAsrEnabled: true,
+      isInConversation: () => true,
       vadSilenceMs: 1200,
       vadSensitivity: "default",
       wakeWords: ["Neo"],

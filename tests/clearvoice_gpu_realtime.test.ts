@@ -360,6 +360,7 @@ describe("ClearVoice 配置持久化、热切换按钮 API 与准实时流集成
       noiseMode: "auto",
       voicePipelineMode: "clearvoice",
       streamingAsrEnabled: true,
+      isInConversation: () => true,
       wakeWords: ["小派"],
       onPartialTranscript: (p) => partials.push(p.text),
       onSegmentReady: async (seg) => {

@@ -587,6 +587,7 @@ describe("VoiceStreamSession Wake-Anchored Capture & Bounded Backpressure", () =
       localEngine: fakeEngine,
       noiseMode: "off",
       vadSensitivity: "aggressive",
+      isInConversation: () => true,
       wakeWords: ["Neo"],
       onSegmentReady: async (seg) => {
         await new Promise((r) => setTimeout(r, 40));
@@ -803,13 +804,16 @@ describe("Single-Sentence Anti-Duplicate Voice Recognition Regression", () => {
     } as unknown as LocalVoiceEngine;
 
     const received: VoiceStreamSegmentPayload[] = [];
+    let inConversation = false;
     const session = new VoiceStreamSession({
       localEngine: fakeEngine,
       noiseMode: "off",
       vadSensitivity: "default",
+      isInConversation: () => inConversation,
       wakeWords: ["Neo"],
       onSegmentReady: async (seg) => {
         received.push(seg);
+        inConversation = true;
         return {
           ok: true,
           matched: true,
@@ -969,6 +973,7 @@ describe("Single-Sentence Anti-Duplicate Voice Recognition Regression", () => {
           wakeWords,
           owwEnabled: true,
           owwThreshold: 0.6,
+          wakeGatedAsr: false,
           onSegmentReady: async (seg) => {
             segs.push(seg);
             return null;
@@ -1003,6 +1008,7 @@ describe("Single-Sentence Anti-Duplicate Voice Recognition Regression", () => {
         wakeWords,
         owwEnabled: true,
         owwThreshold: 0.6,
+        wakeGatedAsr: false,
         onSegmentReady: async (seg) => {
           multiSegs.push(seg);
           return null;
