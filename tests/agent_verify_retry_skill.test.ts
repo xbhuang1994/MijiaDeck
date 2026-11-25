@@ -16,7 +16,12 @@ import {
   normalizeSkillIntentKey,
 } from "../src/agent/agentSkillStore.ts";
 import { PiAgentService, TASK_ACK_TEXT } from "../src/agent/piAgentService.ts";
-import { MAX_RECOVERY_ROUNDS } from "../src/agent/taskVerificationLoop.ts";
+import {
+  DEFAULT_SPEAKER_PLAYBACK_SETTLE_DELAYS_MS,
+  DEFAULT_VERIFY_SETTLE_DELAYS_MS,
+  MAX_RECOVERY_ROUNDS,
+  resolveSpeakerPlayingValue,
+} from "../src/agent/taskVerificationLoop.ts";
 import { NetworkMonitor } from "../src/core/availability.ts";
 import { JobExecutor } from "../src/core/jobs.ts";
 import { setDataPathOverrides } from "../src/core/jsonStore.ts";
@@ -33,6 +38,7 @@ function createHarness(options: {
   service?: VirtualDemoService;
   customStreamFn?: ConstructorParameters<typeof PiAgentService>[0]["customStreamFn"];
   customModel?: ConstructorParameters<typeof PiAgentService>[0]["customModel"];
+  verificationOptions?: ConstructorParameters<typeof PiAgentService>[0]["verificationOptions"];
 } = {}) {
   const service = options.service ?? new VirtualDemoService();
   const jobs = new JobExecutor();
@@ -62,6 +68,7 @@ function createHarness(options: {
     },
     ...(options.customStreamFn ? { customStreamFn: options.customStreamFn } : {}),
     ...(options.customModel ? { customModel: options.customModel } : {}),
+    ...(options.verificationOptions ? { verificationOptions: options.verificationOptions } : {}),
   });
 
   return {
@@ -241,10 +248,14 @@ describe("Pi Agent Closed-Loop: Immediate Ack -> Execute -> State Verify -> 3-Ro
       expect(r1.retryNotices?.[1]?.plan).toContain("底层属性写入");
       expect(r1.retryNotices?.[1]?.text).toContain("第2次重试");
 
-      // Voice heard: "好的", retry 1 notice, retry 2 notice, verified final reply
+      // Self-healing retries are SILENT in voice TTS (recorded in timeline/retryNotices, never spoken aloud!)
+      // Voice hears ONLY: immediate ack "好的" and final verified reply.
       expect(spoken[0]).toBe("好的");
-      expect(spoken.some((s) => s.includes("第1次重试"))).toBe(true);
-      expect(spoken.some((s) => s.includes("第2次重试"))).toBe(true);
+      expect(spoken.some((s) => s.includes("第1次重试"))).toBe(false);
+      expect(spoken.some((s) => s.includes("第2次重试"))).toBe(false);
+      expect(spoken.some((s) => s.includes("重试"))).toBe(false);
+      expect(spoken.length).toBe(2);
+      expect(timelineEvents.filter((e) => e.kind === "retry_notice").length).toBe(2);
       expect(r1.reply).toContain("状态检查已通过");
       expect(r1.reply).toContain("沉淀为技能");
 
@@ -430,9 +441,10 @@ describe("Pi Agent Closed-Loop: Immediate Ack -> Execute -> State Verify -> 3-Ro
       expect(await service.readProp("demo-light-living", "brightness")).toBe(85);
       // Premature Round 0 text was NOT streamed as unverified delta before verification!
       expect(emittedDeltas.length).toBe(0);
-      // Voice sequence: "好的" -> retry 1 notice -> final verified reply
+      // Voice sequence: "好的" -> final verified reply (retry 1 runs silently without TTS broadcast!)
       expect(spoken[0]).toBe("好的");
-      expect(spoken[1]).toContain("第1次重试");
+      expect(spoken.some((s) => s.includes("第1次重试"))).toBe(false);
+      expect(spoken.length).toBe(2);
       expect(spoken[spoken.length - 1]).toContain("85%");
       // Skill saved from LLM recovery
       expect(res.skillEvent?.kind).toBe("created");
@@ -509,5 +521,271 @@ describe("Pi Agent Closed-Loop: Immediate Ack -> Execute -> State Verify -> 3-Ro
     expect(delRes.status).toBe(200);
     expect(loadAgentSkills().length).toBe(0);
     expect(existsSync(mdPath)).toBe(false);
+  });
+
+  test("absorbs speaker playing-state cloud/device propagation delay on Round 0 with 0 retries, 0 false skills, and silent completion", async () => {
+    expect(DEFAULT_SPEAKER_PLAYBACK_SETTLE_DELAYS_MS).toEqual([700, 1000, 1300]);
+    expect(DEFAULT_VERIFY_SETTLE_DELAYS_MS).toEqual([300, 600]);
+    expect(
+      resolveSpeakerPlayingValue({
+        name: "playing-state",
+        desc: "播放状态",
+        type: "uint",
+        readable: true,
+        writable: false,
+        range: null,
+        value_list: [{ value: 0, description: "Playing", desc_zh_cn: "播放中" }],
+        unit: null,
+        siid: 3,
+        piid: 1,
+      }),
+    ).toBe(0);
+    expect(
+      resolveSpeakerPlayingValue({
+        name: "playing-state",
+        desc: "播放状态",
+        type: "uint",
+        readable: true,
+        writable: false,
+        range: null,
+        value_list: null,
+        unit: null,
+        siid: 3,
+        piid: 1,
+      }),
+    ).toBe(1);
+
+    const service = new VirtualDemoService();
+    await service.runAction("demo-speaker-xiaoai", "play");
+
+    // Simulate real XiaoAI speaker (e.g. xiaomi.wifispeaker.l05b) lag:
+    // pause succeeds immediately on device, but MIoT playing-state stays 1 for the first 3 readProps calls
+    // (1 inside control_speaker + 2 inside verifyExecutedToolCalls), then reports 2 on the 4th read!
+    let speakerReadCount = 0;
+    const origReadProps = service.readProps.bind(service);
+    service.readProps = async (did: string, names: string[]) => {
+      const vals = await origReadProps(did, names);
+      if (did === "demo-speaker-xiaoai" && names.includes("playing-state")) {
+        speakerReadCount += 1;
+        if (speakerReadCount <= 3) {
+          return { ...vals, "playing-state": 1 };
+        }
+      }
+      return vals;
+    };
+
+    const recordedSleeps: number[] = [];
+    const h = createHarness({
+      service,
+      verificationOptions: {
+        speakerPlaybackSettleDelaysMs: [15, 25, 35],
+        sleep: async (ms) => {
+          recordedSleeps.push(ms);
+        },
+      },
+    });
+    try {
+      await h.ready();
+      const spoken: string[] = [];
+      const retryEvents: unknown[] = [];
+      h.agent.on("speakChunk", (c) => spoken.push(c.text));
+      h.agent.on("streamEvent", (ev) => {
+        if (ev.kind === "retry_notice") retryEvents.push(ev);
+      });
+
+      const res = await h.agent.prompt("停止播放音乐", { source: "voice" });
+      expect(res.ok).toBe(true);
+      expect(res.retriesUsed).toBe(0);
+      expect(res.retryNotices).toBeUndefined();
+      expect(retryEvents.length).toBe(0);
+      expect(res.verification?.status).toBe("passed");
+      expect(res.verification?.passed).toBe(true);
+      expect(res.verification?.checks[0]?.summary).toContain("延迟同步确认");
+      expect(res.silentCompleted).toBe(true);
+      expect(res.reply).toBe("");
+      expect(recordedSleeps).toEqual([15, 25]);
+      // Voice spoke ONLY the immediate ack (no retry speech, no redundant confirmation speech)
+      expect(spoken.length).toBe(1);
+      expect(spoken.some((s) => s.includes("重试"))).toBe(false);
+      // Must NOT pollute skill store when latency was merely readback lag
+      expect(loadAgentSkills().length).toBe(0);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("recovers from transient speaker readback error during settle polling with 0 retries, and fails fast on fatal readback error", async () => {
+    const service = new VirtualDemoService();
+    await service.runAction("demo-speaker-xiaoai", "play");
+
+    let verifyReads = 0;
+    const origReadProps = service.readProps.bind(service);
+    service.readProps = async (did: string, names: string[]) => {
+      if (did === "demo-speaker-xiaoai" && names.length === 1 && names[0] === "playing-state") {
+        verifyReads += 1;
+        if (verifyReads === 1) {
+          throw new Error("设备响应超时，请稍后重试（错误码 -705004000）");
+        }
+      }
+      return origReadProps(did, names);
+    };
+
+    const sleepCalls: number[] = [];
+    const h = createHarness({
+      service,
+      verificationOptions: {
+        speakerPlaybackSettleDelaysMs: [10, 20, 30],
+        sleep: async (ms) => {
+          sleepCalls.push(ms);
+        },
+      },
+    });
+    try {
+      await h.ready();
+      const res = await h.agent.prompt("暂停播放音乐", { source: "voice" });
+      expect(res.ok).toBe(true);
+      expect(res.retriesUsed).toBe(0);
+      expect(res.verification?.status).toBe("passed");
+      expect(res.silentCompleted).toBe(true);
+      expect(sleepCalls).toEqual([10]);
+
+      // Fatal readback error (e.g. session logged out) must abort settle polling immediately (0 sleeps)
+      sleepCalls.length = 0;
+      await service.runAction("demo-speaker-xiaoai", "play");
+      service.readProps = async (did: string, names: string[]) => {
+        if (did === "demo-speaker-xiaoai" && names.length === 1 && names[0] === "playing-state") {
+          throw new Error("尚未登录，请先扫码登录");
+        }
+        return origReadProps(did, names);
+      };
+      const fatalRes = await h.agent.prompt("停止播放音乐", { source: "text" });
+      expect(sleepCalls).toEqual([]);
+      expect(fatalRes.retriesUsed).toBe(0);
+      expect(fatalRes.verification?.passed).toBe(false);
+      expect(fatalRes.verification?.status).toBe("unsolvable");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("escalates silently via silent execute-text-directive when speaker genuinely ignores pause, without TTS retry spam or muting speaker", async () => {
+    const service = new VirtualDemoService();
+    await service.runAction("demo-speaker-xiaoai", "play");
+
+    // Simulate a speaker where play-control `pause` returns ok but does NOT stop playback (e.g. radio/news/TTS),
+    // while `execute-text-directive` ("停止播放", silent=1) genuinely stops playback!
+    const recordedActions: Array<{ name: string; params?: unknown }> = [];
+    const origRunAction = service.runAction.bind(service);
+    service.runAction = async (did: string, name: string, params?: unknown) => {
+      if (did === "demo-speaker-xiaoai") {
+        recordedActions.push({ name, params });
+        if (name === "pause" || name === "stop") {
+          return; // silently fails to stop playback!
+        }
+      }
+      return origRunAction(did, name, params);
+    };
+
+    const h = createHarness({
+      service,
+      verificationOptions: {
+        settleDelaysMs: [5, 5],
+        speakerPlaybackSettleDelaysMs: [5, 5, 5],
+        sleep: async () => {},
+      },
+    });
+    try {
+      await h.ready();
+      const spoken: string[] = [];
+      const retryEvents: Array<{ attempt: number; plan: string }> = [];
+      h.agent.on("speakChunk", (c) => spoken.push(c.text));
+      h.agent.on("streamEvent", (ev) => {
+        if (ev.kind === "retry_notice") {
+          retryEvents.push({
+            attempt: Number(ev.attempt),
+            plan: String(ev.plan ?? ""),
+          });
+        }
+      });
+
+      const res = await h.agent.prompt("停止播放音乐", { source: "voice" });
+      expect(res.ok).toBe(true);
+      // VirtualDemoService speaker has only `pause` (no `stop`), so Round 0 already executed `pause`,
+      // and Round 1 jumps directly to silent `send_xiaoai_command("停止播放", silent: true)`!
+      expect(res.retriesUsed).toBe(1);
+      expect(res.verification?.status).toBe("recovered");
+      expect(res.verification?.passed).toBe(true);
+      expect(await service.readProp("demo-speaker-xiaoai", "playing-state")).toBe(2);
+      // Speaker was NOT left muted as an unnecessary side-effect!
+      expect(await service.readProp("demo-speaker-xiaoai", "mute")).toBe(false);
+
+      // Verify silent execution flag [directive, 1] was sent to execute-text-directive
+      const textDirectiveCall = recordedActions.find((a) => a.name === "execute-text-directive");
+      expect(textDirectiveCall).toBeDefined();
+      expect(textDirectiveCall?.params).toEqual(["停止播放", 1]);
+
+      // Retry notice recorded in UI timeline, NEVER broadcast via voice TTS!
+      expect(retryEvents.length).toBe(1);
+      expect(retryEvents[0]?.plan).toContain("静默小爱文本指令");
+      expect(spoken.some((s) => s.includes("重试"))).toBe(false);
+      expect(spoken.length).toBe(2); // immediate ack + final verified reply only
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("never broadcasts TTS during any of 3 failed voice retries and aborts promptly during settle polling", async () => {
+    const service = new VirtualDemoService();
+    await service.setPowerState("demo-light-living", false);
+    service.setPowerState = async () => {};
+    service.writeProp = async () => {};
+
+    const h = createHarness({
+      service,
+      verificationOptions: {
+        settleDelaysMs: [5, 5],
+        sleep: async () => {},
+      },
+    });
+    try {
+      await h.ready();
+      const spoken: string[] = [];
+      h.agent.on("speakChunk", (c) => spoken.push(c.text));
+
+      const res = await h.agent.prompt("打开客厅吸顶灯", { source: "voice" });
+      expect(res.retriesUsed).toBe(MAX_RECOVERY_ROUNDS);
+      expect(res.verification?.status).toBe("failed");
+      expect(res.retryNotices?.length).toBe(3);
+      // ZERO retry notices spoken aloud; only ack + final failure summary
+      expect(spoken.some((s) => s.includes("重试"))).toBe(false);
+      expect(spoken.length).toBe(2);
+      expect(spoken[0]).toBe("好的");
+      expect(spoken[1]).toContain("已尝试 3 轮");
+    } finally {
+      await h.cleanup();
+    }
+
+    // Abort during long settle polling resolves immediately without waiting for the timer
+    const slowService = new VirtualDemoService();
+    await slowService.setPowerState("demo-light-living", false);
+    slowService.setPowerState = async () => {};
+    const hAbort = createHarness({
+      service: slowService,
+      verificationOptions: {
+        settleDelaysMs: [10_000],
+      },
+    });
+    try {
+      await hAbort.ready();
+      const sub = hAbort.agent.submitPrompt("打开客厅吸顶灯", { source: "text" });
+      await Bun.sleep(40);
+      const t0 = performance.now();
+      expect(hAbort.agent.abortTask(sub.taskId)).toBe(true);
+      const abortedRes = await sub.promise;
+      expect(performance.now() - t0).toBeLessThan(800);
+      expect(abortedRes.ok).toBe(false);
+    } finally {
+      await hAbort.cleanup();
+    }
   });
 });

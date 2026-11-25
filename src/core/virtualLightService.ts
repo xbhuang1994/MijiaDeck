@@ -1414,7 +1414,15 @@ export class VirtualDemoService implements IMijiaService {
       if (text === undefined || text === null || String(text).trim() === "") {
         throw new ServiceError(`动作 ${action.name} 需要文本参数`);
       }
-      this.lastDirective = String(text);
+      const textStr = String(text);
+      this.lastDirective = textStr;
+      if (action.name === "execute-text-directive" && "playing-state" in entry.values) {
+        if (/(?:停止播放|暂停播放|别放了|停止音乐|暂停音乐)/.test(textStr)) {
+          entry.values["playing-state"] = 2;
+        } else if (/(?:继续播放|恢复播放)/.test(textStr)) {
+          entry.values["playing-state"] = 1;
+        }
+      }
       return;
     }
     if (action.name === "play") {
