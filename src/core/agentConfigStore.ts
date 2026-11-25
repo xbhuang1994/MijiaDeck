@@ -317,6 +317,8 @@ export interface AgentVoiceConfig {
   systemOneConfidenceThreshold: number;
   // Caveman 极简回复风格（参考 juliusbrussee/caveman）
   cavemanMode: CavemanReplyMode;
+  /** 简单常规控制指令（如开关灯等）执行且状态核验正常后保持静默（默认开启，仅异常或需询问时回复） */
+  silentSimpleControlReply: boolean;
   /** AI 思考/推理等级：off（关闭）/ minimal / low / medium / high / xhigh / max（思考过程仅展示在对话框，不语音播报） */
   thinkingLevel: AgentThinkingLevel;
   // openWakeWord 独立本地声学唤醒词优化（支持用户自定义唤醒词）
@@ -392,6 +394,7 @@ export interface AgentConfigPatch {
   systemOneTimeoutMs?: unknown;
   systemOneConfidenceThreshold?: unknown;
   cavemanMode?: unknown;
+  silentSimpleControlReply?: unknown;
   thinkingLevel?: unknown;
   owwEnabled?: unknown;
   owwThreshold?: unknown;
@@ -452,6 +455,7 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     systemOneTimeoutMs: 2000,
     systemOneConfidenceThreshold: 0.65,
     cavemanMode: DEFAULT_CAVEMAN_MODE,
+    silentSimpleControlReply: true,
     thinkingLevel: DEFAULT_THINKING_LEVEL,
     owwEnabled: true,
     owwThreshold: 0.6,
@@ -797,6 +801,10 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
       ).toFixed(2),
     ),
     cavemanMode,
+    silentSimpleControlReply:
+      typeof raw.silentSimpleControlReply === "boolean"
+        ? raw.silentSimpleControlReply
+        : defaults.silentSimpleControlReply,
     thinkingLevel,
     owwEnabled: typeof raw.owwEnabled === "boolean" ? raw.owwEnabled : defaults.owwEnabled,
     owwThreshold: Number(clampNumber(raw.owwThreshold, 0.25, 0.95, defaults.owwThreshold).toFixed(2)),
@@ -1217,6 +1225,9 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
       throw new Error(`不支持的回复精简模式: ${cmRaw}`);
     }
     nextRaw.cavemanMode = mapped;
+  }
+  if (patch.silentSimpleControlReply !== undefined) {
+    nextRaw.silentSimpleControlReply = Boolean(patch.silentSimpleControlReply);
   }
   if (patch.thinkingLevel !== undefined) {
     const tlRaw = String(patch.thinkingLevel).trim().toLowerCase();

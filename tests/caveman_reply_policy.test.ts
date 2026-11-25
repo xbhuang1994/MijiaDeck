@@ -27,6 +27,7 @@ import {
 } from "../src/agent/localPlannerStream.ts";
 import { PiAgentService } from "../src/agent/piAgentService.ts";
 import { createSmartHomeTools } from "../src/agent/smartHomeTools.ts";
+import { defaultAgentVoiceConfig } from "../src/core/agentConfigStore.ts";
 import { NetworkMonitor } from "../src/core/availability.ts";
 import { JobExecutor } from "../src/core/jobs.ts";
 import { setDataPathOverrides } from "../src/core/jsonStore.ts";
@@ -88,6 +89,11 @@ function createHarness(options: {
 
   const agent = new PiAgentService({
     deps,
+    // 此测试集专门检验 lite/full/ultra 各档位的回复文案压缩与措辞，显式关闭常规控制静默以便逐条断言文案
+    initialConfig: {
+      ...defaultAgentVoiceConfig(),
+      silentSimpleControlReply: false,
+    },
     ...(customStreamFn ? { customStreamFn } : {}),
   });
 
