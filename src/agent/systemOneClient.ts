@@ -6,7 +6,7 @@
  * SystemOne 决策模型客户端（POST {baseUrl}/systemone）。
  *
  * 面向语音唤醒注意力门控、连续对话判别、双轨 ASR 择优、TTS 回声判别、
- * 指令意图分类与隐式家居动作识别，提供：
+ * 指令意图分类、隐式家居动作识别与场景化即时应答词分类，提供：
  * - 单次 HTTP 批量多问题决策（choice / score / noul）
  * - 每实例熔断器（404/405/501、401/403 即刻熔断；超时/5xx/429 连续 2 次指数退避）
  * - 负向结果短 TTL LRU 缓存（仅缓存非执行判定，绝不缓存 direct_command / followup）
@@ -19,6 +19,14 @@ import {
   type AgentVoiceConfig,
 } from "../core/agentConfigStore.ts";
 import { createBoundedFetch, type BoundedFetch, type FetchLike } from "../core/httpTimeout.ts";
+import {
+  TASK_ACK_MIN_CONFIDENCE,
+  TASK_ACK_QUESTION,
+  resolveTaskAckPhrase,
+  type TaskAckScenario,
+} from "./taskAckPolicy.ts";
+
+export type { TaskAckScenario };
 
 // ==================== Wire Protocol Types ====================
 
@@ -90,6 +98,7 @@ export interface SystemOneResponse<
 
 export interface SystemOneDecideOptions {
   timeoutMs?: number;
+  signal?: AbortSignal;
   cacheKey?: string;
   cacheable?: boolean;
 }
@@ -264,6 +273,29 @@ export interface ImplicitActionResult {
   confidence: number;
   probabilities: Record<ImplicitActionChoice, number>;
   needsAgent: boolean;
+  model: string;
+  usage: SystemOneUsage;
+  latencyMs: number;
+}
+
+export interface TaskAckInput {
+  utterance: string;
+  recentHistory?: ReadonlyArray<SystemOneHistoryEntry>;
+  source?: "text" | "voice";
+}
+
+export interface TaskAckOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  minConfidence?: number;
+}
+
+export interface TaskAckClassificationResult {
+  scenario: TaskAckScenario;
+  ackText: string;
+  confident: boolean;
+  confidence: number;
+  probabilities: Record<TaskAckScenario, number>;
   model: string;
   usage: SystemOneUsage;
   latencyMs: number;
@@ -916,6 +948,9 @@ export class SystemOneClient {
     if (!this._enabled) {
       return null;
     }
+    if (options?.signal?.aborted) {
+      return null;
+    }
     if (Object.keys(questions).length === 0) {
       return null;
     }
@@ -977,6 +1012,7 @@ export class SystemOneClient {
         headers,
         body,
         timeoutMs: effectiveTimeoutMs,
+        ...(options?.signal ? { signal: options.signal } : {}),
       });
 
       const elapsedMs = Math.max(0, Math.round(performance.now() - t0));
@@ -1018,6 +1054,12 @@ export class SystemOneClient {
       }
       return validated;
     } catch (err) {
+      if (options?.signal?.aborted) {
+        if (isHalfOpenProbe) {
+          this._halfOpenProbeInFlight = false;
+        }
+        return null;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       const kind: Exclude<SystemOneFailureKind, "none"> = isTimeoutError(err)
         ? "timeout"
@@ -1484,6 +1526,64 @@ export class SystemOneClient {
       confidence: ans.confidence,
       probabilities: ans.probabilities,
       needsAgent: ans.choice === "needs_llm_agent" || ans.confidence < this._confidenceThreshold,
+      model: res.model,
+      usage: res.usage,
+      latencyMs,
+    };
+  }
+
+  /**
+   * (g) 场景化即时简短应答词快速判定（`execute_control | query_status | think_creative | ...`）。
+   */
+  async classifyTaskAck(
+    input: TaskAckInput,
+    opts?: TaskAckOptions,
+  ): Promise<TaskAckClassificationResult | null> {
+    if (!this._enabled || opts?.signal?.aborted) return null;
+    const cleanUtterance = collapseWhitespace(input.utterance);
+    if (!cleanUtterance) return null;
+
+    const state: Record<string, unknown> = {
+      utterance: truncateText(cleanUtterance, 200),
+    };
+    if (input.source) {
+      state.source = input.source;
+    }
+    const history = formatCompactHistory(
+      input.recentHistory,
+      HISTORY_MAX_ENTRIES,
+      HISTORY_MAX_CHARS,
+    );
+    if (history.length > 0) {
+      state.history = history;
+    }
+
+    const t0 = performance.now();
+    const res = await this.decide(
+      state,
+      {
+        task_ack: TASK_ACK_QUESTION,
+      },
+      {
+        timeoutMs: opts?.timeoutMs,
+        signal: opts?.signal,
+      },
+    );
+    if (!res) return null;
+
+    const latencyMs = Math.max(0, Math.round(performance.now() - t0));
+    const ans = res.answers.task_ack;
+    const minConfidence =
+      typeof opts?.minConfidence === "number" && Number.isFinite(opts.minConfidence)
+        ? clamp01(opts.minConfidence)
+        : TASK_ACK_MIN_CONFIDENCE;
+    const scenario = ans.choice;
+    return {
+      scenario,
+      ackText: resolveTaskAckPhrase(scenario, cleanUtterance),
+      confident: ans.confidence >= minConfidence,
+      confidence: ans.confidence,
+      probabilities: ans.probabilities,
       model: res.model,
       usage: res.usage,
       latencyMs,

@@ -13,8 +13,10 @@ import {
   type DualTrackAsrChoice,
   type EchoCheckChoice,
   type ImplicitActionChoice,
+  type TaskAckScenario,
   type WakeAttentionDecision,
 } from "../src/agent/systemOneClient.ts";
+import { TASK_ACK_SCENARIOS } from "../src/agent/taskAckPolicy.ts";
 import {
   DEFAULT_SYSTEMONE_MODEL,
   defaultAgentVoiceConfig,
@@ -720,6 +722,77 @@ describe("SystemOneClient wire protocol & 6 domain methods", () => {
     conf = 0.45;
     const r3 = await client.classifyImplicitAction({ utterance: "有点杂音" });
     expect(r3!.needsAgent).toBe(true);
+  });
+
+  test("(g) classifyTaskAck selects scenario-specific short ack, handles ZH/EN, low confidence, and caller abort", async () => {
+    let scenario: TaskAckScenario = "query_status";
+    let conf = 0.94;
+    let delayMs = 0;
+    const { fetcher, requests } = createMockFetcher(async (_req, _idx, init) => {
+      if (delayMs > 0) {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(resolve, delayMs);
+          init?.signal?.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              reject(new DOMException("Aborted", "AbortError"));
+            },
+            { once: true },
+          );
+        });
+      }
+      return jsonResponse({
+        model: DEFAULT_SYSTEMONE_MODEL,
+        answers: {
+          task_ack: makeChoiceAnswer<TaskAckScenario>(scenario, conf, TASK_ACK_SCENARIOS),
+        },
+        usage: { input_tokens: 95, output_tokens: 1 },
+      });
+    });
+
+    const client = new SystemOneClient({
+      baseUrl: "https://karpo.example.com/v1",
+      apiKey: "sk-test-ack-123456",
+      fetcher,
+    });
+
+    const r1 = await client.classifyTaskAck({
+      utterance: "空调设置的多少度",
+      source: "voice",
+      recentHistory: [{ role: "user", text: "打开空调" }],
+    });
+    expect(requests).toHaveLength(1);
+    const state = requests[0]!.body.state as Record<string, unknown>;
+    expect(state.utterance).toBe("空调设置的多少度");
+    expect(state.source).toBe("voice");
+    expect(state.history).toEqual(["U: 打开空调"]);
+    expect(r1!.scenario).toBe("query_status");
+    expect(r1!.ackText).toBe("稍等我看一下");
+    expect(r1!.confident).toBe(true);
+
+    // Pure English utterance maps to concise English ack phrase
+    scenario = "think_creative";
+    conf = 0.88;
+    const r2 = await client.classifyTaskAck({ utterance: "Tell me a joke" });
+    expect(r2!.scenario).toBe("think_creative");
+    expect(r2!.ackText).toBe("Let me think");
+    expect(r2!.confident).toBe(true);
+
+    // Low confidence marks confident = false
+    conf = 0.3;
+    const r3 = await client.classifyTaskAck({ utterance: "嗯..." });
+    expect(r3!.confident).toBe(false);
+
+    // Caller AbortSignal cancels cleanly without counting as a SystemOne failure
+    delayMs = 200;
+    const ac = new AbortController();
+    const pending = client.classifyTaskAck({ utterance: "给我讲个笑话" }, { signal: ac.signal });
+    setTimeout(() => ac.abort(), 20);
+    const rAborted = await pending;
+    expect(rAborted).toBeNull();
+    expect(client.lastFailureKind).toBe("none");
+    expect(client.getStatus().circuitState).toBe("closed");
   });
 });
 

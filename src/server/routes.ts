@@ -163,7 +163,12 @@ export interface AppRuntime {
   reloadVoiceStreams?: (
     wakeWords: readonly string[],
     threshold?: number,
-    options?: { streamingAsrEnabled?: boolean },
+    options?: {
+      streamingAsrEnabled?: boolean;
+      voicePipelineMode?: agentConfigStoreModule.VoicePipelineMode;
+      vadSilenceMs?: number;
+      vadSensitivity?: agentConfigStoreModule.VadSensitivityMode;
+    },
   ) => void;
   speakerAudioProps?: Map<string, { volName: string; muteName: string }>;
 }
@@ -2021,7 +2026,10 @@ export function createRequestHandler(
           taskId: result.taskId,
           entryId: result.entryId,
           ack: result.ack,
+          ...(result.ackScenario ? { ackScenario: result.ackScenario } : {}),
+          ...(result.ackSource ? { ackSource: result.ackSource } : {}),
           reply: result.reply,
+          ...(result.silentCompleted ? { silentCompleted: true } : {}),
           ...(result.thinking ? { thinking: result.thinking } : {}),
           ...(result.thinkingLevel ? { thinkingLevel: result.thinkingLevel } : {}),
           ...(result.memoryEvent ? { memoryEvent: result.memoryEvent } : {}),
@@ -2516,9 +2524,18 @@ export function createRequestHandler(
           if (updated.ttsEngine !== "browser" && updated.autoSpeakReply) {
             void runtime.voiceListener.prewarmLocalTts().catch(() => {});
           }
+          if (
+            updated.voicePipelineMode === "clearvoice" &&
+            runtime.voiceListener.localEngine.clearVoiceGpu.getStatus().ready
+          ) {
+            void runtime.voiceListener.localEngine.clearVoiceGpu.warmup().catch(() => {});
+          }
         }
         runtime.reloadVoiceStreams?.(updated.wakeWords, updated.owwThreshold, {
           streamingAsrEnabled: updated.qwen3StreamingEnabled,
+          voicePipelineMode: updated.voicePipelineMode,
+          vadSilenceMs: updated.vadSilenceMs,
+          vadSensitivity: updated.vadSensitivity,
         });
         emitBroadcast(runtime);
         return jsonResponse({

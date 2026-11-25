@@ -181,6 +181,7 @@ function handleWsMessage(
         owwEnabled: cfg.owwEnabled,
         owwThreshold: cfg.owwThreshold,
         streamingAsrEnabled: cfg.qwen3StreamingEnabled,
+        voicePipelineMode: cfg.voicePipelineMode,
         onPartialTranscript: (partial) => {
           try {
             ws.send(
@@ -474,6 +475,21 @@ export async function startMijiaDeckServer(
         stream.reloadWakeWords(wakeWords, threshold);
         if (typeof streamOpts?.streamingAsrEnabled === "boolean") {
           stream.setStreamingAsrEnabled(streamOpts.streamingAsrEnabled);
+        }
+        if (
+          streamOpts?.voicePipelineMode === "legacy" ||
+          streamOpts?.voicePipelineMode === "clearvoice"
+        ) {
+          stream.setVoicePipelineMode(streamOpts.voicePipelineMode);
+        }
+        if (
+          typeof streamOpts?.vadSilenceMs === "number" ||
+          streamOpts?.vadSensitivity !== undefined
+        ) {
+          stream.updateVadTiming({
+            vadSilenceMs: streamOpts?.vadSilenceMs,
+            vadSensitivity: streamOpts?.vadSensitivity,
+          });
         }
       }
     },

@@ -25,6 +25,7 @@ export type AgentProviderMode =
   | "openai-compatible";
 
 export type VoiceEngineMode = "auto" | "local" | "browser" | "whisper";
+export type VoicePipelineMode = "legacy" | "clearvoice";
 export type LocalAsrEngineMode = "auto" | "qwen3-asr" | "sensevoice";
 export type Qwen3ComputeDeviceMode = "auto" | "gpu" | "cpu";
 export type TtsEngineMode = "auto" | "local" | "browser";
@@ -151,6 +152,19 @@ export const PROVIDER_PRESETS: ReadonlyArray<ProviderPreset> = [
 
 const VALID_PROVIDERS = new Set<string>(PROVIDER_PRESETS.map((p) => p.id));
 const VALID_VOICE_ENGINES = new Set<string>(["auto", "local", "browser", "whisper"]);
+const VALID_VOICE_PIPELINE_MODES = new Set<string>(["legacy", "clearvoice"]);
+const VOICE_PIPELINE_MODE_ALIASES: Readonly<Record<string, VoicePipelineMode>> = {
+  legacy: "legacy",
+  original: "legacy",
+  old: "legacy",
+  default: "legacy",
+  sherpa: "legacy",
+  gtcrn: "legacy",
+  clearvoice: "clearvoice",
+  "clearvoice-gpu": "clearvoice",
+  mossformer2: "clearvoice",
+  new: "clearvoice",
+};
 const VALID_LOCAL_ASR_ENGINES = new Set<string>(["auto", "qwen3-asr", "sensevoice"]);
 const LOCAL_ASR_ENGINE_ALIASES: Readonly<Record<string, LocalAsrEngineMode>> = {
   auto: "auto",
@@ -234,6 +248,7 @@ const VALID_CUSTOM_APIS = new Set<string>([
 export const DEFAULT_WAKE_WORDS = ["小派", "小湃", "小π", "派派", "pi", "米家助手"] as const;
 export const DEFAULT_WAKE_ACK_PHRASE = "嗯?";
 export const DEFAULT_LOCAL_ASR_ENGINE: LocalAsrEngineMode = "auto";
+export const DEFAULT_VOICE_PIPELINE_MODE: VoicePipelineMode = "legacy";
 export const DEFAULT_QWEN3_COMPUTE_DEVICE: Qwen3ComputeDeviceMode = "auto";
 export const DEFAULT_QWEN3_STREAMING_ENABLED = true;
 export const DEFAULT_TTS_ENGINE: TtsEngineMode = "auto";
@@ -252,6 +267,10 @@ export interface AgentVoiceConfig {
   maxHistoryTurns: number;
   voiceEnabled: boolean;
   voiceEngine: VoiceEngineMode;
+  /** 语音前端降噪与切片方案：legacy（原方案 GTCRN/声源分离）/ clearvoice（新方案 ClearVoice GPU 准实时切片 -> Qwen3-ASR） */
+  voicePipelineMode: VoicePipelineMode;
+  /** 可选外部 ClearVoice GPU 服务地址（留空则自动在本地 GPU 启动内置 ClearVoice 服务） */
+  clearVoiceServiceUrl: string;
   /** 本地离线语音转写策略：auto（主用 Qwen3-ASR-0.6B，备用 SenseVoice 自动兜底）/ qwen3-asr / sensevoice */
   localAsrEngine: LocalAsrEngineMode;
   /** Qwen3-ASR-0.6B 计算设备：auto（自动识别 GPU 优先，无 GPU 时回落 CPU）/ gpu / cpu */
@@ -298,6 +317,8 @@ export interface AgentVoiceConfig {
   systemOneConfidenceThreshold: number;
   // Caveman 极简回复风格（参考 juliusbrussee/caveman）
   cavemanMode: CavemanReplyMode;
+  /** 简单常规控制指令（如开关灯等）执行且状态核验正常后保持静默（默认开启，仅异常或需询问时回复） */
+  silentSimpleControlReply: boolean;
   /** AI 思考/推理等级：off（关闭）/ minimal / low / medium / high / xhigh / max（思考过程仅展示在对话框，不语音播报） */
   thinkingLevel: AgentThinkingLevel;
   // openWakeWord 独立本地声学唤醒词优化（支持用户自定义唤醒词）
@@ -334,6 +355,8 @@ export interface AgentConfigPatch {
   maxHistoryTurns?: unknown;
   voiceEnabled?: unknown;
   voiceEngine?: unknown;
+  voicePipelineMode?: unknown;
+  clearVoiceServiceUrl?: unknown;
   localAsrEngine?: unknown;
   qwen3ComputeDevice?: unknown;
   qwen3StreamingEnabled?: unknown;
@@ -371,6 +394,7 @@ export interface AgentConfigPatch {
   systemOneTimeoutMs?: unknown;
   systemOneConfidenceThreshold?: unknown;
   cavemanMode?: unknown;
+  silentSimpleControlReply?: unknown;
   thinkingLevel?: unknown;
   owwEnabled?: unknown;
   owwThreshold?: unknown;
@@ -393,6 +417,8 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     maxHistoryTurns: 12,
     voiceEnabled: true,
     voiceEngine: "auto",
+    voicePipelineMode: DEFAULT_VOICE_PIPELINE_MODE,
+    clearVoiceServiceUrl: "",
     localAsrEngine: DEFAULT_LOCAL_ASR_ENGINE,
     qwen3ComputeDevice: DEFAULT_QWEN3_COMPUTE_DEVICE,
     qwen3StreamingEnabled: DEFAULT_QWEN3_STREAMING_ENABLED,
@@ -407,7 +433,7 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     ttsSpeed: DEFAULT_TTS_SPEED,
     continuousListen: true,
     vadThreshold: 0.018,
-    vadSilenceMs: 600,
+    vadSilenceMs: 1000,
     vadSensitivity: "default",
     noiseSuppressionMode: "auto",
     sourceSeparationMode: "auto",
@@ -429,6 +455,7 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     systemOneTimeoutMs: 2000,
     systemOneConfidenceThreshold: 0.65,
     cavemanMode: DEFAULT_CAVEMAN_MODE,
+    silentSimpleControlReply: true,
     thinkingLevel: DEFAULT_THINKING_LEVEL,
     owwEnabled: true,
     owwThreshold: 0.6,
@@ -511,6 +538,15 @@ export function normalizeLocalAsrEngine(
   return LOCAL_ASR_ENGINE_ALIASES[key] ?? fallback;
 }
 
+export function normalizeVoicePipelineMode(
+  value: unknown,
+  fallback: VoicePipelineMode = DEFAULT_VOICE_PIPELINE_MODE,
+): VoicePipelineMode {
+  if (typeof value !== "string") return fallback;
+  const key = value.trim().toLowerCase();
+  return VOICE_PIPELINE_MODE_ALIASES[key] ?? fallback;
+}
+
 export function normalizeQwen3ComputeDevice(
   value: unknown,
   fallback: Qwen3ComputeDeviceMode = DEFAULT_QWEN3_COMPUTE_DEVICE,
@@ -569,6 +605,11 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     : defaults.voiceEngine;
 
   const localAsrEngine = normalizeLocalAsrEngine(raw.localAsrEngine, defaults.localAsrEngine);
+  const voicePipelineMode = normalizeVoicePipelineMode(
+    raw.voicePipelineMode,
+    defaults.voicePipelineMode,
+  );
+  const clearVoiceServiceUrl = normalizeUrl(raw.clearVoiceServiceUrl);
   const qwen3ComputeDevice = normalizeQwen3ComputeDevice(
     raw.qwen3ComputeDevice,
     defaults.qwen3ComputeDevice,
@@ -697,6 +738,8 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     maxHistoryTurns: Math.round(clampNumber(raw.maxHistoryTurns, 2, 40, defaults.maxHistoryTurns)),
     voiceEnabled: typeof raw.voiceEnabled === "boolean" ? raw.voiceEnabled : defaults.voiceEnabled,
     voiceEngine,
+    voicePipelineMode,
+    clearVoiceServiceUrl,
     localAsrEngine,
     qwen3ComputeDevice,
     qwen3StreamingEnabled,
@@ -758,6 +801,10 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
       ).toFixed(2),
     ),
     cavemanMode,
+    silentSimpleControlReply:
+      typeof raw.silentSimpleControlReply === "boolean"
+        ? raw.silentSimpleControlReply
+        : defaults.silentSimpleControlReply,
     thinkingLevel,
     owwEnabled: typeof raw.owwEnabled === "boolean" ? raw.owwEnabled : defaults.owwEnabled,
     owwThreshold: Number(clampNumber(raw.owwThreshold, 0.25, 0.95, defaults.owwThreshold).toFixed(2)),
@@ -991,6 +1038,21 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
     }
     nextRaw.voiceEngine = eng;
   }
+  if (patch.voicePipelineMode !== undefined) {
+    const rawMode = String(patch.voicePipelineMode).trim().toLowerCase();
+    const mappedMode = VOICE_PIPELINE_MODE_ALIASES[rawMode];
+    if (!mappedMode || !VALID_VOICE_PIPELINE_MODES.has(mappedMode)) {
+      throw new Error(`不支持的语音降噪方案模式: ${rawMode}`);
+    }
+    nextRaw.voicePipelineMode = mappedMode;
+  }
+  if (patch.clearVoiceServiceUrl !== undefined) {
+    const rawUrl = String(patch.clearVoiceServiceUrl).trim();
+    if (rawUrl && !normalizeUrl(rawUrl)) {
+      throw new Error("ClearVoice GPU 服务地址必须是以 http:// 或 https:// 开头的有效地址");
+    }
+    nextRaw.clearVoiceServiceUrl = rawUrl;
+  }
   if (patch.localAsrEngine !== undefined) {
     const rawAsr = String(patch.localAsrEngine).trim().toLowerCase();
     const mappedAsr = LOCAL_ASR_ENGINE_ALIASES[rawAsr];
@@ -1163,6 +1225,9 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
       throw new Error(`不支持的回复精简模式: ${cmRaw}`);
     }
     nextRaw.cavemanMode = mapped;
+  }
+  if (patch.silentSimpleControlReply !== undefined) {
+    nextRaw.silentSimpleControlReply = Boolean(patch.silentSimpleControlReply);
   }
   if (patch.thinkingLevel !== undefined) {
     const tlRaw = String(patch.thinkingLevel).trim().toLowerCase();

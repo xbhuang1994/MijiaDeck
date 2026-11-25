@@ -17,6 +17,8 @@ export type ClientVoiceMode = "idle" | "listening" | "awake" | "processing" | "s
 export interface ClientVoiceConfig {
   voiceEnabled: boolean;
   voiceEngine: "auto" | "local" | "browser" | "whisper";
+  voicePipelineMode?: "legacy" | "clearvoice";
+  clearVoiceServiceUrl?: string;
   localAsrEngine?: "auto" | "qwen3-asr" | "sensevoice";
   qwen3ComputeDevice?: "auto" | "gpu" | "cpu";
   qwen3StreamingEnabled?: boolean;
@@ -616,14 +618,14 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
 
     // 兜底 HTTP 模式下的自适应噪声底噪 + VAD 状态
     this.vadThreshold = Number(opts.vadThreshold) || 0.018;
-    this.vadSilenceMs = Number(opts.vadSilenceMs) || 600;
+    this.vadSilenceMs = Number(opts.vadSilenceMs) || 1000;
     this.noiseFloor = 0.006;
     this.speaking = false;
     this.speechChunks = [];
     this.speechSampleCount = 0;
     this.silentSamples = 0;
     this.loudFrames = 0;
-    this.maxSpeechSamples = this.targetRate * 5;
+    this.maxSpeechSamples = this.targetRate * 30;
     this.minSpeechSamples = Math.round(this.targetRate * 0.22);
 
     this.paused = false;
@@ -1024,7 +1026,7 @@ export class VoiceListenerClient {
     ttsSpeed: 0.98,
     continuousListen: true,
     vadThreshold: 0.018,
-    vadSilenceMs: 750,
+    vadSilenceMs: 1000,
     noiseSuppressionMode: "auto",
     vadMode: "silero",
     voiceprintMode: "tag",
@@ -2302,7 +2304,7 @@ export class VoiceListenerClient {
         if (rms >= this.config.vadThreshold * 0.75) {
           lastLoud = now;
         }
-        if (now - lastLoud >= this.config.vadSilenceMs || now - startedAt >= 15_000) {
+        if (now - lastLoud >= this.config.vadSilenceMs || now - startedAt >= 30_000) {
           speaking = false;
           const total = chunks.reduce((a, c) => a + c.length, 0);
           const merged = new Float32Array(total);

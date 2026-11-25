@@ -169,6 +169,7 @@ export interface UiAgentTimelineEntry {
   skillEvent?: UiAgentSkillEvent | null;
   memoryEvent?: UiAgentMemoryEvent | null;
   pendingConfirmation?: UiPendingConfirmation | null;
+  silentCompleted?: boolean;
   error?: string;
 }
 
@@ -240,6 +241,7 @@ export interface UiPublicAgentConfig extends ClientVoiceConfig {
   effectiveSystemOneBaseUrl?: string;
   effectiveSystemOneConfigured?: boolean;
   cavemanMode?: UiCavemanMode;
+  silentSimpleControlReply?: boolean;
   thinkingLevel?: UiThinkingLevel;
   preferLocalIntents?: boolean;
   owwEnabled?: boolean;
@@ -310,6 +312,25 @@ export interface UiLocalVoiceStatus {
   readyForDenoise: boolean;
   readyForDpdfnet?: boolean;
   readyForVoxlock?: boolean;
+  readyForClearVoiceGpu?: boolean;
+  clearVoice?: {
+    gpuDetected: boolean;
+    gpuName: string | null;
+    vramTotalMb: number | null;
+    vramFreeMb: number | null;
+    runtimeReady: boolean;
+    modelReady: boolean;
+    scriptReady: boolean;
+    customServiceUrl: string;
+    ready: boolean;
+    serverRunning: boolean;
+    provider: "cuda" | "cpu" | "remote" | "none";
+    modelName: string;
+    serviceUrl: string | null;
+    lastLatencyMs: number | null;
+    lastInferMs: number | null;
+    lastError: string | null;
+  };
   readyForVad: boolean;
   readyForVoiceprint: boolean;
   readyForQwen3Asr?: boolean;
@@ -360,6 +381,7 @@ export interface UiLocalVoiceStatus {
     senseVoice: boolean;
     openWakeWord?: boolean;
     localTts?: boolean;
+    clearVoiceMossformer2?: boolean;
   };
 }
 
@@ -376,6 +398,8 @@ export interface UiVoiceSnapshot {
   active: boolean;
   mode: ClientVoiceMode;
   engine: "local" | "browser" | "whisper" | "manual";
+  voicePipelineMode?: "legacy" | "clearvoice";
+  clearVoiceServiceUrl?: string;
   localAsrEngine?: "auto" | "qwen3-asr" | "sensevoice";
   qwen3ComputeDevice?: "auto" | "gpu" | "cpu";
   qwen3StreamingEnabled?: boolean;
@@ -849,6 +873,11 @@ export class PiAgentPanelController {
       void this.toggleStreamingAsrMode();
     });
 
+    const pipelineToggleBtn = document.getElementById("pi-voice-pipeline-toggle-btn");
+    pipelineToggleBtn?.addEventListener("click", () => {
+      void this.toggleVoicePipelineMode();
+    });
+
     const cavemanBtn = document.getElementById("pi-caveman-toggle-btn");
     cavemanBtn?.addEventListener("click", () => {
       void this.cycleCavemanMode();
@@ -1078,6 +1107,29 @@ export class PiAgentPanelController {
     }
   }
 
+  async toggleVoicePipelineMode(): Promise<void> {
+    const current =
+      this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy";
+    const next: "legacy" | "clearvoice" = current === "clearvoice" ? "legacy" : "clearvoice";
+    try {
+      const res = await this.deps.apiPost<{
+        agent?: UiPiAgentSnapshot;
+        voice?: UiVoiceSnapshot;
+      }>("/api/agent/config", { voicePipelineMode: next });
+      if (res.agent) this.applyAgentSnapshot(res.agent);
+      if (res.voice) this.applyVoiceSnapshot(res.voice);
+      this.deps.showToast(
+        next === "clearvoice"
+          ? "已切换新方案：ClearVoice GPU 准实时切片 → Qwen3-ASR"
+          : "已切回原方案（GTCRN + 声源分离）",
+        2400,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.deps.showToast(`切换语音方案失败：${msg}`, 3000);
+    }
+  }
+
   async toggleWakeWordMode(): Promise<void> {
     const current = this.agentState?.config.wakeWordEnabled ?? true;
     try {
@@ -1291,6 +1343,9 @@ export class PiAgentPanelController {
       const target = this.agentState.timeline.find((e) => e.id === entryId);
       if (target) {
         target.text = ev.text;
+        if (ev.silent === true) {
+          target.silentCompleted = true;
+        }
         if (typeof ev.thinking === "string") target.thinking = ev.thinking;
         target.thinkingActive = false;
         if (ev.verification) target.verification = ev.verification as UiAgentVerificationSummary;
@@ -2086,6 +2141,7 @@ export class PiAgentPanelController {
     const oneShotBtn = node<HTMLButtonElement>("pi-voice-oneshot-btn");
     const wakeBtn = node<HTMLButtonElement>("pi-voice-wake-toggle-btn");
     const streamingBtn = document.getElementById("pi-streaming-toggle-btn") as HTMLButtonElement | null;
+    const pipelineBtn = document.getElementById("pi-voice-pipeline-toggle-btn") as HTMLButtonElement | null;
     const cavemanBtn = document.getElementById("pi-caveman-toggle-btn") as HTMLButtonElement | null;
 
     const mode = this.effectiveMode();
@@ -2165,6 +2221,24 @@ export class PiAgentPanelController {
         : "流式转写已关闭，当前使用传统静音判停整句识别（点击开启实时流式转写）";
     }
 
+    if (pipelineBtn) {
+      const pipelineMode =
+        this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy";
+      const isClearVoice = pipelineMode === "clearvoice";
+      const cvInfo = this.voiceState?.localEngine?.clearVoice;
+      const cvReady = Boolean(this.voiceState?.localEngine?.readyForClearVoiceGpu ?? cvInfo?.ready);
+      pipelineBtn.textContent = isClearVoice
+        ? cvReady
+          ? "方案：ClearVoice"
+          : "ClearVoice(待就绪)"
+        : "方案：原方案";
+      pipelineBtn.classList.toggle("active", isClearVoice);
+      pipelineBtn.setAttribute("aria-pressed", String(isClearVoice));
+      pipelineBtn.title = isClearVoice
+        ? "当前为新方案：ClearVoice GPU 准实时切片（Silero VAD 双触发 + 0.3s 上下文 + 20ms 淡入淡出）→ Qwen3-ASR（点击切回原方案）"
+        : "当前为原方案（GTCRN + Silero VAD + 声源分离），点击切换为 ClearVoice GPU 准实时切片 → Qwen3-ASR 新方案";
+    }
+
     if (cavemanBtn) {
       const cm = this.currentCavemanMode();
       cavemanBtn.textContent = CAVEMAN_LABELS[cm];
@@ -2217,14 +2291,18 @@ export class PiAgentPanelController {
       const streamingOn =
         (this.voiceState?.qwen3StreamingEnabled ?? this.agentState?.config.qwen3StreamingEnabled ?? true) !==
         false;
+      const pipelineIsCv =
+        (this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy") ===
+        "clearvoice";
+      const cvPrefix = pipelineIsCv ? "ClearVoice GPU → " : "";
       const localAsrLabel =
         localEngine?.primaryAsrEngine === "qwen3-asr"
-          ? `本地 Qwen3-ASR 0.6B${qwen3DevTag ? ` (${qwen3DevTag})` : ""}${streamingOn ? " · 流式" : ""}`
+          ? `${cvPrefix}本地 Qwen3-ASR 0.6B${qwen3DevTag ? ` (${qwen3DevTag})` : ""}${streamingOn ? " · 流式" : ""}`
           : localEngine?.primaryAsrEngine === "sensevoice"
             ? localEngine.activeLocalAsrMode === "sensevoice"
-              ? "本地 SenseVoice (备用)"
-              : "本地 SenseVoice (兜底)"
-            : "本地离线语音";
+              ? `${cvPrefix}本地 SenseVoice (备用)`
+              : `${cvPrefix}本地 SenseVoice (兜底)`
+            : `${cvPrefix}本地离线语音`;
       const engineLabel =
         this.localClientState.engine === "local"
           ? localAsrLabel
@@ -2256,9 +2334,14 @@ export class PiAgentPanelController {
           : le?.primaryAsrEngine === "sensevoice"
             ? "本地 SenseVoice (备用)"
             : "";
+      const pipelineIsCv =
+        (this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy") ===
+        "clearvoice";
       const readyHint =
         le?.readyForLocalAsr && asrReadyPrefix
-          ? `${asrReadyPrefix} · openWakeWord · 降噪已就绪`
+          ? pipelineIsCv
+            ? `新方案 ClearVoice GPU (MossFormer2 切片) → ${asrReadyPrefix} 已就绪`
+            : `${asrReadyPrefix} · openWakeWord · 降噪已就绪`
           : wakeEnabled
             ? `点击「进入对话」或「开启持续监听」（唤醒词：${wakeWords.slice(0, 3).join(" / ")}）`
             : "点击「进入对话」或按 Alt+V 即可语音操控 Pi Agent";
@@ -2362,7 +2445,26 @@ export class PiAgentPanelController {
     if (owwOn && owwReady) {
       tags.push({ label: "openWakeWord" });
     }
-    if (vs?.noiseSuppressionMode !== "off") {
+    const pipelineMode = vs?.voicePipelineMode ?? cfg?.voicePipelineMode ?? "legacy";
+    if (pipelineMode === "clearvoice") {
+      const cvStatus = vs?.localEngine?.clearVoice;
+      const cvReady = Boolean(vs?.localEngine?.readyForClearVoiceGpu ?? cvStatus?.ready);
+      const provTag =
+        cvStatus?.provider === "cuda"
+          ? "CUDA GPU"
+          : cvStatus?.provider === "remote"
+            ? "远程 GPU"
+            : cvReady
+              ? "CPU"
+              : "未就绪";
+      tags.push({
+        label: `ClearVoice · ${provTag}`,
+        warn: !cvReady,
+        title: cvReady
+          ? `ClearVoice MossFormer2_SE_48K 准实时切片降噪 (${cvStatus?.gpuName || provTag} · 280ms 静音 / 2.0s 超时 / 0.3s 上下文 / 20ms 淡入淡出) → Qwen3-ASR`
+          : "ClearVoice GPU 运行时或 MossFormer2 模型尚未就绪（自动兜底本地降噪）",
+      });
+    } else if (vs?.noiseSuppressionMode !== "off") {
       const nMode = vs?.noiseSuppressionMode;
       const nLabel =
         nMode === "dpdfnet" && vs?.localEngine?.readyForDpdfnet
@@ -2713,7 +2815,9 @@ export class PiAgentPanelController {
           const vPill = document.createElement("span");
           vPill.className = `pi-verify-pill is-${v.status}`;
           if (v.status === "passed") {
-            vPill.textContent = "✓ 状态检查通过";
+            vPill.textContent = entry.silentCompleted
+              ? "✓ 状态检查通过 · 静默完成"
+              : "✓ 状态检查通过";
           } else if (v.status === "recovered") {
             vPill.textContent = `✓ 第 ${v.retriesUsed} 轮自愈后检查通过`;
           } else if (v.status === "unsolvable") {
@@ -2781,17 +2885,20 @@ export class PiAgentPanelController {
         }
       }
 
-      const bubble = document.createElement("div");
-      bubble.className = "pi-msg-bubble";
-      bubble.dataset.agentMsgText = entry.id;
-      bubble.textContent =
+      const bubbleText =
         entry.text ||
         (entry.status === "streaming"
           ? entry.thinkingActive
             ? "正在思考中…"
             : "正在执行并核验设备状态…"
           : "");
-      item.appendChild(bubble);
+      if (bubbleText) {
+        const bubble = document.createElement("div");
+        bubble.className = "pi-msg-bubble";
+        bubble.dataset.agentMsgText = entry.id;
+        bubble.textContent = bubbleText;
+        item.appendChild(bubble);
+      }
 
       // Inline quick confirm / cancel action buttons for the currently active pending confirmation
       const activePendingId = this.agentState?.pendingConfirmation?.id;

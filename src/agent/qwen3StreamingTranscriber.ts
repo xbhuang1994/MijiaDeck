@@ -44,13 +44,115 @@ export interface StreamingSentenceSplitResult {
 
 const STRONG_PUNCT_SET = new Set(["。", "！", "？", "!", "?", "\n"]);
 const CLAUSE_PUNCT_SET = new Set(["；", ";", "，", ",", "、", "：", ":"]);
+const CONTINUATION_TRAILING_PUNCT_RE = /[,，、;；:：…—\-~～]\s*$/;
 const EDGE_PUNCT_RE = /^[\s,，。．.、!！?？:：;；\-—~～"'“”‘’]+|[\s,，。．.、!！?？:：;；\-—~～"'“”‘’]+$/g;
 const TRAILING_SOFT_PUNCT_RE = /[\s,，。．.、!！?？:：;；…\-—~～]+$/;
 const LEADING_VOCATIVE_RE = /^(?:嘿|嗨|喂|哎|你好|您好|hey|hi|ok|hello)[\s,，、!！。:：]*/i;
 const MEANINGFUL_CHAR_RE = /[\u4e00-\u9fffA-Za-z0-9]/g;
 
+// 中文/英文句中停顿或未说完信号（即使 ASR 乐观地在尾部补了句号“。”，仍极可能是慢语速思考停顿）
+const ZH_INCOMPLETE_ENDING_RE =
+  /(?:然后再|顺便再|顺便把|顺便帮我|帮我再|给我再|再把|然后|顺便|还有|并且|而且|以及|另外|此外|不过|但是|可是|然而|如果|要是|假如|因为|所以|因此|或者|还是|接着|紧接着|随后|同时|比如|比如说|例如|就是说|也就是说|换句话说|就是|对了|首先|其次|第一|第二|第三|帮我把|给我把|请把|麻烦把|能不能把|帮我|给我|请你|麻烦你|麻烦|我想|我要|我想要|我打算|我准备|我需要|能不能|可不可以|可以帮我|帮我看一下|想问一下|把|将|被|给|向|对|对于|关于|从|往|朝|在|到|的|得|地|和|跟|与|同|嗯+|呃+|额+|啊+|那个|这个|怎么说呢|我想想|让我想想)$/;
+const EN_INCOMPLETE_ENDING_RE =
+  /\b(?:and|or|but|then|also|because|so|if|when|while|that|which|with|without|to|for|from|into|about|the|a|an|my|our|your|please|um|uh|well)\s*$/i;
+// 句尾出现“把/将 + 对象”却尚未说出动作谓语（如“帮我把客厅吸顶灯” / “把卧室空调”）
+// 先屏蔽“空调/开关/洗衣机/扫地机”等内置动字的复合设备名词，防止“空调”里的“调”被误判为谓语
+const ZH_BA_OBJECT_TAIL_RE = /(?:把|将)([^，。！？；,.!?;]{1,18})$/;
+const ZH_BA_DEVICE_NOUN_MASK_RE =
+  /(?:空气净化器|扫地机器人|洗烘一体机|智洗烘|抽油烟机|智能门锁|监控摄像头|空调|开关|洗衣机|洗碗机|烘干机|扫地机|拖地机|除湿机|加湿器|净化器|吹风机|电风扇|落地扇|循环扇|喂食器|吸顶灯|台灯|落地灯|射灯|灯带|门锁|窗帘)/g;
+const ZH_BA_PREDICATE_RE =
+  /(?:开|关|调|设|改|换|切|停|放|播|降|升|提|加|减|亮|暗|暖|冷|静音|闭麦|出粮|喂|洗|烘|清|扫|拉|推|锁|解|查|看|读|说|发|删|退|回|定|变|弄|搞|处理|解决|拟定|安排|运行|启动|暂停|继续|恢复|重启|重置|关闭|打开|熄灭|点亮|灭|turn|open|close|set|dim|bright|stop|play|pause|start|off|on)/i;
+const ZH_CONTINUATION_HEAD_RE = /^(?:的|得|地|了|着|过|到|成|为|给|在|里|上|下|中|吧|吗|呢|啊|呀|调|开|关|设|改|换|切|停|放|播|亮|暗|暖|冷|大|小|高|低)/;
+
 export function countMeaningfulChars(text: string): number {
   return (text.match(MEANINGFUL_CHAR_RE) ?? []).length;
+}
+
+/**
+ * 判断一段实时转写文本是否明显处于“话还没说完”的句中停顿态：
+ * - 末尾带逗号/顿号/分号/冒号/省略号等非终结标点；
+ * - 末尾落在连词、介词、犹豫词、起手短语（如“然后”“顺便”“帮我”“把”“那个”“的”等）；
+ * - 出现“把/将 + 设备目标”但尚未说出具体动作谓语（如“帮我把客厅的吸顶灯”）。
+ *
+ * 显式排除独立唤醒词（如“Neo” / “小派”）与已完整闭合的短命令（如“打开客厅吸顶灯”）。
+ */
+export function looksLikeIncompleteUtterance(
+  rawText: string,
+  wakeWords: readonly string[] = [],
+): boolean {
+  const trimmed = rawText.trim();
+  if (!trimmed) return false;
+  if (isStandaloneWakePrefix(trimmed, wakeWords) || isWakeQueryText(trimmed)) {
+    return false;
+  }
+
+  // 剥离句首唤醒词以聚焦真实话语主体
+  let body = trimmed;
+  if (wakeWords.length > 0) {
+    const span = findWakeWordSpan(trimmed, wakeWords);
+    if (span && span.beforeText.replace(LEADING_VOCATIVE_RE, "").replace(EDGE_PUNCT_RE, "").trim().length === 0) {
+      body = span.afterText.trim();
+    }
+  }
+  if (!body) return false;
+
+  // 规则 1：显式以非终结停顿标点结尾（，、；：…—）
+  if (CONTINUATION_TRAILING_PUNCT_RE.test(trimmed)) {
+    return true;
+  }
+
+  // 规则 2：尾部剥离标点后落入典型未闭合连词/介词/犹豫词/“把+对象无谓语”
+  const endsWithQuestionOrExcl = /[？?！!]\s*$/.test(body);
+  const bodyNoPunct = body.replace(/[\s,，。．.、!！?？:：;；…\-—~～"'“”‘’]+$/g, "").trim();
+  if (!bodyNoPunct) return false;
+
+  if (ZH_INCOMPLETE_ENDING_RE.test(bodyNoPunct)) {
+    return true;
+  }
+  if (EN_INCOMPLETE_ENDING_RE.test(bodyNoPunct)) {
+    return true;
+  }
+  if (!endsWithQuestionOrExcl) {
+    const baMatch = ZH_BA_OBJECT_TAIL_RE.exec(bodyNoPunct);
+    if (baMatch && baMatch[1]) {
+      const maskedTail = baMatch[1].replace(ZH_BA_DEVICE_NOUN_MASK_RE, "");
+      if (!ZH_BA_PREDICATE_RE.test(maskedTail)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * 将慢语速停顿后前后两段连续话语平滑拼接为一句完整提示，自动消除重复前缀与人工句中句号。
+ */
+export function joinUtteranceFragments(prevText: string, nextText: string): string {
+  const prev = prevText.trim();
+  const next = nextText.trim();
+  if (!prev) return next;
+  if (!next) return prev;
+
+  const dedupedNext = stripCommittedPrefix(next, prev);
+  if (!dedupedNext) return prev;
+
+  let left = prev;
+  // 若前段结尾被 ASR 乐观补上了“。”，但去掉“。”明显未说完或后段以紧接谓语/助词开头，则去掉人工句号避免硬断语义
+  if (/[。.]$/.test(left)) {
+    const leftWithoutDot = left.slice(0, -1).trim();
+    if (
+      leftWithoutDot &&
+      (looksLikeIncompleteUtterance(leftWithoutDot) || ZH_CONTINUATION_HEAD_RE.test(dedupedNext))
+    ) {
+      left = leftWithoutDot;
+    }
+  }
+
+  const lastChar = left[left.length - 1] ?? "";
+  const firstChar = dedupedNext[0] ?? "";
+  const needsSpace = /[A-Za-z0-9]$/.test(lastChar) && /^[A-Za-z0-9]/.test(firstChar);
+  return `${left}${needsSpace ? " " : ""}${dedupedNext}`;
 }
 
 export function endsWithStrongSentencePunct(text: string): boolean {
@@ -333,21 +435,27 @@ export function splitStreamingSentences(
 
 export interface Qwen3StreamingHypothesisTrackerOptions {
   wakeWords?: readonly string[];
-  /** 末尾带强句末标点后等待多少毫秒静音即触发快速断句（默认 320ms） */
+  /** 末尾带强句末标点后等待多少毫秒静音即触发快速断句（仅在开启 enablePunctuationPauseCommit 时生效，默认 320ms） */
   punctuationPauseMs?: number;
-  /** 无标点连续讲话最长多少字符触发子句断句（默认 64） */
+  /** 无标点连续讲话最长多少字符触发子句断句（仅在开启 splitMidUtterance 时生效，默认 64） */
   maxCharsWithoutPunct?: number;
+  /** 是否在说话中途按句末标点/超长字数强制拆分为多条句子下发（默认 false：等整段话说完一起发送） */
+  splitMidUtterance?: boolean;
+  /** 是否在句尾带强标点+短停顿时提前截断收句（默认 false：等待完整尾静音判停防慢语速误拆） */
+  enablePunctuationPauseCommit?: boolean;
 }
 
 /**
- * 有状态的流式转写假设与断句状态机：
- * 追踪当前话语的 LocalAgreement 稳定前缀、已提交句子前缀与静音停顿计时，
- * 输出实时字幕更新事件与已闭合句子列表。
+ * 有状态的流式转写假设与整句稳定字幕状态机：
+ * 追踪当前话语的 LocalAgreement 稳定前缀、语义未闭合提示与可选句中拆分，
+ * 默认等用户整段话说完后再统一提交，避免慢语速长语音被提前拆碎。
  */
 export class Qwen3StreamingHypothesisTracker {
   private _wakeWords: string[];
   private readonly _punctuationPauseMs: number;
   private readonly _maxCharsWithoutPunct: number;
+  private readonly _splitMidUtterance: boolean;
+  private readonly _enablePunctuationPauseCommit: boolean;
 
   private _prevHypothesis = "";
   private _stableText = "";
@@ -359,6 +467,8 @@ export class Qwen3StreamingHypothesisTracker {
     this._wakeWords = [...(options.wakeWords ?? [])];
     this._punctuationPauseMs = options.punctuationPauseMs ?? 320;
     this._maxCharsWithoutPunct = options.maxCharsWithoutPunct ?? 64;
+    this._splitMidUtterance = options.splitMidUtterance === true;
+    this._enablePunctuationPauseCommit = options.enablePunctuationPauseCommit === true;
   }
 
   get latestText(): string {
@@ -373,12 +483,17 @@ export class Qwen3StreamingHypothesisTracker {
     return this._committedPrefix;
   }
 
+  get isLatestIncomplete(): boolean {
+    return looksLikeIncompleteUtterance(this._latestText, this._wakeWords);
+  }
+
   setWakeWords(wakeWords: readonly string[]): void {
     this._wakeWords = [...wakeWords];
   }
 
   /**
-   * 喂入一次新的流式 ASR 假设，返回实时字幕状态以及（若中途检测到多句标点边界）立刻可提交的完整句子。
+   * 喂入一次新的流式 ASR 假设，返回实时字幕状态；
+   * 仅当显式开启 `splitMidUtterance` 时才在句中按标点提前拆分提交，默认保留完整话语直至说完。
    */
   ingestHypothesis(
     rawHypothesis: string,
@@ -404,35 +519,37 @@ export class Qwen3StreamingHypothesisTracker {
     this._prevHypothesis = cleaned;
     this._latestText = cleaned;
 
-    // 2. 检测流式句中多句标点断句（例如 “打开客厅吸顶灯。把空调调到”）
-    const split = splitStreamingSentences(cleaned, {
-      wakeWords: this._wakeWords,
-      forceFlush: false,
-      maxCharsWithoutPunct: this._maxCharsWithoutPunct,
-    });
+    // 2. 仅在显式启用句中拆分模式时才按句末标点提前拆句下发
+    if (this._splitMidUtterance) {
+      const split = splitStreamingSentences(cleaned, {
+        wakeWords: this._wakeWords,
+        forceFlush: false,
+        maxCharsWithoutPunct: this._maxCharsWithoutPunct,
+      });
 
-    if (split.completed.length > 0) {
-      const committedBatch = split.completed.join("");
-      this._committedPrefix = `${this._committedPrefix}${committedBatch}`.trim();
-      this._prevHypothesis = split.remainder;
-      this._stableText = split.remainder;
-      this._latestText = split.remainder;
-      this._trailingSilenceMs = 0;
+      if (split.completed.length > 0) {
+        const committedBatch = split.completed.join("");
+        this._committedPrefix = `${this._committedPrefix}${committedBatch}`.trim();
+        this._prevHypothesis = split.remainder;
+        this._stableText = split.remainder;
+        this._latestText = split.remainder;
+        this._trailingSilenceMs = 0;
 
-      const partial: StreamingPartialUpdate | null = split.remainder
-        ? {
-            text: split.remainder,
-            stableText: split.remainder,
-            unstableText: "",
-            engine: meta.engine,
-            latencyMs: meta.latencyMs,
-          }
-        : null;
-      return {
-        partial,
-        completedSentences: split.completed,
-        commitReason: "punctuation_split",
-      };
+        const partial: StreamingPartialUpdate | null = split.remainder
+          ? {
+              text: split.remainder,
+              stableText: split.remainder,
+              unstableText: "",
+              engine: meta.engine,
+              latencyMs: meta.latencyMs,
+            }
+          : null;
+        return {
+          partial,
+          completedSentences: split.completed,
+          commitReason: "punctuation_split",
+        };
+      }
     }
 
     const unstableText = cleaned.startsWith(this._stableText)
@@ -453,8 +570,8 @@ export class Qwen3StreamingHypothesisTracker {
   }
 
   /**
-   * 推进帧级语音/静音状态：当最新识别文本已带有完整句末标点（且非独立唤醒词前缀）且停顿达到 punctuationPauseMs，
-   * 立即建议收句，大幅缩短句尾等待延迟！
+   * 推进帧级语音/静音状态：仅在显式开启 `enablePunctuationPauseCommit` 时，
+   * 当最新识别文本已带有完整句末标点（且非独立唤醒词前缀、非未闭合停顿）且停顿达到 punctuationPauseMs 才提前收句。
    */
   advanceFrame(
     frameDurationMs: number,
@@ -471,9 +588,11 @@ export class Qwen3StreamingHypothesisTracker {
     this._trailingSilenceMs += frameDurationMs;
 
     if (
+      this._enablePunctuationPauseCommit &&
       this._trailingSilenceMs >= this._punctuationPauseMs &&
       endsWithStrongSentencePunct(this._latestText) &&
       !isStandaloneWakePrefix(this._latestText, this._wakeWords) &&
+      !looksLikeIncompleteUtterance(this._latestText, this._wakeWords) &&
       countMeaningfulChars(this._latestText) >= 2
     ) {
       return { shouldCommitByPunctPause: true };
@@ -482,19 +601,28 @@ export class Qwen3StreamingHypothesisTracker {
   }
 
   /**
-   * 静音判停、超长上限或手动 flush 时，取出当前未闭合文本并按标点干净切分输出，随后重置状态。
+   * 静音判停、超长上限或手动 flush 时，取出当前完整话语文本并重置状态：
+   * - 默认整句模式（splitMidUtterance=false）：返回合并后的单条完整文本，绝不强拆多句；
+   * - 显式分句模式（splitMidUtterance=true）：按强标点拆分为句子列表。
    */
   flush(finalHypothesis?: string): string[] {
-    const source =
+    const source = (
       finalHypothesis !== undefined
         ? stripCommittedPrefix(finalHypothesis.trim(), this._committedPrefix)
-        : this._latestText;
+        : this._latestText
+    ).trim();
+    this.reset();
+    if (!source || countMeaningfulChars(source) < 1) {
+      return [];
+    }
+    if (!this._splitMidUtterance) {
+      return [source];
+    }
     const split = splitStreamingSentences(source, {
       wakeWords: this._wakeWords,
       forceFlush: true,
       maxCharsWithoutPunct: this._maxCharsWithoutPunct,
     });
-    this.reset();
     return split.completed;
   }
 

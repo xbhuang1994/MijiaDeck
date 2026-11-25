@@ -24,6 +24,7 @@ import {
   type NoiseSuppressionMode,
   type Qwen3ComputeDeviceMode,
   type VadEngineMode,
+  type VoicePipelineMode,
 } from "../core/agentConfigStore.ts";
 import { projectRoot } from "../core/appMeta.ts";
 import {
@@ -62,13 +63,25 @@ import {
   matchEnglishHeadWakeWord,
 } from "./voiceAttentionGate.ts";
 import {
+  ClearVoiceGpuRuntime,
+  type ClearVoiceGpuStatus,
+} from "./clearVoiceGpuRuntime.ts";
+import {
   Qwen3AsrGpuRuntime,
   type Qwen3GpuStatus,
 } from "./qwen3AsrGpuRuntime.ts";
 import { getPrimaryOwnerRefWavPath } from "./voiceprintStore.ts";
 
-export type { LocalAsrEngineMode, NoiseSuppressionMode, Qwen3ComputeDeviceMode, Qwen3GpuStatus, VadEngineMode };
-export { Qwen3AsrGpuRuntime };
+export type {
+  ClearVoiceGpuStatus,
+  LocalAsrEngineMode,
+  NoiseSuppressionMode,
+  Qwen3ComputeDeviceMode,
+  Qwen3GpuStatus,
+  VadEngineMode,
+  VoicePipelineMode,
+};
+export { ClearVoiceGpuRuntime, Qwen3AsrGpuRuntime };
 
 export interface LocalVoiceModelPaths {
   modelsDir: string;
@@ -115,10 +128,13 @@ export interface LocalVoiceEngineStatus {
     pyannoteDiarization?: boolean;
     spleeterSeparation?: boolean;
     localTts?: boolean;
+    clearVoiceMossformer2?: boolean;
   };
   readyForDenoise: boolean;
   readyForDpdfnet: boolean;
   readyForVoxlock: boolean;
+  readyForClearVoiceGpu: boolean;
+  clearVoice: ClearVoiceGpuStatus;
   readyForVad: boolean;
   readyForVoiceprint: boolean;
   readyForQwen3Asr: boolean;
@@ -492,6 +508,7 @@ export class LocalVoiceEngine {
   private readonly _oww: OpenWakeWordEngine;
   private readonly _tts: LocalTtsEngine;
   private readonly _qwen3Gpu: Qwen3AsrGpuRuntime;
+  private readonly _clearVoiceGpu: ClearVoiceGpuRuntime;
   private _preferredAsrEngine: LocalAsrEngineMode = DEFAULT_LOCAL_ASR_ENGINE;
   private _qwen3ComputeDevice: Qwen3ComputeDeviceMode = DEFAULT_QWEN3_COMPUTE_DEVICE;
   private _sourceSeparator: AudioSourceSeparator | null = null;
@@ -529,6 +546,7 @@ export class LocalVoiceEngine {
     this._oww = new OpenWakeWordEngine({ modelsDir: p.modelsDir });
     this._tts = new LocalTtsEngine({ modelsDir: p.modelsDir });
     this._qwen3Gpu = new Qwen3AsrGpuRuntime({ modelsDir: p.modelsDir });
+    this._clearVoiceGpu = new ClearVoiceGpuRuntime({ modelsDir: p.modelsDir });
   }
 
   get preferredAsrEngine(): LocalAsrEngineMode {
@@ -566,6 +584,14 @@ export class LocalVoiceEngine {
 
   get qwen3Gpu(): Qwen3AsrGpuRuntime {
     return this._qwen3Gpu;
+  }
+
+  get clearVoiceGpu(): ClearVoiceGpuRuntime {
+    return this._clearVoiceGpu;
+  }
+
+  setClearVoiceServiceUrl(url: string): void {
+    this._clearVoiceGpu.setCustomServiceUrl(url);
   }
 
   get paths(): LocalVoiceModelPaths {
@@ -632,6 +658,7 @@ export class LocalVoiceEngine {
     const speakerCampp = existsSync(p.speakerCampp);
     const qwen3AsrCpu = this._hasQwen3AsrModels(p);
     const gpuStatus = this._qwen3Gpu.getStatus();
+    const clearVoiceStatus = this._clearVoiceGpu.getStatus();
     const readyForQwen3Gpu = gpuStatus.ready;
     const qwen3AsrGpu = gpuStatus.runtimeReady && gpuStatus.modelReady;
     const senseVoice = this._hasSenseVoiceModels(p);
@@ -690,10 +717,13 @@ export class LocalVoiceEngine {
         pyannoteDiarization,
         spleeterSeparation,
         localTts: ttsStatus.ready,
+        clearVoiceMossformer2: clearVoiceStatus.modelReady,
       },
       readyForDenoise: addonAvailable && gtcrn,
       readyForDpdfnet: addonAvailable && dpdfnet4,
       readyForVoxlock: addonAvailable && voxlock,
+      readyForClearVoiceGpu: clearVoiceStatus.ready,
+      clearVoice: clearVoiceStatus,
       readyForVad: addonAvailable && sileroVad,
       readyForVoiceprint: addonAvailable && speakerCampp,
       readyForQwen3Asr,
@@ -744,6 +774,7 @@ export class LocalVoiceEngine {
       preloadEnglish?: boolean;
       localAsrEngine?: LocalAsrEngineMode;
       qwen3ComputeDevice?: Qwen3ComputeDeviceMode;
+      voicePipelineMode?: VoicePipelineMode;
     } = {},
   ): Promise<void> {
     const yieldTick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -756,6 +787,13 @@ export class LocalVoiceEngine {
       await yieldTick();
       this._ensureSpeakerExtractor();
       await yieldTick();
+      if (
+        options.voicePipelineMode === "clearvoice" &&
+        this._clearVoiceGpu.getStatus().ready &&
+        !this._clearVoiceGpu.isInFailureCooldown()
+      ) {
+        void this._clearVoiceGpu.warmup().catch(() => {});
+      }
       if (mode !== "sensevoice") {
         // 1. 若检测到可用 GPU 且未强制仅 CPU，优先预热 GPU 运行时（含 Vulkan 着色器预热），无需加载 9.5s CPU ONNX
         if (deviceMode !== "cpu" && this._qwen3Gpu.getStatus().ready && !this._qwen3Gpu.isInFailureCooldown()) {
@@ -958,7 +996,7 @@ export class LocalVoiceEngine {
           provider: "cpu",
           debug: false,
         },
-        30,
+        Math.max(35, Math.ceil((options.maxSpeechDuration ?? 4.2) + 8)),
       );
     } catch (err) {
       this._lastError = err instanceof Error ? err.message : String(err);
@@ -1007,8 +1045,8 @@ export class LocalVoiceEngine {
           decoder: p.qwen3AsrDecoder,
           tokenizer: p.qwen3AsrTokenizer,
           hotwords: "",
-          maxTotalLen: 512,
-          maxNewTokens: 128,
+          maxTotalLen: 1024,
+          maxNewTokens: 256,
           temperature: 1e-6,
           topP: 0.8,
           seed: 42,
@@ -1162,7 +1200,7 @@ export class LocalVoiceEngine {
           threshold: Math.max(0.15, Math.min(0.85, options.threshold ?? 0.4)),
           minSilenceDuration: 0.3,
           minSpeechDuration: 0.14,
-          maxSpeechDuration: 20,
+          maxSpeechDuration: 30,
         })
       : null;
 
@@ -1360,13 +1398,14 @@ export class LocalVoiceEngine {
         stream.setOption("hotwords", csv);
       }
     }
-    if (
+    const effectiveMaxNewTokens =
       typeof options.maxNewTokens === "number" &&
       Number.isFinite(options.maxNewTokens) &&
-      options.maxNewTokens > 0 &&
-      typeof stream.setOption === "function"
-    ) {
-      stream.setOption("max_new_tokens", String(Math.round(options.maxNewTokens)));
+      options.maxNewTokens > 0
+        ? Math.round(options.maxNewTokens)
+        : Math.max(128, Math.min(384, Math.ceil((pcm16k.length / 16000) * 16) + 32));
+    if (typeof stream.setOption === "function") {
+      stream.setOption("max_new_tokens", String(effectiveMaxNewTokens));
     }
     stream.acceptWaveform({ samples: pcm16k, sampleRate: 16000 });
     const rawResult = await recognizer.decodeAsync(stream);
@@ -1940,6 +1979,15 @@ export class LocalVoiceEngine {
         }
       }
 
+      // 2.6 若已就绪 ClearVoice 运行时但缺失 MossFormer2_SE_48K 模型，顺带补齐
+      if (this._clearVoiceGpu.hasRuntime() && !this._clearVoiceGpu.hasModel()) {
+        try {
+          await this._clearVoiceGpu.downloadMissingModel();
+        } catch {
+          // ClearVoice 为可选增强方案，下载失败不阻断主方案
+        }
+      }
+
       const fetchAndExtractOptionalTar = async (url: string, checkFile: string, archiveName: string) => {
         if (existsSync(checkFile)) return;
         const tarPath = path.join(p.modelsDir, archiveName);
@@ -1982,6 +2030,7 @@ export class LocalVoiceEngine {
   dispose(): void {
     this._sourceSeparator?.dispose();
     this._sourceSeparator = null;
+    this._clearVoiceGpu.dispose();
     this._qwen3Gpu.dispose();
     this._oww.dispose();
     this._tts.dispose();
