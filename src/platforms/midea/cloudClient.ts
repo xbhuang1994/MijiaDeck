@@ -9,6 +9,7 @@ import {
   type MideaCloudBrand,
   type MideaCloudPreset,
 } from "./constants.ts";
+import { mideaChecksum } from "./protocols.ts";
 import { MideaCloudSecurity } from "./security.ts";
 
 export interface MideaCloudClientOptions {
@@ -41,11 +42,24 @@ export interface MideaCloudAppliance {
   modelNumber: string;
   sn: string;
   sn8: string;
+  manufacturerCode?: string;
   online: boolean;
   homeId: string;
   homeName: string;
   roomName: string;
   protocolVersion: 2 | 3;
+}
+
+export interface MideaLuaApplianceMeta {
+  deviceType?: number;
+  sn?: string;
+  modelNumber?: string;
+  manufacturerCode?: string;
+}
+
+export interface MideaTransparentSendOptions {
+  /** 允许 1306（异步应答缺失）视作已下发并返回 null，常用于写控制指令。 */
+  allowAsyncReplyMissing?: boolean;
 }
 
 export interface MideaTokenKeyPair {
@@ -105,6 +119,34 @@ function parseProtocolVersion(raw: Record<string, unknown>): 2 | 3 {
   return 3;
 }
 
+function isValidPlainMideaFrame(buf: Buffer): boolean {
+  if (buf.length < 12 || buf[0] !== 0xaa) {
+    return false;
+  }
+  const totalLen = buf[1]! + 1;
+  if (totalLen < 12 || totalLen > buf.length) {
+    return false;
+  }
+  return mideaChecksum(buf.subarray(1, totalLen - 1)) === buf[totalLen - 1];
+}
+
+function isTokenInvalidError(code: string, msg: string): boolean {
+  if (code === "40002" || code === "7400" || code === "40001" || code === "3106") {
+    return true;
+  }
+  const lower = msg.toLowerCase();
+  return (
+    lower.includes("user token not exist") ||
+    lower.includes("user does not exist") ||
+    lower.includes("token invalid") ||
+    lower.includes("token expired") ||
+    (lower.includes("token") && lower.includes("not exist")) ||
+    msg.includes("token校验不通过") ||
+    msg.includes("登录失效") ||
+    msg.includes("会话失效")
+  );
+}
+
 function parseReplyToBuffer(reply: unknown, security: MideaCloudSecurity): Buffer | null {
   if (typeof reply !== "string") {
     return null;
@@ -122,27 +164,36 @@ function parseReplyToBuffer(reply: unknown, security: MideaCloudSecurity): Buffe
       .map((n) => n & 0xff);
     return nums.length > 0 ? Buffer.from(nums) : null;
   }
-  // 格式 2：直接十六进制 0xAA 帧
-  if (/^aa[0-9a-f]+$/i.test(trimmed) && trimmed.length % 2 === 0) {
-    return Buffer.from(trimmed, "hex");
-  }
-  // 格式 3：AES 加密后的十六进制密文
-  if (/^[0-9a-f]+$/i.test(trimmed) && trimmed.length >= 32 && trimmed.length % 32 === 0) {
-    try {
-      const decrypted = security.aesDecryptBytes(trimmed);
-      if (decrypted.includes(0xaa)) {
+  if (/^[0-9a-f]+$/i.test(trimmed) && trimmed.length % 2 === 0) {
+    const rawBuf = Buffer.from(trimmed, "hex");
+    // 格式 2：直接十六进制 0xAA 明文帧（校验长度与校验和，避免 AES 密文偶发以 0xAA 开头被误判）
+    if (isValidPlainMideaFrame(rawBuf)) {
+      return rawBuf;
+    }
+    // 格式 3：AES 加密后的十六进制密文
+    if (trimmed.length >= 32 && trimmed.length % 32 === 0) {
+      try {
+        const decrypted = security.aesDecryptBytes(trimmed);
+        const asText = decrypted.toString("utf-8").trim();
+        if (asText.includes(",")) {
+          const parsedCsv = parseReplyToBuffer(asText, security);
+          if (parsedCsv) {
+            return parsedCsv;
+          }
+        }
+        if (/^[0-9a-f]+$/i.test(asText) && asText.length % 2 === 0) {
+          return Buffer.from(asText, "hex");
+        }
+        if (decrypted.includes(0xaa)) {
+          return decrypted;
+        }
         return decrypted;
+      } catch {
+        return rawBuf;
       }
-      const asText = decrypted.toString("utf-8").trim();
-      if (/^[0-9a-f]+$/i.test(asText) && asText.length % 2 === 0) {
-        return Buffer.from(asText, "hex");
-      }
-      if (asText.includes(",")) {
-        return parseReplyToBuffer(asText, security);
-      }
-      return decrypted;
-    } catch {
-      return Buffer.from(trimmed, "hex");
+    }
+    if (rawBuf[0] === 0xaa) {
+      return rawBuf;
     }
   }
   return null;
@@ -158,6 +209,8 @@ export class MideaCloudClient {
   private readonly _timeoutMs: number;
 
   private _session: MideaCloudSession | null = null;
+  private _loginPromise: Promise<MideaCloudSession> | null = null;
+  private _reloginPromise: Promise<MideaCloudSession> | null = null;
 
   constructor(options: MideaCloudClientOptions) {
     this.preset = MIDEA_CLOUD_PRESETS[options.brand];
@@ -176,6 +229,10 @@ export class MideaCloudClient {
     return this._baseUrl;
   }
 
+  get supportsLuaCloud(): boolean {
+    return this.preset.protocol === "mas";
+  }
+
   get isLoggedIn(): boolean {
     return Boolean(this._session && (this._session.accessToken || this._session.sessionId));
   }
@@ -189,10 +246,20 @@ export class MideaCloudClient {
     this.security.clearAesKeys();
   }
 
+  private async _reloginOnce(): Promise<void> {
+    if (!this._reloginPromise) {
+      this.clearSession();
+      this._reloginPromise = this.login().finally(() => {
+        this._reloginPromise = null;
+      });
+    }
+    await this._reloginPromise;
+  }
+
   private async _requestMas(
     endpoint: string,
     payload: Record<string, unknown>,
-    options?: { requireAuth?: boolean },
+    options?: { requireAuth?: boolean; _retriedAfterLogin?: boolean },
   ): Promise<Record<string, unknown>> {
     const url = `${this._baseUrl}${endpoint}`;
     const random = String(Math.floor(Date.now() / 1000));
@@ -215,6 +282,16 @@ export class MideaCloudClient {
       sign,
       random,
     };
+    if (this.preset.brand === "msmarthome") {
+      headers["x-recipe-app"] = this.preset.appId;
+      headers["authorization"] = `Basic ${Buffer.from(
+        `${this.preset.appKey}:${this.preset.iotKey ?? ""}`,
+        "ascii",
+      ).toString("base64")}`;
+      if (options?.requireAuth !== false && this._session?.uid) {
+        headers["uid"] = this._session.uid;
+      }
+    }
     if (options?.requireAuth !== false && this._session?.accessToken) {
       headers["accessToken"] = this._session.accessToken;
     }
@@ -254,8 +331,20 @@ export class MideaCloudClient {
 
     const code = parsed["code"];
     if (code !== undefined && String(code) !== "0") {
+      const codeStr = String(code);
       const msg = typeof parsed["msg"] === "string" ? parsed["msg"] : "云端返回错误";
-      throw new MideaCloudError(`美的云端错误 (${code}): ${msg}`, String(code));
+      if (
+        options?.requireAuth !== false &&
+        !options?._retriedAfterLogin &&
+        isTokenInvalidError(codeStr, msg)
+      ) {
+        await this._reloginOnce();
+        return await this._requestMas(endpoint, payload, {
+          ...options,
+          _retriedAfterLogin: true,
+        });
+      }
+      throw new MideaCloudError(`美的云端错误 (${codeStr}): ${msg}`, codeStr);
     }
 
     return isRecord(parsed["data"]) ? parsed["data"] : parsed;
@@ -264,7 +353,7 @@ export class MideaCloudClient {
   private async _requestLegacy(
     endpoint: string,
     payload: Record<string, unknown>,
-    options?: { requireAuth?: boolean },
+    options?: { requireAuth?: boolean; _retriedAfterLogin?: boolean },
   ): Promise<Record<string, unknown>> {
     const url = `${this._baseUrl}${endpoint}`;
     const formObj: Record<string, unknown> = {
@@ -328,8 +417,20 @@ export class MideaCloudClient {
 
     const errCode = parsed["errorCode"] ?? parsed["code"];
     if (errCode !== undefined && String(errCode) !== "0") {
+      const codeStr = String(errCode);
       const msg = typeof parsed["msg"] === "string" ? parsed["msg"] : "云端返回错误";
-      throw new MideaCloudError(`美的云端错误 (${errCode}): ${msg}`, String(errCode));
+      if (
+        options?.requireAuth !== false &&
+        !options?._retriedAfterLogin &&
+        isTokenInvalidError(codeStr, msg)
+      ) {
+        await this._reloginOnce();
+        return await this._requestLegacy(endpoint, payload, {
+          ...options,
+          _retriedAfterLogin: true,
+        });
+      }
+      throw new MideaCloudError(`美的云端错误 (${codeStr}): ${msg}`, codeStr);
     }
 
     if (isRecord(parsed["result"])) {
@@ -342,9 +443,15 @@ export class MideaCloudClient {
   }
 
   private async _ensureLoggedIn(): Promise<void> {
-    if (!this.isLoggedIn) {
-      await this.login();
+    if (this.isLoggedIn) {
+      return;
     }
+    if (!this._loginPromise) {
+      this._loginPromise = this.login().finally(() => {
+        this._loginPromise = null;
+      });
+    }
+    await this._loginPromise;
   }
 
   /**
@@ -410,10 +517,19 @@ export class MideaCloudClient {
 
       const keySeed =
         (typeof loginData["key"] === "string" && loginData["key"]) ||
-        (mdata && typeof mdata["key"] === "string" ? mdata["key"] : "");
+        (mdata && typeof mdata["key"] === "string" ? mdata["key"] : "") ||
+        (this.preset.brand === "msmarthome" &&
+        mdata &&
+        typeof mdata["accessToken"] === "string" &&
+        typeof loginData["accessToken"] === "string"
+          ? loginData["accessToken"]
+          : "");
       const ivSeed =
         (typeof loginData["iv"] === "string" && loginData["iv"]) ||
-        (mdata && typeof mdata["iv"] === "string" ? mdata["iv"] : "");
+        (mdata && typeof mdata["iv"] === "string" ? mdata["iv"] : "") ||
+        (this.preset.brand === "msmarthome" && typeof loginData["randomData"] === "string"
+          ? loginData["randomData"]
+          : "");
       if (keySeed) {
         this.security.setAesKeys(keySeed, ivSeed || undefined);
       }
@@ -513,6 +629,9 @@ export class MideaCloudClient {
     const resolvedRoom =
       String(item["roomName"] ?? roomName ?? "").trim() || "默认房间";
 
+    const manufacturerCode =
+      String(item["enterpriseCode"] ?? item["manufacturerCode"] ?? "0000").trim() || "0000";
+
     return {
       id,
       name,
@@ -520,6 +639,7 @@ export class MideaCloudClient {
       modelNumber,
       sn,
       sn8,
+      manufacturerCode,
       online,
       homeId,
       homeName: homeName || "我的家",
@@ -677,29 +797,144 @@ export class MideaCloudClient {
 
   /**
    * 通过美的云端透传接口下发 0xAA 串口帧（`/v1/appliance/transparent/send`）。
+   * - MAS v5（Meiju / MSmartHome）要求传入 `applianceCode`、`timestamp`、`isFull`（而非 `applianceId`），
+   *   否则云端会返回 `(1001): Invalid param wrong format: null`。
+   * - 旧版协议（NetHome Plus / Midea Air）仍使用 `applianceId` + `funId`。
    */
   async sendTransparentCommand(
     applianceId: string,
     commandBytes: Uint8Array,
+    options?: MideaTransparentSendOptions,
   ): Promise<Buffer | null> {
     await this._ensureLoggedIn();
 
+    const applianceCode = String(applianceId).trim();
     const signedOrder = Array.from(commandBytes)
       .map((b) => (b > 127 ? b - 256 : b))
       .join(",");
     const encryptedOrder = this.security.aesEncrypt(signedOrder);
 
-    const payload: Record<string, unknown> = {
-      applianceId: String(applianceId).trim(),
-      order: encryptedOrder,
-      funId: "0000",
-    };
+    try {
+      let data: Record<string, unknown>;
+      if (this.preset.protocol === "mas") {
+        const payload: Record<string, unknown> = {
+          applianceCode,
+          order: encryptedOrder,
+          timestamp: "true",
+          isFull: "false",
+        };
+        if (this.preset.brand === "msmarthome") {
+          payload["deviceId"] = this.security.getDeviceId(this._account);
+        }
+        data = await this._requestMas("/v1/appliance/transparent/send", payload);
+      } else {
+        const payload: Record<string, unknown> = {
+          applianceId: applianceCode,
+          order: encryptedOrder,
+          funId: "0000",
+        };
+        data = await this._requestLegacy("/v1/appliance/transparent/send", payload);
+      }
 
-    const data =
-      this.preset.protocol === "mas"
-        ? await this._requestMas("/v1/appliance/transparent/send", payload)
-        : await this._requestLegacy("/v1/appliance/transparent/send", payload);
+      return parseReplyToBuffer(data["reply"] ?? data["result"], this.security);
+    } catch (err) {
+      if (
+        options?.allowAsyncReplyMissing &&
+        err instanceof MideaCloudError &&
+        String(err.code) === "1306"
+      ) {
+        return null;
+      }
+      throw err;
+    }
+  }
 
-    return parseReplyToBuffer(data["reply"] ?? data["result"], this.security);
+  /**
+   * 通过美的云端 Lua 接口查询设备结构化实时状态：
+   * - Meiju: `/mjl/v1/device/status/lua/get`
+   * - MSmartHome: `/v1/device/status/lua/get`
+   */
+  async getLuaStatus(
+    applianceId: string,
+    query: Record<string, unknown> = {},
+    meta?: MideaLuaApplianceMeta,
+  ): Promise<Record<string, unknown>> {
+    await this._ensureLoggedIn();
+    const applianceCode = String(applianceId).trim();
+
+    if (this.preset.brand === "meiju") {
+      return await this._requestMas("/mjl/v1/device/status/lua/get", {
+        applianceCode,
+        command: { query },
+      });
+    }
+
+    if (this.preset.brand === "msmarthome") {
+      const typeHex = `0x${((meta?.deviceType ?? 0xac) & 0xff).toString(16).toUpperCase().padStart(2, "0")}`;
+      const encryptedSn = meta?.sn
+        ? this.security.aesEncryptWithFixedKey(Buffer.from(meta.sn, "ascii"))
+        : "";
+      return await this._requestMas("/v1/device/status/lua/get", {
+        deviceId: this.security.getDeviceId(this._account),
+        iotAppId: this.preset.appId,
+        applianceMFCode: meta?.manufacturerCode || "0000",
+        applianceType: typeHex,
+        modelNumber: meta?.modelNumber || "0",
+        applianceSn: encryptedSn,
+        version: "0",
+        "encryptedType ": "2",
+        applianceCode,
+        command: { query },
+      });
+    }
+
+    throw new MideaCloudError("当前美的云端品牌协议不支持 Lua 状态查询");
+  }
+
+  /**
+   * 通过美的云端 Lua 接口下发结构化控制指令：
+   * - Meiju: `/mjl/v1/device/lua/control`
+   * - MSmartHome: `/v1/device/lua/control`
+   */
+  async sendLuaControl(
+    applianceId: string,
+    control: Record<string, unknown>,
+    options?: { status?: Record<string, unknown>; meta?: MideaLuaApplianceMeta },
+  ): Promise<Record<string, unknown>> {
+    await this._ensureLoggedIn();
+    const applianceCode = String(applianceId).trim();
+    const command: Record<string, unknown> = { control };
+    if (options?.status && Object.keys(options.status).length > 0) {
+      command["status"] = options.status;
+    }
+
+    if (this.preset.brand === "meiju") {
+      return await this._requestMas("/mjl/v1/device/lua/control", {
+        applianceCode,
+        command,
+      });
+    }
+
+    if (this.preset.brand === "msmarthome") {
+      const meta = options?.meta;
+      const typeHex = `0x${((meta?.deviceType ?? 0xac) & 0xff).toString(16).toUpperCase().padStart(2, "0")}`;
+      const encryptedSn = meta?.sn
+        ? this.security.aesEncryptWithFixedKey(Buffer.from(meta.sn, "ascii"))
+        : "";
+      return await this._requestMas("/v1/device/lua/control", {
+        deviceId: this.security.getDeviceId(this._account),
+        iotAppId: this.preset.appId,
+        applianceMFCode: meta?.manufacturerCode || "0000",
+        applianceType: typeHex,
+        modelNumber: meta?.modelNumber || "0",
+        applianceSn: encryptedSn,
+        version: "0",
+        "encryptedType ": "2",
+        applianceCode,
+        command,
+      });
+    }
+
+    throw new MideaCloudError("当前美的云端品牌协议不支持 Lua 控制");
   }
 }

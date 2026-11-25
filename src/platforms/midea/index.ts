@@ -53,6 +53,8 @@ export {
   buildGenericQuery,
   buildHumidifierQuery,
   buildHumidifierSet,
+  buildLuaControlPayload,
+  buildLuaQueryParams,
   buildMideaFrame,
   buildPurifierQuery,
   buildPurifierSet,
@@ -66,6 +68,7 @@ export {
   defaultHumidifierState,
   defaultPurifierState,
   defaultWaterHeaterState,
+  hasDedicatedBinaryProtocol,
   mideaChecksum,
   mideaCrc8,
   parseAcResponse,
@@ -74,6 +77,7 @@ export {
   parseFanResponse,
   parseGenericResponse,
   parseHumidifierResponse,
+  parseLuaApplianceStatus,
   parseMideaFrame,
   parsePurifierResponse,
   parseWaterHeaterResponse,
@@ -98,7 +102,9 @@ export {
   type MideaCloudClientOptions,
   type MideaCloudHome,
   type MideaCloudSession,
+  type MideaLuaApplianceMeta,
   type MideaTokenKeyPair,
+  type MideaTransparentSendOptions,
 } from "./cloudClient.ts";
 
 export {

@@ -841,3 +841,540 @@ export function parseApplianceResponse(
       return parseGenericResponse(frame, type);
   }
 }
+
+// ---------- 云端 Lua JSON 状态与控制转换 ----------
+
+const DEDICATED_BINARY_PROTOCOL_TYPES = new Set<number>([
+  0xac,
+  0xcc,
+  0xa1,
+  0xfa,
+  0xfc,
+  0xfd,
+  0xe2,
+  0xe3,
+]);
+
+/** 判断设备品类是否拥有专用 0xAA 二进制帧编解码器（其余品类在云端优先使用 Lua 接口）。 */
+export function hasDedicatedBinaryProtocol(deviceType: number): boolean {
+  return DEDICATED_BINARY_PROTOCOL_TYPES.has(deviceType & 0xff);
+}
+
+/** 构造 `/mjl/v1/device/status/lua/get` 的默认查询参数。 */
+export function buildLuaQueryParams(deviceType: number): Record<string, unknown> {
+  if ((deviceType & 0xff) === 0xcf) {
+    return { query_type: "0x11" };
+  }
+  return {};
+}
+
+function parseLuaBool(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return value !== 0;
+  if (typeof value === "string") {
+    const lower = value.trim().toLowerCase();
+    if (lower === "on" || lower === "1" || lower === "true" || lower === "start") {
+      return true;
+    }
+    if (lower === "off" || lower === "0" || lower === "false" || lower === "stop" || lower === "pause") {
+      return false;
+    }
+  }
+  return undefined;
+}
+
+function parseLuaNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return undefined;
+    const num = Number(trimmed);
+    if (Number.isFinite(num)) {
+      return num;
+    }
+  }
+  return undefined;
+}
+
+function parseLuaAcMode(value: unknown): MideaAcMode | undefined {
+  if (typeof value === "string") {
+    switch (value.trim().toLowerCase()) {
+      case "auto":
+      case "1":
+        return 1;
+      case "cool":
+      case "2":
+        return 2;
+      case "dry":
+      case "3":
+        return 3;
+      case "heat":
+      case "4":
+        return 4;
+      case "fan":
+      case "fan_only":
+      case "5":
+        return 5;
+      default:
+        return undefined;
+    }
+  }
+  const num = parseLuaNumber(value);
+  if (num !== undefined && num >= 1 && num <= 5) {
+    return Math.round(num) as MideaAcMode;
+  }
+  return undefined;
+}
+
+function parseLuaDehumidifierMode(value: unknown): MideaDehumidifierMode | undefined {
+  if (typeof value === "string") {
+    switch (value.trim().toLowerCase()) {
+      case "set":
+      case "target":
+      case "1":
+        return 1;
+      case "continuity":
+      case "continuous":
+      case "2":
+        return 2;
+      case "auto":
+      case "smart":
+      case "3":
+        return 3;
+      case "dry_clothes":
+      case "clothes_dry":
+      case "4":
+        return 4;
+      default:
+        return undefined;
+    }
+  }
+  const num = parseLuaNumber(value);
+  if (num !== undefined && num >= 1 && num <= 4) {
+    return Math.round(num) as MideaDehumidifierMode;
+  }
+  return undefined;
+}
+
+function parseValidTemp(value: unknown): number | undefined {
+  const num = parseLuaNumber(value);
+  if (num === undefined || num < -40 || num > 100) {
+    return undefined;
+  }
+  return num;
+}
+
+/**
+ * 将美的云端 `/status/lua/get` 返回的 JSON 状态对象映射为统一的 `MideaApplianceState`。
+ */
+export function parseLuaApplianceStatus(
+  deviceType: number,
+  raw: Record<string, unknown>,
+  existing?: MideaApplianceState | null,
+): MideaApplianceState | null {
+  const keys = Object.keys(raw);
+  if (keys.length === 0) {
+    return null;
+  }
+  const type = deviceType & 0xff;
+  const fallback =
+    existing && existing.deviceType === type ? existing : defaultApplianceState(type);
+
+  switch (fallback.kind) {
+    case "ac": {
+      const power = parseLuaBool(raw["power"]);
+      const mode = parseLuaAcMode(raw["mode"]);
+      const baseTemp = parseLuaNumber(raw["temperature"]);
+      const smallTemp = parseLuaNumber(raw["small_temperature"]) ?? 0;
+      const targetTempRaw =
+        baseTemp !== undefined
+          ? Number.isInteger(baseTemp) && smallTemp > 0 && smallTemp < 1
+            ? baseTemp + smallTemp
+            : baseTemp
+          : undefined;
+      const indoorTemp = parseValidTemp(raw["indoor_temperature"]);
+      const outdoorTemp = parseValidTemp(raw["outdoor_temperature"]);
+      const fanSpeed = parseLuaNumber(raw["wind_speed"]);
+      const swingVertical = parseLuaBool(raw["wind_swing_ud"]);
+      const swingHorizontal = parseLuaBool(raw["wind_swing_lr"]);
+      const eco = parseLuaBool(raw["eco"]);
+      const turbo = parseLuaBool(raw["strong_wind"]) ?? parseLuaBool(raw["jet_cool"]);
+      const auxHeat = parseLuaBool(raw["ptc"]);
+      const screenDisplayNow = parseLuaBool(raw["screen_display_now"]);
+      const screenDisplayNum = parseLuaNumber(raw["screen_display"]);
+      const screenDisplay =
+        screenDisplayNow ??
+        (screenDisplayNum !== undefined
+          ? screenDisplayNum > 0
+          : parseLuaBool(raw["screen_display"]));
+
+      if (
+        power === undefined &&
+        mode === undefined &&
+        targetTempRaw === undefined &&
+        indoorTemp === undefined
+      ) {
+        return null;
+      }
+
+      return {
+        ...fallback,
+        power: power ?? fallback.power,
+        mode: mode ?? fallback.mode,
+        targetTemperature:
+          targetTempRaw !== undefined
+            ? clamp(Math.round(targetTempRaw * 2) / 2, 16, 30)
+            : fallback.targetTemperature,
+        fanSpeed: fanSpeed !== undefined ? clamp(Math.round(fanSpeed), 1, 102) : fallback.fanSpeed,
+        swingVertical: swingVertical ?? fallback.swingVertical,
+        swingHorizontal: swingHorizontal ?? fallback.swingHorizontal,
+        eco: eco ?? fallback.eco,
+        turbo: turbo ?? fallback.turbo,
+        auxHeat: auxHeat ?? fallback.auxHeat,
+        screenDisplay: screenDisplay ?? fallback.screenDisplay,
+        ...(indoorTemp !== undefined
+          ? { indoorTemperature: indoorTemp }
+          : fallback.indoorTemperature !== undefined
+            ? { indoorTemperature: fallback.indoorTemperature }
+            : {}),
+        ...(outdoorTemp !== undefined
+          ? { outdoorTemperature: outdoorTemp }
+          : fallback.outdoorTemperature !== undefined
+            ? { outdoorTemperature: fallback.outdoorTemperature }
+            : {}),
+      };
+    }
+    case "dehumidifier": {
+      const power = parseLuaBool(raw["power"]);
+      const mode = parseLuaDehumidifierMode(raw["mode"]);
+      const targetHumidity = parseLuaNumber(raw["humidity"]);
+      const currentHumidity = parseLuaNumber(raw["cur_humidity"]);
+      const currentTemperature =
+        parseValidTemp(raw["indoor_temperature"]) ?? parseValidTemp(raw["temperature"]);
+      const fanSpeed = parseLuaNumber(raw["wind_speed"]);
+      const tankNum = parseLuaNumber(raw["tank_status"]);
+      const tankFull =
+        tankNum !== undefined ? tankNum >= 100 : parseLuaBool(raw["tank_full"]);
+      const ion = parseLuaBool(raw["anion"]);
+      const swing = parseLuaBool(raw["wind_swing"]);
+      const childLock = parseLuaBool(raw["child_lock"]);
+
+      if (power === undefined && currentHumidity === undefined && targetHumidity === undefined) {
+        return null;
+      }
+
+      return {
+        ...fallback,
+        power: power ?? fallback.power,
+        mode: mode ?? fallback.mode,
+        targetHumidity:
+          targetHumidity !== undefined
+            ? clamp(Math.round(targetHumidity), 35, 85)
+            : fallback.targetHumidity,
+        fanSpeed: fanSpeed !== undefined ? clamp(Math.round(fanSpeed), 1, 102) : fallback.fanSpeed,
+        tankFull: tankFull ?? fallback.tankFull,
+        ion: ion ?? fallback.ion,
+        swing: swing ?? fallback.swing,
+        childLock: childLock ?? fallback.childLock,
+        ...(currentHumidity !== undefined && currentHumidity >= 0 && currentHumidity <= 100
+          ? { currentHumidity }
+          : fallback.currentHumidity !== undefined
+            ? { currentHumidity: fallback.currentHumidity }
+            : {}),
+        ...(currentTemperature !== undefined
+          ? { currentTemperature }
+          : fallback.currentTemperature !== undefined
+            ? { currentTemperature: fallback.currentTemperature }
+            : {}),
+      };
+    }
+    case "fan": {
+      const power = parseLuaBool(raw["power"]);
+      const fanSpeed = parseLuaNumber(raw["gear"]) ?? parseLuaNumber(raw["wind_speed"]);
+      const swingRaw = raw["swing"];
+      const oscillate =
+        parseLuaBool(swingRaw) ??
+        (typeof swingRaw === "string" && swingRaw.trim() !== ""
+          ? swingRaw.trim().toLowerCase() !== "off"
+          : undefined);
+      let mode: number | undefined;
+      if (typeof raw["mode"] === "string") {
+        const lower = raw["mode"].trim().toLowerCase();
+        if (lower === "normal") mode = 0;
+        else if (lower === "natural") mode = 1;
+        else if (lower === "sleep") mode = 2;
+        else if (lower === "comfort") mode = 3;
+      } else {
+        mode = parseLuaNumber(raw["mode"]);
+      }
+
+      if (power === undefined && fanSpeed === undefined) {
+        return null;
+      }
+      return {
+        ...fallback,
+        power: power ?? fallback.power,
+        fanSpeed: fanSpeed !== undefined ? clamp(Math.round(fanSpeed), 1, 26) : fallback.fanSpeed,
+        oscillate: oscillate ?? fallback.oscillate,
+        mode: mode !== undefined ? clamp(Math.round(mode), 0, 3) : fallback.mode,
+      };
+    }
+    case "purifier": {
+      const power = parseLuaBool(raw["power"]);
+      const fanSpeed = parseLuaNumber(raw["wind_speed"]);
+      const pm25 = parseLuaNumber(raw["pm25"]);
+      const ion = parseLuaBool(raw["anion"]);
+      const childLock = parseLuaBool(raw["child_lock"]);
+      let mode: number | undefined;
+      if (typeof raw["mode"] === "string") {
+        const lower = raw["mode"].trim().toLowerCase();
+        if (lower === "auto") mode = 0x10;
+        else if (lower === "manual") mode = 0x20;
+        else if (lower === "sleep") mode = 0x30;
+      } else {
+        mode = parseLuaNumber(raw["mode"]);
+      }
+
+      if (power === undefined && pm25 === undefined) {
+        return null;
+      }
+      return {
+        ...fallback,
+        power: power ?? fallback.power,
+        fanSpeed: fanSpeed !== undefined ? clamp(Math.round(fanSpeed), 0, 102) : fallback.fanSpeed,
+        mode: mode ?? fallback.mode,
+        ion: ion ?? fallback.ion,
+        childLock: childLock ?? fallback.childLock,
+        ...(pm25 !== undefined
+          ? { pm25: Math.round(pm25) }
+          : fallback.pm25 !== undefined
+            ? { pm25: fallback.pm25 }
+            : {}),
+      };
+    }
+    case "humidifier": {
+      const power = parseLuaBool(raw["power"]);
+      const targetHumidity = parseLuaNumber(raw["humidity"]);
+      const currentHumidity = parseLuaNumber(raw["cur_humidity"]);
+      const fanSpeed = parseLuaNumber(raw["wind_speed"]);
+      const tankEmpty = parseLuaBool(raw["tank_status"]);
+
+      if (power === undefined && currentHumidity === undefined && targetHumidity === undefined) {
+        return null;
+      }
+      return {
+        ...fallback,
+        power: power ?? fallback.power,
+        targetHumidity:
+          targetHumidity !== undefined
+            ? clamp(Math.round(targetHumidity), 40, 80)
+            : fallback.targetHumidity,
+        fanSpeed: fanSpeed !== undefined ? clamp(Math.round(fanSpeed), 1, 100) : fallback.fanSpeed,
+        tankEmpty: tankEmpty ?? fallback.tankEmpty,
+        ...(currentHumidity !== undefined && currentHumidity >= 0 && currentHumidity <= 100
+          ? { currentHumidity }
+          : fallback.currentHumidity !== undefined
+            ? { currentHumidity: fallback.currentHumidity }
+            : {}),
+      };
+    }
+    case "water-heater": {
+      const power = parseLuaBool(raw["power"]);
+      const targetTemperature = parseLuaNumber(raw["temperature"]);
+      const currentTemperature =
+        parseValidTemp(raw["cur_temperature"]) ?? parseValidTemp(raw["in_temperature"]);
+      const heating = parseLuaBool(raw["heat"]) ?? parseLuaBool(raw["heating"]);
+
+      if (power === undefined && currentTemperature === undefined && targetTemperature === undefined) {
+        return null;
+      }
+      return {
+        ...fallback,
+        power: power ?? fallback.power,
+        targetTemperature:
+          targetTemperature !== undefined
+            ? clamp(Math.round(targetTemperature), 30, 75)
+            : fallback.targetTemperature,
+        heating: heating ?? fallback.heating,
+        ...(currentTemperature !== undefined
+          ? { currentTemperature }
+          : fallback.currentTemperature !== undefined
+            ? { currentTemperature: fallback.currentTemperature }
+            : {}),
+      };
+    }
+    case "generic": {
+      const directPower = parseLuaBool(raw["power"]);
+      const dbPower = parseLuaBool(raw["db_power"]);
+      const daPower = parseLuaBool(raw["da_power"]);
+      const ledPower = parseLuaBool(raw["led_power"]);
+
+      let power: boolean | undefined = directPower;
+      if (power === undefined) {
+        if (dbPower !== undefined || daPower !== undefined) {
+          power = Boolean(dbPower) || Boolean(daPower);
+        } else if (ledPower !== undefined) {
+          power = ledPower;
+        }
+      }
+
+      if (power === undefined) {
+        return null;
+      }
+      return {
+        ...fallback,
+        power,
+      };
+    }
+  }
+}
+
+/**
+ * 构造美的云端 `/lua/control` 所需的 `command.control` JSON 对象。
+ */
+export function buildLuaControlPayload(
+  deviceType: number,
+  nextState: MideaApplianceState,
+  propName?: string,
+  rawLuaStatus?: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  const key = propName ? propName.trim().toLowerCase().replaceAll("_", "-") : "on";
+  const type = deviceType & 0xff;
+
+  if (key === "on" || key === "power") {
+    const val = nextState.power ? "on" : "off";
+    if (nextState.kind === "generic") {
+      if (rawLuaStatus && "db_power" in rawLuaStatus && !("power" in rawLuaStatus)) {
+        return { db_power: val };
+      }
+      if (rawLuaStatus && "led_power" in rawLuaStatus && !("power" in rawLuaStatus)) {
+        return { led_power: val };
+      }
+      if (type === 0xd9) {
+        return { db_power: val };
+      }
+      if (type === 0x13) {
+        return { led_power: val };
+      }
+    }
+    return { power: val };
+  }
+
+  switch (nextState.kind) {
+    case "ac": {
+      switch (key) {
+        case "mode": {
+          const modeNames: Record<MideaAcMode, string> = {
+            1: "auto",
+            2: "cool",
+            3: "dry",
+            4: "heat",
+            5: "fan",
+          };
+          return { mode: modeNames[nextState.mode] ?? "auto" };
+        }
+        case "target-temperature": {
+          const intTemp = Math.floor(nextState.targetTemperature);
+          const half = nextState.targetTemperature - intTemp >= 0.5 ? 0.5 : 0;
+          return { temperature: intTemp, small_temperature: half };
+        }
+        case "fan-speed":
+          return { wind_speed: nextState.fanSpeed };
+        case "swing-vertical":
+          return { wind_swing_ud: nextState.swingVertical ? "on" : "off" };
+        case "swing-horizontal":
+          return { wind_swing_lr: nextState.swingHorizontal ? "on" : "off" };
+        case "eco":
+          return { eco: nextState.eco ? "on" : "off" };
+        case "turbo":
+          return { strong_wind: nextState.turbo ? "on" : "off" };
+        case "aux-heat":
+          return { ptc: nextState.auxHeat ? "on" : "off" };
+        case "screen-display":
+          return { screen_display: nextState.screenDisplay ? 100 : 0 };
+        default:
+          return null;
+      }
+    }
+    case "dehumidifier": {
+      switch (key) {
+        case "mode": {
+          const modeNames: Record<MideaDehumidifierMode, string> = {
+            1: "set",
+            2: "continuity",
+            3: "auto",
+            4: "dry_clothes",
+          };
+          return { mode: modeNames[nextState.mode] ?? "set" };
+        }
+        case "target-humidity":
+          return { humidity: nextState.targetHumidity };
+        case "fan-speed":
+          return { wind_speed: nextState.fanSpeed };
+        case "ion":
+          return { anion: nextState.ion ? "on" : "off" };
+        case "swing":
+          return { wind_swing: nextState.swing ? "on" : "off" };
+        case "child-lock":
+          return { child_lock: nextState.childLock ? "on" : "off" };
+        default:
+          return null;
+      }
+    }
+    case "fan": {
+      switch (key) {
+        case "fan-speed":
+        case "speed":
+          return { gear: nextState.fanSpeed };
+        case "oscillate":
+        case "swing":
+          return { swing: nextState.oscillate ? "on" : "off" };
+        case "mode": {
+          const modes = ["normal", "natural", "sleep", "comfort"];
+          return { mode: modes[nextState.mode] ?? "normal" };
+        }
+        default:
+          return null;
+      }
+    }
+    case "purifier": {
+      switch (key) {
+        case "mode":
+          return {
+            mode:
+              nextState.mode === 0x20 ? "manual" : nextState.mode === 0x30 ? "sleep" : "auto",
+          };
+        case "fan-speed":
+          return { wind_speed: nextState.fanSpeed };
+        case "ion":
+          return { anion: nextState.ion ? "on" : "off" };
+        case "child-lock":
+          return { child_lock: nextState.childLock ? "on" : "off" };
+        default:
+          return null;
+      }
+    }
+    case "humidifier": {
+      switch (key) {
+        case "target-humidity":
+          return { humidity: nextState.targetHumidity };
+        case "fan-speed":
+          return { wind_speed: nextState.fanSpeed };
+        default:
+          return null;
+      }
+    }
+    case "water-heater": {
+      switch (key) {
+        case "target-temperature":
+          return { temperature: nextState.targetTemperature };
+        default:
+          return null;
+      }
+    }
+    case "generic":
+      return null;
+  }
+}

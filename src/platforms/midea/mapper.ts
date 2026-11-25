@@ -27,6 +27,7 @@ export interface MideaApplianceRecord {
   model?: string;
   sn?: string;
   sn8?: string;
+  manufacturerCode?: string;
   ip?: string;
   port?: number;
   protocolVersion: 2 | 3;

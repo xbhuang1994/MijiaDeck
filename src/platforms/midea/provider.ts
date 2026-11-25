@@ -22,6 +22,7 @@ import type {
 } from "../types.ts";
 import {
   MideaCloudClient,
+  type MideaLuaApplianceMeta,
   type MideaTokenKeyPair,
 } from "./cloudClient.ts";
 import {
@@ -50,8 +51,12 @@ import {
 import {
   buildApplianceQuery,
   buildApplianceSet,
+  buildLuaControlPayload,
+  buildLuaQueryParams,
   defaultApplianceState,
+  hasDedicatedBinaryProtocol,
   parseApplianceResponse,
+  parseLuaApplianceStatus,
   type MideaApplianceState,
 } from "./protocols.ts";
 
@@ -150,7 +155,9 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
   private _cloudClient: MideaCloudClient | null = null;
   private _appliances = new Map<string, MideaApplianceRecord>();
   private _states = new Map<string, MideaApplianceState>();
+  private _luaStatuses = new Map<string, Record<string, unknown>>();
   private _tokenCandidates = new Map<string, MideaTokenKeyPair[]>();
+  private _loadingDevicesPromise: Promise<DeviceInfo[]> | null = null;
 
   private _controlBlockReason = "";
   private _authFailed = false;
@@ -393,6 +400,7 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
     this._cloudClient = null;
     this._appliances.clear();
     this._states.clear();
+    this._luaStatuses.clear();
     this._tokenCandidates.clear();
 
     if (enabled && (mode === "cloud" || mode === "hybrid") && this._hasCloudCredentials(nextConfig)) {
@@ -433,6 +441,7 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
     this._lanTransport.close?.();
     this._appliances.clear();
     this._states.clear();
+    this._luaStatuses.clear();
     this._tokenCandidates.clear();
 
     const cleared: MideaPlatformConfig = {
@@ -543,6 +552,7 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
             model: item.modelNumber || existing?.model,
             sn: item.sn,
             sn8: item.sn8,
+            manufacturerCode: item.manufacturerCode,
             ip: existing?.ip,
             port: existing?.port ?? MIDEA_LAN_TCP_PORT,
             protocolVersion: existing?.protocolVersion ?? item.protocolVersion,
@@ -605,13 +615,35 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
   private async _requireAppliance(nativeDid: string): Promise<MideaApplianceRecord> {
     let record = this._appliances.get(nativeDid);
     if (!record && this._appliances.size === 0 && this._config.enabled) {
-      await this.listDevices();
+      if (!this._loadingDevicesPromise) {
+        this._loadingDevicesPromise = this.listDevices().finally(() => {
+          this._loadingDevicesPromise = null;
+        });
+      }
+      await this._loadingDevicesPromise;
       record = this._appliances.get(nativeDid);
     }
     if (!record) {
       throw new ServiceError(`未找到美的设备：${nativeDid}`);
     }
     return record;
+  }
+
+  private _luaMeta(record: MideaApplianceRecord): MideaLuaApplianceMeta {
+    return {
+      deviceType: record.type,
+      sn: record.sn,
+      modelNumber: record.model,
+      manufacturerCode: record.manufacturerCode,
+    };
+  }
+
+  private _canUseLan(record: MideaApplianceRecord): boolean {
+    return (
+      Boolean(record.ip) &&
+      (this._config.mode === "local" ||
+        (this._config.mode === "hybrid" && this._config.preferLocal))
+    );
   }
 
   private async _sendViaLan(record: MideaApplianceRecord, frame: Uint8Array): Promise<Buffer> {
@@ -673,19 +705,248 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
       : new Error(String(lastErr ?? "美的局域网 V3 通信失败"));
   }
 
-  private async _sendFrame(record: MideaApplianceRecord, frame: Uint8Array): Promise<Buffer | null> {
-    const canLan =
-      Boolean(record.ip) &&
-      (this._config.mode === "local" ||
-        (this._config.mode === "hybrid" && this._config.preferLocal));
+  private _parseAndStoreFrame(
+    record: MideaApplianceRecord,
+    reply: Buffer | null,
+    fallbackState?: MideaApplianceState,
+  ): MideaApplianceState | null {
+    if (reply) {
+      try {
+        const parsed = parseApplianceResponse(record.type, reply);
+        if (parsed) {
+          this._states.set(record.id, parsed);
+          return parsed;
+        }
+      } catch {
+        // 部分设备回包非完整状态帧，交由调用方回退处理
+      }
+    }
+    if (fallbackState) {
+      this._states.set(record.id, fallbackState);
+      return fallbackState;
+    }
+    return null;
+  }
+
+  private async _queryViaLua(
+    cloudClient: MideaCloudClient,
+    record: MideaApplianceRecord,
+  ): Promise<MideaApplianceState | null> {
+    const raw = await cloudClient.getLuaStatus(
+      record.id,
+      buildLuaQueryParams(record.type),
+      this._luaMeta(record),
+    );
+    const parsed = parseLuaApplianceStatus(record.type, raw, this._states.get(record.id));
+    if (parsed) {
+      this._luaStatuses.set(record.id, raw);
+      this._states.set(record.id, parsed);
+      return parsed;
+    }
+    return null;
+  }
+
+  private async _queryViaCloud(
+    cloudClient: MideaCloudClient,
+    record: MideaApplianceRecord,
+  ): Promise<MideaApplianceState> {
+    const useDedicatedBinary = hasDedicatedBinaryProtocol(record.type);
+
+    if (!useDedicatedBinary && cloudClient.supportsLuaCloud) {
+      let luaErr: unknown;
+      try {
+        const parsedLua = await this._queryViaLua(cloudClient, record);
+        if (parsedLua) {
+          return parsedLua;
+        }
+      } catch (err) {
+        luaErr = err;
+      }
+      try {
+        const reply = await cloudClient.sendTransparentCommand(
+          record.id,
+          buildApplianceQuery(record.type),
+        );
+        const parsed = this._parseAndStoreFrame(record, reply);
+        if (parsed) {
+          return parsed;
+        }
+      } catch (transparentErr) {
+        throw luaErr ?? transparentErr;
+      }
+      if (luaErr) {
+        throw luaErr;
+      }
+      const existing = this._states.get(record.id) ?? defaultApplianceState(record.type);
+      this._states.set(record.id, existing);
+      return existing;
+    }
+
+    let transparentErr: unknown;
+    try {
+      const reply = await cloudClient.sendTransparentCommand(
+        record.id,
+        buildApplianceQuery(record.type),
+      );
+      const parsed = this._parseAndStoreFrame(record, reply);
+      if (parsed) {
+        return parsed;
+      }
+    } catch (err) {
+      transparentErr = err;
+    }
+
+    if (cloudClient.supportsLuaCloud) {
+      try {
+        const parsedLua = await this._queryViaLua(cloudClient, record);
+        if (parsedLua) {
+          return parsedLua;
+        }
+      } catch {
+        // Lua 回退也失败时，保留原始透传错误
+      }
+    }
+
+    if (transparentErr) {
+      throw transparentErr;
+    }
+    const existing = this._states.get(record.id) ?? defaultApplianceState(record.type);
+    this._states.set(record.id, existing);
+    return existing;
+  }
+
+  private async _writeViaCloud(
+    cloudClient: MideaCloudClient,
+    record: MideaApplianceRecord,
+    nextState: MideaApplianceState,
+    propName?: string,
+  ): Promise<MideaApplianceState> {
+    const useDedicatedBinary = hasDedicatedBinaryProtocol(record.type);
+    const luaControl = buildLuaControlPayload(
+      record.type,
+      nextState,
+      propName,
+      this._luaStatuses.get(record.id),
+    );
+
+    const runLuaControl = async (): Promise<MideaApplianceState> => {
+      const luaResp = await cloudClient.sendLuaControl(record.id, luaControl!, {
+        status: this._luaStatuses.get(record.id),
+        meta: this._luaMeta(record),
+      });
+      const prevLua = this._luaStatuses.get(record.id) ?? {};
+      this._luaStatuses.set(record.id, { ...prevLua, ...luaResp, ...luaControl });
+      this._states.set(record.id, nextState);
+      return nextState;
+    };
+
+    const runTransparentWrite = async (): Promise<MideaApplianceState> => {
+      const reply = await cloudClient.sendTransparentCommand(
+        record.id,
+        buildApplianceSet(record.type, nextState),
+        { allowAsyncReplyMissing: true },
+      );
+      return this._parseAndStoreFrame(record, reply, nextState) ?? nextState;
+    };
+
+    if (!useDedicatedBinary && cloudClient.supportsLuaCloud && luaControl) {
+      let luaErr: unknown;
+      try {
+        return await runLuaControl();
+      } catch (err) {
+        luaErr = err;
+      }
+      try {
+        return await runTransparentWrite();
+      } catch {
+        throw luaErr;
+      }
+    }
+
+    let transparentErr: unknown;
+    try {
+      return await runTransparentWrite();
+    } catch (err) {
+      transparentErr = err;
+    }
+
+    if (cloudClient.supportsLuaCloud && luaControl) {
+      try {
+        return await runLuaControl();
+      } catch {
+        // Lua 回退失败时优先保留原始透传错误
+      }
+    }
+
+    throw transparentErr;
+  }
+
+  private async _queryState(record: MideaApplianceRecord): Promise<MideaApplianceState> {
+    const canLan = this._canUseLan(record);
     const cloudClient = this._ensureCloudClient();
+    const queryFrame = buildApplianceQuery(record.type);
 
     if (canLan) {
       try {
-        return await this._sendViaLan(record, frame);
+        const reply = await this._sendViaLan(record, queryFrame);
+        const existing = this._states.get(record.id) ?? defaultApplianceState(record.type);
+        return this._parseAndStoreFrame(record, reply, existing) ?? existing;
       } catch (lanErr) {
         if (this._config.mode === "hybrid" && cloudClient) {
-          return await cloudClient.sendTransparentCommand(record.id, frame);
+          try {
+            return await this._queryViaCloud(cloudClient, record);
+          } catch (cloudErr) {
+            const safeMsg = sanitizeErrorMessage(cloudErr, this._activeSecrets());
+            throw new ServiceError(`美的云端查询失败：${safeMsg}`);
+          }
+        }
+        const safeMsg = sanitizeErrorMessage(lanErr, this._activeSecrets());
+        throw new ServiceError(`美的局域网查询失败：${safeMsg}`);
+      }
+    }
+
+    if (cloudClient) {
+      try {
+        return await this._queryViaCloud(cloudClient, record);
+      } catch (cloudErr) {
+        if (record.ip) {
+          try {
+            const reply = await this._sendViaLan(record, queryFrame);
+            const existing = this._states.get(record.id) ?? defaultApplianceState(record.type);
+            return this._parseAndStoreFrame(record, reply, existing) ?? existing;
+          } catch {
+            // 局域网回退也失败，返回原始云端错误
+          }
+        }
+        const safeMsg = sanitizeErrorMessage(cloudErr, this._activeSecrets());
+        throw new ServiceError(`美的云端查询失败：${safeMsg}`);
+      }
+    }
+
+    throw new ServiceError(`美的设备「${record.name}」当前既无可用局域网地址，也未登录美的云端`);
+  }
+
+  private async _writeState(
+    record: MideaApplianceRecord,
+    nextState: MideaApplianceState,
+    propName?: string,
+  ): Promise<MideaApplianceState> {
+    const canLan = this._canUseLan(record);
+    const cloudClient = this._ensureCloudClient();
+    const setFrame = buildApplianceSet(record.type, nextState);
+
+    if (canLan) {
+      try {
+        const reply = await this._sendViaLan(record, setFrame);
+        return this._parseAndStoreFrame(record, reply, nextState) ?? nextState;
+      } catch (lanErr) {
+        if (this._config.mode === "hybrid" && cloudClient) {
+          try {
+            return await this._writeViaCloud(cloudClient, record, nextState, propName);
+          } catch (cloudErr) {
+            const safeMsg = sanitizeErrorMessage(cloudErr, this._activeSecrets());
+            throw new ServiceError(`美的云端控制失败：${safeMsg}`);
+          }
         }
         const safeMsg = sanitizeErrorMessage(lanErr, this._activeSecrets());
         throw new ServiceError(`美的局域网控制失败：${safeMsg}`);
@@ -694,10 +955,15 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
 
     if (cloudClient) {
       try {
-        return await cloudClient.sendTransparentCommand(record.id, frame);
+        return await this._writeViaCloud(cloudClient, record, nextState, propName);
       } catch (cloudErr) {
         if (record.ip) {
-          return await this._sendViaLan(record, frame);
+          try {
+            const reply = await this._sendViaLan(record, setFrame);
+            return this._parseAndStoreFrame(record, reply, nextState) ?? nextState;
+          } catch {
+            // 局域网回退也失败，返回原始云端错误
+          }
         }
         const safeMsg = sanitizeErrorMessage(cloudErr, this._activeSecrets());
         throw new ServiceError(`美的云端控制失败：${safeMsg}`);
@@ -705,46 +971,6 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
     }
 
     throw new ServiceError(`美的设备「${record.name}」当前既无可用局域网地址，也未登录美的云端`);
-  }
-
-  private async _queryState(record: MideaApplianceRecord): Promise<MideaApplianceState> {
-    const queryFrame = buildApplianceQuery(record.type);
-    const reply = await this._sendFrame(record, queryFrame);
-    if (reply) {
-      try {
-        const parsed = parseApplianceResponse(record.type, reply);
-        if (parsed) {
-          this._states.set(record.id, parsed);
-          return parsed;
-        }
-      } catch {
-        // 若响应解析失败，回退已有状态或默认状态
-      }
-    }
-    const existing = this._states.get(record.id) ?? defaultApplianceState(record.type);
-    this._states.set(record.id, existing);
-    return existing;
-  }
-
-  private async _writeState(
-    record: MideaApplianceRecord,
-    nextState: MideaApplianceState,
-  ): Promise<MideaApplianceState> {
-    const setFrame = buildApplianceSet(record.type, nextState);
-    const reply = await this._sendFrame(record, setFrame);
-    if (reply) {
-      try {
-        const parsed = parseApplianceResponse(record.type, reply);
-        if (parsed) {
-          this._states.set(record.id, parsed);
-          return parsed;
-        }
-      } catch {
-        // 部分设备设置回包不是完整状态帧，保留已下发目标状态
-      }
-    }
-    this._states.set(record.id, nextState);
-    return nextState;
   }
 
   async deviceDetail(nativeDid: string): Promise<DeviceDetail> {
@@ -788,7 +1014,7 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
       }
     }
     const nextState = applyMideaStateProp(current, name, value);
-    await this._writeState(record, nextState);
+    await this._writeState(record, nextState, name);
   }
 
   async runAction(nativeDid: string, name: string, _params?: unknown): Promise<void> {
@@ -833,7 +1059,7 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
     }
     const targetPower = !current.power;
     const nextState = applyMideaStateProp(current, "on", targetPower);
-    const applied = await this._writeState(record, nextState);
+    const applied = await this._writeState(record, nextState, "on");
     return applied.power;
   }
 

@@ -750,6 +750,11 @@ describe("MideaCloudClient 模拟 HTTP 协议流程", () => {
         });
       }
       if (url.includes("/v1/appliance/transparent/send")) {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        expect(body.applianceCode).toBe("152839104215234");
+        expect(body.applianceId).toBeUndefined();
+        expect(body.timestamp).toBe("true");
+        expect(body.isFull).toBe("false");
         return jsonResponse({ code: "0", data: { reply: encryptedReply } });
       }
       return jsonResponse({ code: "404", msg: "unknown" }, 404);
@@ -924,7 +929,9 @@ describe("MideaPlatformProvider 端到端集成、降级回退与凭据脱敏", 
       }
       if (url.includes("/v1/appliance/transparent/send")) {
         const body = JSON.parse(String(init?.body ?? "{}"));
-        cloudTransparentCalls.push(String(body.applianceId));
+        expect(body.applianceId).toBeUndefined();
+        expect(body.applianceCode).toBe("152839104215234");
+        cloudTransparentCalls.push(String(body.applianceCode));
         const sec = new MideaCloudSecurity("meiju");
         const signedCsv = sec.aesDecrypt(String(body.order));
         const rawBytes = Buffer.from(
@@ -1112,5 +1119,399 @@ describe("MideaPlatformProvider 端到端集成、降级回退与凭据脱敏", 
     expect(provider.isConnected()).toBe(false);
     expect(provider.status().state).toBe("disconnected");
     expect(provider.status().configSummary["hasPassword"]).toBe(false);
+  });
+
+  test("16. MAS 透传严格使用 applianceCode（避免 1001）、Legacy 保留 applianceId、处理 1306 与 aa 开头密文", async () => {
+    const serverSec = new MideaCloudSecurity("meiju");
+    const sessionKeyPlain = "1122334455667788";
+    const encryptedSessionKey = serverSec.aesEncryptWithFixedKey(sessionKeyPlain);
+    serverSec.setAesKeys(sessionKeyPlain);
+
+    const acReplyFrame = buildAcStatusResponseFrame({
+      ...defaultAcState(),
+      power: true,
+      mode: 4,
+      targetTemperature: 23.5,
+      indoorTemperature: 21.5,
+    });
+    const signedCsvReply = Array.from(acReplyFrame)
+      .map((b) => (b > 127 ? b - 256 : b))
+      .join(",");
+    const encryptedCsvReply = serverSec.aesEncrypt(signedCsvReply);
+
+    let transparentMode: "ok" | "1306" = "ok";
+    const mockMeijuFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/v1/user/login/id/get")) {
+        return jsonResponse({ code: "0", data: { loginId: "login-1001" } });
+      }
+      if (url.includes("/mj/user/login")) {
+        return jsonResponse({
+          code: "0",
+          data: { uid: "uid-1001", key: encryptedSessionKey, mdata: { accessToken: "tok-1001" } },
+        });
+      }
+      if (url.includes("/v1/appliance/transparent/send")) {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        // 真实美的 MAS 网关：若缺少 applianceCode 则报错 (1001): Invalid param wrong format: null
+        if (!body.applianceCode || body.applianceId !== undefined) {
+          return jsonResponse({ code: "1001", msg: "Invalid param wrong format: null" });
+        }
+        expect(body.timestamp).toBe("true");
+        expect(body.isFull).toBe("false");
+        if (transparentMode === "1306") {
+          return jsonResponse({ code: "1306", msg: "The async reply does not exist " });
+        }
+        return jsonResponse({ code: "0", data: { reply: encryptedCsvReply } });
+      }
+      return jsonResponse({ code: "404" }, 404);
+    }) as typeof fetch;
+
+    const meijuClient = new MideaCloudClient({
+      brand: "meiju",
+      account: "13800138000",
+      password: "Password!1",
+      httpFetch: mockMeijuFetch,
+    });
+
+    // 正常加密逗号分隔字节流回复可完整解码
+    const replyBuf = await meijuClient.sendTransparentCommand("210006741641007", buildAcQuery());
+    expect(replyBuf).not.toBeNull();
+    expect(parseAcResponse(replyBuf!)).toMatchObject({
+      power: true,
+      mode: 4,
+      targetTemperature: 23.5,
+      indoorTemperature: 21.5,
+    });
+
+    // 1306 异步应答缺失：默认抛错，写指令允许时返回 null
+    transparentMode = "1306";
+    await expect(
+      meijuClient.sendTransparentCommand("210006741641007", buildAcQuery()),
+    ).rejects.toThrow("1306");
+    const tolerated = await meijuClient.sendTransparentCommand(
+      "210006741641007",
+      buildAcSet({ power: false }),
+      { allowAsyncReplyMissing: true },
+    );
+    expect(tolerated).toBeNull();
+
+    // 构造一条 AES 密文恰好以 "aa" 开头的有效回复，验证不会误判为明文 0xAA 帧
+    let aaPrefixedKey = "";
+    let aaPrefixedCipher = "";
+    const aaFrame = buildAcStatusResponseFrame({
+      ...defaultAcState(),
+      power: true,
+      targetTemperature: 25,
+      fanSpeed: 60,
+      indoorTemperature: 22,
+    });
+    const aaCsv = Array.from(aaFrame)
+      .map((b) => (b > 127 ? b - 256 : b))
+      .join(",");
+    for (let k = 0; k < 4096; k++) {
+      const candidateKey = `mideakey${String(k).padStart(8, "0")}`;
+      const tmpSec = new MideaCloudSecurity("meiju");
+      tmpSec.setAesKeys(candidateKey);
+      const cipher = tmpSec.aesEncrypt(aaCsv);
+      if (cipher.startsWith("aa")) {
+        aaPrefixedKey = candidateKey;
+        aaPrefixedCipher = cipher;
+        break;
+      }
+    }
+    expect(aaPrefixedCipher.startsWith("aa")).toBe(true);
+    const aaEncryptedSessionKey = new MideaCloudSecurity("meiju").aesEncryptWithFixedKey(aaPrefixedKey);
+    const aaFetch = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/v1/user/login/id/get")) {
+        return jsonResponse({ code: "0", data: { loginId: "login-aa" } });
+      }
+      if (url.includes("/mj/user/login")) {
+        return jsonResponse({
+          code: "0",
+          data: { uid: "uid-aa", key: aaEncryptedSessionKey, mdata: { accessToken: "tok-aa" } },
+        });
+      }
+      if (url.includes("/v1/appliance/transparent/send")) {
+        return jsonResponse({ code: "0", data: { reply: aaPrefixedCipher } });
+      }
+      return jsonResponse({ code: "404" }, 404);
+    }) as typeof fetch;
+    const aaClient = new MideaCloudClient({
+      brand: "meiju",
+      account: "13800138000",
+      password: "Password!1",
+      httpFetch: aaFetch,
+    });
+    const decodedAa = await aaClient.sendTransparentCommand("210006741641007", buildAcQuery());
+    expect(decodedAa).not.toBeNull();
+    expect(parseAcResponse(decodedAa!)?.indoorTemperature).toBe(22);
+
+    // Legacy 协议仍保留 applianceId + funId=0000
+    let legacyBody = "";
+    const legacyFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith("/v1/user/login/id/get")) {
+        return jsonResponse({ errorCode: "0", result: { loginId: "leg-1" } });
+      }
+      if (url.endsWith("/v1/user/login")) {
+        return jsonResponse({ errorCode: "0", result: { sessionId: "sess-leg-1", userId: "u-leg" } });
+      }
+      if (url.endsWith("/v1/appliance/transparent/send")) {
+        legacyBody = String(init?.body ?? "");
+        return jsonResponse({ errorCode: "0", result: { reply: acReplyFrame.toString("hex") } });
+      }
+      return jsonResponse({ errorCode: "404" }, 404);
+    }) as typeof fetch;
+    const legacyClient = new MideaCloudClient({
+      brand: "nethomeplus",
+      account: "u@example.com",
+      password: "LegacyPassword",
+      httpFetch: legacyFetch,
+    });
+    const legacyReply = await legacyClient.sendTransparentCommand("300001", buildAcQuery());
+    expect(legacyBody).toContain("applianceId=300001");
+    expect(legacyBody).toContain("funId=0000");
+    expect(parseAcResponse(legacyReply!)?.targetTemperature).toBe(23.5);
+  });
+
+  test("17. 云端 Token 失效 (40002) 自动重登并重试请求", async () => {
+    let loginCount = 0;
+    let statusCalls = 0;
+
+    const mockFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      if (url.includes("/v1/user/login/id/get")) {
+        return jsonResponse({ code: "0", data: { loginId: `login-${loginCount + 1}` } });
+      }
+      if (url.includes("/mj/user/login")) {
+        loginCount += 1;
+        return jsonResponse({
+          code: "0",
+          data: { uid: "u-relogin", mdata: { accessToken: `tok-${loginCount}` } },
+        });
+      }
+      if (url.includes("/mjl/v1/device/status/lua/get")) {
+        statusCalls += 1;
+        if (headers["accessToken"] === "tok-1") {
+          return jsonResponse({ code: "40002", msg: "user token not exist" });
+        }
+        return jsonResponse({ code: "0", data: { power: "on", temperature: 25 } });
+      }
+      return jsonResponse({ code: "404" }, 404);
+    }) as typeof fetch;
+
+    const client = new MideaCloudClient({
+      brand: "meiju",
+      account: "13800138000",
+      password: "Password!1",
+      httpFetch: mockFetch,
+    });
+
+    const data = await client.getLuaStatus("210006741641007");
+    expect(data["power"]).toBe("on");
+    expect(loginCount).toBe(2);
+    expect(statusCalls).toBe(2);
+  });
+
+  test("18. Cloud 模式全链路：0xDC/0xD9 走 Lua 读写，0xAC 透传 1306 回退 Lua，并发 powerStates 合并加载", async () => {
+    const serverSec = new MideaCloudSecurity("meiju");
+    const sessionKeyPlain = "aabbccddeeff0011";
+    const encryptedSessionKey = serverSec.aesEncryptWithFixedKey(sessionKeyPlain);
+    serverSec.setAesKeys(sessionKeyPlain);
+
+    let listHomeCalls = 0;
+    let acTransparentFailsWith1306 = true;
+    const luaControls: Array<{ applianceCode: string; control: Record<string, unknown> }> = [];
+    const transparentCodes: string[] = [];
+
+    const luaStateByCode: Record<string, Record<string, unknown>> = {
+      "210006741641007": {
+        power: "on",
+        mode: "cool",
+        temperature: 24,
+        small_temperature: 0.5,
+        wind_speed: 60,
+        indoor_temperature: 22.4,
+        ptc: "on",
+        screen_display_now: "on",
+      },
+      "210006738408610": {
+        power: "on",
+        program: "mixed_wash",
+        running_status: 1,
+      },
+      "210006741790988": {
+        db_power: "off",
+        db_running_status: "off",
+        db_program: "single_drying",
+      },
+    };
+
+    const mockFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+
+      if (url.includes("/v1/user/login/id/get")) {
+        return jsonResponse({ code: "0", data: { loginId: "login-cloud-all" } });
+      }
+      if (url.includes("/mj/user/login")) {
+        return jsonResponse({
+          code: "0",
+          data: {
+            uid: "u-cloud-all",
+            key: encryptedSessionKey,
+            mdata: { accessToken: "tok-cloud-all" },
+          },
+        });
+      }
+      if (url.includes("/v1/homegroup/list/get")) {
+        listHomeCalls += 1;
+        return jsonResponse({
+          code: "0",
+          data: { homeList: [{ homegroupId: "h-1", name: "方寸别院", isDefault: "1" }] },
+        });
+      }
+      if (url.includes("/v1/appliance/home/list/get")) {
+        return jsonResponse({
+          code: "0",
+          data: {
+            homeList: [
+              {
+                homegroupId: "h-1",
+                name: "方寸别院",
+                roomList: [
+                  {
+                    name: "客厅",
+                    applianceList: [
+                      {
+                        applianceCode: "210006741641007",
+                        name: "大空调",
+                        type: "0xAC",
+                        onlineStatus: "1",
+                        sn8: "22251749",
+                      },
+                      {
+                        applianceCode: "210006738408610",
+                        name: "干衣机",
+                        type: "0xDC",
+                        onlineStatus: "1",
+                        sn8: "38210481",
+                      },
+                      {
+                        applianceCode: "210006741790988",
+                        name: "美的可爱多",
+                        type: "0xD9",
+                        onlineStatus: "1",
+                        sn8: "38135636",
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        });
+      }
+      if (url.includes("/v1/appliance/transparent/send")) {
+        expect(body.applianceId).toBeUndefined();
+        expect(typeof body.applianceCode).toBe("string");
+        transparentCodes.push(String(body.applianceCode));
+        if (acTransparentFailsWith1306) {
+          return jsonResponse({ code: "1306", msg: "The async reply does not exist " });
+        }
+        const replyFrame = buildAcStatusResponseFrame({
+          ...defaultAcState(),
+          power: false,
+          mode: 1,
+          targetTemperature: 26,
+          indoorTemperature: 22,
+        });
+        const csv = Array.from(replyFrame)
+          .map((b) => (b > 127 ? b - 256 : b))
+          .join(",");
+        return jsonResponse({ code: "0", data: { reply: serverSec.aesEncrypt(csv) } });
+      }
+      if (url.includes("/mjl/v1/device/status/lua/get")) {
+        const code = String(body.applianceCode ?? "");
+        const st = luaStateByCode[code];
+        if (!st) return jsonResponse({ code: "1014", msg: "lua analysis exception" });
+        return jsonResponse({ code: "0", data: st });
+      }
+      if (url.includes("/mjl/v1/device/lua/control")) {
+        const code = String(body.applianceCode ?? "");
+        const ctrl = (body.command?.control ?? {}) as Record<string, unknown>;
+        luaControls.push({ applianceCode: code, control: ctrl });
+        luaStateByCode[code] = { ...(luaStateByCode[code] ?? {}), ...ctrl };
+        return jsonResponse({ code: "0", data: luaStateByCode[code] });
+      }
+      return jsonResponse({ code: "404" }, 404);
+    }) as typeof fetch;
+
+    const provider = new MideaPlatformProvider({
+      httpFetch: mockFetch,
+      skipLoadConfig: true,
+      initialConfig: {
+        enabled: true,
+        mode: "cloud",
+        cloudBrand: "meiju",
+        account: "13800138000",
+        password: "Password!1",
+        useChinaServer: true,
+      },
+    });
+
+    // 冷启动并发读取三台不同品类设备的开关状态，只应触发 1 次 listDevices/listHomes
+    const states = await provider.powerStates([
+      "210006741641007",
+      "210006738408610",
+      "210006741790988",
+    ]);
+    expect(listHomeCalls).toBe(1);
+    expect(states).toEqual({
+      "210006741641007": true, // 0xAC 透传 1306 后自动回退 Lua 拿到 power=on
+      "210006738408610": true, // 0xDC 直接走 Lua 拿到 power=on
+      "210006741790988": false, // 0xD9 直接走 Lua 拿到 db_power=off
+    });
+    // 0xDC 与 0xD9 未触发无意义的通用二进制透传
+    expect(transparentCodes).toEqual(["210006741641007"]);
+
+    // 0xAC 回退 Lua 读取实时温控属性无报错
+    const acProps = await provider.readProps("210006741641007", [
+      "on",
+      "mode",
+      "target-temperature",
+      "temperature",
+      "aux-heat",
+    ]);
+    expect(acProps).toEqual({
+      on: true,
+      mode: 2,
+      "target-temperature": 24.5,
+      temperature: 22.4,
+      "aux-heat": true,
+    });
+
+    // 0xDC 与 0xD9 开关控制自动走 /mjl/v1/device/lua/control 并匹配对应键名
+    await provider.setPowerState("210006738408610", false);
+    await provider.setPowerState("210006741790988", true);
+    expect(luaControls).toEqual([
+      { applianceCode: "210006738408610", control: { power: "off" } },
+      { applianceCode: "210006741790988", control: { db_power: "on" } },
+    ]);
+
+    // 0xAC 关机遇到 1306 异步应答缺失也应视作送达成功（不误报控制失败）
+    await provider.setPowerState("210006741641007", false);
+
+    // 恢复 0xAC 透传正常后，直接读取到最新 0xAA 状态帧
+    acTransparentFailsWith1306 = false;
+    const acAfter = await provider.readProps("210006741641007", ["on", "target-temperature", "temperature"]);
+    expect(acAfter).toEqual({
+      on: false,
+      "target-temperature": 26,
+      temperature: 22,
+    });
   });
 });
