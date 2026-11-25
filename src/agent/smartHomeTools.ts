@@ -19,6 +19,7 @@ import {
   supportsCardPower,
 } from "../core/deviceControls.ts";
 import { coercePropWriteValue, deviceCategoryLabel } from "../core/deviceDetailModel.ts";
+import { SCENES_FEATURE_ENABLED } from "../core/featureFlags.ts";
 import { JobExecutor } from "../core/jobs.ts";
 import {
   createSceneInfo,
@@ -1791,7 +1792,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
             enabled: p.enabled,
             state: p.state,
             deviceCount: p.deviceCount,
-            sceneCount: p.sceneCount,
+            ...(SCENES_FEATURE_ENABLED ? { sceneCount: p.sceneCount } : {}),
           })),
           uiSummary,
         });
@@ -1815,8 +1816,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
     controlSpeakerTool,
     setDevicePropertyTool,
     runDeviceActionTool,
-    listScenesTool,
-    runSceneTool,
+    ...(SCENES_FEATURE_ENABLED ? [listScenesTool, runSceneTool] : []),
     sendXiaoAiTool,
   ];
 }

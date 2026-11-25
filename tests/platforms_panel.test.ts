@@ -153,7 +153,8 @@ describe("formatPlatformSummaryLine & platformStatusTone", () => {
       deviceCount: 12,
       sceneCount: 3,
     });
-    expect(formatPlatformSummaryLine(connectedWithScenes)).toBe("已连接 · 12 台设备 · 3 个场景");
+    // Scenes feature is currently disabled, so summary omits scene counts
+    expect(formatPlatformSummaryLine(connectedWithScenes)).toBe("已连接 · 12 台设备");
 
     const disconnected = makeStatus({
       id: "midea",

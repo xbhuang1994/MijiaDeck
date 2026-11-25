@@ -35,6 +35,7 @@ import type {
   TraySceneSnapshot,
 } from "../core/contracts.ts";
 import { isCamera, isLight, lightControls, supportsCardPower, trayEligible } from "../core/deviceControls.ts";
+import { SCENES_FEATURE_ENABLED } from "../core/featureFlags.ts";
 import { JobExecutor } from "../core/jobs.ts";
 import {
   createSceneInfo,
@@ -364,7 +365,8 @@ function serializeSettings(runtime: AppRuntime): Record<string, unknown> {
     theme_color: s.getThemeColor(),
     custom_theme_color: s.getCustomThemeColor(),
     hide_no_func_devices: s.getHideNoFuncDevices(),
-    show_scene_tab: s.getShowSceneTab(),
+    show_scene_tab: SCENES_FEATURE_ENABLED ? s.getShowSceneTab() : false,
+    scenes_enabled: SCENES_FEATURE_ENABLED,
     default_speaker_did: s.getDefaultSpeakerDid(),
     ui_scale: s.getUiScale(),
     tray_columns: s.getTrayColumns(),
@@ -468,10 +470,20 @@ function buildFallbackPlatformStatuses(runtime: AppRuntime): PlatformStatus[] {
 }
 
 function listPlatformStatuses(runtime: AppRuntime): PlatformStatus[] {
-  if (isMultiPlatformService(runtime.service)) {
-    return runtime.service.listPlatforms();
+  const statuses = isMultiPlatformService(runtime.service)
+    ? runtime.service.listPlatforms()
+    : buildFallbackPlatformStatuses(runtime);
+  if (SCENES_FEATURE_ENABLED) {
+    return statuses;
   }
-  return buildFallbackPlatformStatuses(runtime);
+  return statuses.map((p) => ({
+    ...p,
+    sceneCount: 0,
+    capabilities: {
+      ...p.capabilities,
+      scenes: false,
+    },
+  }));
 }
 
 /**
@@ -521,16 +533,24 @@ export function serializeState(runtime: AppRuntime): Record<string, unknown> {
     theme: serializeTheme(runtime),
     homes: [...mw.homes],
     currentHome: mw.currentHome || ALL_HOMES,
-    rooms: [...mw.tabNames],
-    currentRoom: mw.currentRoom || ALL_ROOMS,
-    roomMenu,
+    rooms: SCENES_FEATURE_ENABLED
+      ? [...mw.tabNames]
+      : mw.tabNames.filter((r) => r !== SCENE_TAB),
+    currentRoom:
+      !SCENES_FEATURE_ENABLED && mw.currentRoom === SCENE_TAB
+        ? ALL_ROOMS
+        : mw.currentRoom || ALL_ROOMS,
+    roomMenu: SCENES_FEATURE_ENABLED
+      ? roomMenu
+      : roomMenu.filter((entry) => entry.name !== SCENE_TAB),
     devices: allDevices.map((d) => ({ ...d })),
     visibleDevices: visibleDevices.map((d) => ({ ...d })),
     bannedDeviceIds,
     bannedDevices: bannedDevices.map((d) => ({ ...d })),
     knownPower: { ...mw.knownPower },
     metrics: { ...mw.metrics },
-    scenes: (mw.scenes ?? []).map((sc) => ({ ...sc })),
+    scenesEnabled: SCENES_FEATURE_ENABLED,
+    scenes: SCENES_FEATURE_ENABLED ? (mw.scenes ?? []).map((sc) => ({ ...sc })) : [],
     loading: {
       active: mw.loadActive,
       fullPage: mw.loadFullPage,
@@ -546,8 +566,10 @@ export function serializeState(runtime: AppRuntime): Record<string, unknown> {
     tray: {
       columns: s.getTrayColumns(),
       devices: ts.load(),
-      scenes: ts.loadScenes(),
-      order: ts.loadOrder(),
+      scenes: SCENES_FEATURE_ENABLED ? ts.loadScenes() : [],
+      order: SCENES_FEATURE_ENABLED
+        ? ts.loadOrder()
+        : ts.loadOrder().filter((item) => item.type !== "scene"),
       audio: audioSnapshot,
       voiceAvailable,
       speakerHint: hint,
@@ -1259,6 +1281,9 @@ export function createRequestHandler(
 
       const sceneMatch = /^\/api\/scenes\/([^/]+)\/run$/.exec(pathname);
       if (method === "POST" && sceneMatch) {
+        if (!SCENES_FEATURE_ENABLED) {
+          throw new HttpError(403, "场景功能已暂闭");
+        }
         const sceneId = decodeSegment(sceneMatch[1]!);
         const body = await readJsonBody(req);
         const knownScene =
@@ -1382,6 +1407,9 @@ export function createRequestHandler(
         if (!room) {
           throw new HttpError(400, "缺少房间名称参数 room");
         }
+        if (!SCENES_FEATURE_ENABLED && room === SCENE_TAB) {
+          throw new HttpError(404, `未找到房间「${room}」`);
+        }
         if (runtime.mainWindow.tabNames.length > 0 && !runtime.mainWindow.tabNames.includes(room)) {
           throw new HttpError(404, `未找到房间「${room}」`);
         }
@@ -1405,6 +1433,9 @@ export function createRequestHandler(
         const selected = body.selected;
         if (kind !== "device" && kind !== "scene") {
           throw new HttpError(400, "参数 kind 必须为 device 或 scene");
+        }
+        if (!SCENES_FEATURE_ENABLED && kind === "scene") {
+          throw new HttpError(403, "场景功能已暂闭，当前仅支持设备托盘项");
         }
         if (!id) {
           throw new HttpError(400, "缺少项目标识参数 id");
@@ -1462,31 +1493,41 @@ export function createRequestHandler(
         if (!Array.isArray(body.devices)) {
           throw new HttpError(400, "参数 devices 必须为数组");
         }
-        if (!Array.isArray(body.scenes)) {
+        if (SCENES_FEATURE_ENABLED && !Array.isArray(body.scenes)) {
           throw new HttpError(400, "参数 scenes 必须为数组");
         }
         if (!Array.isArray(body.order)) {
           throw new HttpError(400, "参数 order 必须为数组");
         }
         const devices = body.devices.map((d) => String(d));
-        const scenes: Array<Partial<TraySceneSnapshot>> = body.scenes
-          .filter(isPlainRecord)
-          .map((item) => ({
-            scene_id: item.scene_id ? String(item.scene_id) : "",
-            name: item.name ? String(item.name) : "",
-            home_id: item.home_id ? String(item.home_id) : "",
-            home_name: item.home_name ? String(item.home_name) : "",
-          }));
+        const rawScenes = Array.isArray(body.scenes) ? body.scenes : [];
+        const scenes: Array<Partial<TraySceneSnapshot>> = SCENES_FEATURE_ENABLED
+          ? rawScenes
+              .filter(isPlainRecord)
+              .map((item) => ({
+                scene_id: item.scene_id ? String(item.scene_id) : "",
+                name: item.name ? String(item.name) : "",
+                home_id: item.home_id ? String(item.home_id) : "",
+                home_name: item.home_name ? String(item.home_name) : "",
+              }))
+          : [];
         const order: TrayOrderItem[] = body.order
           .filter(isPlainRecord)
-          .filter((item) => (item.type === "device" || item.type === "scene") && Boolean(item.id))
+          .filter((item) => {
+            if (!item.id) return false;
+            return SCENES_FEATURE_ENABLED
+              ? item.type === "device" || item.type === "scene"
+              : item.type === "device";
+          })
           .map((item) => ({
             type: item.type as "device" | "scene",
             id: String(item.id),
           }));
 
         runtime.trayStore.save(devices);
-        runtime.trayStore.saveScenes(scenes);
+        if (SCENES_FEATURE_ENABLED) {
+          runtime.trayStore.saveScenes(scenes);
+        }
         runtime.trayStore.saveOrder(order);
         runtime.mainWindow.updateTrayDevices();
         emitBroadcast(runtime);
@@ -1624,9 +1665,11 @@ export function createRequestHandler(
           s.setHideNoFuncDevices(hideNoFunc);
         }
 
-        const showSceneTab = getBooleanField(body, "show_scene_tab", "showSceneTab");
-        if (showSceneTab !== undefined) {
-          s.setShowSceneTab(showSceneTab);
+        if (SCENES_FEATURE_ENABLED) {
+          const showSceneTab = getBooleanField(body, "show_scene_tab", "showSceneTab");
+          if (showSceneTab !== undefined) {
+            s.setShowSceneTab(showSceneTab);
+          }
         }
 
         const checkUpdateEnabled = getBooleanField(
@@ -1694,7 +1737,7 @@ export function createRequestHandler(
           mw.updateCountLabel();
           mw.updateTrayDevices();
         }
-        const newShow = s.getShowSceneTab();
+        const newShow = SCENES_FEATURE_ENABLED ? s.getShowSceneTab() : false;
         if (newShow !== mw.showSceneTab) {
           mw.showSceneTab = newShow;
           if (!newShow && mw.currentRoom === SCENE_TAB) {

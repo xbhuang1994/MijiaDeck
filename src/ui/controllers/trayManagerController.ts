@@ -11,6 +11,7 @@ import {
   type TraySceneSnapshot,
 } from "../../core/contracts.ts";
 import { deviceTitle, trayEligible } from "../../core/deviceControls.ts";
+import { SCENES_FEATURE_ENABLED } from "../../core/featureFlags.ts";
 import type { DeviceInfo, SceneInfo } from "../../core/models.ts";
 import * as settingsStore from "../../core/settingsStore.ts";
 import * as trayStore from "../../core/trayStore.ts";
@@ -82,7 +83,7 @@ function itemKey(item: TrayOrderItem): string {
 export class TrayManagerController {
   readonly events = new TypedEmitter<TrayManagerEvents>();
   readonly title = "编辑卡片";
-  readonly tabLabels: readonly [string, string] = ["设备", "场景"];
+  readonly tabLabels: readonly string[] = SCENES_FEATURE_ENABLED ? ["设备", "场景"] : ["设备"];
 
   devices: DeviceInfo[];
   currentRoom: string | null = null;
@@ -130,13 +131,17 @@ export class TrayManagerController {
     }
     this.roomNames = [...roomSet].sort(lexCompare);
 
-    this.scenes = options.scenes !== undefined ? options.scenes : null;
-    this.sceneLoader = options.sceneLoader ?? null;
+    this.scenes = SCENES_FEATURE_ENABLED && options.scenes !== undefined ? options.scenes : [];
+    this.sceneLoader = SCENES_FEATURE_ENABLED ? (options.sceneLoader ?? null) : null;
     this.jobs = options.jobs ?? null;
 
-    this.order = trayStore.loadOrder();
-    for (const snap of trayStore.loadScenes()) {
-      this.snapMap.set(snap.scene_id, snap);
+    this.order = SCENES_FEATURE_ENABLED
+      ? trayStore.loadOrder()
+      : trayStore.loadOrder().filter((item) => item.type !== "scene");
+    if (SCENES_FEATURE_ENABLED) {
+      for (const snap of trayStore.loadScenes()) {
+        this.snapMap.set(snap.scene_id, snap);
+      }
     }
 
     const selected = trayStore.load();
@@ -236,14 +241,15 @@ export class TrayManagerController {
   // ---------- 选项卡与视图切换 ----------
 
   switchTab(index: 0 | 1): void {
-    this.activeTab = index;
-    const isDev = index === 0;
+    const nextTab: 0 | 1 = SCENES_FEATURE_ENABLED ? index : 0;
+    this.activeTab = nextTab;
+    const isDev = nextTab === 0;
     const isList = this.view === "list";
     this.deviceListVisible = isDev && isList;
-    this.sceneListVisible = !isDev && isList;
+    this.sceneListVisible = SCENES_FEATURE_ENABLED && !isDev && isList;
     this.roomFilterVisible = isDev && isList;
     this.updateSubtitle();
-    if (!isDev) {
+    if (SCENES_FEATURE_ENABLED && !isDev) {
       this.ensureScenes();
     }
     this.emitStateChanged();
@@ -395,6 +401,9 @@ export class TrayManagerController {
         items.push({ type: "device", id: row.did });
       }
     }
+    if (!SCENES_FEATURE_ENABLED) {
+      return items;
+    }
     if (this.sceneFilled) {
       for (const row of this.sceneRows) {
         if (row.checked) {
@@ -426,7 +435,9 @@ export class TrayManagerController {
     this.order = filtered;
 
     if (filtered.length === 0) {
-      this.sortEmptyText = "暂无已加入托盘的项目\n先在设备或场景页勾选添加";
+      this.sortEmptyText = SCENES_FEATURE_ENABLED
+        ? "暂无已加入托盘的项目\n先在设备或场景页勾选添加"
+        : "暂无已加入托盘的设备\n先在设备页勾选添加";
       return;
     }
     this.sortEmptyText = null;
@@ -554,6 +565,9 @@ export class TrayManagerController {
   }
 
   selectedSceneData(): TraySceneSnapshot[] {
+    if (!SCENES_FEATURE_ENABLED) {
+      return [];
+    }
     // 场景页未呈现过确认列表（未开启 / 加载中 / 加载失败）时返回已存快照原值
     if (!this.sceneFilled) {
       return trayStore.loadScenes();

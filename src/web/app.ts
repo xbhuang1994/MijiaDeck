@@ -2,6 +2,7 @@
 // MijiaDeck: 米家设备的桌面控制端 (Bun + TypeScript)
 // Zero-dependency browser client wired to MijiaDeck REST + WebSocket API.
 
+import { SCENES_FEATURE_ENABLED } from "../core/featureFlags.ts";
 import { renderQrSvg } from "../ui/qrSvg.ts";
 import { DeviceDetailModalController } from "./deviceDetailModal.ts";
 import {
@@ -1367,7 +1368,7 @@ export class MijiaDeckWebApp {
         custom_theme_color: "#333333",
         ui_scale: 1.0,
         voice_fab_enabled: true,
-        show_scene_tab: true,
+        show_scene_tab: SCENES_FEATURE_ENABLED,
         autostart: false,
         autostart_supported: false,
         default_speaker_did: "",
@@ -1516,7 +1517,8 @@ export class MijiaDeckWebApp {
       this.state.currentHome = currentHome || ALL_HOMES;
     }
     if (Array.isArray(rec.rooms)) {
-      this.state.rooms = rec.rooms.map((r) => String(r));
+      const mapped = rec.rooms.map((r) => String(r));
+      this.state.rooms = SCENES_FEATURE_ENABLED ? mapped : mapped.filter((r) => r !== SCENE_TAB);
     }
     if (Array.isArray(rec.roomMenu)) {
       const entries: RoomMenuEntry[] = [];
@@ -1525,6 +1527,7 @@ export class MijiaDeckWebApp {
         if (!entryRec) continue;
         const name = readStr(entryRec, "name");
         if (!name) continue;
+        if (!SCENES_FEATURE_ENABLED && name === SCENE_TAB) continue;
         const countRaw = entryRec.count;
         const count =
           typeof countRaw === "number" && Number.isFinite(countRaw) ? countRaw : null;
@@ -1538,7 +1541,9 @@ export class MijiaDeckWebApp {
     }
     const currentRoom = readStr(rec, "currentRoom", "current_room");
     if (currentRoom !== undefined) {
-      this.state.currentRoom = currentRoom || ALL_ROOMS;
+      const normalizedRoom = currentRoom || ALL_ROOMS;
+      this.state.currentRoom =
+        !SCENES_FEATURE_ENABLED && normalizedRoom === SCENE_TAB ? ALL_ROOMS : normalizedRoom;
     }
 
     if (Array.isArray(rec.devices)) {
@@ -1556,9 +1561,11 @@ export class MijiaDeckWebApp {
       this.state.bannedDeviceIds = bannedRaw.map((id) => String(id)).filter((id) => id.length > 0);
     }
     if (Array.isArray(rec.scenes)) {
-      this.state.scenes = rec.scenes
-        .map(normalizeSceneInfo)
-        .filter((s): s is SceneInfo => s !== null);
+      this.state.scenes = SCENES_FEATURE_ENABLED
+        ? rec.scenes
+            .map(normalizeSceneInfo)
+            .filter((s): s is SceneInfo => s !== null)
+        : [];
     }
 
     const powerObj = asRecord(rec.knownPower ?? rec.known_power ?? rec.powerStates ?? rec.power_states);
@@ -1626,12 +1633,17 @@ export class MijiaDeckWebApp {
         this.state.trayDevices = trayRec.devices.map((d) => String(d));
       }
       if (Array.isArray(trayRec.scenes)) {
-        this.state.trayScenes = trayRec.scenes
-          .map(normalizeSceneInfo)
-          .filter((s): s is SceneInfo => s !== null);
+        this.state.trayScenes = SCENES_FEATURE_ENABLED
+          ? trayRec.scenes
+              .map(normalizeSceneInfo)
+              .filter((s): s is SceneInfo => s !== null)
+          : [];
       }
       if (Array.isArray(trayRec.order)) {
-        this.state.trayOrder = normalizeTrayOrder(trayRec.order);
+        const normalizedOrder = normalizeTrayOrder(trayRec.order);
+        this.state.trayOrder = SCENES_FEATURE_ENABLED
+          ? normalizedOrder
+          : normalizedOrder.filter((item) => item.type !== "scene");
       }
       const cols = readNum(trayRec, "columns", "tray_columns");
       if (cols === 1 || cols === 2) {
@@ -1660,12 +1672,17 @@ export class MijiaDeckWebApp {
       );
     }
     if (Array.isArray(rec.trayScenes ?? rec.tray_scenes)) {
-      this.state.trayScenes = ((rec.trayScenes ?? rec.tray_scenes) as unknown[])
-        .map(normalizeSceneInfo)
-        .filter((s): s is SceneInfo => s !== null);
+      this.state.trayScenes = SCENES_FEATURE_ENABLED
+        ? ((rec.trayScenes ?? rec.tray_scenes) as unknown[])
+            .map(normalizeSceneInfo)
+            .filter((s): s is SceneInfo => s !== null)
+        : [];
     }
     if (Array.isArray(rec.trayOrder ?? rec.tray_order)) {
-      this.state.trayOrder = normalizeTrayOrder((rec.trayOrder ?? rec.tray_order) as unknown[]);
+      const normalizedOrder = normalizeTrayOrder((rec.trayOrder ?? rec.tray_order) as unknown[]);
+      this.state.trayOrder = SCENES_FEATURE_ENABLED
+        ? normalizedOrder
+        : normalizedOrder.filter((item) => item.type !== "scene");
     }
     const flatCols = readNum(rec, "trayColumns", "tray_columns");
     if (flatCols === 1 || flatCols === 2) {
@@ -1749,7 +1766,7 @@ export class MijiaDeckWebApp {
     const fab = readBool(rec, "voice_fab_enabled", "voiceFabEnabled");
     if (fab !== undefined) s.voice_fab_enabled = fab;
     const sceneTab = readBool(rec, "show_scene_tab", "showSceneTab");
-    if (sceneTab !== undefined) s.show_scene_tab = sceneTab;
+    if (sceneTab !== undefined) s.show_scene_tab = SCENES_FEATURE_ENABLED ? sceneTab : false;
     const autostart = readBool(rec, "autostart");
     if (autostart !== undefined) s.autostart = autostart;
     const autostartSup = readBool(rec, "autostart_supported", "autostartSupported");
@@ -1845,7 +1862,7 @@ export class MijiaDeckWebApp {
     }
     const rooms = [...roomSet].sort((a, b) => a.localeCompare(b, "zh-CN"));
     const tabs: string[] = [];
-    if (this.state.settings.show_scene_tab) {
+    if (SCENES_FEATURE_ENABLED && this.state.settings.show_scene_tab) {
       tabs.push(SCENE_TAB);
     }
     tabs.push(ALL_ROOMS, ...rooms, BANNED_TAB);
@@ -2293,7 +2310,7 @@ export class MijiaDeckWebApp {
 
     grid.replaceChildren();
 
-    if (this.state.currentRoom === SCENE_TAB) {
+    if (SCENES_FEATURE_ENABLED && this.state.currentRoom === SCENE_TAB) {
       bannedHintBar.hidden = true;
       const home = this.state.currentHome;
       const scenes = this.state.scenes.filter(
@@ -2785,7 +2802,7 @@ export class MijiaDeckWebApp {
           items.push({ type: "device", device: dev });
           seen.add(key);
         }
-      } else if (item.type === "scene") {
+      } else if (SCENES_FEATURE_ENABLED && item.type === "scene") {
         const scene = sceneMap.get(item.id);
         if (scene) {
           items.push({ type: "scene", scene });
@@ -2803,11 +2820,13 @@ export class MijiaDeckWebApp {
         seen.add(key);
       }
     }
-    for (const scene of this.state.trayScenes) {
-      const key = `scene:${scene.scene_id}`;
-      if (seen.has(key)) continue;
-      items.push({ type: "scene", scene: sceneMap.get(scene.scene_id) ?? scene });
-      seen.add(key);
+    if (SCENES_FEATURE_ENABLED) {
+      for (const scene of this.state.trayScenes) {
+        const key = `scene:${scene.scene_id}`;
+        if (seen.has(key)) continue;
+        items.push({ type: "scene", scene: sceneMap.get(scene.scene_id) ?? scene });
+        seen.add(key);
+      }
     }
 
     if (items.length === 0) {
@@ -3071,6 +3090,7 @@ export class MijiaDeckWebApp {
   }
 
   private async runScene(scene: SceneInfo): Promise<void> {
+    if (!SCENES_FEATURE_ENABLED) return;
     if (this.busyScenes.has(scene.scene_id)) return;
     this.busyScenes.add(scene.scene_id);
     this.renderGrid();
@@ -3180,6 +3200,7 @@ export class MijiaDeckWebApp {
     id: string,
     selected: boolean,
   ): Promise<void> {
+    if (!SCENES_FEATURE_ENABLED && kind === "scene") return;
     try {
       const res = await apiPost<unknown>("/api/tray/membership", { kind, id, selected });
       const rec = asRecord(res);
@@ -3566,7 +3587,11 @@ export class MijiaDeckWebApp {
     fabToggle.checked = hasSpeaker ? s.voice_fab_enabled : false;
     el("setting-row-voice-fab").classList.toggle("is-disabled", !hasSpeaker);
 
-    el<HTMLInputElement>("set-show-scene-tab").checked = s.show_scene_tab;
+    const sceneSettingRow = document.getElementById("setting-row-show-scene-tab");
+    if (sceneSettingRow) {
+      sceneSettingRow.hidden = !SCENES_FEATURE_ENABLED;
+    }
+    el<HTMLInputElement>("set-show-scene-tab").checked = SCENES_FEATURE_ENABLED ? s.show_scene_tab : false;
 
     // Autostart
     const autoToggle = el<HTMLInputElement>("set-autostart");
@@ -4510,7 +4535,9 @@ export class MijiaDeckWebApp {
     const minimizeToTray = el<HTMLInputElement>("set-minimize-to-tray").checked;
     const startMinimized = minimizeToTray ? el<HTMLInputElement>("set-start-minimized").checked : false;
     const voiceFabEnabled = el<HTMLInputElement>("set-voice-fab").checked;
-    const showSceneTab = el<HTMLInputElement>("set-show-scene-tab").checked;
+    const showSceneTab = SCENES_FEATURE_ENABLED
+      ? el<HTMLInputElement>("set-show-scene-tab").checked
+      : false;
     const autostart = el<HTMLInputElement>("set-autostart").checked;
     const defaultSpeakerDid = el<HTMLSelectElement>("set-default-speaker").value;
     const hideNoFunc = el<HTMLInputElement>("set-hide-no-func").checked;
@@ -4527,8 +4554,7 @@ export class MijiaDeckWebApp {
       uiScale: this.settingsDraft.uiScale,
       voice_fab_enabled: voiceFabEnabled,
       voiceFabEnabled,
-      show_scene_tab: showSceneTab,
-      showSceneTab,
+      ...(SCENES_FEATURE_ENABLED ? { show_scene_tab: showSceneTab, showSceneTab } : {}),
       autostart,
       default_speaker_did: defaultSpeakerDid,
       defaultSpeakerDid,
@@ -4954,8 +4980,13 @@ export class MijiaDeckWebApp {
     this.trayMgrView = "list";
     this.trayMgrRoom = "";
     this.trayMgrCheckedDevices = new Set(this.state.trayDevices);
-    this.trayMgrCheckedScenes = new Set(this.state.trayScenes.map((s) => s.scene_id));
-    this.trayMgrOrder = this.state.trayOrder.map((o) => ({ ...o }));
+    this.trayMgrCheckedScenes = SCENES_FEATURE_ENABLED
+      ? new Set(this.state.trayScenes.map((s) => s.scene_id))
+      : new Set();
+    this.trayMgrOrder = (SCENES_FEATURE_ENABLED
+      ? this.state.trayOrder
+      : this.state.trayOrder.filter((o) => o.type === "device")
+    ).map((o) => ({ ...o }));
 
     this.populateTrayManagerRoomFilter();
     this.renderTrayManager();
@@ -4983,10 +5014,17 @@ export class MijiaDeckWebApp {
   }
 
   private renderTrayManager(): void {
+    if (!SCENES_FEATURE_ENABLED) {
+      this.trayMgrTab = "devices";
+    }
     const isList = this.trayMgrView === "list";
     const isDev = this.trayMgrTab === "devices";
 
     el("tray-mgr-tabs").hidden = !isList;
+    const sceneTabBtn = document.getElementById("tray-mgr-tab-scenes");
+    if (sceneTabBtn) {
+      sceneTabBtn.hidden = !SCENES_FEATURE_ENABLED;
+    }
     el("tray-mgr-sort-btn").textContent = isList ? "排序" : "返回";
     el("tray-mgr-room-filter").hidden = !(isList && isDev);
 
@@ -5130,8 +5168,10 @@ export class MijiaDeckWebApp {
     for (const did of this.trayMgrCheckedDevices) {
       checked.push({ type: "device", id: did });
     }
-    for (const sid of this.trayMgrCheckedScenes) {
-      checked.push({ type: "scene", id: sid });
+    if (SCENES_FEATURE_ENABLED) {
+      for (const sid of this.trayMgrCheckedScenes) {
+        checked.push({ type: "scene", id: sid });
+      }
     }
     const checkedKeys = new Set(checked.map((c) => `${c.type}:${c.id}`));
     const result = this.trayMgrOrder.filter((it) => checkedKeys.has(`${it.type}:${it.id}`));
@@ -5152,7 +5192,9 @@ export class MijiaDeckWebApp {
     if (order.length === 0) {
       const empty = document.createElement("div");
       empty.className = "tray-mgr-empty";
-      empty.textContent = "暂无已加入托盘的项目\n先在设备或场景页勾选添加";
+      empty.textContent = SCENES_FEATURE_ENABLED
+        ? "暂无已加入托盘的项目\n先在设备或场景页勾选添加"
+        : "暂无已加入托盘的设备\n先在设备页勾选添加";
       list.appendChild(empty);
       return;
     }
@@ -5263,10 +5305,12 @@ export class MijiaDeckWebApp {
         home_name: s.home_name,
       });
     }
-    const scenes: TraySceneSnapshot[] = order
-      .filter((o) => o.type === "scene")
-      .map((o) => sceneLookup.get(o.id))
-      .filter((s): s is TraySceneSnapshot => s !== undefined);
+    const scenes: TraySceneSnapshot[] = SCENES_FEATURE_ENABLED
+      ? order
+          .filter((o) => o.type === "scene")
+          .map((o) => sceneLookup.get(o.id))
+          .filter((s): s is TraySceneSnapshot => s !== undefined)
+      : [];
 
     try {
       const res = await apiPost<unknown>("/api/tray/save", { devices, scenes, order });
@@ -6268,6 +6312,9 @@ export class MijiaDeckWebApp {
   private bindTrayManagerEvents(): void {
     document.querySelectorAll<HTMLButtonElement>("[data-tm-tab]").forEach((btn) => {
       btn.addEventListener("click", () => {
+        if (!SCENES_FEATURE_ENABLED && btn.dataset.tmTab === "scenes") {
+          return;
+        }
         this.trayMgrTab = btn.dataset.tmTab === "scenes" ? "scenes" : "devices";
         this.renderTrayManager();
       });

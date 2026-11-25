@@ -13,6 +13,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { APP_VERSION, isPackaged, runtimeEnv } from "./appMeta.ts";
 import type { TrayPosition } from "./contracts.ts";
+import { SCENES_FEATURE_ENABLED } from "./featureFlags.ts";
 import { dataFile, readJson, writeJson } from "./jsonStore.ts";
 
 export const SETTINGS_VERSION = 1;
@@ -38,7 +39,7 @@ const DEFAULTS: Record<string, unknown> = {
   theme_color: "green",
   custom_theme_color: "#333333",
   hide_no_func_devices: false,
-  show_scene_tab: true, // 主页选项卡最左侧显示「场景」入口（手动场景一键执行）
+  show_scene_tab: SCENES_FEATURE_ENABLED, // 场景功能先行屏蔽；恢复开启后在主页选项卡最左侧显示「场景」入口
   default_speaker_did: "", // 小爱指令默认输出音箱；空串=自动（第一个在线）
   ui_scale: 1.0, // 界面缩放个人微调乘数（叠加在系统 DPI 缩放之上），需重启生效
   tray_columns: 2, // 托盘快捷窗口卡片列数：1 或 2
@@ -150,12 +151,18 @@ export function setHideNoFuncDevices(value: boolean): void {
   writeRaw(raw);
 }
 
-/** 是否在主页选项卡最左侧显示「场景」入口，默认开启。 */
+/** 是否在主页选项卡最左侧显示「场景」入口（场景功能屏蔽期间恒返回 false）。 */
 export function getShowSceneTab(): boolean {
+  if (!SCENES_FEATURE_ENABLED) {
+    return false;
+  }
   return Boolean(readRaw().show_scene_tab);
 }
 
 export function setShowSceneTab(value: boolean): void {
+  if (!SCENES_FEATURE_ENABLED) {
+    return;
+  }
   const raw = readRaw();
   raw.show_scene_tab = Boolean(value);
   writeRaw(raw);

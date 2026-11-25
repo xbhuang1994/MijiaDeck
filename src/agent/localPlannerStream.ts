@@ -27,6 +27,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { DeviceInfo, PropInfo, SceneInfo } from "../core/models.ts";
 import { isLight } from "../core/deviceControls.ts";
+import { SCENES_FEATURE_ENABLED } from "../core/featureFlags.ts";
 import { isSpeaker } from "../core/models.ts";
 import { resolveDevices } from "./smartHomeTools.ts";
 import {
@@ -654,18 +655,20 @@ function planSingleClause(
     };
   }
 
-  // 2. 查看场景列表 / 执行场景
-  if (/(有哪些场景|查看场景|列出场景|场景列表)/.test(clause)) {
-    return { name: "list_scenes", arguments: {} };
-  }
-  const matchedScene = detectScene(clause, scenes);
-  if (matchedScene && /(执行|启动|运行|开启|切换|打开|模式|场景|^)/.test(clause)) {
-    // 防止“回家模式”等直接命中场景名
-    if (/(执行|启动|运行|触发|模式|场景)/.test(clause) || normalize(clause) === normalize(matchedScene.name)) {
-      return {
-        name: "run_scene",
-        arguments: { target: matchedScene.scene_id },
-      };
+  // 2. 查看场景列表 / 执行场景（场景功能屏蔽期间跳过）
+  if (SCENES_FEATURE_ENABLED) {
+    if (/(有哪些场景|查看场景|列出场景|场景列表)/.test(clause)) {
+      return { name: "list_scenes", arguments: {} };
+    }
+    const matchedScene = detectScene(clause, scenes);
+    if (matchedScene && /(执行|启动|运行|开启|切换|打开|模式|场景|^)/.test(clause)) {
+      // 防止“回家模式”等直接命中场景名
+      if (/(执行|启动|运行|触发|模式|场景)/.test(clause) || normalize(clause) === normalize(matchedScene.name)) {
+        return {
+          name: "run_scene",
+          arguments: { target: matchedScene.scene_id },
+        };
+      }
     }
   }
 
@@ -1571,6 +1574,13 @@ export function summarizeToolResults(
   return lead && !/^(好的|抱歉)/.test(joined) ? `${lead}${joined}` : joined;
 }
 
+function isDisabledSceneRequest(text: string): boolean {
+  if (SCENES_FEATURE_ENABLED) return false;
+  return /(有哪些场景|查看场景|列出场景|场景列表|(?:执行|开启|启动|运行|触发|切换).*(?:场景|模式))/.test(
+    text.trim(),
+  );
+}
+
 function buildFinalReplyWithoutTools(
   userText: string,
   devices: readonly DeviceInfo[],
@@ -1603,16 +1613,31 @@ function buildFinalReplyWithoutTools(
     return `你好呀！家里现在有${onlineCount}台设备在线（共${devices.length}台），直接说出想控制的设备就可以。`;
   }
 
+  if (isDisabledSceneRequest(trimmed)) {
+    if (effectiveMode === "ultra" || effectiveMode === "full") {
+      return "场景功能暂未开启";
+    }
+    return "场景功能目前暂未开启，我可以帮你控制设备、调光调色、查温湿度或控制音箱。";
+  }
+
   if (effectiveMode === "ultra") {
-    return "支持开关、调光、音箱、喂食、场景和温湿度查询，请说指令";
+    return SCENES_FEATURE_ENABLED
+      ? "支持开关、调光、音箱、喂食、场景和温湿度查询，请说指令"
+      : "支持开关、调光、音箱、喂食和温湿度查询，请说指令";
   }
   if (effectiveMode === "full") {
-    return "我可以帮你控制开关、调光调色、音箱、喂食器、场景和查温湿度，直接说指令就行。";
+    return SCENES_FEATURE_ENABLED
+      ? "我可以帮你控制开关、调光调色、音箱、喂食器、场景和查温湿度，直接说指令就行。"
+      : "我可以帮你控制开关、调光调色、音箱、喂食器和查温湿度，直接说指令就行。";
   }
   if (effectiveMode === "lite") {
-    return "我可以帮你开关设备、调光调色、控制音箱、执行场景和查温湿度，直接告诉我你想做什么就行。";
+    return SCENES_FEATURE_ENABLED
+      ? "我可以帮你开关设备、调光调色、控制音箱、执行场景和查温湿度，直接告诉我你想做什么就行。"
+      : "我可以帮你开关设备、调光调色、控制音箱和查温湿度，直接告诉我你想做什么就行。";
   }
-  return "我是 MijiaDeck 助手，可以帮你控制开关、调光调色、查温湿度、控制小爱音箱、喂食和执行场景；需要更复杂的对话也可以在设置里接入云端大模型。";
+  return SCENES_FEATURE_ENABLED
+    ? "我是 MijiaDeck 助手，可以帮你控制开关、调光调色、查温湿度、控制小爱音箱、喂食和执行场景；需要更复杂的对话也可以在设置里接入云端大模型。"
+    : "我是 MijiaDeck 助手，可以帮你控制开关、调光调色、查温湿度、控制小爱音箱和喂食；需要更复杂的对话也可以在设置里接入云端大模型。";
 }
 
 function pushTextStreamReply(
@@ -1736,7 +1761,7 @@ export function createLocalSmartHomeStreamFn(
         }
 
         if (planned.length === 0) {
-          if (sawNeedsLlm || isGreetingOrHelp(userText)) {
+          if (sawNeedsLlm || isGreetingOrHelp(userText) || isDisabledSceneRequest(userText)) {
             const replyText = buildFinalReplyWithoutTools(userText, devices, cavemanMode, sawNeedsLlm);
             pushTextStreamReply(stream, model, now, replyText);
             return;

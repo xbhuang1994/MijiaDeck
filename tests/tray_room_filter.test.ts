@@ -91,7 +91,7 @@ describe("TrayRoomFilterTest", () => {
     expect(new Set(dialog.visibleDeviceIds())).toEqual(new Set(["none"]));
   });
 
-  it("switching rooms keeps checked devices and saved scene intact in selectedOrder", () => {
+  it("switching rooms keeps checked devices intact and excludes disabled scenes from selectedOrder", () => {
     dialog.setRoomFilter("卧室");
     expect(dialog.deviceRows.find((r) => r.did === "office")?.visible).toBe(false);
     expect(dialog.isDeviceChecked("office")).toBe(true);
@@ -100,25 +100,24 @@ describe("TrayRoomFilterTest", () => {
     dialog.setRoomFilter("办公室");
 
     const selected = new Set(dialog.selectedOrder().map((item) => `${item.type}:${item.id}`));
-    expect(selected).toEqual(new Set(["device:office", "device:bed", "scene:scene"]));
+    expect(selected).toEqual(new Set(["device:office", "device:bed"]));
 
     dialog.setRoomFilter(null);
     expect(dialog.deviceRows.every((r) => r.visible)).toBe(true);
   });
 
-  it("tabs and sort preserve room filter, hide room button on scenes/sort views, and restore on devices list", () => {
+  it("tabs hide scenes while disabled and sort preserves room filter and restores on devices list", () => {
     dialog.toggleDevice("bed");
     dialog.setRoomFilter("办公室");
 
     dialog.switchTab(1);
-    expect(dialog.tabLabels[0]).toBe("设备");
-    expect(dialog.tabLabels[1]).toBe("场景");
-    expect(dialog.roomFilterVisible).toBe(false);
-    expect(dialog.isSceneChecked("scene")).toBe(true);
-    expect(dialog.selectedSceneData()[0]?.scene_id).toBe("scene");
+    expect(dialog.tabLabels).toEqual(["设备"]);
+    expect(dialog.activeTab).toBe(0);
+    expect(dialog.roomFilterVisible).toBe(true);
+    expect(dialog.selectedSceneData()).toEqual([]);
 
     dialog.switchView("sort");
-    expect(new Set(dialog.sortLayoutIds())).toEqual(new Set(["office", "bed", "scene"]));
+    expect(new Set(dialog.sortLayoutIds())).toEqual(new Set(["office", "bed"]));
     expect(dialog.roomFilterVisible).toBe(false);
 
     dialog.switchView("list");

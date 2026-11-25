@@ -246,10 +246,11 @@ describe("PiAgentService with Local Smart-Home Stream Engine", () => {
       expect(await h.service.powerState("demo-switch-bar.s3")).toBe(false);
       expect(await h.service.powerState("demo-switch-bar.s4")).toBe(false);
 
-      // 7. Manual scene execution ("回家模式" turns lights back on)
+      // 7. Manual scenes are currently disabled: prompt must not execute scenes or mutate lights
       const rScene = await h.agent.prompt("执行回家模式");
       expect(rScene.ok).toBe(true);
-      expect(await h.service.powerState("demo-light-living")).toBe(true);
+      expect(rScene.toolCalls.length).toBe(0);
+      expect(await h.service.powerState("demo-light-living")).toBe(false);
     } finally {
       await h.cleanup();
     }

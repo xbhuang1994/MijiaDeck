@@ -464,9 +464,10 @@ describe("SmartHomeTools & LocalPlannerStream — Natural Replies (lite/full) & 
       expect(sensorBatReply.reply).toContain("54%");
       expect(sensorBatReply.reply).toContain("电量");
 
-      // Scene, feeder, speaker volume & music
+      // Scene disabled: returns clear notice without executing any scene tool
       const sceneRes = await h.agent.prompt("执行回家模式");
-      expect(sceneRes.reply).toBe("好的，已经执行回家模式了");
+      expect(sceneRes.reply).toContain("场景功能");
+      expect(sceneRes.toolCalls.length).toBe(0);
 
       const feedRes = await h.agent.prompt("给宠物喂食器出粮2份");
       expect(feedRes.reply).toBe("好的，智能宠物喂食器已经出粮2份了");
@@ -575,12 +576,13 @@ describe("SmartHomeTools & LocalPlannerStream — Natural Replies (lite/full) & 
       expect(partialText).toContain("；");
       barSpot!.online = true;
 
-      // 6. Feeder, scene, speaker controls, xiaoai, boolean property
+      // 6. Feeder, disabled scene notice, speaker controls, xiaoai, boolean property
       const feedRes = await h.agent.prompt("给宠物喂食器出粮2份");
       expect(feedRes.reply).toBe("智能宠物喂食器已出粮 2 份");
 
       const sceneRes = await h.agent.prompt("执行回家模式");
-      expect(sceneRes.reply).toBe("已执行：回家模式");
+      expect(sceneRes.reply).toBe("场景功能暂未开启");
+      expect(sceneRes.toolCalls.length).toBe(0);
 
       const volRes = await h.agent.prompt("小爱音箱音量调到65");
       expect(volRes.reply).toBe("小爱音箱 Pro 音量 65%");
@@ -611,10 +613,8 @@ describe("SmartHomeTools & LocalPlannerStream — Natural Replies (lite/full) & 
       expect((listDevRes.details as Record<string, unknown>).uiSummary).toMatch(/^共 \d+ 台：/);
       expect(String((listDevRes.details as Record<string, unknown>).uiSummary)).not.toContain("[did=");
 
-      const listScnRes = await h.findTool("list_scenes").execute("tc_ls", {});
-      expect((listScnRes.content[0] as { text: string }).text).toContain("[id=");
-      expect((listScnRes.details as Record<string, unknown>).uiSummary).toMatch(/^共 \d+ 个场景：/);
-      expect(String((listScnRes.details as Record<string, unknown>).uiSummary)).not.toContain("[id=");
+      // Scene tools are disabled and omitted from Pi Agent tool registry
+      expect(h.tools.some((t) => t.name === "list_scenes" || t.name === "run_scene")).toBe(false);
 
       const detailRes = await h.findTool("get_device_detail").execute("tc_gd", { target: "客厅吸顶灯" });
       expect((detailRes.content[0] as { text: string }).text).toContain("[did=demo-light-living]");
@@ -641,9 +641,8 @@ describe("SmartHomeTools & LocalPlannerStream — Natural Replies (lite/full) & 
       expect(devList.reply.endsWith("：")).toBe(false);
 
       const scnList = await h.agent.prompt("有哪些场景");
-      expect(scnList.reply).toMatch(/^共 \d+ 个场景：/);
-      expect(scnList.reply).not.toContain("[id=");
-      expect(scnList.reply.endsWith("：")).toBe(false);
+      expect(scnList.reply).toBe("场景功能暂未开启");
+      expect(scnList.toolCalls.length).toBe(0);
 
       // Sensor summary omits battery >= 20% unless user asked for 电量
       const sensorReply = await h.agent.prompt("卧室现在温度和湿度多少？");

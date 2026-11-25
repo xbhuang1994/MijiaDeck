@@ -26,6 +26,7 @@ import {
   trayEligible,
 } from "../../core/deviceControls.ts";
 import { createSceneInfo, isSpeaker, type DeviceDetail, type DeviceInfo, type SceneInfo } from "../../core/models.ts";
+import { SCENES_FEATURE_ENABLED } from "../../core/featureFlags.ts";
 import * as settingsStore from "../../core/settingsStore.ts";
 import * as trayStore from "../../core/trayStore.ts";
 import { AudioBarController, type AudioBarService, type AudioBarTimers } from "./audioBarController.ts";
@@ -1032,13 +1033,20 @@ export class TrayQuickWindowController {
 
     this.emptyText = EMPTY_TRAY_TEXT;
     const dids = this.trayDids ?? (this.trayDids = trayStore.load());
-    const sceneData = this.trayScenes ?? (this.trayScenes = trayStore.loadScenes());
-    const order = this.trayOrder ?? (this.trayOrder = trayStore.loadOrder());
+    const sceneData = SCENES_FEATURE_ENABLED
+      ? (this.trayScenes ?? (this.trayScenes = trayStore.loadScenes()))
+      : [];
+    const rawOrder = this.trayOrder ?? (this.trayOrder = trayStore.loadOrder());
+    const order = SCENES_FEATURE_ENABLED
+      ? rawOrder
+      : rawOrder.filter((item) => item.type !== "scene");
 
     const lookup = new Map<string, DeviceInfo>(this.devices.map((d) => [d.did, d]));
     const didSet = new Set<string>(dids);
-    for (const s of sceneData) {
-      this.sceneLookup.set(s.scene_id, createSceneInfo(s));
+    if (SCENES_FEATURE_ENABLED) {
+      for (const s of sceneData) {
+        this.sceneLookup.set(s.scene_id, createSceneInfo(s));
+      }
     }
 
     const built: TrayQuickRow[] = [];
@@ -1049,7 +1057,7 @@ export class TrayQuickWindowController {
       if (item.type === "device" && didSet.has(item.id) && lookup.has(item.id)) {
         built.push(this.makeRow(lookup.get(item.id)!, built.length));
         seen.add(markKey("device", item.id));
-      } else if (item.type === "scene" && this.sceneLookup.has(item.id)) {
+      } else if (SCENES_FEATURE_ENABLED && item.type === "scene" && this.sceneLookup.has(item.id)) {
         built.push(this.makeSceneRow(this.sceneLookup.get(item.id)!, built.length));
         seen.add(markKey("scene", item.id));
       }
@@ -1062,11 +1070,13 @@ export class TrayQuickWindowController {
       }
     }
 
-    for (const s of sceneData) {
-      const sid = s.scene_id;
-      if (!seen.has(markKey("scene", sid)) && this.sceneLookup.has(sid)) {
-        built.push(this.makeSceneRow(this.sceneLookup.get(sid)!, built.length));
-        seen.add(markKey("scene", sid));
+    if (SCENES_FEATURE_ENABLED) {
+      for (const s of sceneData) {
+        const sid = s.scene_id;
+        if (!seen.has(markKey("scene", sid)) && this.sceneLookup.has(sid)) {
+          built.push(this.makeSceneRow(this.sceneLookup.get(sid)!, built.length));
+          seen.add(markKey("scene", sid));
+        }
       }
     }
 
@@ -1155,6 +1165,9 @@ export class TrayQuickWindowController {
   }
 
   runScene(sceneId: string): void {
+    if (!SCENES_FEATURE_ENABLED) {
+      return;
+    }
     const row = this.rows.find((r) => r.type === "scene" && r.id === sceneId);
     const scene = this.sceneLookup.get(sceneId);
     if (!row || !scene || !this.service.runScene) {

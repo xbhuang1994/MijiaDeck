@@ -21,6 +21,7 @@ import type {
   PlatformQrAuthSession,
   PlatformStatus,
 } from "../platforms/types.ts";
+import { SCENES_FEATURE_ENABLED } from "../core/featureFlags.ts";
 import { renderQrSvg } from "../ui/qrSvg.ts";
 
 // ---------------------------------------------------------------------------
@@ -581,7 +582,9 @@ export function formatPlatformSummaryLine(status: UiPlatformStatus): string {
   }
   if (status.connected || status.state === "connected") {
     const devCount = Math.max(0, Math.trunc(Number(status.deviceCount) || 0));
-    const sceneCount = Math.max(0, Math.trunc(Number(status.sceneCount) || 0));
+    const sceneCount = SCENES_FEATURE_ENABLED
+      ? Math.max(0, Math.trunc(Number(status.sceneCount) || 0))
+      : 0;
     return sceneCount > 0
       ? `已连接 · ${devCount} 台设备 · ${sceneCount} 个场景`
       : `已连接 · ${devCount} 台设备`;
@@ -622,7 +625,7 @@ function defaultPlatformStatus(id: UiPlatformId): UiPlatformStatus {
       credentialsAuth: id === "midea" || id === "deye",
       openApiAuth: id === "tuya",
       lanDiscovery: id === "tuya" || id === "midea",
-      scenes: id === "mijia" || id === "tuya",
+      scenes: SCENES_FEATURE_ENABLED && (id === "mijia" || id === "tuya"),
     },
     configSummary: {},
   };
@@ -2474,12 +2477,14 @@ export class PlatformsPanelController {
         status.connected ? (accountId ? `已登录 (${accountId})` : "已登录小米账号") : "未登录",
       ),
       this.createStatBox("同步设备", `${Math.max(0, Math.trunc(status.deviceCount || 0))} 台`),
-      this.createStatBox(
-        "手动场景 / 协议",
-        apiVersion
-          ? `${Math.max(0, Math.trunc(status.sceneCount || 0))} 个 · ${apiVersion}`
-          : `${Math.max(0, Math.trunc(status.sceneCount || 0))} 个场景`,
-      ),
+      SCENES_FEATURE_ENABLED
+        ? this.createStatBox(
+            "手动场景 / 协议",
+            apiVersion
+              ? `${Math.max(0, Math.trunc(status.sceneCount || 0))} 个 · ${apiVersion}`
+              : `${Math.max(0, Math.trunc(status.sceneCount || 0))} 个场景`,
+          )
+        : this.createStatBox("协议版本", apiVersion || "MIoT"),
     );
 
     const actions = document.createElement("div");

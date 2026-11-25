@@ -156,7 +156,7 @@
           <button type="button" id="access-banner-action" class="primary-button access-banner-btn" hidden></button>
         </div>
 
-        <!-- Responsive Device & Scene Card Grid -->
+        <!-- Responsive Device Card Grid -->
         <div id="card-grid-scroll" class="card-grid-scroll">
           <div id="banned-hint-bar" class="banned-hint-bar" hidden>
             <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -165,7 +165,7 @@
             </svg>
             <span>已屏蔽设备不再出现在智能控制列表、快捷托盘及 Pi Agent 语音控制中；右键点击设备卡片可取消屏蔽。</span>
           </div>
-          <div id="card-grid" class="card-grid" role="region" aria-label="设备与场景列表"></div>
+          <div id="card-grid" class="card-grid" role="region" aria-label="设备列表"></div>
           <div id="grid-empty" class="grid-empty" hidden>
             <p id="grid-empty-title" class="grid-empty-title"></p>
             <p id="grid-empty-detail" class="grid-empty-detail"></p>
@@ -285,7 +285,7 @@
       <div id="pi-agent-empty" class="pi-agent-empty">
         <div class="pi-empty-icon" aria-hidden="true">π</div>
         <p class="pi-empty-title">用语音或文字直接控制智能家居</p>
-        <p class="pi-empty-desc">支持多设备协同、调光调色、传感器读数、音箱播报、喂食器出粮与手动场景；也可以接入 DeepSeek / OpenAI / Claude / Gemini / Ollama 大模型。</p>
+        <p class="pi-empty-desc">支持多设备协同、调光调色、传感器读数、音箱播报与喂食器出粮；也可以接入 DeepSeek / OpenAI / Claude / Gemini / Ollama 大模型。</p>
         <div id="pi-quick-chips" class="pi-quick-chips"></div>
       </div>
       <div id="pi-agent-timeline" class="pi-agent-timeline" role="log" aria-live="polite"></div>
@@ -529,7 +529,7 @@
             </label>
           </div>
 
-          <div class="setting-card">
+          <div class="setting-card" id="setting-row-show-scene-tab" hidden>
             <div class="setting-info">
               <div class="setting-label">显示场景选项卡</div>
               <div class="setting-desc">在主页房间选项卡左侧显示「场景」入口，可一键执行米家 APP 中创建的手动场景</div>
@@ -616,7 +616,7 @@
           <div class="setting-card setting-card-wrap">
             <div class="setting-info">
               <div class="setting-label">模型引擎</div>
-              <div class="setting-desc" id="set-agent-provider-desc">内置本地引擎免 API Key 即可执行常见开关、调光、温湿度、喂食器与场景操作；也可接入主流云端大模型或自定义网关</div>
+              <div class="setting-desc" id="set-agent-provider-desc">内置本地引擎免 API Key 即可执行常见开关、调光、温湿度与喂食器操作；也可接入主流云端大模型或自定义网关</div>
             </div>
             <select id="set-agent-provider" class="md-select agent-select" aria-label="Pi Agent 模型引擎"></select>
           </div>
@@ -1160,7 +1160,7 @@
       <div class="tray-mgr-toolbar">
         <div id="tray-mgr-tabs" class="tray-mgr-tabs" role="tablist">
           <button type="button" class="settings-tab active" role="tab" aria-selected="true" data-tm-tab="devices">设备</button>
-          <button type="button" class="settings-tab" role="tab" aria-selected="false" data-tm-tab="scenes">场景</button>
+          <button type="button" class="settings-tab" id="tray-mgr-tab-scenes" role="tab" aria-selected="false" data-tm-tab="scenes" hidden>场景</button>
         </div>
         <button type="button" id="tray-mgr-sort-btn" class="secondary-button btn-compact">排序</button>
       </div>

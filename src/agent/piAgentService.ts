@@ -43,6 +43,7 @@ import {
 } from "../core/agentConfigStore.ts";
 import { TypedEmitter } from "../core/contracts.ts";
 import { deviceCategoryLabel } from "../core/deviceDetailModel.ts";
+import { SCENES_FEATURE_ENABLED } from "../core/featureFlags.ts";
 import type { FetchLike } from "../core/httpTimeout.ts";
 import {
   buildCavemanPromptBlock,
@@ -309,7 +310,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     }
     this._localStreamFn = createLocalSmartHomeStreamFn({
       getDevices: () => this._deps.mainWindow.activeDevices(),
-      getScenes: () => this._deps.mainWindow.scenes ?? [],
+      getScenes: () => (SCENES_FEATURE_ENABLED ? (this._deps.mainWindow.scenes ?? []) : []),
       getKnownPower: () => this._deps.mainWindow.knownPower,
       getCavemanMode: () => this._config.cavemanMode,
       classifyImplicitAction: async (utterance: string) => {
@@ -349,7 +350,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   private _buildSystemPrompt(): string {
     const mw = this._deps.mainWindow;
     const devices = mw.activeDevices();
-    const scenes = mw.scenes ?? [];
+    const scenes = SCENES_FEATURE_ENABLED ? (mw.scenes ?? []) : [];
 
     const deviceCatalog =
       devices.length === 0
@@ -382,10 +383,17 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       speakerRole: vm?.speakerRole,
     });
     const intentHint = vm?.intent ? `Intent hint: ${vm.intent}.` : "";
+    const roomTabs = mw.tabNames.filter(
+      (name) => name !== BANNED_TAB && (SCENES_FEATURE_ENABLED || name !== "场景"),
+    );
     return [
-      "你是 MijiaDeck 内置的智能家居控制助手（Pi Agent），专门负责响应用户的语音或文字指令，并通过工具真实地查询和控制用户的米家智能设备与手动场景。",
+      SCENES_FEATURE_ENABLED
+        ? "你是 MijiaDeck 内置的智能家居控制助手（Pi Agent），专门负责响应用户的语音或文字指令，并通过工具真实地查询和控制用户的米家智能设备与手动场景。"
+        : "你是 MijiaDeck 内置的智能家居控制助手（Pi Agent），专门负责响应用户的语音或文字指令，并通过工具真实地查询和控制用户的米家智能设备。",
       "执行原则：",
-      "1. 当用户要求开关设备、调节灯光亮度/色温/颜色、控制小米/小爱音箱（开关、播放指定歌曲、调节音量、静音、暂停/停止/切歌）、设置设备属性、执行动作（如喂食器出粮）、执行场景或查询传感器状态时，必须调用对应工具完成实际操作，绝不虚构操作结果。",
+      SCENES_FEATURE_ENABLED
+        ? "1. 当用户要求开关设备、调节灯光亮度/色温/颜色、控制小米/小爱音箱（开关、播放指定歌曲、调节音量、静音、暂停/停止/切歌）、设置设备属性、执行动作（如喂食器出粮）、执行场景或查询传感器状态时，必须调用对应工具完成实际操作，绝不虚构操作结果。"
+        : "1. 当用户要求开关设备、调节灯光亮度/色温/颜色、控制小米/小爱音箱（开关、播放指定歌曲、调节音量、静音、暂停/停止/切歌）、设置设备属性、执行动作（如喂食器出粮）或查询传感器状态时，必须调用对应工具完成实际操作，绝不虚构操作结果。",
       "2. 控制小米/小爱音箱（包括开关音箱、播放指定音乐/歌曲、设置或增减音量、静音、暂停/停止/播放/切歌）优先使用 `control_speaker` 工具。",
       "3. 支持一次响应中包含多个工具调用（例如同时调节客厅灯亮度并关闭餐厅主灯）。",
       "4. 完成工具调用后直接告知执行结果或读取到的数据，严格遵循下方回复风格约束，不要输出内部 did/id 或冗长客套。",
@@ -394,12 +402,10 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       cavemanBlock,
       ...(intentHint ? [intentHint] : []),
       "",
-      `当前家庭：${mw.currentHome || "全部"} | 房间列表：${mw.tabNames.filter((t) => t !== BANNED_TAB).join("、") || "全屋"}`,
+      `当前家庭：${mw.currentHome || "全部"} | 房间列表：${roomTabs.join("、") || "全屋"}`,
       "当前设备清单：",
       deviceCatalog,
-      "",
-      "当前手动场景：",
-      sceneCatalog,
+      ...(SCENES_FEATURE_ENABLED ? ["", "当前手动场景：", sceneCatalog] : []),
       extra ? `\n用户附加指令：\n${extra}` : "",
     ]
       .filter((line) => line !== undefined)
@@ -451,7 +457,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             userText,
             {
               getDevices: () => this._deps.mainWindow.activeDevices(),
-              getScenes: () => this._deps.mainWindow.scenes ?? [],
+              getScenes: () => (SCENES_FEATURE_ENABLED ? (this._deps.mainWindow.scenes ?? []) : []),
             },
             recentTarget,
           );

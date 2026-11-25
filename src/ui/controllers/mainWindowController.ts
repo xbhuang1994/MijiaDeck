@@ -33,6 +33,7 @@ import {
   trayEligible,
 } from "../../core/deviceControls.ts";
 import * as iconStore from "../../core/iconStore.ts";
+import { SCENES_FEATURE_ENABLED } from "../../core/featureFlags.ts";
 import { isSpeaker, type DeviceInfo, type SceneInfo } from "../../core/models.ts";
 import * as settingsStore from "../../core/settingsStore.ts";
 import * as trayStore from "../../core/trayStore.ts";
@@ -572,7 +573,7 @@ export class MainWindowController
     this.viewportWidth = options.viewportWidth ?? DEFAULT_WINDOW_WIDTH - 58;
     this.visible = options.initiallyVisible ?? true;
     this.hideNoFunc = settingsStore.getHideNoFuncDevices();
-    this.showSceneTab = settingsStore.getShowSceneTab();
+    this.showSceneTab = SCENES_FEATURE_ENABLED ? settingsStore.getShowSceneTab() : false;
     this.bannedDids = banStore.load();
 
     // 网络与主题控制器
@@ -1223,7 +1224,7 @@ export class MainWindowController
     this.loadCardIcons();
     this.syncAccessUi();
     // 场景入口开启时启动即预取场景列表，进场景页无需等待
-    if (this.showSceneTab) {
+    if (SCENES_FEATURE_ENABLED && this.showSceneTab) {
       this.loadScenes();
     }
   }
@@ -1663,7 +1664,7 @@ export class MainWindowController
     }
     const sortedRooms = [...roomSet].sort(lexCompare);
     this.tabNames = [
-      ...(this.showSceneTab ? [SCENE_TAB] : []),
+      ...(SCENES_FEATURE_ENABLED && this.showSceneTab ? [SCENE_TAB] : []),
       ALL_ROOMS,
       ...sortedRooms,
       BANNED_TAB,
@@ -1675,9 +1676,10 @@ export class MainWindowController
   }
 
   selectRoom(room: string): void {
-    this.currentRoom = room;
+    const nextRoom = !SCENES_FEATURE_ENABLED && room === SCENE_TAB ? ALL_ROOMS : room;
+    this.currentRoom = nextRoom;
     this.rebuildGrid();
-    if (room === SCENE_TAB) {
+    if (SCENES_FEATURE_ENABLED && nextRoom === SCENE_TAB) {
       if (this.scenes === null) {
         this.showStatus("正在加载场景…");
       }
@@ -1717,7 +1719,7 @@ export class MainWindowController
   }
 
   updateCountLabel(): void {
-    if (this.currentRoom === SCENE_TAB) {
+    if (SCENES_FEATURE_ENABLED && this.currentRoom === SCENE_TAB) {
       const count = (this.scenes ?? []).length;
       this.countLabelText = `共 ${count} 个场景`;
       this.summaryOnlineVisible = false;
@@ -1760,7 +1762,11 @@ export class MainWindowController
     this.sceneCards.clear();
     this.sceneEmptyHint = "";
 
-    if (this.currentRoom === SCENE_TAB) {
+    if (!SCENES_FEATURE_ENABLED && this.currentRoom === SCENE_TAB) {
+      this.currentRoom = ALL_ROOMS;
+    }
+
+    if (SCENES_FEATURE_ENABLED && this.currentRoom === SCENE_TAB) {
       this._rebuildSceneGrid();
       this.emitStateChanged();
       return;
@@ -1881,7 +1887,7 @@ export class MainWindowController
   // ---------- 场景（手动控制） ----------
 
   loadScenes(): void {
-    if (!this.networkOnline || this.loggedOut || this.loadingScenes) {
+    if (!SCENES_FEATURE_ENABLED || !this.networkOnline || this.loggedOut || this.loadingScenes) {
       return;
     }
     this.loadingScenes = true;
@@ -1894,8 +1900,8 @@ export class MainWindowController
 
   onScenesLoaded(scenes: SceneInfo[]): void {
     this.loadingScenes = false;
-    this.scenes = scenes;
-    if (this.currentRoom === SCENE_TAB) {
+    this.scenes = SCENES_FEATURE_ENABLED ? scenes : [];
+    if (SCENES_FEATURE_ENABLED && this.currentRoom === SCENE_TAB) {
       this.rebuildGrid();
       this.updateCountLabel();
     }
@@ -1904,7 +1910,7 @@ export class MainWindowController
   onScenesFailed(error: Error): void {
     this.loadingScenes = false;
     console.warn("加载场景失败:", error.message);
-    if (this.currentRoom !== SCENE_TAB) {
+    if (!SCENES_FEATURE_ENABLED || this.currentRoom !== SCENE_TAB) {
       return;
     }
     if (this.scenes === null) {
@@ -1915,6 +1921,9 @@ export class MainWindowController
   }
 
   onSceneExecuted(sceneId: string): void {
+    if (!SCENES_FEATURE_ENABLED) {
+      return;
+    }
     const scene = (this.scenes ?? []).find((s) => s.scene_id === sceneId);
     const card = this.sceneCards.get(sceneId);
     if (!scene || !card) {
@@ -2121,10 +2130,10 @@ export class MainWindowController
     if (this.tray !== null) {
       this.tray.hideQuick();
     }
-    const cached = this.currentHome === ALL_HOMES ? this.scenes : null;
+    const cached = SCENES_FEATURE_ENABLED && this.currentHome === ALL_HOMES ? this.scenes : [];
     const dlg = new TrayManagerController(this.displayedDevices(), {
       scenes: cached,
-      sceneLoader: this.showSceneTab ? () => this.service.sceneList(null) : null,
+      sceneLoader: SCENES_FEATURE_ENABLED && this.showSceneTab ? () => this.service.sceneList(null) : null,
       jobs: this.jobs,
     });
     dlg.events.on("accepted", () => {
@@ -2135,7 +2144,9 @@ export class MainWindowController
         .filter((it) => it.type === "scene" && sceneById.has(it.id))
         .map((it) => sceneById.get(it.id)!);
       trayStore.save(dids);
-      trayStore.saveScenes(scenes);
+      if (SCENES_FEATURE_ENABLED) {
+        trayStore.saveScenes(scenes);
+      }
       trayStore.saveOrder(order);
       this.updateTrayDevices();
       this.showToast("托盘项目已更新", 2000);
@@ -2169,7 +2180,7 @@ export class MainWindowController
         this.updateCountLabel();
         this.updateTrayDevices();
       }
-      const newShow = settingsStore.getShowSceneTab();
+      const newShow = SCENES_FEATURE_ENABLED ? settingsStore.getShowSceneTab() : false;
       if (newShow !== this.showSceneTab) {
         this.showSceneTab = newShow;
         if (!newShow && this.currentRoom === SCENE_TAB) {

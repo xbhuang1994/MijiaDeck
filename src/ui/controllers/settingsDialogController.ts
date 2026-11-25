@@ -9,6 +9,7 @@
  */
 
 import { TypedEmitter } from "../../core/contracts.ts";
+import { SCENES_FEATURE_ENABLED } from "../../core/featureFlags.ts";
 import { type DeviceInfo, isSpeaker } from "../../core/models.ts";
 import {
   UI_SCALES,
@@ -228,8 +229,8 @@ export class SettingsDialogController extends TypedEmitter<SettingsDialogEvents>
     this.voiceFabInteractive = this.hasSpeaker;
     this.voiceFabEnabled = this.hasSpeaker ? getVoiceFabEnabled() : false;
 
-    // 场景选项卡
-    this.showSceneTab = getShowSceneTab();
+    // 场景选项卡（场景功能屏蔽期间恒为 false）
+    this.showSceneTab = SCENES_FEATURE_ENABLED ? getShowSceneTab() : false;
 
     // 开机自启动
     this.autostartSupported = autostartSupported();
@@ -390,6 +391,9 @@ export class SettingsDialogController extends TypedEmitter<SettingsDialogEvents>
   }
 
   setShowSceneTab(enabled: boolean): void {
+    if (!SCENES_FEATURE_ENABLED) {
+      return;
+    }
     this.showSceneTab = Boolean(enabled);
     this.emit("changed", this.snapshot());
   }
@@ -462,7 +466,9 @@ export class SettingsDialogController extends TypedEmitter<SettingsDialogEvents>
     }
 
     setHideNoFuncDevices(this.hideNoFuncDevices);
-    setShowSceneTab(this.showSceneTab);
+    if (SCENES_FEATURE_ENABLED) {
+      setShowSceneTab(this.showSceneTab);
+    }
     setCheckUpdateEnabled(this.checkUpdateEnabled);
     setThemeMode(this.pendingThemeMode);
     setThemeColor(this.pendingThemeColor);

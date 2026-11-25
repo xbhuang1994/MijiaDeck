@@ -7,6 +7,7 @@
  * API Key 仅存储在服务端数据目录，面向前端序列化时一律脱敏。
  */
 
+import { SCENES_FEATURE_ENABLED } from "./featureFlags.ts";
 import { dataFile, readJson, writeJson } from "./jsonStore.ts";
 
 export const AGENT_CONFIG_VERSION = 2;
@@ -55,7 +56,9 @@ export const PROVIDER_PRESETS: ReadonlyArray<ProviderPreset> = [
   {
     id: "local",
     label: "内置本地引擎（免 API Key）",
-    description: "零延迟本地智能家居规划引擎，经由 Pi Agent 工具循环执行常见开关、调光、传感器、场景与喂食指令",
+    description: SCENES_FEATURE_ENABLED
+      ? "零延迟本地智能家居规划引擎，经由 Pi Agent 工具循环执行常见开关、调光、传感器、场景与喂食指令"
+      : "零延迟本地智能家居规划引擎，经由 Pi Agent 工具循环执行常见开关、调光、传感器与喂食指令",
     defaultModel: "mijia-local-planner",
     suggestedModels: ["mijia-local-planner"],
     defaultBaseUrl: "",

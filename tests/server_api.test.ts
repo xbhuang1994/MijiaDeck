@@ -206,7 +206,7 @@ describe("ServerApiTest", () => {
     expect(lightAfter.values.brightness).toBe(88);
   });
 
-  test("scene execution and voice commands succeed and reflect effects", async () => {
+  test("scene execution is blocked while disabled and voice commands still succeed", async () => {
     const base = server!.url;
 
     const sleepRes = await fetch(`${base}/api/scenes/demo-scene-sleep/run`, {
@@ -214,25 +214,18 @@ describe("ServerApiTest", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({}),
     });
-    expect(sleepRes.status).toBe(200);
-    const sleepBody = (await sleepRes.json()) as { ok: boolean; message: string };
-    expect(sleepBody.ok).toBe(true);
-    expect(sleepBody.message).toContain("晚安模式");
+    expect(sleepRes.status).toBe(403);
+    const sleepBody = (await sleepRes.json()) as { ok: boolean; error: string };
+    expect(sleepBody.ok).toBe(false);
 
-    const stateAfterSleep = (await (await fetch(`${base}/api/state`)).json()) as {
+    const stateAfterBlockedScene = (await (await fetch(`${base}/api/state`)).json()) as {
       knownPower: Record<string, boolean | null>;
+      scenes: unknown[];
+      rooms: string[];
     };
-    expect(stateAfterSleep.knownPower["demo-light-living"]).toBe(false);
-
-    const homeRes = await fetch(`${base}/api/scenes/demo-scene-home/run`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
-    });
-    expect(homeRes.status).toBe(200);
-    const homeBody = (await homeRes.json()) as { ok: boolean; message: string };
-    expect(homeBody.ok).toBe(true);
-    expect(homeBody.message).toContain("回家模式");
+    expect(stateAfterBlockedScene.knownPower["demo-light-living"]).toBe(true);
+    expect(stateAfterBlockedScene.scenes).toEqual([]);
+    expect(stateAfterBlockedScene.rooms).not.toContain("场景");
 
     const voiceRes = await fetch(`${base}/api/voice`, {
       method: "POST",
@@ -290,7 +283,7 @@ describe("ServerApiTest", () => {
     expect(memberData.ok).toBe(true);
     expect(memberData.tray.devices).toContain("demo-light-living");
 
-    // Tray full save with mixed order
+    // Tray full save strips scene entries while scenes feature is disabled
     const saveTrayRes = await fetch(`${base}/api/tray/save`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -313,11 +306,11 @@ describe("ServerApiTest", () => {
     expect(saveTrayRes.status).toBe(200);
     const saveTrayData = (await saveTrayRes.json()) as {
       ok: boolean;
-      tray: { order: Array<{ type: string; id: string }> };
+      tray: { scenes: unknown[]; order: Array<{ type: string; id: string }> };
     };
     expect(saveTrayData.ok).toBe(true);
+    expect(saveTrayData.tray.scenes).toEqual([]);
     expect(saveTrayData.tray.order).toEqual([
-      { type: "scene", id: "demo-scene-home" },
       { type: "device", id: "demo-light-living" },
     ]);
 
