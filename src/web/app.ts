@@ -482,6 +482,9 @@ function deviceIconSvg(model: string): string {
   if (m.includes("sensor") || m.includes("htv") || m.includes("thermometer")) {
     return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 14.76V5a2 2 0 1 0-4 0v9.76a4 4 0 1 0 4 0z"></path></svg>`;
   }
+  if (m.includes("washing-machine") || m.includes("washer") || m.includes("dryer")) {
+    return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="2.5" width="16" height="19" rx="2.5"></rect><line x1="4" y1="7" x2="20" y2="7"></line><circle cx="7.5" cy="4.8" r="0.8" fill="currentColor"></circle><circle cx="10.5" cy="4.8" r="0.8" fill="currentColor"></circle><line x1="14.5" y1="4.8" x2="17" y2="4.8"></line><circle cx="12" cy="14" r="4.5"></circle><path d="M9.4 14.3c.9-.8 1.7-.8 2.6 0s1.7.8 2.6 0"></path></svg>`;
+  }
   if (m.includes("dehumidifier") || m.includes("humidifier")) {
     return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"></path></svg>`;
   }

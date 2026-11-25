@@ -21,6 +21,7 @@ import {
   groupPropsByService,
   isIrRemoteDevice,
   isPetFeederDevice,
+  isWasherDevice,
   nextAvailableFeedPlanId,
   parseFeedPlans,
   percentageProgressFor,
@@ -159,6 +160,23 @@ function semanticToneForTelemetry(
   if (name === "pet-food-left-level") {
     if (formatted.includes("缺") || rawValue === 2) return "warn";
     if (formatted.includes("正常") || rawValue === 1) return "good";
+  }
+  if (name === "door-opened" || name === "detergent-lack" || name === "softener-lack") {
+    if (rawValue === true) return "warn";
+    if (rawValue === false) return "good";
+  }
+  if (name === "water-overheating" || name === "drying-tunnel-overheating") {
+    if (rawValue === true) return "danger";
+    if (rawValue === false) return "good";
+  }
+  if (name === "remote-control-flag") {
+    if (rawValue === true) return "good";
+    if (rawValue === false) return "warn";
+  }
+  if (name === "error-code") {
+    const code = String(rawValue ?? "").trim();
+    if (code && code !== "0") return "danger";
+    if (code === "0") return "good";
   }
   if (name.includes("battery") || name.includes("life-level") || name.includes("left-level")) {
     if (name.includes("battery") && rawValue === 0 && allValues?.["status"] === 0) {
@@ -648,6 +666,15 @@ export class DeviceDetailModalController {
     if (irActions.length > 0) {
       container.appendChild(this.buildIrRemoteHero(data, irActions, heroConsumedActions));
       renderedAnything = true;
+    }
+
+    // 4c. Washing Machine Multi-Drum & Cycle Control Workbench Hero
+    if (isWasherDevice(data.device, data.props, data.actions)) {
+      const washerHero = this.buildWasherHero(data, heroConsumedProps, heroConsumedActions);
+      if (washerHero) {
+        container.appendChild(washerHero);
+        renderedAnything = true;
+      }
     }
 
     const hasAnyReportedValue = Object.values(data.values).some(
@@ -2073,6 +2100,417 @@ export class DeviceDetailModalController {
       await this.writeProp(measureProp.name, portions);
     }
     await this.runAction(dispenseAction.name, undefined, `已下发出粮指令（${portions} 份）`);
+  }
+
+  private buildWasherHero(
+    data: DeviceDetailApiResponse,
+    consumedProps: Set<string>,
+    consumedActions: Set<string>,
+  ): HTMLElement | null {
+    const programProp = data.props.find((p) => p.name === "program");
+    const statusProp = data.props.find((p) => p.name === "running-status");
+    const progressProp = data.props.find((p) => p.name === "progress");
+    const drumProp = data.props.find((p) => p.name === "drum-location");
+    const startAct = data.actions.find((a) => a.name === "start-wash");
+    const pauseAct = data.actions.find((a) => a.name === "pause-wash");
+    const cancelApptAct = data.actions.find((a) => a.name === "cancel-appointment");
+
+    if (!programProp && !statusProp && !drumProp && !startAct) {
+      return null;
+    }
+
+    for (const name of ["control-status", "running-status", "progress", "remain-time", "program", "drum-location"]) {
+      consumedProps.add(name);
+    }
+    for (const p of data.props) {
+      if (p.name.startsWith("drum-")) {
+        consumedProps.add(p.name);
+      }
+    }
+    if (startAct) consumedActions.add(startAct.name);
+    if (pauseAct) consumedActions.add(pauseAct.name);
+    if (cancelApptAct) consumedActions.add(cancelApptAct.name);
+
+    const hasMultiDrum = Boolean(drumProp?.value_list && drumProp.value_list.length > 1);
+    const activeDrumKey = String(
+      data.values["drum-location"] ?? drumProp?.value_list?.[0]?.value ?? "main",
+    );
+    const activeDrumOpt = drumProp?.value_list?.find((o) => String(o.value) === activeDrumKey);
+    const activeDrumTitle = activeDrumOpt?.desc_zh_cn ?? activeDrumOpt?.description ?? "";
+
+    const runningStatusRaw = String(
+      data.values["running-status"] ?? (data.powerState ? "standby" : "off"),
+    );
+    const isRunning = runningStatusRaw === "start";
+    const isPaused = runningStatusRaw === "pause";
+    const isDelay = runningStatusRaw === "delay";
+    const isFault = runningStatusRaw === "fault";
+    const statusLabel =
+      resolveEnumLabel(runningStatusRaw, statusProp?.value_list) ??
+      (isRunning ? "运行中" : isPaused ? "已暂停" : data.powerState ? "待机" : "已关机");
+
+    const progressRaw = data.values["progress"];
+    const progressLabel = resolveEnumLabel(progressRaw, progressProp?.value_list);
+    const remainRaw = data.values["remain-time"];
+    const remainMins =
+      typeof remainRaw === "number" && Number.isFinite(remainRaw) ? Math.max(0, Math.round(remainRaw)) : 0;
+    const apptRaw = data.values["appointment-time"];
+    const apptMins =
+      typeof apptRaw === "number" && Number.isFinite(apptRaw) ? Math.max(0, Math.round(apptRaw)) : 0;
+
+    const currentProgramVal = String(data.values["program"] ?? "");
+    const currentProgramLabel =
+      resolveEnumLabel(currentProgramVal, programProp?.value_list) ?? (currentProgramVal || "未选择程序");
+
+    const section = this.createSection(
+      hasMultiDrum ? "多筒洗涤控制" : "洗涤控制台",
+      hasMultiDrum
+        ? `${drumProp!.value_list!.length} 筒独立控制 · 点击卡片切换筒位`
+        : data.online
+          ? statusLabel
+          : "设备离线",
+    );
+
+    const wrap = document.createElement("div");
+    wrap.className = "dd-washer-wrap";
+
+    // 1. Multi-drum interactive selector cards (0xD9 复式/三筒洗烘机)
+    if (hasMultiDrum && drumProp?.value_list) {
+      const drumGrid = document.createElement("div");
+      drumGrid.className = `dd-washer-drum-grid cols-${Math.min(drumProp.value_list.length, 3)}`;
+      const switchBusy = this.busyProps.has("drum-location");
+
+      for (const opt of drumProp.value_list) {
+        const key = String(opt.value);
+        const fullLabel = opt.desc_zh_cn || opt.description || key;
+        const [shortName, roleHint] = fullLabel.split("·").map((s) => s.trim());
+        const isActive = key === activeDrumKey;
+        const dStatus = String(data.values[`drum-${key}-status`] ?? (data.powerState ? "standby" : "off"));
+        const dStatusProp = data.props.find((p) => p.name === `drum-${key}-status`);
+        const dStatusLabel = resolveEnumLabel(dStatus, dStatusProp?.value_list) ?? dStatus;
+        const dProgVal = String(data.values[`drum-${key}-program`] ?? "");
+        const dProgProp = data.props.find((p) => p.name === `drum-${key}-program`);
+        const dProgLabel = resolveEnumLabel(dProgVal, dProgProp?.value_list) ?? (dProgVal || "—");
+        const dRemainRaw = data.values[`drum-${key}-remain-time`];
+        const dRemain =
+          typeof dRemainRaw === "number" && Number.isFinite(dRemainRaw) ? Math.round(dRemainRaw) : 0;
+        const dDetergentLack = data.values[`drum-${key}-detergent-lack`] === true;
+        const dRunning = dStatus === "start";
+
+        const card = document.createElement("button");
+        card.type = "button";
+        card.className = `dd-washer-drum-card${isActive ? " is-active" : ""}${dRunning ? " is-running" : ""}`;
+        card.disabled = !data.online || switchBusy;
+        card.setAttribute("aria-pressed", String(isActive));
+
+        const top = document.createElement("div");
+        top.className = "dd-washer-drum-top";
+        const nameEl = document.createElement("span");
+        nameEl.className = "dd-washer-drum-name";
+        nameEl.textContent = shortName || fullLabel;
+        const pill = document.createElement("span");
+        pill.className = `dd-washer-drum-pill is-${dStatus}`;
+        pill.textContent = dStatusLabel;
+        top.append(nameEl, pill);
+
+        const roleEl = document.createElement("div");
+        roleEl.className = "dd-washer-drum-role";
+        roleEl.textContent = roleHint || (isActive ? "当前操作筒" : "点击切换");
+
+        const foot = document.createElement("div");
+        foot.className = "dd-washer-drum-foot";
+        const progEl = document.createElement("span");
+        progEl.className = "dd-washer-drum-prog";
+        progEl.textContent = dProgLabel;
+        const timeEl = document.createElement("span");
+        timeEl.className = "dd-washer-drum-time";
+        timeEl.textContent =
+          dRunning || dStatus === "pause"
+            ? dRemain > 0
+              ? `剩 ${dRemain} 分`
+              : dStatusLabel
+            : dRemain > 0 && data.powerState
+              ? `${dRemain} 分`
+              : "待机";
+        foot.append(progEl, timeEl);
+
+        card.append(top, roleEl, foot);
+        if (dDetergentLack) {
+          const lack = document.createElement("div");
+          lack.className = "dd-washer-drum-warn";
+          lack.textContent = "洗衣液不足";
+          card.appendChild(lack);
+        }
+
+        card.addEventListener("click", () => {
+          if (isActive) return;
+          void this.switchWasherDrum(key);
+        });
+        drumGrid.appendChild(card);
+      }
+
+      wrap.appendChild(drumGrid);
+    }
+
+    // 2. Main live status + action workbench card
+    const heroCard = document.createElement("div");
+    heroCard.className = `dd-washer-hero-card${isRunning ? " is-running" : ""}`;
+
+    // Alerts bar inside hero when actionable / critical
+    const alertChips: Array<{ text: string; tone: "warn" | "danger" }> = [];
+    if (data.values["remote-control-flag"] === false) {
+      alertChips.push({
+        text: "机身未开启远程控制，部分控制需先在洗衣机面板启用远程控制",
+        tone: "warn",
+      });
+    }
+    if (data.values["door-opened"] === true) {
+      alertChips.push({ text: "舱门未关，启动前请先关好舱门", tone: "warn" });
+    }
+    if (data.values["water-overheating"] === true) {
+      alertChips.push({ text: "水温过热告警", tone: "danger" });
+    }
+    if (data.values["drying-tunnel-overheating"] === true) {
+      alertChips.push({ text: "烘干风道过热告警", tone: "danger" });
+    }
+    const errCode = String(data.values["error-code"] ?? "").trim();
+    if (errCode && errCode !== "0") {
+      alertChips.push({ text: `故障代码：${errCode}`, tone: "danger" });
+    }
+    if (alertChips.length > 0) {
+      const alertBar = document.createElement("div");
+      alertBar.className = "dd-washer-alerts";
+      for (const a of alertChips) {
+        const chip = document.createElement("div");
+        chip.className = `dd-washer-alert is-${a.tone}`;
+        chip.textContent = a.text;
+        alertBar.appendChild(chip);
+      }
+      heroCard.appendChild(alertBar);
+    }
+
+    // Live status + remaining countdown row
+    const statusRow = document.createElement("div");
+    statusRow.className = "dd-washer-status-row";
+
+    const statusLeft = document.createElement("div");
+    statusLeft.className = "dd-washer-status-left";
+
+    const badgeRow = document.createElement("div");
+    badgeRow.className = "dd-washer-badge-row";
+    if (hasMultiDrum && activeDrumTitle) {
+      const drumBadge = document.createElement("span");
+      drumBadge.className = "dd-washer-drum-tag";
+      drumBadge.textContent = activeDrumTitle;
+      badgeRow.appendChild(drumBadge);
+    }
+    const statusBadge = document.createElement("span");
+    statusBadge.className = `dd-washer-status-badge ${
+      isRunning
+        ? "is-running"
+        : isPaused
+          ? "is-paused"
+          : isDelay
+            ? "is-delay"
+            : isFault
+              ? "is-fault"
+              : "is-idle"
+    }`;
+    statusBadge.textContent = statusLabel;
+    badgeRow.appendChild(statusBadge);
+
+    if (isRunning && progressLabel && progressLabel !== "未运行") {
+      const stageTag = document.createElement("span");
+      stageTag.className = "dd-washer-stage-tag";
+      stageTag.textContent = progressLabel;
+      badgeRow.appendChild(stageTag);
+    }
+
+    const progHeading = document.createElement("div");
+    progHeading.className = "dd-washer-program-title";
+    progHeading.textContent = currentProgramLabel;
+
+    // Compact summary of key active wash parameters
+    const paramSummaryParts: string[] = [];
+    const tempProp = data.props.find((p) => p.name === "temperature");
+    if (tempProp && data.values["temperature"] !== undefined && data.values["temperature"] !== null) {
+      paramSummaryParts.push(`水温 ${formatPropertyValue(tempProp, data.values["temperature"])}`);
+    }
+    const spinProp = data.props.find((p) => p.name === "dehydration-speed");
+    if (
+      spinProp &&
+      data.values["dehydration-speed"] !== undefined &&
+      data.values["dehydration-speed"] !== null
+    ) {
+      paramSummaryParts.push(formatPropertyValue(spinProp, data.values["dehydration-speed"]));
+    }
+    const rinseRaw = data.values["rinse-count"];
+    if (typeof rinseRaw === "number" && rinseRaw > 0) {
+      paramSummaryParts.push(`漂洗 ${rinseRaw} 次`);
+    }
+    const dryProp = data.props.find((p) => p.name === "dry-mode");
+    const dryRaw = data.values["dry-mode"];
+    if (dryProp && typeof dryRaw === "number" && dryRaw > 0) {
+      paramSummaryParts.push(formatPropertyValue(dryProp, dryRaw));
+    }
+
+    const summarySub = document.createElement("div");
+    summarySub.className = "dd-washer-param-summary";
+    summarySub.textContent =
+      paramSummaryParts.length > 0 ? paramSummaryParts.join(" · ") : "可在下方调整洗涤参数与附加功能";
+
+    statusLeft.append(badgeRow, progHeading, summarySub);
+
+    const timeRight = document.createElement("div");
+    timeRight.className = "dd-washer-countdown";
+    const timeVal = document.createElement("div");
+    timeVal.className = "dd-washer-countdown-num";
+    const shownMins = isDelay && apptMins > 0 ? apptMins : remainMins;
+    timeVal.textContent = shownMins > 0 ? String(shownMins) : "--";
+    const timeUnit = document.createElement("span");
+    timeUnit.className = "dd-washer-countdown-unit";
+    timeUnit.textContent = "分钟";
+    timeVal.appendChild(timeUnit);
+    const timeCaption = document.createElement("div");
+    timeCaption.className = "dd-washer-countdown-label";
+    timeCaption.textContent = isDelay
+      ? "预约倒计时"
+      : isRunning
+        ? "预计剩余"
+        : isPaused
+          ? "暂停剩余"
+          : "预计耗时";
+    timeRight.append(timeVal, timeCaption);
+
+    statusRow.append(statusLeft, timeRight);
+    heroCard.appendChild(statusRow);
+
+    // Primary Start / Pause + Cancel Appointment controls
+    const actionRow = document.createElement("div");
+    actionRow.className = "dd-washer-action-row";
+
+    const busyStartPause =
+      this.busyActions.has("start-wash") ||
+      this.busyActions.has("pause-wash") ||
+      this.busyProps.has("control-status");
+
+    const mainBtn = document.createElement("button");
+    mainBtn.type = "button";
+    mainBtn.className = isRunning
+      ? "secondary-button dd-washer-main-btn is-pause"
+      : "primary-button dd-washer-main-btn";
+    mainBtn.disabled = !data.online || busyStartPause;
+    mainBtn.textContent = busyStartPause
+      ? "指令下发中…"
+      : isRunning
+        ? "⏸ 暂停洗涤"
+        : isPaused
+          ? "▶ 继续洗涤"
+          : "▶ 开始洗涤";
+    mainBtn.addEventListener("click", () => {
+      if (isRunning) {
+        if (pauseAct) {
+          void this.runAction(pauseAct.name, undefined, "已暂停洗涤");
+        } else {
+          void this.writeProp("control-status", false);
+        }
+      } else if (startAct) {
+        void this.runAction(startAct.name, undefined, "已开始洗涤");
+      } else {
+        void this.writeProp("control-status", true);
+      }
+    });
+    actionRow.appendChild(mainBtn);
+
+    if (apptMins > 0 && cancelApptAct) {
+      const cancelBtn = document.createElement("button");
+      cancelBtn.type = "button";
+      cancelBtn.className = "secondary-button dd-washer-cancel-btn";
+      cancelBtn.disabled = !data.online || this.busyActions.has(cancelApptAct.name);
+      cancelBtn.textContent = "取消预约";
+      cancelBtn.addEventListener("click", () => {
+        void this.runAction(cancelApptAct.name, undefined, "已取消预约");
+      });
+      actionRow.appendChild(cancelBtn);
+    }
+
+    heroCard.appendChild(actionRow);
+
+    // Quick Program Selector (chips + full select dropdown)
+    if (programProp?.writable && programProp.value_list && programProp.value_list.length > 0) {
+      const progBlock = document.createElement("div");
+      progBlock.className = "dd-washer-program-block";
+
+      const progHead = document.createElement("div");
+      progHead.className = "dd-washer-program-head";
+      const progLabel = document.createElement("span");
+      progLabel.className = "dd-washer-program-label";
+      progLabel.textContent = `${programProp.desc || "洗涤程序"}（共 ${programProp.value_list.length} 项）`;
+
+      const select = document.createElement("select");
+      select.className = "md-select dd-washer-program-select";
+      select.disabled = !data.online || this.busyProps.has(programProp.name);
+      select.setAttribute("aria-label", programProp.desc || "洗涤程序");
+      for (const opt of programProp.value_list) {
+        const optEl = document.createElement("option");
+        optEl.value = String(opt.value);
+        optEl.textContent = resolveEnumLabel(opt.value, [opt]) ?? String(opt.value);
+        if (String(opt.value) === currentProgramVal) {
+          optEl.selected = true;
+        }
+        select.appendChild(optEl);
+      }
+      select.addEventListener("change", () => {
+        void this.writeProp(programProp.name, select.value);
+      });
+
+      progHead.append(progLabel, select);
+      progBlock.appendChild(progHead);
+
+      const chipOpts = programProp.value_list.slice(0, 8);
+      if (
+        currentProgramVal &&
+        !chipOpts.some((o) => String(o.value) === currentProgramVal)
+      ) {
+        const curOpt = programProp.value_list.find((o) => String(o.value) === currentProgramVal);
+        if (curOpt) {
+          chipOpts.pop();
+          chipOpts.unshift(curOpt);
+        }
+      }
+
+      const chipsRow = document.createElement("div");
+      chipsRow.className = "dd-washer-program-chips";
+      for (const opt of chipOpts) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        const selected = String(opt.value) === currentProgramVal;
+        btn.className = `dd-preset-chip${selected ? " active" : ""}`;
+        btn.disabled = !data.online || this.busyProps.has(programProp.name);
+        btn.textContent = resolveEnumLabel(opt.value, [opt]) ?? String(opt.value);
+        btn.addEventListener("click", () => {
+          if (selected) return;
+          void this.writeProp(programProp.name, opt.value);
+        });
+        chipsRow.appendChild(btn);
+      }
+      progBlock.appendChild(chipsRow);
+      heroCard.appendChild(progBlock);
+    }
+
+    wrap.appendChild(heroCard);
+    section.appendChild(wrap);
+    return section;
+  }
+
+  private async switchWasherDrum(drumKey: string): Promise<void> {
+    const data = this.data;
+    if (!data || !data.online) return;
+    const gen = this.generation;
+    await this.writeProp("drum-location", drumKey);
+    if (gen !== this.generation || !this.device) return;
+    // 切换筒位后刷新完整详情以获取该筒专属的程序列表与功能项
+    await this.fetchDetail(data.did, gen, false, false);
   }
 
   private buildTelemetrySection(data: DeviceDetailApiResponse, telemetry: PropInfo[]): HTMLElement {

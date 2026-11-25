@@ -18,7 +18,14 @@ import {
   lightControls,
   supportsCardPower,
 } from "../core/deviceControls.ts";
-import { coercePropWriteValue, deviceCategoryLabel, isIrRemoteDevice } from "../core/deviceDetailModel.ts";
+import {
+  coercePropWriteValue,
+  deviceCategoryLabel,
+  formatWasherCardMetrics,
+  isIrRemoteDevice,
+  isWasherDevice,
+  resolveEnumLabel,
+} from "../core/deviceDetailModel.ts";
 import { SCENES_FEATURE_ENABLED } from "../core/featureFlags.ts";
 import { JobExecutor } from "../core/jobs.ts";
 import {
@@ -150,6 +157,13 @@ function deviceMatchesCategory(device: DeviceInfo, category: string): boolean {
       device.model.includes("dehumidifier") ||
       device.spec_type.includes("dehumidifier") ||
       device.name.includes("除湿")
+    );
+  }
+  if (cat === "washer" || cat === "washing-machine" || cat === "洗衣机" || cat === "洗烘") {
+    return (
+      isWasherDevice(device) ||
+      device.name.includes("洗衣") ||
+      device.name.includes("洗烘")
     );
   }
   if (cat === "inverter" || cat === "solar-inverter" || cat === "逆变器" || cat === "光伏") {
@@ -302,12 +316,26 @@ export function resolveDevices(
         deviceMatchesCategory(d, "feeder");
       const cameraHit =
         (rest.includes("摄像") || rest.includes("监控") || rest.includes("相机")) && isCamera(d);
+      const washerHit =
+        (rest.includes("洗衣") ||
+          rest.includes("洗烘") ||
+          rest.includes("滚筒") ||
+          rest.includes("波轮") ||
+          rest.includes("可爱多")) &&
+        deviceMatchesCategory(d, "washer");
 
-      if (roomHit && (!rest || rest === "设备" || lightHit || speakerHit || sensorHit || feederHit || cameraHit)) {
+      if (
+        roomHit &&
+        (!rest || rest === "设备" || lightHit || speakerHit || sensorHit || feederHit || cameraHit || washerHit)
+      ) {
         score = 75;
       } else if (roomHit && rest.length >= 1 && dName.includes(rest)) {
         score = 82;
-      } else if (!roomHit && !hasConflictingRoom && (lightHit || speakerHit || sensorHit || feederHit || cameraHit)) {
+      } else if (
+        !roomHit &&
+        !hasConflictingRoom &&
+        (lightHit || speakerHit || sensorHit || feederHit || cameraHit || washerHit)
+      ) {
         score = 65;
       } else if (!hasConflictingRoom && dCat && (dCat.includes(normTarget) || normTarget.includes(dCat))) {
         score = 60;
@@ -487,6 +515,32 @@ function formatDeviceDetailUiSummary(
 ): string {
   if (!device.online) {
     return joinDeviceLabel(device.name, "离线");
+  }
+
+  if (isWasherDevice(device, props)) {
+    const parts: string[] = [];
+    const drumProp = props.find((p) => p.name === "drum-location");
+    const drumLabel = resolveEnumLabel(values["drum-location"], drumProp?.value_list);
+    if (drumLabel) {
+      parts.push(drumLabel.split("·")[0]?.trim() || drumLabel);
+    }
+    const statusProp = props.find((p) => p.name === "running-status");
+    const statusLabel = resolveEnumLabel(values["running-status"], statusProp?.value_list);
+    if (statusLabel) {
+      parts.push(statusLabel);
+    } else if (typeof values["on"] === "boolean") {
+      parts.push(values["on"] ? "已开" : "已关");
+    }
+    const programProp = props.find((p) => p.name === "program");
+    const programLabel = resolveEnumLabel(values["program"], programProp?.value_list);
+    if (programLabel) {
+      parts.push(programLabel);
+    }
+    const remain = values["remain-time"];
+    if (typeof remain === "number" && remain > 0 && values["running-status"] === "start") {
+      parts.push(`剩 ${Math.round(remain)} 分`);
+    }
+    return parts.length > 0 ? `${device.name} ${parts.join(" · ")}` : joinDeviceLabel(device.name, "在线");
   }
 
   const temp = values["temperature"];
@@ -748,6 +802,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
             "appliance",
             "ac",
             "dehumidifier",
+            "washer",
             "inverter",
           ] as const,
           {
@@ -844,12 +899,18 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
           mutated = true;
         }
       }
-      const freshMetrics = formatMetricsText(
-        values["temperature"],
-        values["relative-humidity"] ?? values["humidity"],
-      );
+      const isWasher = isWasherDevice(device, detail.props, detail.actions);
+      const freshMetrics = isWasher
+        ? formatWasherCardMetrics(detail.props, values)
+        : formatMetricsText(
+            values["temperature"],
+            values["relative-humidity"] ?? values["humidity"],
+          );
       if (freshMetrics && deps.mainWindow.metrics[device.did] !== freshMetrics) {
         deps.mainWindow.metrics[device.did] = freshMetrics;
+        mutated = true;
+      } else if (isWasher && !freshMetrics && deps.mainWindow.metrics[device.did]) {
+        delete deps.mainWindow.metrics[device.did];
         mutated = true;
       }
       if (mutated) {
@@ -1276,7 +1337,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
     name: "set_device_property",
     label: "设置设备属性",
     description:
-      "修改任意智能设备的可写 MIoT 属性（如音箱音量 volume、静音 mute、空调目标温度、风扇档位、定时倒计时等）。",
+      "修改任意智能设备的可写属性（如洗衣机的筒位 drum-location、程序 program、水温 temperature、脱水转速 dehydration-speed、烘干 dry-mode、预约 appointment-time、童锁 child-lock；音箱音量 volume、静音 mute；空调目标温度；风扇档位等）。",
     parameters: obj({
       target: str({ description: "设备 did 或名称" }),
       property: str({ description: "属性名（如 volume、mute、mode）或中文描述（如 音量、静音）" }),
@@ -1380,7 +1441,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
     name: "run_device_action",
     label: "执行设备动作",
     description:
-      "执行智能设备的动作或红外遥控按键，例如涂鸦红外遥控按键（PowerOn、PowerOff、Volume+、Volume-、Play、Pause、Next、Previous 等）、宠物喂食器出粮（pet-food-out）、音箱播放/暂停/上一首/下一首/朗读文本等。",
+      "执行智能设备的动作或红外遥控按键，例如洗衣机开始洗涤（start-wash）、暂停洗涤（pause-wash）、取消预约（cancel-appointment，可选 params 传入筒位如 [\"left\"]），涂鸦红外遥控按键（PowerOn、PowerOff、Volume+ 等），宠物喂食器出粮（pet-food-out），音箱播放/暂停/朗读文本等。",
     parameters: obj({
       target: str({ description: "设备 did 或名称" }),
       action: str({ description: "动作名/红外按键名（如 PowerOn、Volume+、Play、pet-food-out）或中文描述（如 开机、音量+、播放、立即出粮、下一首）" }),

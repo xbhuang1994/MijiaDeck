@@ -160,6 +160,22 @@ export const MIDEA_APPLIANCE_TYPES: Readonly<Record<number, MideaApplianceTypeIn
     supportsMetrics: true,
     metricFeatures: ["temperature", "target-temperature"],
   },
+  0xd9: {
+    code: 0xd9,
+    hex: "d9",
+    kind: "washing-machine",
+    label: "复式洗衣机",
+    supportsMetrics: false,
+    metricFeatures: [],
+  },
+  0xda: {
+    code: 0xda,
+    hex: "da",
+    kind: "washing-machine",
+    label: "波轮洗衣机",
+    supportsMetrics: false,
+    metricFeatures: [],
+  },
   0xdb: {
     code: 0xdb,
     hex: "db",

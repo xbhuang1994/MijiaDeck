@@ -1,6 +1,80 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // MijiaDeck: 美的家电 0xAA 串口应用层帧编解码（对齐 midea_ac_lan & mill1000/midea-msmart）
 
+import {
+  buildWasherLuaControlPayload,
+  buildWasherLuaQueries,
+  buildWasherQuery,
+  buildWasherSet,
+  buildWasherStatusResponseFrame,
+  decodeWasherProgress,
+  defaultWasherState,
+  encodeWasherProgramForLua,
+  formatWasherProgramLabel,
+  formatWasherProgressStage,
+  formatWasherRunningStatus,
+  getWasherProgramOptions,
+  isMideaWasherType,
+  normalizeWasherProgram,
+  parseWasherLuaStatus,
+  parseWasherResponse,
+  parseWasherRunningStatus,
+  resolveMideaWasherProfile,
+  resolveWasherTargetDrum,
+  syncActiveDrumToTopLevel,
+  WASHER_PROGRESS_OPTIONS,
+  WASHER_RUNNING_STATUS_OPTIONS,
+  type MideaWasherDrumKey,
+  type MideaWasherDrumLayout,
+  type MideaWasherDrumSpec,
+  type MideaWasherDrumState,
+  type MideaWasherLuaQueryPlan,
+  type MideaWasherMeta,
+  type MideaWasherProfile,
+  type MideaWasherProgressStage,
+  type MideaWasherRunningStatus,
+  type MideaWasherState,
+  type MideaWasherTypeCode,
+  type ParseWasherLuaContext,
+} from "./washer.ts";
+
+export {
+  buildWasherLuaControlPayload,
+  buildWasherLuaQueries,
+  buildWasherQuery,
+  buildWasherSet,
+  buildWasherStatusResponseFrame,
+  decodeWasherProgress,
+  defaultWasherState,
+  encodeWasherProgramForLua,
+  formatWasherProgramLabel,
+  formatWasherProgressStage,
+  formatWasherRunningStatus,
+  getWasherProgramOptions,
+  isMideaWasherType,
+  normalizeWasherProgram,
+  parseWasherLuaStatus,
+  parseWasherResponse,
+  parseWasherRunningStatus,
+  resolveMideaWasherProfile,
+  resolveWasherTargetDrum,
+  syncActiveDrumToTopLevel,
+  WASHER_PROGRESS_OPTIONS,
+  WASHER_RUNNING_STATUS_OPTIONS,
+  type MideaWasherDrumKey,
+  type MideaWasherDrumLayout,
+  type MideaWasherDrumSpec,
+  type MideaWasherDrumState,
+  type MideaWasherLuaQueryPlan,
+  type MideaWasherMeta,
+  type MideaWasherProfile,
+  type MideaWasherProgressStage,
+  type MideaWasherRunningStatus,
+  type MideaWasherState,
+  type MideaWasherTypeCode,
+  type ParseWasherLuaContext,
+};
+
 /**
  * 美的 CRC8-854 查找表（CRC-8/MAXIM-DOW，反射多项式 0x8C，与 `msmart/crc8.py` 逐字节一致）。
  */
@@ -929,9 +1003,13 @@ export type MideaApplianceState =
   | MideaPurifierState
   | MideaHumidifierState
   | MideaWaterHeaterState
+  | MideaWasherState
   | MideaGenericState;
 
-export function defaultApplianceState(deviceType: number): MideaApplianceState {
+export function defaultApplianceState(
+  deviceType: number,
+  meta?: MideaWasherMeta,
+): MideaApplianceState {
   switch (deviceType & 0xff) {
     case 0xac:
     case 0xcc:
@@ -947,6 +1025,10 @@ export function defaultApplianceState(deviceType: number): MideaApplianceState {
     case 0xe2:
     case 0xe3:
       return defaultWaterHeaterState(deviceType & 0xff);
+    case 0xd9:
+    case 0xda:
+    case 0xdb:
+      return defaultWasherState((deviceType & 0xff) as MideaWasherTypeCode, meta);
     default:
       return defaultGenericState(deviceType & 0xff);
   }
@@ -968,12 +1050,20 @@ export function buildApplianceQuery(deviceType: number): Buffer {
     case 0xe2:
     case 0xe3:
       return buildWaterHeaterQuery(deviceType & 0xff);
+    case 0xd9:
+    case 0xda:
+    case 0xdb:
+      return buildWasherQuery((deviceType & 0xff) as MideaWasherTypeCode);
     default:
       return buildGenericQuery(deviceType & 0xff);
   }
 }
 
-export function buildApplianceSet(deviceType: number, state: MideaApplianceState): Buffer {
+export function buildApplianceSet(
+  deviceType: number,
+  state: MideaApplianceState,
+  propName?: string,
+): Buffer {
   switch (state.kind) {
     case "ac":
       return buildAcSet(state, { deviceType: deviceType & 0xff });
@@ -987,6 +1077,8 @@ export function buildApplianceSet(deviceType: number, state: MideaApplianceState
       return buildHumidifierSet(state);
     case "water-heater":
       return buildWaterHeaterSet(state, deviceType & 0xff);
+    case "washer":
+      return buildWasherSet(state, propName);
     case "generic":
       return buildGenericPowerSet(deviceType & 0xff, state.power);
   }
@@ -1014,6 +1106,14 @@ export function parseApplianceResponse(
     case 0xe2:
     case 0xe3:
       return parseWaterHeaterResponse(frame);
+    case 0xd9:
+    case 0xda:
+    case 0xdb:
+      return parseWasherResponse(
+        type as MideaWasherTypeCode,
+        frame,
+        existing?.kind === "washer" ? existing : undefined,
+      );
     default:
       return parseGenericResponse(frame, type);
   }
@@ -1030,6 +1130,8 @@ const DEDICATED_BINARY_PROTOCOL_TYPES = new Set<number>([
   0xfd,
   0xe2,
   0xe3,
+  0xda,
+  0xdb,
 ]);
 
 /** 判断设备品类是否拥有专用 0xAA 二进制帧编解码器（其余品类在云端优先使用 Lua 接口）。 */
@@ -1038,9 +1140,17 @@ export function hasDedicatedBinaryProtocol(deviceType: number): boolean {
 }
 
 /** 构造 `/mjl/v1/device/status/lua/get` 的默认查询参数。 */
-export function buildLuaQueryParams(deviceType: number): Record<string, unknown> {
-  if ((deviceType & 0xff) === 0xcf) {
+export function buildLuaQueryParams(
+  deviceType: number,
+  meta?: MideaWasherMeta,
+): Record<string, unknown> {
+  const code = deviceType & 0xff;
+  if (code === 0xcf) {
     return { query_type: "0x11" };
+  }
+  if (code === 0xd9) {
+    const queries = buildWasherLuaQueries(code, meta);
+    return queries[0]?.query ?? { query_type: "db" };
   }
   return {};
 }
@@ -1150,12 +1260,21 @@ export function parseLuaApplianceStatus(
   deviceType: number,
   raw: Record<string, unknown>,
   existing?: MideaApplianceState | null,
+  washerContext?: ParseWasherLuaContext,
 ): MideaApplianceState | null {
   const keys = Object.keys(raw);
   if (keys.length === 0) {
     return null;
   }
   const type = deviceType & 0xff;
+  if (isMideaWasherType(type)) {
+    return parseWasherLuaStatus(
+      type,
+      raw,
+      existing?.kind === "washer" ? existing : undefined,
+      washerContext,
+    );
+  }
   const fallback =
     existing && existing.deviceType === type ? existing : defaultApplianceState(type);
 
@@ -1382,16 +1501,24 @@ export function parseLuaApplianceStatus(
             : {}),
       };
     }
+    case "washer":
+      return parseWasherLuaStatus(
+        type,
+        raw,
+        fallback,
+        washerContext,
+      );
     case "generic": {
       const directPower = parseLuaBool(raw["power"]);
       const dbPower = parseLuaBool(raw["db_power"]);
       const daPower = parseLuaBool(raw["da_power"]);
+      const dcPower = parseLuaBool(raw["dc_power"]);
       const ledPower = parseLuaBool(raw["led_power"]);
 
       let power: boolean | undefined = directPower;
       if (power === undefined) {
-        if (dbPower !== undefined || daPower !== undefined) {
-          power = Boolean(dbPower) || Boolean(daPower);
+        if (dbPower !== undefined || daPower !== undefined || dcPower !== undefined) {
+          power = Boolean(dbPower) || Boolean(daPower) || Boolean(dcPower);
         } else if (ledPower !== undefined) {
           power = ledPower;
         }
@@ -1420,11 +1547,12 @@ export function extractLuaExplicitPower(
     return direct;
   }
   const type = deviceType & 0xff;
-  if (!hasDedicatedBinaryProtocol(type)) {
+  if (!hasDedicatedBinaryProtocol(type) || type === 0xd9) {
     const dbPower = parseLuaBool(raw["db_power"]);
     const daPower = parseLuaBool(raw["da_power"]);
-    if (dbPower !== undefined || daPower !== undefined) {
-      return Boolean(dbPower) || Boolean(daPower);
+    const dcPower = parseLuaBool(raw["dc_power"]);
+    if (dbPower !== undefined || daPower !== undefined || dcPower !== undefined) {
+      return Boolean(dbPower) || Boolean(daPower) || Boolean(dcPower);
     }
     const ledPower = parseLuaBool(raw["led_power"]);
     if (ledPower !== undefined) {
@@ -1443,6 +1571,10 @@ export function buildLuaControlPayload(
   propName?: string,
   rawLuaStatus?: Record<string, unknown> | null,
 ): Record<string, unknown> | null {
+  if (nextState.kind === "washer") {
+    return buildWasherLuaControlPayload(nextState, propName, rawLuaStatus);
+  }
+
   const key = propName ? propName.trim().toLowerCase().replaceAll("_", "-") : "on";
   const type = deviceType & 0xff;
 

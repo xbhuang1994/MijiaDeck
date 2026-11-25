@@ -52,6 +52,8 @@ import { fetchLatestRelease, isNewer, type ReleaseInfo } from "../core/updateChe
 import {
   coercePropWriteValue,
   deviceCategoryLabel,
+  formatWasherCardMetrics,
+  isWasherDevice,
   type DeviceChannelState,
 } from "../core/deviceDetailModel.ts";
 import {
@@ -993,12 +995,18 @@ export function createRequestHandler(
           }
         }
 
-        const freshMetrics = formatMetricsText(
-          values["temperature"],
-          values["relative-humidity"] ?? values["humidity"],
-        );
+        const isWasher = isWasherDevice(device, props, actions);
+        const freshMetrics = isWasher
+          ? formatWasherCardMetrics(props, values)
+          : formatMetricsText(
+              values["temperature"],
+              values["relative-humidity"] ?? values["humidity"],
+            );
         if (freshMetrics && mw.metrics[did] !== freshMetrics) {
           mw.metrics[did] = freshMetrics;
+          stateMutated = true;
+        } else if (isWasher && !freshMetrics && mw.metrics[did]) {
+          delete mw.metrics[did];
           stateMutated = true;
         }
 
@@ -1142,11 +1150,24 @@ export function createRequestHandler(
 
         await runInJobs(runtime.jobs, () => runtime.service.writeProp(did, propName, coerced.value), 1);
 
-        // 回读设备最新状态（调亮度可能自动开灯、调风速档位可能切换模式等）
+        // 回读设备最新状态（调亮度可能自动开灯、调风速档位可能切换模式、洗衣机切换筒位/程序需联动刷新全量状态）
         let values: Record<string, unknown> = { [propName]: coerced.value };
         let powerPropName: string | null = null;
+        let readbackProps: PropInfo[] = cachedDetail?.props ?? [];
+        const device = runtime.mainWindow.allDevices.find((d) => d.did === did);
+        const isWasher = device
+          ? isWasherDevice(device, cachedDetail?.props)
+          : Boolean(
+              cachedDetail?.props.some(
+                (p) => p.service === "washer-status" || p.name === "drum-location",
+              ),
+            );
         try {
-          const detail = cachedDetail ?? (await runInJobs(runtime.jobs, () => runtime.service.deviceDetail(did), 2));
+          const detail =
+            !cachedDetail || propName === "drum-location" || propName === "location"
+              ? await runInJobs(runtime.jobs, () => runtime.service.deviceDetail(did), 2)
+              : cachedDetail;
+          readbackProps = detail.props;
           const powerProp = findPowerProp(detail.props);
           powerPropName = powerProp?.name ?? null;
           const controls = lightControls(detail.props);
@@ -1166,7 +1187,8 @@ export function createRequestHandler(
             if (
               p.readable &&
               !isSensitivePropertyName(p.name) &&
-              (p.name === "volume" ||
+              (isWasher ||
+                p.name === "volume" ||
                 p.name.startsWith("mute") ||
                 p.name === "mode" ||
                 p.name === "status" ||
@@ -1192,18 +1214,21 @@ export function createRequestHandler(
           values = { [propName]: coerced.value };
         }
 
-        const device = runtime.mainWindow.allDevices.find((d) => d.did === did);
         const powerVal = powerPropName ? values[powerPropName] : values["on"];
         if (typeof powerVal === "boolean" && (!device || supportsCardPower(device) || isCamera(device))) {
           runtime.mainWindow.applyPowerState(did, powerVal);
           runtime.mainWindow.updateTrayDevices();
         }
-        const freshMetrics = formatMetricsText(
-          values["temperature"],
-          values["relative-humidity"] ?? values["humidity"],
-        );
+        const freshMetrics = isWasher
+          ? formatWasherCardMetrics(readbackProps, values)
+          : formatMetricsText(
+              values["temperature"],
+              values["relative-humidity"] ?? values["humidity"],
+            );
         if (freshMetrics) {
           runtime.mainWindow.metrics[did] = freshMetrics;
+        } else if (isWasher && runtime.mainWindow.metrics[did]) {
+          delete runtime.mainWindow.metrics[did];
         }
         if (runtime.mainWindow.tray !== null && runtime.mainWindow.tray.quick.audioBar.did === did) {
           runtime.mainWindow.tray.quick.audioBar.refreshAfterCommand(did);
@@ -1255,11 +1280,19 @@ export function createRequestHandler(
           if (prioritized.length > 0) {
             values = await runInJobs(
               runtime.jobs,
-              () => runtime.service.readProps(did, prioritized.slice(0, 30)),
+              () => runtime.service.readProps(did, prioritized.slice(0, 60)),
               2,
             );
           }
           const device = runtime.mainWindow.allDevices.find((d) => d.did === did);
+          if (device && isWasherDevice(device, detail.props, detail.actions)) {
+            const washerMetrics = formatWasherCardMetrics(detail.props, values);
+            if (washerMetrics) {
+              runtime.mainWindow.metrics[did] = washerMetrics;
+            } else if (runtime.mainWindow.metrics[did]) {
+              delete runtime.mainWindow.metrics[did];
+            }
+          }
           if (
             powerProp &&
             typeof values[powerProp.name] !== "boolean" &&

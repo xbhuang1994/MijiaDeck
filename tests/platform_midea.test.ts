@@ -1512,7 +1512,11 @@ describe("MideaPlatformProvider 端到端集成、降级回退与凭据脱敏", 
     await provider.setPowerState("210006741641007", false);
     expect(luaControls).toEqual([
       { applianceCode: "210006738408610", control: { power: "off" }, hasStatus: true },
-      { applianceCode: "210006741790988", control: { db_power: "on" }, hasStatus: true },
+      {
+        applianceCode: "210006741790988",
+        control: { bucket: "db", db_location: 2, db_power: "on" },
+        hasStatus: true,
+      },
       { applianceCode: "210006741641007", control: { power: "off" }, hasStatus: true },
     ]);
     expect(luaStateByCode["210006741641007"]!["power"]).toBe("off");

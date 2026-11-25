@@ -54,12 +54,17 @@ import {
   buildApplianceSet,
   buildLuaControlPayload,
   buildLuaQueryParams,
+  buildWasherLuaQueries,
   defaultApplianceState,
   extractLuaExplicitPower,
+  isMideaWasherType,
   parseApplianceResponse,
   parseLuaApplianceStatus,
   parseMideaFrame,
+  resolveWasherTargetDrum,
   type MideaApplianceState,
+  type MideaWasherMeta,
+  type ParseWasherLuaContext,
 } from "./protocols.ts";
 
 export const MIDEA_PLATFORM_METADATA: PlatformMetadata = {
@@ -164,6 +169,7 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
   private _appliances = new Map<string, MideaApplianceRecord>();
   private _states = new Map<string, MideaApplianceState>();
   private _luaStatuses = new Map<string, Record<string, unknown>>();
+  private _luaDrumStatuses = new Map<string, Record<string, unknown>>();
   private _acPreferB0 = new Set<string>();
   private _tokenCandidates = new Map<string, MideaTokenKeyPair[]>();
   private _loadingDevicesPromise: Promise<DeviceInfo[]> | null = null;
@@ -410,6 +416,7 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
     this._appliances.clear();
     this._states.clear();
     this._luaStatuses.clear();
+    this._luaDrumStatuses.clear();
     this._acPreferB0.clear();
     this._tokenCandidates.clear();
 
@@ -452,6 +459,7 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
     this._appliances.clear();
     this._states.clear();
     this._luaStatuses.clear();
+    this._luaDrumStatuses.clear();
     this._acPreferB0.clear();
     this._tokenCandidates.clear();
 
@@ -649,6 +657,13 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
     };
   }
 
+  private _washerMeta(record: MideaApplianceRecord): MideaWasherMeta {
+    return {
+      ...(record.sn8 ? { sn8: record.sn8 } : {}),
+      ...(record.model ? { modelNumber: record.model } : {}),
+    };
+  }
+
   private _canUseLan(record: MideaApplianceRecord): boolean {
     return (
       Boolean(record.ip) &&
@@ -738,7 +753,7 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
     nextState: MideaApplianceState,
     propName?: string,
   ): Array<{ frame: Buffer; isB0: boolean }> {
-    const legacyFrame = buildApplianceSet(record.type, nextState);
+    const legacyFrame = buildApplianceSet(record.type, nextState, propName);
     if (nextState.kind === "ac") {
       const b0Frame = buildAcPropertySet(nextState, propName, { deviceType: record.type });
       if (b0Frame) {
@@ -831,15 +846,69 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
   private async _queryViaLua(
     cloudClient: MideaCloudClient,
     record: MideaApplianceRecord,
+    options?: { allDrums?: boolean },
   ): Promise<MideaApplianceState | null> {
-    const raw = await cloudClient.getLuaStatus(
-      record.id,
-      buildLuaQueryParams(record.type),
-      this._luaMeta(record),
-    );
-    const parsed = parseLuaApplianceStatus(record.type, raw, this._states.get(record.id));
+    const washerMeta = isMideaWasherType(record.type) ? this._washerMeta(record) : undefined;
+    const typeCode = record.type & 0xff;
+
+    // 0xD9 复式/三筒洗衣机：在详情与刷新时并行拉取每个筒的实时状态（避免误发不兼容的 da/dc 桶）
+    if (typeCode === 0xd9 && options?.allDrums) {
+      const plans = buildWasherLuaQueries(typeCode, washerMeta);
+      const settled = await Promise.allSettled(
+        plans.map((plan) =>
+          cloudClient.getLuaStatus(record.id, plan.query, this._luaMeta(record)),
+        ),
+      );
+      let accState: MideaApplianceState | null | undefined = this._states.get(record.id);
+      let anyParsed = false;
+      let firstErr: unknown;
+
+      for (let i = 0; i < plans.length; i++) {
+        const plan = plans[i]!;
+        const result = settled[i]!;
+        if (result.status === "rejected") {
+          if (firstErr === undefined) firstErr = result.reason;
+          continue;
+        }
+        const raw = result.value;
+        const ctx: ParseWasherLuaContext = {
+          meta: washerMeta,
+          drumKey: plan.drumKey,
+          bucket: plan.bucket,
+          location: plan.location,
+        };
+        const parsed = parseLuaApplianceStatus(record.type, raw, accState, ctx);
+        if (parsed) {
+          anyParsed = true;
+          accState = parsed;
+          this._luaDrumStatuses.set(`${record.id}:${plan.drumKey}`, raw);
+          if (i === 0 || (parsed.kind === "washer" && parsed.activeDrum === plan.drumKey)) {
+            this._luaStatuses.set(record.id, raw);
+          }
+        }
+      }
+
+      if (anyParsed && accState) {
+        this._states.set(record.id, accState);
+        return accState;
+      }
+      if (firstErr !== undefined) {
+        throw firstErr;
+      }
+      return null;
+    }
+
+    const queryParams = buildLuaQueryParams(record.type, washerMeta);
+    const raw = await cloudClient.getLuaStatus(record.id, queryParams, this._luaMeta(record));
+    const washerCtx: ParseWasherLuaContext | undefined = washerMeta
+      ? { meta: washerMeta }
+      : undefined;
+    const parsed = parseLuaApplianceStatus(record.type, raw, this._states.get(record.id), washerCtx);
     if (parsed) {
       this._luaStatuses.set(record.id, raw);
+      if (parsed.kind === "washer") {
+        this._luaDrumStatuses.set(`${record.id}:${parsed.activeDrum}`, raw);
+      }
       this._states.set(record.id, parsed);
       return parsed;
     }
@@ -849,14 +918,16 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
   private async _queryViaCloud(
     cloudClient: MideaCloudClient,
     record: MideaApplianceRecord,
+    options?: { allDrums?: boolean },
   ): Promise<MideaApplianceState> {
+    const washerMeta = isMideaWasherType(record.type) ? this._washerMeta(record) : undefined;
     // MAS 云端（美的美居 / MSmartHome）优先使用官方 Lua 状态接口：
-    // 由云端按设备具体型号/SN8 编解码，兼容旧协议 0xC0 与新协议 0xB0/0x7E（如 220133xx/222517xx 空调），
-    // 并同时缓存完整 Lua 状态供后续 /lua/control 携带 status 上下文。
+    // 由云端按设备具体型号/SN8 编解码，兼容旧协议 0xC0 与新协议 0xB0/0x7E（如 220133xx/222517xx 空调）
+    // 以及多筒复式洗衣机 0xD9 / 滚筒 0xDB / 波轮 0xDA，并同时缓存完整 Lua 状态供后续 /lua/control 携带 status 上下文。
     if (cloudClient.supportsLuaCloud) {
       let luaErr: unknown;
       try {
-        const parsedLua = await this._queryViaLua(cloudClient, record);
+        const parsedLua = await this._queryViaLua(cloudClient, record, options);
         if (parsedLua) {
           return parsedLua;
         }
@@ -878,7 +949,8 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
       if (luaErr) {
         throw luaErr;
       }
-      const existing = this._states.get(record.id) ?? defaultApplianceState(record.type);
+      const existing =
+        this._states.get(record.id) ?? defaultApplianceState(record.type, washerMeta);
       this._states.set(record.id, existing);
       return existing;
     }
@@ -891,7 +963,8 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
     if (parsed) {
       return parsed;
     }
-    const existing = this._states.get(record.id) ?? defaultApplianceState(record.type);
+    const existing =
+      this._states.get(record.id) ?? defaultApplianceState(record.type, washerMeta);
     this._states.set(record.id, existing);
     return existing;
   }
@@ -903,50 +976,85 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
     propName?: string,
   ): Promise<MideaApplianceState> {
     const verifyPower = isPowerPropName(propName);
+    const washerMeta = isMideaWasherType(record.type) ? this._washerMeta(record) : undefined;
+    const washerTarget =
+      nextState.kind === "washer" ? resolveWasherTargetDrum(nextState, propName) : null;
+    const drumStatusKey = washerTarget ? `${record.id}:${washerTarget.drumKey}` : null;
+    const getCachedLuaStatus = (): Record<string, unknown> | undefined =>
+      (drumStatusKey ? this._luaDrumStatuses.get(drumStatusKey) : undefined) ??
+      this._luaStatuses.get(record.id);
 
     const runLuaControl = async (): Promise<MideaApplianceState> => {
-      // 若尚未缓存该设备的 Lua 状态，先尽力读取一次以便旧 0x40 协议 Lua 脚本保留当前模式/温度等上下文
-      if (!this._luaStatuses.has(record.id)) {
+      // 若尚未缓存该设备/目标筒的 Lua 状态，先尽力读取一次以便 Lua 脚本保留当前模式/温度/筒位等上下文
+      if (!getCachedLuaStatus()) {
         try {
-          await this._queryViaLua(cloudClient, record);
+          await this._queryViaLua(cloudClient, record, {
+            allDrums: (record.type & 0xff) === 0xd9,
+          });
         } catch {
           // 读取失败不影响直接下发控制指令
         }
       }
+      const cachedStatus = getCachedLuaStatus();
       const luaControl = buildLuaControlPayload(
         record.type,
         nextState,
         propName,
-        this._luaStatuses.get(record.id),
+        cachedStatus,
       );
       if (!luaControl) {
         throw new ServiceError(`美的云端 Lua 暂不支持控制属性「${propName ?? "on"}」`);
       }
 
       const luaResp = await cloudClient.sendLuaControl(record.id, luaControl, {
-        status: this._luaStatuses.get(record.id),
+        status: cachedStatus,
         meta: this._luaMeta(record),
       });
-      const prevLua = this._luaStatuses.get(record.id) ?? {};
+      const prevLua = cachedStatus ?? {};
       let finalLua =
         Object.keys(luaResp).length > 0 ? { ...prevLua, ...luaResp } : { ...prevLua, ...luaControl };
+      const washerCtx: ParseWasherLuaContext | undefined = washerTarget
+        ? {
+            meta: washerMeta,
+            drumKey: washerTarget.drumKey,
+            bucket: washerTarget.spec.bucket,
+            location: washerTarget.spec.location,
+          }
+        : undefined;
       let parsedState =
-        parseLuaApplianceStatus(record.type, finalLua, nextState) ?? nextState;
+        parseLuaApplianceStatus(record.type, finalLua, nextState, washerCtx) ?? nextState;
 
       if (verifyPower) {
+        const expectedPower =
+          nextState.kind === "washer" && washerTarget
+            ? (nextState.drums[washerTarget.drumKey]?.power ?? nextState.power)
+            : nextState.power;
         let reportedPower = extractLuaExplicitPower(record.type, luaResp);
-        if (reportedPower !== undefined && reportedPower !== nextState.power) {
+        if (reportedPower !== undefined && reportedPower !== expectedPower) {
           // 偶发回包为切换前快照时，再读一次实时状态核验，避免误报或漏报
           try {
+            const verifyQuery =
+              washerTarget && (record.type & 0xff) === 0xd9
+                ? washerTarget.spec.bucket === "dc"
+                  ? { query_type: "dc", dc_location: washerTarget.spec.location }
+                  : washerTarget.spec.bucket === "da"
+                    ? { query_type: "da", da_location: washerTarget.spec.location }
+                    : { query_type: "db", db_location: washerTarget.spec.location }
+                : buildLuaQueryParams(record.type, washerMeta);
             const verifyRaw = await cloudClient.getLuaStatus(
               record.id,
-              buildLuaQueryParams(record.type),
+              verifyQuery,
               this._luaMeta(record),
             );
             const verifyPowerVal = extractLuaExplicitPower(record.type, verifyRaw);
             if (verifyPowerVal !== undefined) {
               reportedPower = verifyPowerVal;
-              const verifiedState = parseLuaApplianceStatus(record.type, verifyRaw, parsedState);
+              const verifiedState = parseLuaApplianceStatus(
+                record.type,
+                verifyRaw,
+                parsedState,
+                washerCtx,
+              );
               if (verifiedState) {
                 finalLua = verifyRaw;
                 parsedState = verifiedState;
@@ -955,17 +1063,23 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
           } catch {
             // 核验查询失败时沿用控制回包中的实际状态
           }
-          if (reportedPower !== nextState.power) {
+          if (reportedPower !== expectedPower) {
+            if (drumStatusKey) this._luaDrumStatuses.set(drumStatusKey, finalLua);
             this._luaStatuses.set(record.id, finalLua);
             this._states.set(record.id, parsedState);
             throw new ServiceError(
-              `美的设备「${record.name}」未响应${nextState.power ? "开机" : "关机"}指令，当前仍为${reportedPower ? "开启" : "关闭"}状态`,
+              `美的设备「${record.name}」未响应${expectedPower ? "开机" : "关机"}指令，当前仍为${reportedPower ? "开启" : "关闭"}状态`,
             );
           }
         }
       }
 
-      this._luaStatuses.set(record.id, finalLua);
+      if (drumStatusKey) {
+        this._luaDrumStatuses.set(drumStatusKey, finalLua);
+      }
+      if (!washerTarget || parsedState.kind !== "washer" || parsedState.activeDrum === washerTarget.drumKey) {
+        this._luaStatuses.set(record.id, finalLua);
+      }
       this._states.set(record.id, parsedState);
       return parsedState;
     };
@@ -1002,8 +1116,7 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
 
     const canUseLua =
       cloudClient.supportsLuaCloud &&
-      buildLuaControlPayload(record.type, nextState, propName, this._luaStatuses.get(record.id)) !==
-        null;
+      buildLuaControlPayload(record.type, nextState, propName, getCachedLuaStatus()) !== null;
 
     if (canUseLua) {
       let luaErr: unknown;
@@ -1022,20 +1135,25 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
     return await runTransparentWrite();
   }
 
-  private async _queryState(record: MideaApplianceRecord): Promise<MideaApplianceState> {
+  private async _queryState(
+    record: MideaApplianceRecord,
+    options?: { allDrums?: boolean },
+  ): Promise<MideaApplianceState> {
     const canLan = this._canUseLan(record);
     const cloudClient = this._ensureCloudClient();
     const queryFrame = buildApplianceQuery(record.type);
+    const washerMeta = isMideaWasherType(record.type) ? this._washerMeta(record) : undefined;
 
     if (canLan) {
       try {
         const reply = await this._sendViaLan(record, queryFrame);
-        const existing = this._states.get(record.id) ?? defaultApplianceState(record.type);
+        const existing =
+          this._states.get(record.id) ?? defaultApplianceState(record.type, washerMeta);
         return this._parseAndStoreFrame(record, reply, existing) ?? existing;
       } catch (lanErr) {
         if (this._config.mode === "hybrid" && cloudClient) {
           try {
-            return await this._queryViaCloud(cloudClient, record);
+            return await this._queryViaCloud(cloudClient, record, options);
           } catch (cloudErr) {
             const safeMsg = sanitizeErrorMessage(cloudErr, this._activeSecrets());
             throw new ServiceError(`美的云端查询失败：${safeMsg}`);
@@ -1048,12 +1166,13 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
 
     if (cloudClient) {
       try {
-        return await this._queryViaCloud(cloudClient, record);
+        return await this._queryViaCloud(cloudClient, record, options);
       } catch (cloudErr) {
         if (record.ip) {
           try {
             const reply = await this._sendViaLan(record, queryFrame);
-            const existing = this._states.get(record.id) ?? defaultApplianceState(record.type);
+            const existing =
+              this._states.get(record.id) ?? defaultApplianceState(record.type, washerMeta);
             return this._parseAndStoreFrame(record, reply, existing) ?? existing;
           } catch {
             // 局域网回退也失败，返回原始云端错误
@@ -1113,12 +1232,13 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
 
   async deviceDetail(nativeDid: string): Promise<DeviceDetail> {
     const record = await this._requireAppliance(nativeDid);
+    const washerMeta = isMideaWasherType(record.type) ? this._washerMeta(record) : undefined;
     let state = this._states.get(record.id) ?? null;
     if (!state) {
       try {
-        state = await this._queryState(record);
+        state = await this._queryState(record, { allDrums: true });
       } catch {
-        state = defaultApplianceState(record.type);
+        state = defaultApplianceState(record.type, washerMeta);
       }
     }
     return mapMideaDeviceToDetail(record, state);
@@ -1126,13 +1246,13 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
 
   async readProp(nativeDid: string, name: string): Promise<unknown> {
     const record = await this._requireAppliance(nativeDid);
-    const state = await this._queryState(record);
+    const state = await this._queryState(record, { allDrums: true });
     return readMideaStateProp(state, name);
   }
 
   async readProps(nativeDid: string, names: string[]): Promise<Record<string, unknown>> {
     const record = await this._requireAppliance(nativeDid);
-    const state = await this._queryState(record);
+    const state = await this._queryState(record, { allDrums: true });
     const out: Record<string, unknown> = {};
     for (const name of names) {
       out[name] = readMideaStateProp(state, name);
@@ -1143,29 +1263,72 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
   async writeProp(nativeDid: string, name: string, value: unknown): Promise<void> {
     this._requireControlAccess();
     const record = await this._requireAppliance(nativeDid);
+    const washerMeta = isMideaWasherType(record.type) ? this._washerMeta(record) : undefined;
     let current = this._states.get(record.id);
     if (!current) {
       try {
-        current = await this._queryState(record);
+        current = await this._queryState(record, { allDrums: (record.type & 0xff) === 0xd9 });
       } catch {
-        current = defaultApplianceState(record.type);
+        current = defaultApplianceState(record.type, washerMeta);
       }
     }
     const nextState = applyMideaStateProp(current, name, value);
+    const normProp = name.trim().toLowerCase().replaceAll("_", "-");
+    if (nextState.kind === "washer" && (normProp === "drum-location" || normProp === "location")) {
+      this._states.set(record.id, nextState);
+      const cloudClient = this._ensureCloudClient();
+      const targetKey = nextState.activeDrum;
+      if (cloudClient?.supportsLuaCloud && !this._luaDrumStatuses.has(`${record.id}:${targetKey}`)) {
+        try {
+          await this._queryViaLua(cloudClient, record, { allDrums: true });
+        } catch {
+          // 保留本地已切换的目标筒选择
+        }
+      }
+      return;
+    }
     await this._writeState(record, nextState, name);
   }
 
-  async runAction(nativeDid: string, name: string, _params?: unknown): Promise<void> {
+  private _extractActionDrumKey(params?: unknown): string | null {
+    if (Array.isArray(params) && typeof params[0] === "string" && params[0].trim()) {
+      return params[0].trim().toLowerCase();
+    }
+    if (isPlainRecord(params) && typeof params["drum"] === "string" && params["drum"].trim()) {
+      return params["drum"].trim().toLowerCase();
+    }
+    return null;
+  }
+
+  async runAction(nativeDid: string, name: string, params?: unknown): Promise<void> {
     this._requireControlAccess();
     const record = await this._requireAppliance(nativeDid);
     const normalized = name.trim().toLowerCase().replaceAll("_", "-");
     if (normalized === "refresh-status" || normalized === "refresh") {
-      await this._queryState(record);
+      await this._queryState(record, { allDrums: true });
       return;
     }
     if (normalized === "toggle-power" || normalized === "toggle") {
       await this.togglePower(nativeDid);
       return;
+    }
+    if (isMideaWasherType(record.type)) {
+      const targetDrum = this._extractActionDrumKey(params);
+      const scopedProp = (prop: string): string =>
+        targetDrum ? `drum-${targetDrum}-${prop}` : prop;
+
+      if (normalized === "start-wash" || normalized === "start") {
+        await this.writeProp(nativeDid, scopedProp("control-status"), true);
+        return;
+      }
+      if (normalized === "pause-wash" || normalized === "pause") {
+        await this.writeProp(nativeDid, scopedProp("control-status"), false);
+        return;
+      }
+      if (normalized === "cancel-appointment") {
+        await this.writeProp(nativeDid, scopedProp("appointment-time"), 0);
+        return;
+      }
     }
     throw new ServiceError(`美的设备不支持动作「${name}」`);
   }
@@ -1187,12 +1350,13 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
   async togglePower(nativeDid: string): Promise<boolean> {
     this._requireControlAccess();
     const record = await this._requireAppliance(nativeDid);
+    const washerMeta = isMideaWasherType(record.type) ? this._washerMeta(record) : undefined;
     let current = this._states.get(record.id);
     if (!current) {
       try {
         current = await this._queryState(record);
       } catch {
-        current = defaultApplianceState(record.type);
+        current = defaultApplianceState(record.type, washerMeta);
       }
     }
     const targetPower = !current.power;

@@ -4006,6 +4006,367 @@ button:disabled {
   border-top: 1px solid var(--c-line);
 }
 
+/* Washing Machine Multi-Drum & Cycle Control Workbench Hero */
+
+.dd-washer-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dd-washer-drum-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.dd-washer-drum-grid.cols-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.dd-washer-drum-card {
+  text-align: left;
+  background: var(--c-card);
+  border: 1px solid var(--c-line);
+  border-radius: 11px;
+  padding: 11px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  transition: background 0.14s ease, border-color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.dd-washer-drum-card:hover:not(:disabled) {
+  background: var(--c-btn-hover);
+  border-color: var(--c-accent-border);
+}
+
+.dd-washer-drum-card.is-active {
+  background: var(--c-accent-surface);
+  border-color: var(--c-theme);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--c-theme) 35%, transparent);
+}
+
+.dd-washer-drum-card:disabled {
+  opacity: 0.55;
+}
+
+.dd-washer-drum-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.dd-washer-drum-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--c-text-primary);
+}
+
+.dd-washer-drum-pill {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--c-surface);
+  color: var(--c-text-secondary);
+  border: 1px solid var(--c-line);
+  white-space: nowrap;
+}
+
+.dd-washer-drum-pill.is-start {
+  background: var(--c-theme);
+  color: var(--c-on-theme-text);
+  border-color: var(--c-theme);
+}
+
+.dd-washer-drum-pill.is-pause,
+.dd-washer-drum-pill.is-delay {
+  background: var(--c-warn-bg);
+  color: var(--c-warn-text);
+  border-color: var(--c-warn-border);
+}
+
+.dd-washer-drum-pill.is-fault {
+  background: color-mix(in srgb, var(--c-danger) 16%, var(--c-card));
+  color: var(--c-error-text);
+  border-color: color-mix(in srgb, var(--c-danger) 45%, var(--c-line));
+}
+
+.dd-washer-drum-role {
+  font-size: 11.5px;
+  color: var(--c-text-secondary);
+}
+
+.dd-washer-drum-foot {
+  margin-top: 2px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.dd-washer-drum-prog {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--c-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dd-washer-drum-time {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--c-theme-dim);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.dd-washer-drum-warn {
+  margin-top: 2px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--c-warn-text);
+}
+
+.dd-washer-hero-card {
+  background: var(--c-card);
+  border: 1px solid var(--c-accent-border);
+  border-radius: 12px;
+  padding: 15px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+}
+
+.dd-washer-hero-card.is-running {
+  border-color: var(--c-theme);
+}
+
+.dd-washer-alerts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dd-washer-alert {
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 7px 11px;
+  border-radius: 8px;
+}
+
+.dd-washer-alert.is-warn {
+  background: var(--c-warn-bg);
+  color: var(--c-warn-text);
+  border: 1px solid var(--c-warn-border);
+}
+
+.dd-washer-alert.is-danger {
+  background: color-mix(in srgb, var(--c-danger) 14%, var(--c-card));
+  color: var(--c-error-text);
+  border: 1px solid color-mix(in srgb, var(--c-danger) 42%, var(--c-line));
+}
+
+.dd-washer-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.dd-washer-status-left {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.dd-washer-badge-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.dd-washer-drum-tag {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--c-surface);
+  color: var(--c-text-primary);
+  border: 1px solid var(--c-line);
+}
+
+.dd-washer-status-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--c-surface);
+  color: var(--c-text-secondary);
+  border: 1px solid var(--c-line);
+}
+
+.dd-washer-status-badge.is-running {
+  background: var(--c-theme);
+  color: var(--c-on-theme-text);
+  border-color: var(--c-theme);
+}
+
+.dd-washer-status-badge.is-paused,
+.dd-washer-status-badge.is-delay {
+  background: var(--c-warn-bg);
+  color: var(--c-warn-text);
+  border-color: var(--c-warn-border);
+}
+
+.dd-washer-status-badge.is-fault {
+  background: color-mix(in srgb, var(--c-danger) 16%, var(--c-card));
+  color: var(--c-error-text);
+  border-color: color-mix(in srgb, var(--c-danger) 45%, var(--c-line));
+}
+
+.dd-washer-stage-tag {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--c-theme-dim);
+}
+
+.dd-washer-program-title {
+  font-size: 19px;
+  font-weight: 700;
+  color: var(--c-text-primary);
+  line-height: 1.25;
+}
+
+.dd-washer-param-summary {
+  font-size: 12px;
+  color: var(--c-text-secondary);
+  line-height: 1.45;
+}
+
+.dd-washer-countdown {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  flex-shrink: 0;
+  padding: 8px 14px;
+  border-radius: 10px;
+  background: var(--c-surface);
+  border: 1px solid var(--c-line);
+  min-width: 96px;
+}
+
+.dd-washer-countdown-num {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--c-text-primary);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+}
+
+.dd-washer-countdown-unit {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--c-text-secondary);
+}
+
+.dd-washer-countdown-label {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--c-text-secondary);
+}
+
+.dd-washer-action-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.dd-washer-main-btn {
+  min-width: 132px;
+  height: 38px;
+  padding: 0 20px;
+  border-radius: 9px;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.dd-washer-main-btn.is-pause {
+  border-color: var(--c-warn-border);
+  color: var(--c-warn-text);
+  background: var(--c-warn-bg);
+}
+
+.dd-washer-main-btn.is-pause:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--c-warn-bg) 78%, var(--c-warn-text) 22%);
+}
+
+.dd-washer-cancel-btn {
+  height: 38px;
+  padding: 0 16px;
+  border-radius: 9px;
+  font-size: 13px;
+}
+
+.dd-washer-program-block {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding-top: 11px;
+  border-top: 1px solid var(--c-line);
+}
+
+.dd-washer-program-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.dd-washer-program-label {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--c-text-secondary);
+}
+
+.dd-washer-program-select {
+  min-width: 170px;
+  max-width: 240px;
+}
+
+.dd-washer-program-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+@media (max-width: 560px) {
+  .dd-washer-drum-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .dd-washer-status-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .dd-washer-countdown {
+    align-items: flex-start;
+  }
+}
+
 /* Writable Control Rows */
 
 .dd-control-list {

@@ -389,6 +389,19 @@ export function formatPropertyValue(prop: PropInfo, rawValue: unknown): string {
     return enumLabel;
   }
   if (prop.type === "bool" || typeof rawValue === "boolean") {
+    const norm = prop.name.toLowerCase();
+    if (norm === "door-opened") {
+      return rawValue ? "已开启" : "已关好";
+    }
+    if (norm === "detergent-lack" || norm === "softener-lack" || norm.endsWith("-detergent-lack")) {
+      return rawValue ? "不足，请补充" : "充足";
+    }
+    if (norm === "water-overheating" || norm === "drying-tunnel-overheating") {
+      return rawValue ? "过热告警" : "正常";
+    }
+    if (norm === "remote-control-flag") {
+      return rawValue ? "已启用" : "未开启";
+    }
     return rawValue ? "已开启" : "已关闭";
   }
   if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
@@ -438,6 +451,10 @@ export function formatPropertyValue(prop: PropInfo, rawValue: unknown): string {
         ? `${skipped.dateText} · 跳过 #${skipped.skippedIds.join(", #")}`
         : `${skipped.dateText}（无跳过）`;
     }
+  }
+  if (prop.name === "error-code") {
+    const codeStr = String(rawValue).trim();
+    return !codeStr || codeStr === "0" ? "无故障" : codeStr;
   }
   const str = String(rawValue).trim();
   return str || "—";
@@ -620,6 +637,90 @@ export function isIrRemoteDevice(
     specType.includes(":device:projector:") ||
     specType.includes(":device:dvd-player:")
   );
+}
+
+/** 判断设备是否为洗衣机/洗烘一体机（兼容型号、MIoT spec_type 与属性/动作特征）。 */
+export function isWasherDevice(
+  device: Pick<DeviceInfo, "model" | "spec_type">,
+  props?: readonly PropInfo[],
+  actions?: readonly ActionInfo[],
+): boolean {
+  const kinds = extractDeviceKinds(device as DeviceInfo);
+  if (kinds.has("washer") || kinds.has("washing-machine") || kinds.has("dryer")) {
+    return true;
+  }
+  if (
+    props?.some(
+      (p) =>
+        p.service === "washer-status" ||
+        p.name === "drum-location" ||
+        p.name === "dehydration-speed" ||
+        p.name === "running-status",
+    )
+  ) {
+    return true;
+  }
+  if (actions?.some((a) => a.name === "start-wash" || a.name === "pause-wash")) {
+    return true;
+  }
+  return false;
+}
+
+/** 根据洗衣机实时属性生成简洁卡片摘要（避免将洗涤水温误显示为室内温度）。 */
+export function formatWasherCardMetrics(
+  props: readonly PropInfo[],
+  values: Record<string, unknown>,
+): string | null {
+  const drumProp = props.find((p) => p.name === "drum-location");
+  if (drumProp?.value_list && drumProp.value_list.length > 1) {
+    const runningParts: string[] = [];
+    let pausedText: string | null = null;
+    let delayText: string | null = null;
+    let endText: string | null = null;
+    for (const opt of drumProp.value_list) {
+      const key = String(opt.value);
+      const label = (opt.desc_zh_cn || opt.description || key).split("·")[0]?.trim() || key;
+      const st = String(values[`drum-${key}-status`] ?? "");
+      const rem = values[`drum-${key}-remain-time`];
+      const remNum = typeof rem === "number" && Number.isFinite(rem) ? Math.round(rem) : 0;
+      if (st === "start") {
+        runningParts.push(remNum > 0 ? `${label} ${remNum}分` : `${label} 运行中`);
+      } else if (st === "pause" && !pausedText) {
+        pausedText = remNum > 0 ? `${label} 暂停 · 剩${remNum}分` : `${label} 已暂停`;
+      } else if (st === "delay" && !delayText) {
+        delayText = `${label} 预约中`;
+      } else if (st === "end" && !endText) {
+        endText = `${label} 已完成`;
+      }
+    }
+    if (runningParts.length > 0) return runningParts.join(" · ");
+    return pausedText ?? delayText ?? endText ?? null;
+  }
+
+  const status = String(values["running-status"] ?? "");
+  const remRaw = values["remain-time"];
+  const rem = typeof remRaw === "number" && Number.isFinite(remRaw) ? Math.round(remRaw) : 0;
+  if (status === "start") {
+    const progressProp = props.find((p) => p.name === "progress");
+    const progressLabel = resolveEnumLabel(values["progress"], progressProp?.value_list);
+    const stage = progressLabel && progressLabel !== "未运行" ? progressLabel : "洗涤中";
+    return rem > 0 ? `${stage} · 剩 ${rem} 分` : stage;
+  }
+  if (status === "pause") {
+    return rem > 0 ? `已暂停 · 剩 ${rem} 分` : "已暂停";
+  }
+  if (status === "delay") {
+    const appt = values["appointment-time"];
+    return typeof appt === "number" && appt > 0 ? `预约中 · ${Math.round(appt)} 分` : "预约中";
+  }
+  if (status === "end") {
+    return "已完成";
+  }
+  if (status === "fault") {
+    const err = String(values["error-code"] ?? "").trim();
+    return err && err !== "0" ? `故障 ${err}` : "故障告警";
+  }
+  return null;
 }
 
 /** 判断设备是否为宠物喂食器（兼容型号、MIoT spec_type 与动作特征）。 */
