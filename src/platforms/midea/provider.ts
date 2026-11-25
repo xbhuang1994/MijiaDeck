@@ -10,6 +10,7 @@ import {
   redactSecrets,
   savePlatformSection,
   summarizeMideaConfig,
+  type MideaCloudSessionCache,
   type MideaLocalDeviceEntry,
   type MideaPlatformConfig,
 } from "../configStore.ts";
@@ -22,6 +23,8 @@ import type {
 } from "../types.ts";
 import {
   MideaCloudClient,
+  MideaCloudError,
+  type MideaCloudSession,
   type MideaLuaApplianceMeta,
   type MideaTokenKeyPair,
 } from "./cloudClient.ts";
@@ -92,6 +95,9 @@ export interface MideaPlatformProviderOptions {
   discoverFn?: (options?: MideaLanDiscoveryOptions) => Promise<MideaLanDiscoveredDevice[]>;
   initialConfig?: Partial<MideaPlatformConfig>;
   skipLoadConfig?: boolean;
+  nowMs?: () => number;
+  reloginCooldownMs?: number;
+  lockoutCooldownMs?: number;
 }
 
 const MASKED_SECRET_RE = /^•+$/;
@@ -154,6 +160,33 @@ function isPowerPropName(propName?: string): boolean {
   return norm === "on" || norm === "power";
 }
 
+function isCloudAuthOrCooldownError(err: unknown): boolean {
+  return err instanceof MideaCloudError && (err.isAuthError || err.isCooldownError);
+}
+
+function toPersistedCloudSession(
+  session: MideaCloudSession | null,
+  cfg: MideaPlatformConfig,
+): MideaCloudSessionCache | null {
+  if (!session || (!session.accessToken && !session.sessionId)) {
+    return null;
+  }
+  return {
+    brand: session.brand,
+    account: (session.account ?? cfg.account).trim(),
+    useChinaServer: session.useChinaServer ?? cfg.useChinaServer,
+    ...(session.baseUrl ? { baseUrl: session.baseUrl } : {}),
+    uid: session.uid,
+    accessToken: session.accessToken,
+    sessionId: session.sessionId,
+    ...(session.aesKeyHex ? { aesKeyHex: session.aesKeyHex } : {}),
+    ...(session.aesIvHex ? { aesIvHex: session.aesIvHex } : {}),
+    ...(session.deviceId ? { deviceId: session.deviceId } : {}),
+    loggedInAt: session.loggedInAt,
+    ...(session.expiresAt !== undefined ? { expiresAt: session.expiresAt } : {}),
+  };
+}
+
 export class MideaPlatformProvider implements IDevicePlatformProvider {
   readonly id = "midea" as const;
   readonly metadata = MIDEA_PLATFORM_METADATA;
@@ -163,6 +196,10 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
   private readonly _discoverFn: (
     options?: MideaLanDiscoveryOptions,
   ) => Promise<MideaLanDiscoveredDevice[]>;
+  private readonly _persistConfig: boolean;
+  private readonly _nowMs: () => number;
+  private readonly _reloginCooldownMs?: number;
+  private readonly _lockoutCooldownMs?: number;
 
   private _config: MideaPlatformConfig;
   private _cloudClient: MideaCloudClient | null = null;
@@ -188,11 +225,19 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
       (this._lanTransport.discover
         ? (opts) => this._lanTransport.discover!(opts)
         : (opts) => discoverMideaLanDevices(opts));
+    this._persistConfig = !options.skipLoadConfig;
+    this._nowMs = options.nowMs ?? (() => Date.now());
+    this._reloginCooldownMs = options.reloginCooldownMs;
+    this._lockoutCooldownMs = options.lockoutCooldownMs;
 
     const loaded = options.skipLoadConfig ? defaultMideaConfig() : loadPlatformSection("midea");
     this._config = {
       ...loaded,
       ...(options.initialConfig ?? {}),
+      cloudSession:
+        options.initialConfig && "cloudSession" in options.initialConfig
+          ? (options.initialConfig.cloudSession ?? null)
+          : (loaded.cloudSession ?? null),
       localDevices: options.initialConfig?.localDevices
         ? [...options.initialConfig.localDevices]
         : [...loaded.localDevices],
@@ -216,9 +261,14 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
   private _activeSecrets(): string[] {
     const secrets: string[] = [];
     if (this._config.password) secrets.push(this._config.password);
-    const session = this._cloudClient?.session;
-    if (session?.accessToken) secrets.push(session.accessToken);
-    if (session?.sessionId) secrets.push(session.sessionId);
+    const liveSession = this._cloudClient?.session;
+    const cachedSession = this._config.cloudSession;
+    for (const session of [liveSession, cachedSession]) {
+      if (session?.accessToken) secrets.push(session.accessToken);
+      if (session?.sessionId) secrets.push(session.sessionId);
+      if (session?.aesKeyHex) secrets.push(session.aesKeyHex);
+      if (session?.aesIvHex) secrets.push(session.aesIvHex);
+    }
     for (const d of this._config.localDevices) {
       if (d.token) secrets.push(d.token);
       if (d.key) secrets.push(d.key);
@@ -252,18 +302,68 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
     }
   }
 
+  private _handleSessionChange(
+    ownerCfg: Pick<MideaPlatformConfig, "cloudBrand" | "account" | "useChinaServer">,
+    session: MideaCloudSession | null,
+  ): void {
+    if (
+      !this._config.enabled ||
+      this._config.cloudBrand !== ownerCfg.cloudBrand ||
+      this._config.account !== ownerCfg.account ||
+      this._config.useChinaServer !== ownerCfg.useChinaServer
+    ) {
+      return;
+    }
+    const persisted = toPersistedCloudSession(session, this._config);
+    this._config = {
+      ...this._config,
+      cloudSession: persisted,
+    };
+    if (this._persistConfig) {
+      this._config = savePlatformSection("midea", this._config);
+    }
+  }
+
+  private _createCloudClient(
+    cfg: MideaPlatformConfig,
+    initialSession: Partial<MideaCloudSession> | null,
+    bindPersist: boolean,
+  ): MideaCloudClient {
+    const ownerIdentity = {
+      cloudBrand: cfg.cloudBrand,
+      account: cfg.account,
+      useChinaServer: cfg.useChinaServer,
+    };
+    return new MideaCloudClient({
+      brand: cfg.cloudBrand,
+      account: cfg.account,
+      password: cfg.password,
+      useChinaServer: cfg.useChinaServer,
+      httpFetch: this._httpFetch,
+      nowMs: this._nowMs,
+      reloginCooldownMs: this._reloginCooldownMs,
+      lockoutCooldownMs: this._lockoutCooldownMs,
+      initialSession,
+      ...(bindPersist
+        ? {
+            onSessionChange: (session) => {
+              this._handleSessionChange(ownerIdentity, session);
+            },
+          }
+        : {}),
+    });
+  }
+
   private _ensureCloudClient(): MideaCloudClient | null {
     if (this._config.mode === "local" || !this._hasCloudCredentials()) {
       return null;
     }
     if (!this._cloudClient) {
-      this._cloudClient = new MideaCloudClient({
-        brand: this._config.cloudBrand,
-        account: this._config.account,
-        password: this._config.password,
-        useChinaServer: this._config.useChinaServer,
-        httpFetch: this._httpFetch,
-      });
+      this._cloudClient = this._createCloudClient(
+        this._config,
+        this._config.cloudSession ?? null,
+        true,
+      );
     }
     return this._cloudClient;
   }
@@ -383,6 +483,12 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
         : this._config.preferLocal;
     const localDevices = this._mergeLocalDevices(config["localDevices"]);
 
+    const cloudIdentityUnchanged =
+      cloudBrand === this._config.cloudBrand &&
+      account === this._config.account &&
+      password === this._config.password &&
+      useChinaServer === this._config.useChinaServer;
+
     const nextConfig: MideaPlatformConfig = {
       enabled,
       mode,
@@ -391,6 +497,7 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
       password,
       useChinaServer,
       preferLocal,
+      cloudSession: cloudIdentityUnchanged ? (this._config.cloudSession ?? null) : null,
       localDevices,
     };
 
@@ -410,9 +517,34 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
       }
     }
 
-    // 重置旧会话并按新配置校验云端登录
-    this._cloudClient?.clearSession();
-    this._cloudClient = null;
+    let nextClient: MideaCloudClient | null = null;
+    if (enabled && (mode === "cloud" || mode === "hybrid") && this._hasCloudCredentials(nextConfig)) {
+      // 当云端账号、密码、品牌与区域未变化且已存在未过期会话时直接复用，避免保存设置引发重复登录
+      const reusableSession =
+        cloudIdentityUnchanged && !this._authFailed
+          ? (this._cloudClient?.exportSession() ?? this._config.cloudSession ?? null)
+          : null;
+      const candidateClient = this._createCloudClient(nextConfig, reusableSession, false);
+      if (!candidateClient.isLoggedIn) {
+        try {
+          await candidateClient.login({ force: true });
+        } catch (err) {
+          this._authFailed = true;
+          const safeMsg = sanitizeErrorMessage(err, [nextConfig.password]);
+          this._lastError = safeMsg;
+          throw new ServiceError(`美的云端登录验证失败：${safeMsg}`);
+        }
+      }
+      nextConfig.cloudSession = toPersistedCloudSession(candidateClient.exportSession(), nextConfig);
+      nextClient = candidateClient;
+      this._authFailed = false;
+      this._lastError = null;
+    } else {
+      this._authFailed = false;
+      this._lastError = null;
+    }
+
+    this._cloudClient = nextClient;
     this._appliances.clear();
     this._states.clear();
     this._luaStatuses.clear();
@@ -420,31 +552,17 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
     this._acPreferB0.clear();
     this._tokenCandidates.clear();
 
-    if (enabled && (mode === "cloud" || mode === "hybrid") && this._hasCloudCredentials(nextConfig)) {
-      const testClient = new MideaCloudClient({
-        brand: nextConfig.cloudBrand,
-        account: nextConfig.account,
-        password: nextConfig.password,
-        useChinaServer: nextConfig.useChinaServer,
-        httpFetch: this._httpFetch,
+    this._config = this._persistConfig ? savePlatformSection("midea", nextConfig) : nextConfig;
+    if (nextClient) {
+      const ownerIdentity = {
+        cloudBrand: this._config.cloudBrand,
+        account: this._config.account,
+        useChinaServer: this._config.useChinaServer,
+      };
+      nextClient.setSessionChangeListener((session) => {
+        this._handleSessionChange(ownerIdentity, session);
       });
-      try {
-        await testClient.login();
-        this._cloudClient = testClient;
-        this._authFailed = false;
-        this._lastError = null;
-      } catch (err) {
-        this._authFailed = true;
-        const safeMsg = sanitizeErrorMessage(err, [nextConfig.password]);
-        this._lastError = safeMsg;
-        throw new ServiceError(`美的云端登录验证失败：${safeMsg}`);
-      }
-    } else {
-      this._authFailed = false;
-      this._lastError = null;
     }
-
-    this._config = savePlatformSection("midea", nextConfig);
     if (this._config.enabled) {
       this._seedLocalAppliances();
     }
@@ -453,7 +571,7 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
   }
 
   async disconnect(): Promise<void> {
-    this._cloudClient?.clearSession();
+    this._cloudClient?.clearSession({ notify: false });
     this._cloudClient = null;
     this._lanTransport.close?.();
     this._appliances.clear();
@@ -467,6 +585,7 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
       ...this._config,
       enabled: false,
       password: "",
+      cloudSession: null,
       localDevices: this._config.localDevices.map((d) => ({
         id: d.id,
         name: d.name,
@@ -478,7 +597,7 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
         ...(d.model ? { model: d.model } : {}),
       })),
     };
-    this._config = savePlatformSection("midea", cleared);
+    this._config = this._persistConfig ? savePlatformSection("midea", cleared) : cleared;
     this._authFailed = false;
     this._lastDeviceCount = 0;
     this._lastError = null;
@@ -536,7 +655,10 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
       // 2. 云端发现家庭/房间/设备与 V3 token/key
       const cloudClient = this._ensureCloudClient();
       if (cloudClient) {
-        progress?.(20, "正在登录美的云端并获取设备列表…");
+        progress?.(
+          20,
+          cloudClient.isLoggedIn ? "正在获取美的云端设备列表…" : "正在登录美的云端并获取设备列表…",
+        );
         const cloudAppliances = await cloudClient.listAppliances();
         for (const item of cloudAppliances) {
           const existing = merged.get(item.id);
@@ -627,6 +749,9 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
     } catch (err) {
       const safeMsg = sanitizeErrorMessage(err, this._activeSecrets());
       this._lastError = safeMsg;
+      if (err instanceof MideaCloudError && err.isAuthError && !err.isCooldownError) {
+        this._authFailed = true;
+      }
       throw new ServiceError(`获取美的设备列表失败：${safeMsg}`);
     }
   }
@@ -932,6 +1057,9 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
           return parsedLua;
         }
       } catch (err) {
+        if (isCloudAuthOrCooldownError(err)) {
+          throw err;
+        }
         luaErr = err;
       }
       try {
@@ -1123,6 +1251,9 @@ export class MideaPlatformProvider implements IDevicePlatformProvider {
       try {
         return await runLuaControl();
       } catch (err) {
+        if (isCloudAuthOrCooldownError(err)) {
+          throw err;
+        }
         luaErr = err;
       }
       try {

@@ -10,6 +10,7 @@ import path from "node:path";
 
 import { isLight, supportsCardPower } from "../src/core/deviceControls.ts";
 import { setDataPathOverrides } from "../src/core/jsonStore.ts";
+import { loadPlatformSection } from "../src/platforms/configStore.ts";
 import {
   CRC8_854_TABLE,
   DISCOVERY_MSG,
@@ -1794,5 +1795,520 @@ describe("MideaPlatformProvider 端到端集成、降级回退与凭据脱敏", 
     await lanProvider.setPowerState("211106254203346", false);
     expect(lanPower).toBe(false);
     expect(lanSentBodyTypes).toEqual([0x41, 0x40, 0xb0, 0xb0]);
+  });
+
+  test("21. 云端会话持久化与跨重启免重复登录（含 AES 会话密钥直恢复、脱敏与 disconnect 清理）", async () => {
+    const serverSec = new MideaCloudSecurity("meiju");
+    const sessionKeyPlain = "f0e1d2c3b4a59687";
+    const encryptedSessionKey = serverSec.aesEncryptWithFixedKey(sessionKeyPlain);
+    serverSec.setAesKeys(sessionKeyPlain);
+    const encryptedSn = serverSec.aesEncrypt("0000AC999SN777777123456");
+
+    let loginCount = 0;
+    let now = 1_760_000_000_000;
+    const serverExpiredDate = now + 30 * 24 * 60 * 60 * 1000;
+
+    const mockFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      if (url.includes("/v1/user/login/id/get")) {
+        return jsonResponse({ code: "0", data: { loginId: `login-persist-${loginCount + 1}` } });
+      }
+      if (url.includes("/mj/user/login")) {
+        loginCount += 1;
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        // 对齐 midea-local / midea_auto_cloud：不再发送随机 pushToken，固定 deviceId 与 platform=2
+        expect(body.iotData.pushToken).toBeUndefined();
+        expect(body.iotData.iotAppId).toBe("900");
+        expect(body.data.appKey).toBe(MIDEA_CLOUD_PRESETS.meiju.appKey);
+        expect(body.data.platform).toBe(2);
+        return jsonResponse({
+          code: "0",
+          data: {
+            uid: "uid-persist-1",
+            key: encryptedSessionKey,
+            mdata: {
+              accessToken: "tok-persist-secret-xyz",
+              tokenPwdInfo: {
+                expiredDate: serverExpiredDate,
+                createDate: now,
+              },
+            },
+          },
+        });
+      }
+      if (url.includes("/v1/homegroup/list/get")) {
+        expect(headers["accessToken"]).toBe("tok-persist-secret-xyz");
+        return jsonResponse({
+          code: "0",
+          data: { homeList: [{ homegroupId: "home-p1", name: "持久化之家", isDefault: "1" }] },
+        });
+      }
+      if (url.includes("/v1/appliance/home/list/get")) {
+        expect(headers["accessToken"]).toBe("tok-persist-secret-xyz");
+        return jsonResponse({
+          code: "0",
+          data: {
+            homeList: [
+              {
+                homegroupId: "home-p1",
+                name: "持久化之家",
+                roomList: [
+                  {
+                    name: "客厅",
+                    applianceList: [
+                      {
+                        applianceCode: "210006741641007",
+                        name: "客厅大空调",
+                        type: "0xAC",
+                        sn: encryptedSn,
+                        onlineStatus: "1",
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        });
+      }
+      if (url.includes("/mjl/v1/device/status/lua/get")) {
+        expect(headers["accessToken"]).toBe("tok-persist-secret-xyz");
+        return jsonResponse({
+          code: "0",
+          data: { power: "on", mode: "cool", temperature: 25, indoor_temperature: 23.5 },
+        });
+      }
+      return jsonResponse({ code: "404" }, 404);
+    }) as typeof fetch;
+
+    // 首次启动并配置：应仅登录 1 次，且会话写入 platforms.json
+    const provider1 = new MideaPlatformProvider({
+      httpFetch: mockFetch,
+      nowMs: () => now,
+    });
+    const st1 = await provider1.configure({
+      enabled: true,
+      mode: "cloud",
+      cloudBrand: "meiju",
+      account: "13800138000",
+      password: "PersistPassword!1",
+      useChinaServer: true,
+    });
+    expect(loginCount).toBe(1);
+    expect(st1.configSummary["hasCloudSession"]).toBe(true);
+
+    const saved = loadPlatformSection("midea");
+    expect(saved.cloudSession?.accessToken).toBe("tok-persist-secret-xyz");
+    expect(saved.cloudSession?.uid).toBe("uid-persist-1");
+    expect(saved.cloudSession?.aesKeyHex).toBe(Buffer.from(sessionKeyPlain, "utf-8").toString("hex"));
+    expect(saved.cloudSession?.expiresAt).toBe(serverExpiredDate);
+
+    // 状态摘要与诊断报告严禁泄露 accessToken 与 aesKeyHex
+    const statusJson = JSON.stringify(st1);
+    expect(statusJson).not.toContain("tok-persist-secret-xyz");
+    expect(statusJson).not.toContain(saved.cloudSession!.aesKeyHex!);
+
+    // 模拟进程重启（全新 MideaPlatformProvider 实例，2 小时后）：直接复用持久化会话，0 次登录，且能直接解密加密 SN
+    now += 2 * 60 * 60 * 1000;
+    const provider2 = new MideaPlatformProvider({
+      httpFetch: mockFetch,
+      nowMs: () => now,
+    });
+    const devices = await provider2.listDevices();
+    expect(loginCount).toBe(1);
+    expect(devices).toHaveLength(1);
+    expect(devices[0]!.name).toBe("客厅大空调");
+    expect(await provider2.powerState("210006741641007")).toBe(true);
+    expect(loginCount).toBe(1);
+
+    const report = await provider2.diagnosticReport(devices[0]!);
+    expect(report).not.toContain("tok-persist-secret-xyz");
+    expect(report).not.toContain(saved.cloudSession!.aesKeyHex!);
+
+    // disconnect 必须清理持久化会话
+    await provider2.disconnect();
+    const afterDisconnect = loadPlatformSection("midea");
+    expect(afterDisconnect.cloudSession).toBeNull();
+    expect(afterDisconnect.password).toBe("");
+  });
+
+  test("22. configure() 在凭据/品牌/区域未变时复用现有会话不重登，变更凭据时才重新校验登录", async () => {
+    let loginCount = 0;
+    const mockFetch = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/v1/user/login/id/get")) {
+        return jsonResponse({ code: "0", data: { loginId: `lid-${loginCount + 1}` } });
+      }
+      if (url.includes("/mj/user/login")) {
+        loginCount += 1;
+        return jsonResponse({
+          code: "0",
+          data: { uid: "u-cfg", mdata: { accessToken: `tok-cfg-${loginCount}` } },
+        });
+      }
+      return jsonResponse({ code: "404" }, 404);
+    }) as typeof fetch;
+
+    const provider = new MideaPlatformProvider({ httpFetch: mockFetch });
+
+    // 首次保存：登录 1 次
+    await provider.configure({
+      enabled: true,
+      mode: "cloud",
+      cloudBrand: "meiju",
+      account: "13900139000",
+      password: "PasswordA!1",
+      useChinaServer: true,
+      preferLocal: true,
+    });
+    expect(loginCount).toBe(1);
+
+    // 仅调整 mode/preferLocal/密码留空重复保存：应直接复用已有会话，loginCount 保持 1
+    await provider.configure({
+      enabled: true,
+      mode: "hybrid",
+      cloudBrand: "meiju",
+      account: "13900139000",
+      password: "",
+      useChinaServer: true,
+      preferLocal: false,
+    });
+    expect(loginCount).toBe(1);
+    expect(loadPlatformSection("midea").cloudSession?.accessToken).toBe("tok-cfg-1");
+
+    // 更改密码后保存：必须强制重新校验登录，并更新持久化会话
+    await provider.configure({
+      enabled: true,
+      mode: "hybrid",
+      cloudBrand: "meiju",
+      account: "13900139000",
+      password: "PasswordB!2",
+      useChinaServer: true,
+      preferLocal: false,
+    });
+    expect(loginCount).toBe(2);
+    expect(loadPlatformSection("midea").cloudSession?.accessToken).toBe("tok-cfg-2");
+  });
+
+  test("23. 多设备并发收到 40002 令牌失效时严格单飞重登 1 次（绝不互相抹掉新令牌形成登录风暴）", async () => {
+    let loginCount = 0;
+    let activeValidToken = "tok-fresh-2";
+    const persistedTokens: Array<string | null> = [];
+    let releaseSlow40002!: () => void;
+    const slow40002Gate = new Promise<void>((resolve) => {
+      releaseSlow40002 = resolve;
+    });
+    let dev2Entered = false;
+
+    const mockFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+
+      if (url.includes("/v1/user/login/id/get")) {
+        return jsonResponse({ code: "0", data: { loginId: `lid-race-${loginCount + 1}` } });
+      }
+      if (url.includes("/mj/user/login")) {
+        loginCount += 1;
+        activeValidToken = `tok-fresh-${loginCount + 1}`;
+        return jsonResponse({
+          code: "0",
+          data: { uid: "u-race", mdata: { accessToken: activeValidToken } },
+        });
+      }
+      if (url.includes("/mjl/v1/device/status/lua/get")) {
+        const code = String(body.applianceCode ?? "");
+        const tok = headers["accessToken"];
+        if (tok === "tok-stale-1") {
+          // 故意让 dev-2 慢于 dev-1 完成重登之后才返回 40002，验证不会抹掉刚换到的新 token
+          if (code === "dev-2") {
+            dev2Entered = true;
+            await slow40002Gate;
+          }
+          return jsonResponse({ code: "40002", msg: "移动平台Token校验不通过 [user token not exist]" });
+        }
+        expect(tok).toBe(activeValidToken);
+        return jsonResponse({ code: "0", data: { power: "on", dev: code } });
+      }
+      return jsonResponse({ code: "404" }, 404);
+    }) as typeof fetch;
+
+    const now = 1_760_000_000_000;
+    const client = new MideaCloudClient({
+      brand: "meiju",
+      account: "13800138000",
+      password: "Password!1",
+      useChinaServer: true,
+      httpFetch: mockFetch,
+      nowMs: () => now,
+      initialSession: {
+        brand: "meiju",
+        account: "13800138000",
+        useChinaServer: true,
+        uid: "u-race",
+        accessToken: "tok-stale-1",
+        sessionId: "",
+        loggedInAt: now - 3600_000,
+      },
+      onSessionChange: (session) => {
+        persistedTokens.push(session?.accessToken ?? null);
+      },
+    });
+
+    const p1 = client.getLuaStatus("dev-1");
+    const p2 = client.getLuaStatus("dev-2");
+    const p3 = client.getLuaStatus("dev-3");
+
+    // 等待 dev-1 与 dev-3 完成单飞重登并拿到新令牌后，再放行 dev-2 迟到的 40002
+    const [r1, r3] = await Promise.all([p1, p3]);
+    expect(loginCount).toBe(1);
+    expect(dev2Entered).toBe(true);
+    releaseSlow40002();
+    const r2 = await p2;
+
+    expect(r1["dev"]).toBe("dev-1");
+    expect(r2["dev"]).toBe("dev-2");
+    expect(r3["dev"]).toBe("dev-3");
+    // 三个并发请求全部命中旧 token 失效，且存在迟到响应，全过程仍严格只重登 1 次
+    expect(loginCount).toBe(1);
+    expect(client.session?.accessToken).toBe("tok-fresh-2");
+    expect(persistedTokens).toEqual([null, "tok-fresh-2"]);
+  });
+
+  test("24. 频繁互踢冷却退避、65027/7610 锁定退避、3101 错密止损与 Lua 鉴权失败不重复回退透传", async () => {
+    let now = 1_760_000_000_000;
+    let loginCount = 0;
+    let transparentCalls = 0;
+    let loginBehavior: "ok" | "65027" | "3101" = "ok";
+    let statusAlways40002 = true;
+
+    const mockFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+
+      if (url.includes("/v1/user/login/id/get")) {
+        return jsonResponse({ code: "0", data: { loginId: `lid-cool-${loginCount + 1}` } });
+      }
+      if (url.includes("/mj/user/login")) {
+        loginCount += 1;
+        if (loginBehavior === "65027") {
+          return jsonResponse({ code: "65027", msg: "该用户在线登录设备已超过上限,请更换账号登录" });
+        }
+        if (loginBehavior === "3101") {
+          return jsonResponse({ code: "3101", msg: "password incorrect" });
+        }
+        return jsonResponse({
+          code: "0",
+          data: { uid: "u-cool", mdata: { accessToken: `tok-cool-${loginCount}` } },
+        });
+      }
+      if (url.includes("/mjl/v1/device/status/lua/get")) {
+        if (statusAlways40002 || headers["accessToken"] === "tok-initial") {
+          return jsonResponse({ code: "40002", msg: "user token not exist" });
+        }
+        return jsonResponse({ code: "0", data: { power: "on", temperature: 24 } });
+      }
+      if (url.includes("/v1/appliance/transparent/send")) {
+        transparentCalls += 1;
+        return jsonResponse({ code: "40002", msg: "user token not exist" });
+      }
+      if (url.includes("/v1/homegroup/list/get")) {
+        return jsonResponse({
+          code: "0",
+          data: { homeList: [{ homegroupId: "h-c", name: "测试家", isDefault: "1" }] },
+        });
+      }
+      if (url.includes("/v1/appliance/home/list/get")) {
+        return jsonResponse({
+          code: "0",
+          data: {
+            homeList: [
+              {
+                homegroupId: "h-c",
+                name: "测试家",
+                roomList: [
+                  {
+                    name: "客厅",
+                    applianceList: [
+                      { applianceCode: "210006741641007", name: "空调", type: "0xAC", onlineStatus: "1" },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        });
+      }
+      return jsonResponse({ code: "404" }, 404);
+    }) as typeof fetch;
+
+    const provider = new MideaPlatformProvider({
+      httpFetch: mockFetch,
+      skipLoadConfig: true,
+      nowMs: () => now,
+      reloginCooldownMs: 60_000,
+      lockoutCooldownMs: 300_000,
+      initialConfig: {
+        enabled: true,
+        mode: "cloud",
+        cloudBrand: "meiju",
+        account: "13800138000",
+        password: "Password!1",
+        useChinaServer: true,
+        cloudSession: {
+          brand: "meiju",
+          account: "13800138000",
+          useChinaServer: true,
+          uid: "u-cool",
+          accessToken: "tok-initial",
+          sessionId: "",
+          loggedInAt: now - 3600_000,
+        },
+      },
+    });
+
+    await provider.listDevices();
+    expect(loginCount).toBe(0);
+
+    // 1. 首次 40002：立即触发 1 次重登，重试仍 40002（模拟刚登录就被另一端踢掉）-> 绝不回退打透传接口
+    await expect(provider.readProp("210006741641007", "on")).rejects.toThrow("40002");
+    expect(loginCount).toBe(1);
+    expect(transparentCalls).toBe(0);
+
+    // 2. 5 秒后再次轮询：即使又收到 40002，仍在 60s 冷却期内，严禁再次登录
+    now += 5_000;
+    await expect(provider.readProp("210006741641007", "on")).rejects.toThrow("冷却");
+    expect(loginCount).toBe(1);
+    expect(transparentCalls).toBe(0);
+
+    // 3. 10 秒后继续轮询：保持冷却，零额外登录
+    now += 10_000;
+    await expect(provider.readProp("210006741641007", "on")).rejects.toThrow("冷却");
+    expect(loginCount).toBe(1);
+
+    // 4. 冷却结束后（累计 61 秒），云端恢复正常 -> 自动重登 1 次并恢复读取
+    now += 46_000;
+    statusAlways40002 = false;
+    expect(await provider.readProp("210006741641007", "on")).toBe(true);
+    expect(loginCount).toBe(2);
+
+    // 5. 单独测试 65027 设备超限（5 分钟冷却）与 3101 密码错误（停止自动重试）
+    let lockedLogins = 0;
+    const lockedClient = new MideaCloudClient({
+      brand: "meiju",
+      account: "13800138001",
+      password: "BadPassword",
+      httpFetch: (async (input: string | URL | Request) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.includes("/v1/user/login/id/get")) {
+          return jsonResponse({ code: "0", data: { loginId: "lid-lock" } });
+        }
+        if (url.includes("/mj/user/login")) {
+          lockedLogins += 1;
+          return jsonResponse(
+            loginBehavior === "65027"
+              ? { code: "65027", msg: "该用户在线登录设备已超过上限" }
+              : { code: "3101", msg: "password incorrect" },
+          );
+        }
+        return jsonResponse({ code: "404" }, 404);
+      }) as typeof fetch,
+      nowMs: () => now,
+      reloginCooldownMs: 60_000,
+      lockoutCooldownMs: 300_000,
+    });
+
+    loginBehavior = "65027";
+    await expect(lockedClient.listHomes()).rejects.toThrow("65027");
+    expect(lockedLogins).toBe(1);
+    now += 60_000; // 仅过 1 分钟，仍在 5 分钟锁定退避期内
+    await expect(lockedClient.listHomes()).rejects.toThrow("冷却");
+    expect(lockedLogins).toBe(1);
+
+    // 超过 5 分钟后再次尝试遇到 3101 密码错误：此后自动请求直接报错不再重复打登录接口
+    now += 245_000;
+    loginBehavior = "3101";
+    await expect(lockedClient.listHomes()).rejects.toThrow("3101");
+    expect(lockedLogins).toBe(2);
+    now += 600_000;
+    await expect(lockedClient.listHomes()).rejects.toThrow("3101");
+    expect(lockedLogins).toBe(2);
+  });
+
+  test("25. MSmartHome CBC 会话密钥直恢复不二次解密，且账号/区域/过期不匹配的缓存自动失效", async () => {
+    const serverSec = new MideaCloudSecurity("msmarthome");
+    const keyPlain = "0123456789abcdef";
+    const ivPlain = "fedcba9876543210";
+    const encKey = serverSec.aesEncryptWithFixedKey(keyPlain);
+    const encIv = serverSec.aesEncryptWithFixedKey(ivPlain);
+    serverSec.setAesKeys(encKey, encIv);
+    const exported = serverSec.exportAesKeys()!;
+    expect(exported.keyHex).toHaveLength(32);
+    expect(exported.ivHex).toHaveLength(32);
+
+    // 模拟密文使用会话 CBC 密钥加密
+    const encryptedSn = serverSec.aesEncrypt("0000AC1234567890MSMART");
+
+    // 另一实例直接 restoreAesKeys 后必须准确解密（不能再次用 fixedKey 解密）
+    const restoredSec = new MideaCloudSecurity("msmarthome");
+    restoredSec.restoreAesKeys(exported.keyHex, exported.ivHex);
+    expect(restoredSec.aesDecrypt(encryptedSn)).toBe("0000AC1234567890MSMART");
+
+    // 过期、账号不匹配或区域不匹配的 initialSession 必须被拒绝
+    const now = 1_760_000_000_000;
+    const baseSession = {
+      brand: "msmarthome" as const,
+      account: "user@example.com",
+      useChinaServer: false,
+      uid: "u-ms",
+      accessToken: "tok-ms",
+      sessionId: "",
+      aesKeyHex: exported.keyHex,
+      aesIvHex: exported.ivHex,
+      loggedInAt: now - 1000,
+      expiresAt: now + 3600_000,
+    };
+
+    const validClient = new MideaCloudClient({
+      brand: "msmarthome",
+      account: "user@example.com",
+      password: "Pwd",
+      useChinaServer: false,
+      nowMs: () => now,
+      initialSession: baseSession,
+    });
+    expect(validClient.isLoggedIn).toBe(true);
+    expect(validClient.security.aesDecrypt(encryptedSn)).toBe("0000AC1234567890MSMART");
+
+    const wrongAccountClient = new MideaCloudClient({
+      brand: "msmarthome",
+      account: "other@example.com",
+      password: "Pwd",
+      useChinaServer: false,
+      nowMs: () => now,
+      initialSession: baseSession,
+    });
+    expect(wrongAccountClient.isLoggedIn).toBe(false);
+
+    const wrongRegionClient = new MideaCloudClient({
+      brand: "msmarthome",
+      account: "user@example.com",
+      password: "Pwd",
+      useChinaServer: true,
+      nowMs: () => now,
+      initialSession: baseSession,
+    });
+    expect(wrongRegionClient.isLoggedIn).toBe(false);
+
+    const expiredClient = new MideaCloudClient({
+      brand: "msmarthome",
+      account: "user@example.com",
+      password: "Pwd",
+      useChinaServer: false,
+      nowMs: () => now + 3600_000,
+      initialSession: baseSession,
+    });
+    expect(expiredClient.isLoggedIn).toBe(false);
   });
 });
