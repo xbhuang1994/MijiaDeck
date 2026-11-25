@@ -1739,6 +1739,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       (uploadNow < this._conversationUntil || uploadSpeechStartedAt < this._conversationUntil);
     const uploadInConversation =
       this._dialogState === "conversation" || uploadAwakeActive || uploadConvActive;
+    let uploadWakeGateHit: WakeWordAcousticHit | null = null;
     if (
       autoDispatch &&
       cfg.wakeWordEnabled &&
@@ -1787,6 +1788,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           voiceState: this.snapshot(),
         };
       }
+      uploadWakeGateHit = gateHit;
     }
 
     // ---- Stage 1.5: 本地自适应多级声源分离与说话人隔离主通道（S_Fused 最终方案） ----
@@ -1836,6 +1838,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
               vadLabelPrefix: "clearvoice",
               rawDurationMs: Math.round((pcm16k.length / 16000) * 1000),
               preVadSegmented: false,
+              streamAcousticWake: uploadWakeGateHit,
             },
             {
               lang,
@@ -2351,7 +2354,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           preVadSegmented: true,
           stripCommittedPrefixHint:
             cvTracks.length === 1 ? segment.stripCommittedPrefixHint : undefined,
-          streamAcousticWake: cvTracks.length === 1 ? (segment.acousticWake ?? null) : null,
+          streamAcousticWake: segment.acousticWake ?? null,
         },
         {
           lang,
@@ -3157,6 +3160,30 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     }
 
     // ---- 阶段 A-III：仅对未被屏蔽的有效音轨执行独立逻辑判定（注意力门控、声纹门禁、回声过滤、唤醒提取） ----
+    // 若流式 openWakeWord 在 ClearVoice 强降噪/分轨前已命中，但分轨重打分均跌破阈值且无音轨命中文本唤醒词：
+    // 仅向唯一未屏蔽有效音轨（或得分显著领先且 >= 0.25 的单一音轨）恢复声学唤醒命中，严格保持其余音轨隔离。
+    if (options.autoDispatch && trackCount > 1 && meta.streamAcousticWake?.matched) {
+      const activeTracks = prepared.filter((p) => !p.muted && p.speechDetected && p.text.length > 0);
+      const anyTrackAlreadyWoke = activeTracks.some(
+        (p) => Boolean(p.acousticWake?.matched) || Boolean(findWakeWordSpan(p.text, cfg.wakeWords)),
+      );
+      if (!anyTrackAlreadyWoke && activeTracks.length > 0) {
+        if (activeTracks.length === 1) {
+          activeTracks[0]!.acousticWake = meta.streamAcousticWake;
+        } else {
+          const ranked = [...activeTracks].sort(
+            (a, b) => (b.acousticWake?.score ?? 0) - (a.acousticWake?.score ?? 0),
+          );
+          const best = ranked[0]!;
+          const secondScore = ranked[1]?.acousticWake?.score ?? 0;
+          const bestScore = best.acousticWake?.score ?? 0;
+          if (bestScore >= 0.25 && bestScore > secondScore) {
+            best.acousticWake = meta.streamAcousticWake;
+          }
+        }
+      }
+    }
+
     if (options.autoDispatch) {
       for (const p of prepared) {
         if (p.muted || !p.speechDetected || !p.text) continue;

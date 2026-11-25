@@ -14,7 +14,10 @@ import {
   SystemOneClient,
   type WakeAttentionDecision,
 } from "../src/agent/systemOneClient.ts";
-import { evaluateVoiceAttention } from "../src/agent/voiceAttentionGate.ts";
+import {
+  evaluateVoiceAttention,
+  extractCommandAfterAcousticWake,
+} from "../src/agent/voiceAttentionGate.ts";
 import { VoiceListenerController } from "../src/agent/voiceListenerController.ts";
 import {
   DEFAULT_SYSTEMONE_MODEL,
@@ -566,6 +569,214 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
       }
       expect(convCalls.length).toBe(1);
       expect(Array.isArray(convCalls[0]!.state.history)).toBe(true);
+    } finally {
+      vl.dispose();
+      agent.dispose();
+      networkMonitor.stop();
+      mw.dispose();
+      await jobs.shutdown();
+    }
+  });
+
+  test("reproduces user bug: openWakeWord Neo 0.70 + ASR '六，我觉得客厅有点暗呢。' verifies with SystemOne (never no-wake/context) and enters next flow cleanly", async () => {
+    // 1. Paused phonetic slip stripping: strips '六，' after acoustic wake while preserving '六点开空调'
+    expect(extractCommandAfterAcousticWake("六，我觉得客厅有点暗呢。", "Neo")).toBe("我觉得客厅有点暗呢");
+    expect(extractCommandAfterAcousticWake("六点开空调", "Neo")).toBe("六点开空调");
+    expect(extractCommandAfterAcousticWake("六。", "Neo")).toBe("");
+
+    // 2. With SystemOne enabled: sends pure { utterance, wake_words } + { decision } and strips '六，' -> enters next flow
+    const { client, calls } = makeMockSystemOneClient(() => ({
+      choice: "valid_wake",
+      confidence: 0.91,
+    }));
+    const withS1 = await evaluateVoiceAttention({
+      rawText: "六，我觉得客厅有点暗呢。",
+      wakeWordEnabled: true,
+      wakeWords: ["Neo"],
+      attentionMode: "smart",
+      dialogState: "standby",
+      inConversation: false,
+      acousticWake: makeAcousticHit("Neo", 0.7),
+      systemOneClient: client,
+    });
+    expect(calls).toHaveLength(1);
+    expect(Object.keys(calls[0]!.state).sort()).toEqual(["utterance", "wake_words"]);
+    expect(Object.keys(calls[0]!.questions)).toEqual(["decision"]);
+    expect(withS1.accept).toBe(true);
+    expect(withS1.wokeOnly).toBe(false);
+    expect(withS1.stage).toBe("systemone-attention");
+    expect(withS1.wakeWord).toBe("Neo");
+    expect(withS1.command).toBe("我觉得客厅有点暗呢");
+
+    // 3. Even when SystemOne is unavailable/offline, matched openWakeWord Neo 0.70 MUST NOT fall back to "未检测到唤醒词或有效对话上下文"
+    const offlineRecovery = await evaluateVoiceAttention({
+      rawText: "六，我觉得客厅有点暗呢。",
+      wakeWordEnabled: true,
+      wakeWords: ["Neo"],
+      attentionMode: "smart",
+      dialogState: "standby",
+      inConversation: false,
+      acousticWake: makeAcousticHit("Neo", 0.7),
+      systemOneClient: null,
+    });
+    expect(offlineRecovery.accept).toBe(true);
+    expect(offlineRecovery.stage).toBe("fast-wake");
+    expect(offlineRecovery.passSource).toBe("acoustic_wake_recovery");
+    expect(offlineRecovery.wakeWord).toBe("Neo");
+    expect(offlineRecovery.command).toBe("我觉得客厅有点暗呢");
+
+    // 4. ClearVoice multi-track segment where ClearVoice +35.5dB denoising drops per-track OWW score below 0.60:
+    //    streamAcousticWake Neo 0.70 is preserved on the winning track and routes through SystemOne -> Pi Agent!
+    const { client: cvS1, calls: cvCalls } = makeMockSystemOneClient(() => ({
+      choice: "valid_wake",
+      confidence: 0.92,
+    }));
+
+    applyTheme("dark", "green");
+    const demo = new VirtualDemoService();
+    const jobs = new JobExecutor();
+    const networkMonitor = new NetworkMonitor({ initialReachability: "online", autoStart: false });
+    const themeCtrl = new ThemeController("dark");
+    const mw = new MainWindowController({
+      service: demo,
+      jobs,
+      themeCtrl,
+      networkMonitor,
+      autoStartTimers: false,
+      cacheLoader: () => null,
+      cacheSaver: () => {},
+    });
+    mw.start();
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && mw.allDevices.length === 0) {
+      await Bun.sleep(10);
+    }
+
+    let asrTrackCall = 0;
+    const fakeLocalEngine = {
+      setPreferredAsrEngine: () => {},
+      setQwen3ComputeDevice: () => {},
+      setClearVoiceServiceUrl: () => {},
+      getStatus: () => ({
+        readyForLocalAsr: true,
+        readyForClearVoiceGpu: true,
+        readyForSourceSeparation: false,
+        readyForDenoise: true,
+        readyForVad: true,
+        readyForVoiceprint: false,
+        readyForWakeWord: true,
+        readyForLocalTts: false,
+      }),
+      openWakeWord: {
+        isReady: true,
+        getStatus: () => ({ ready: true, prototypeCount: 2, enrolledCount: 2, ttsCount: 0 }),
+      },
+      detectSpeechSegments: (samples: Float32Array) => ({
+        hasSpeech: true,
+        speechSamples: samples,
+        speechRatio: 0.9,
+        engine: "silero",
+        durationMs: 3,
+      }),
+      scoreWakeWordAudio: (_samples: Float32Array) => {
+        // Simulate ClearVoice SE +35.5dB altering timbre so per-track re-score drops below 0.60
+        const idx = asrTrackCall;
+        return {
+          wakeWord: "Neo",
+          score: idx === 0 ? 0.48 : 0.08,
+          rawScore: idx === 0 ? 0.48 : 0.08,
+          threshold: 0.6,
+          matched: false,
+          source: "enrolled" as const,
+          frameIndex: 1,
+          sampleOffset: 4000,
+          latencyMs: 3,
+        };
+      },
+      transcribeLocal: async (): Promise<LocalAsrOutput> => {
+        asrTrackCall += 1;
+        return {
+          text: asrTrackCall === 1 ? "六，我觉得客厅有点暗呢。" : "今天晚上看什么电影",
+          rawText: asrTrackCall === 1 ? "六，我觉得客厅有点暗呢。" : "今天晚上看什么电影",
+          lang: "zh",
+          emotion: "",
+          event: "<|Speech|>",
+          engine: "qwen3-asr-gpu",
+          durationMs: 25,
+        };
+      },
+      dispose: () => {},
+    } as unknown as LocalVoiceEngine;
+
+    const cfg = normalizeAgentVoiceConfig({
+      ...defaultAgentVoiceConfig(),
+      provider: "local",
+      voicePipelineMode: "clearvoice",
+      wakeWords: ["Neo"],
+      owwEnabled: true,
+      owwThreshold: 0.6,
+      autoSpeakReply: false,
+      sourceSeparationMode: "off",
+      systemOneMode: "on",
+      systemOneBaseUrl: "https://systemone.local.test/v1",
+      systemOneApiKey: "sk-cv-wake",
+      conversationWindowSec: 25,
+    });
+    const agent = new PiAgentService({
+      deps: { mainWindow: mw, service: demo, jobs, settingsStore, broadcastState: () => {} },
+      initialConfig: cfg,
+    });
+    (agent as unknown as { _systemOne: SystemOneClient })._systemOne = cvS1;
+    const vl = new VoiceListenerController(agent, { localEngine: fakeLocalEngine });
+
+    try {
+      const segRes = await vl.processDualTrackSegment({
+        rawSamples: new Float32Array(32000).fill(0.08),
+        denoisedSamples: new Float32Array(32000).fill(0.08),
+        separatedTracks: [
+          {
+            trackId: "cv_track_1",
+            trackIndex: 1,
+            sourceSlot: 0,
+            samples: new Float32Array(32000).fill(0.08),
+            sampleRate: 16000,
+            rms: 0.08,
+            energyRatio: 0.7,
+            outputSnrDb: 35.5,
+            snrGainDb: 35.5,
+          },
+          {
+            trackId: "cv_track_2",
+            trackIndex: 2,
+            sourceSlot: 1,
+            samples: new Float32Array(32000).fill(0.04),
+            sampleRate: 16000,
+            rms: 0.04,
+            energyRatio: 0.3,
+            outputSnrDb: 18,
+            snrGainDb: 18,
+          },
+        ],
+        denoiseEngine: "clearvoice-mossformer2-bss-se-gpu",
+        pipelineMode: "clearvoice",
+        inputSnrDb: 0,
+        outputSnrDb: 35.5,
+        snrGainDb: 35.5,
+        startSec: 0,
+        durationSec: 2,
+        forcedRoll: false,
+        wakeAnchored: true,
+        acousticWake: makeAcousticHit("Neo", 0.7),
+      });
+
+      expect(cvCalls.filter((c) => Boolean(c.questions.decision))).toHaveLength(1);
+      expect(segRes.matched).toBe(true);
+      expect(segRes.command).toBe("我觉得客厅有点暗呢");
+      expect(segRes.tracks).toHaveLength(2);
+      // Track 1 accepted via SystemOne pure wake check; Track 2 remains strictly isolated & rejected
+      expect(segRes.tracks![0]!.matched).toBe(true);
+      expect(segRes.tracks![0]!.attention?.stage).toBe("systemone-attention");
+      expect(segRes.tracks![1]!.matched).toBe(false);
     } finally {
       vl.dispose();
       agent.dispose();
