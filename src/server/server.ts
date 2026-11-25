@@ -180,6 +180,24 @@ function handleWsMessage(
         wakeWords: cfg.wakeWords,
         owwEnabled: cfg.owwEnabled,
         owwThreshold: cfg.owwThreshold,
+        streamingAsrEnabled: cfg.qwen3StreamingEnabled,
+        onPartialTranscript: (partial) => {
+          try {
+            ws.send(
+              JSON.stringify({
+                type: "voice_stream_event",
+                kind: "partial",
+                text: partial.text,
+                stableText: partial.stableText,
+                unstableText: partial.unstableText,
+                engine: partial.engine,
+                latencyMs: partial.latencyMs,
+              }),
+            );
+          } catch {
+            // ignore closed socket
+          }
+        },
         onWakeWordSpot: (hit) => {
           vl.recordWakeWordSpot(hit);
           try {
@@ -412,9 +430,12 @@ export async function startMijiaDeckServer(
         state: snapshot,
       });
     },
-    reloadVoiceStreams: (wakeWords, threshold) => {
+    reloadVoiceStreams: (wakeWords, threshold, streamOpts) => {
       for (const stream of activeVoiceStreams) {
         stream.reloadWakeWords(wakeWords, threshold);
+        if (typeof streamOpts?.streamingAsrEnabled === "boolean") {
+          stream.setStreamingAsrEnabled(streamOpts.streamingAsrEnabled);
+        }
       }
     },
   };

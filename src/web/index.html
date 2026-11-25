@@ -275,6 +275,7 @@
         <button type="button" id="pi-voice-start-btn" class="primary-button btn-compact">开启持续监听</button>
         <button type="button" id="pi-voice-oneshot-btn" class="secondary-button btn-compact" title="免唤醒单次语音输入（快捷键 Alt+V）">单次说话</button>
         <button type="button" id="pi-voice-wake-toggle-btn" class="pi-wake-pill active" title="点击切换唤醒词模式或免唤醒直达模式">唤醒词：小派</button>
+        <button type="button" id="pi-streaming-toggle-btn" class="pi-wake-pill active" title="点击快速开启或关闭 Qwen3-ASR 实时流式转写与智能断句">流式：开</button>
         <button type="button" id="pi-caveman-toggle-btn" class="pi-caveman-pill active" title="点击切换语音与文字回复风格">自然 · Lite</button>
       </div>
       <div id="pi-voice-telemetry" class="pi-voice-telemetry" hidden></div>
@@ -723,12 +724,13 @@
 
           <div class="setting-card setting-card-wrap" id="voice-pipeline-status-card">
             <div class="setting-info">
-              <div class="setting-label">本地离线语音 AI 引擎状态（Sherpa-ONNX · CPU）</div>
-              <div class="setting-desc" id="voice-pipeline-status-desc">本地离线运行 Qwen3-ASR-0.6B（主）与 SenseVoice（备用）多语种识别、GTCRN 降噪、Silero VAD、3D-Speaker 声纹与 openWakeWord 唤醒，国内无需联网即可高精度转写</div>
+              <div class="setting-label">本地离线语音 AI 引擎状态（Qwen3-ASR GPU/CPU · Sherpa-ONNX）</div>
+              <div class="setting-desc" id="voice-pipeline-status-desc">本地离线运行 Qwen3-ASR-0.6B（主，自动识别 GPU 加速 / CPU 兜底）与 SenseVoice（备用）多语种识别、GTCRN 降噪、Silero VAD、3D-Speaker 声纹与 openWakeWord 唤醒</div>
             </div>
             <div class="voice-status-row">
               <div class="voice-status-badges" id="voice-model-badges">
                 <span class="voice-badge-pill" id="badge-model-qwen3-asr">Qwen3-ASR 0.6B (主)</span>
+                <span class="voice-badge-pill" id="badge-model-qwen3-gpu">GPU 加速</span>
                 <span class="voice-badge-pill" id="badge-model-asr">SenseVoice (备用)</span>
                 <span class="voice-badge-pill" id="badge-model-gtcrn">GTCRN 降噪</span>
                 <span class="voice-badge-pill" id="badge-model-dpdfnet">DPDFNet4 强噪</span>
@@ -757,14 +759,37 @@
 
           <div class="setting-card" id="setting-row-local-asr-engine">
             <div class="setting-info">
-              <div class="setting-label">本地语音转写方案（CPU）</div>
-              <div class="setting-desc">默认使用 Qwen3-ASR-0.6B（CPU）作为主方案提升中英转写准确率，主模型未就绪或异常时自动无缝切换至 SenseVoice 储备方案</div>
+              <div class="setting-label">本地语音转写方案</div>
+              <div class="setting-desc">默认使用 Qwen3-ASR-0.6B 作为主方案提升中英转写准确率，主模型未就绪或异常时自动无缝切换至 SenseVoice 储备方案</div>
             </div>
             <select id="set-voice-local-asr-engine" class="md-select" aria-label="本地语音转写方案">
               <option value="auto">自动：Qwen3-ASR-0.6B 主用 · SenseVoice 备用（推荐）</option>
-              <option value="qwen3-asr">仅主方案：Qwen3-ASR-0.6B（CPU 高精度）</option>
+              <option value="qwen3-asr">仅主方案：Qwen3-ASR-0.6B（高精度）</option>
               <option value="sensevoice">切换备用：SenseVoiceSmall（轻量极速）</option>
             </select>
+          </div>
+
+          <div class="setting-card" id="setting-row-qwen3-device">
+            <div class="setting-info">
+              <div class="setting-label">Qwen3-ASR 推理设备（自动识别 GPU）</div>
+              <div class="setting-desc" id="set-voice-qwen3-device-desc">自动检测本机独立/集成 GPU 并优先在 GPU 上加速运行 Qwen3-ASR-0.6B；无可用 GPU 或显存不足时自动无缝回退 CPU</div>
+            </div>
+            <select id="set-voice-qwen3-device" class="md-select" aria-label="Qwen3-ASR 推理设备">
+              <option value="auto">自动识别：有 GPU 优先 GPU（推荐）</option>
+              <option value="gpu">优先 GPU 加速（不可用时回退 CPU）</option>
+              <option value="cpu">仅使用 CPU 运行</option>
+            </select>
+          </div>
+
+          <div class="setting-card" id="setting-row-qwen3-streaming">
+            <div class="setting-info">
+              <div class="setting-label">Qwen3-ASR 流式转写与智能断句</div>
+              <div class="setting-desc" id="set-voice-qwen3-streaming-desc">开启后说话期间实时逐字流式转写并智能断句（句末标点+短停顿快速收句、唤醒词防误拆，兼容 GPU / CPU / 备用引擎）；关闭则恢复传统静音判停整句转写</div>
+            </div>
+            <label class="md-switch">
+              <input type="checkbox" id="set-voice-qwen3-streaming" checked aria-label="Qwen3-ASR 流式转写开关">
+              <span class="md-switch-track"></span>
+            </label>
           </div>
 
           <div class="setting-card">

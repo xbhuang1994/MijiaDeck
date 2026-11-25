@@ -18,6 +18,8 @@ export interface ClientVoiceConfig {
   voiceEnabled: boolean;
   voiceEngine: "auto" | "local" | "browser" | "whisper";
   localAsrEngine?: "auto" | "qwen3-asr" | "sensevoice";
+  qwen3ComputeDevice?: "auto" | "gpu" | "cpu";
+  qwen3StreamingEnabled?: boolean;
   voiceLang: string;
   wakeWordEnabled: boolean;
   wakeWords: string[];
@@ -786,8 +788,16 @@ export class VoiceListenerClient {
     if (ev.kind === "speech_start") {
       this.interimTranscript = "收音中…";
       this.emitState(false);
+    } else if (ev.kind === "partial") {
+      const partialText = typeof ev.text === "string" ? ev.text.trim() : "";
+      if (partialText) {
+        this.interimTranscript = partialText;
+        this.emitState(false);
+      }
     } else if (ev.kind === "speech_end") {
-      this.interimTranscript = "识别中…";
+      if (!this.interimTranscript || this.interimTranscript === "收音中…") {
+        this.interimTranscript = "识别中…";
+      }
       this.emitState(false);
     } else if (ev.kind === "result") {
       this.interimTranscript = "";

@@ -140,7 +140,11 @@ export interface AppRuntime {
   voiceListener?: VoiceListenerController;
   broadcaster?: StateBroadcaster;
   broadcastState?: () => void;
-  reloadVoiceStreams?: (wakeWords: readonly string[], threshold?: number) => void;
+  reloadVoiceStreams?: (
+    wakeWords: readonly string[],
+    threshold?: number,
+    options?: { streamingAsrEnabled?: boolean },
+  ) => void;
   speakerAudioProps?: Map<string, { volName: string; muteName: string }>;
 }
 
@@ -2118,7 +2122,9 @@ export function createRequestHandler(
             void runtime.voiceListener.prewarmLocalTts().catch(() => {});
           }
         }
-        runtime.reloadVoiceStreams?.(updated.wakeWords, updated.owwThreshold);
+        runtime.reloadVoiceStreams?.(updated.wakeWords, updated.owwThreshold, {
+          streamingAsrEnabled: updated.qwen3StreamingEnabled,
+        });
         emitBroadcast(runtime);
         return jsonResponse({
           ok: true,

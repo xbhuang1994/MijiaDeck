@@ -26,6 +26,13 @@ import type {
 } from "./localVoiceEngine.ts";
 import type { OpenWakeWordStreamSession, WakeWordAcousticHit } from "./openWakeWordEngine.ts";
 import {
+  Qwen3StreamingHypothesisTracker,
+  splitStreamingSentences,
+  stripCommittedPrefix,
+  type StreamingCommitReason,
+  type StreamingPartialUpdate,
+} from "./qwen3StreamingTranscriber.ts";
+import {
   StreamingAutoGain,
   vadSensitivityToSeconds,
   VoiceCommandSegmenter,
@@ -47,6 +54,16 @@ export interface VoiceStreamSegmentPayload {
   acousticWake?: WakeWordAcousticHit | null;
   /** 是否由流式 openWakeWord 锚定并由滞回分段器极速截断 */
   wakeAnchored?: boolean;
+  /** 流式转写开启时预计算的完整单句文本（干净环境可直接复用免二次解码） */
+  precomputedTranscript?: string;
+  /** 流式转写使用的 ASR 引擎标识 */
+  precomputedAsrEngine?: string;
+  /** 流式转写耗时（ms） */
+  precomputedAsrMs?: number;
+  /** 句中已通过流式断句提交的前缀，供完整重解码时去重防重复执行 */
+  stripCommittedPrefixHint?: string;
+  /** 流式智能断句触发原因 */
+  commitReason?: StreamingCommitReason;
 }
 
 export interface VoiceStreamSessionOptions {
@@ -65,6 +82,14 @@ export interface VoiceStreamSessionOptions {
   wakeWords?: readonly string[];
   owwEnabled?: boolean;
   owwThreshold?: number;
+  /** 是否启用 Qwen3-ASR 实时流式转写与智能断句（默认 false 保持非流式兼容，服务端按配置透传） */
+  streamingAsrEnabled?: boolean;
+  /** 实时流式字幕增量更新回调 */
+  onPartialTranscript?: (ev: StreamingPartialUpdate) => void;
+  /** 流式假设刷新最小新音频步进（ms，默认 GPU 360ms / CPU 850ms） */
+  streamingPollIntervalMs?: number;
+  /** 句末标点+短停顿快速断句静音阈值（ms，默认 320ms） */
+  streamingPunctuationPauseMs?: number;
   onWakeWordSpot?: (hit: WakeWordAcousticHit) => void;
   onSpeechActivity?: (speaking: boolean) => void;
   onSegmentReady: (
@@ -105,6 +130,17 @@ export class VoiceStreamSession {
   private _wakeWords: string[];
   private _owwThreshold: number | undefined;
 
+  // 实时流式转写与智能断句状态（受开关 streamingAsrEnabled 控制，关闭时零额外开销）
+  private _streamingAsrEnabled: boolean;
+  private readonly _streamTracker: Qwen3StreamingHypothesisTracker;
+  private _streamSpeechOriginSample: number | null = null;
+  private _streamLastDecodedEndSample = 0;
+  private _streamDecodeInFlight = false;
+  private _streamAbort: AbortController | null = null;
+  private _streamGen = 0;
+  private _streamLastEngine = "";
+  private _streamLastLatencyMs = 0;
+
   // 双轨时间对齐环形缓冲（Raw + Denoised 同步保留 20 秒，支撑唤醒词锚定极速切段与零重复降噪）
   private readonly _rawRing = new Float32Array(RAW_RING_CAPACITY);
   private readonly _denRing = new Float32Array(RAW_RING_CAPACITY);
@@ -142,6 +178,11 @@ export class VoiceStreamSession {
     this._inputRate = options.sampleRate ?? TARGET_SR;
     this._wakeWords = [...(options.wakeWords ?? [])];
     this._owwThreshold = options.owwThreshold;
+    this._streamingAsrEnabled = options.streamingAsrEnabled === true;
+    this._streamTracker = new Qwen3StreamingHypothesisTracker({
+      wakeWords: this._wakeWords,
+      punctuationPauseMs: options.streamingPunctuationPauseMs ?? 320,
+    });
 
     const online = options.localEngine.createOnlineDenoiser(options.noiseMode);
     this._onlineDenoiser = online?.denoiser ?? null;
@@ -201,7 +242,51 @@ export class VoiceStreamSession {
         }
       }
       this._segmenter.forceStartCommand(Math.max(this._lastFrameRms, 0.05));
+      if (this._streamingAsrEnabled) {
+        this._resetStreamingState(true);
+        this._streamSpeechOriginSample = this._wakeAnchorSample;
+        this._streamLastDecodedEndSample = this._wakeAnchorSample ?? this._rawTotalSamples;
+      }
     }
+  }
+
+  private _abortStreamingDecode(): void {
+    const abort = this._streamAbort;
+    this._streamAbort = null;
+    if (abort) {
+      try {
+        abort.abort();
+      } catch {
+        // ignore
+      }
+    }
+    this._streamDecodeInFlight = false;
+  }
+
+  private _resetStreamingState(abortInFlight = true): void {
+    this._streamGen += 1;
+    if (abortInFlight) {
+      this._abortStreamingDecode();
+    }
+    this._streamTracker.reset();
+    this._streamSpeechOriginSample = null;
+    this._streamLastDecodedEndSample = this._rawTotalSamples;
+    this._streamLastEngine = "";
+    this._streamLastLatencyMs = 0;
+  }
+
+  /**
+   * 运行期热切换流式转写开关（在设置中打开/关闭后无需重连 WebSocket 立即生效）。
+   */
+  setStreamingAsrEnabled(enabled: boolean): void {
+    const next = Boolean(enabled);
+    if (this._streamingAsrEnabled === next) return;
+    this._streamingAsrEnabled = next;
+    this._resetStreamingState(true);
+  }
+
+  get streamingAsrEnabled(): boolean {
+    return this._streamingAsrEnabled;
   }
 
   /**
@@ -246,6 +331,7 @@ export class VoiceStreamSession {
     this._lastDenOverlap = new Float32Array(0);
     this._segmenter.reset();
     this._resetVadState();
+    this._resetStreamingState(true);
     this._oww?.resetSegmentTracking();
     this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, this._rawTotalSamples);
   }
@@ -256,6 +342,7 @@ export class VoiceStreamSession {
   reloadWakeWords(wakeWords: readonly string[], threshold?: number): void {
     if (this._disposed) return;
     this._wakeWords = [...wakeWords];
+    this._streamTracker.setWakeWords(this._wakeWords);
     const thresholdChanged = threshold !== undefined && threshold !== this._owwThreshold;
     if (threshold !== undefined) {
       this._owwThreshold = threshold;
@@ -373,6 +460,31 @@ export class VoiceStreamSession {
         if (nowDetected !== this._vadDetected) {
           this._vadDetected = nowDetected;
           this._opts.onSpeechActivity?.(nowDetected);
+          if (nowDetected && this._streamingAsrEnabled && this._streamSpeechOriginSample === null) {
+            this._streamSpeechOriginSample = Math.max(
+              this._lastEmittedEndSample > 0 ? this._lastEmittedEndSample : 0,
+              this._rawTotalSamples - PRE_ROLL_SAMPLES,
+            );
+            this._streamLastDecodedEndSample = this._streamSpeechOriginSample;
+            this._streamTracker.reset();
+          }
+        }
+
+        // 流式转写智能断句：结合 Silero 语音态与帧级短时能量判静（因 Silero isDetected 会保持至完整 minSilenceDuration），
+        // 已出现句末强标点且真实停顿 >= 320ms 时立即断句，免苦等完整 VAD 尾静音
+        if (this._streamingAsrEnabled) {
+          const punctSilenceFloor = Math.max(0.008, this._segmenter.ambientRmsFloor * 1.45);
+          const frameHasVoice = nowDetected && frameRms >= punctSilenceFloor;
+          const { shouldCommitByPunctPause } = this._streamTracker.advanceFrame(32, frameHasVoice);
+          if (
+            shouldCommitByPunctPause &&
+            !this._streamDecodeInFlight &&
+            (this._wakeAnchorSample !== null || this._streamSpeechOriginSample !== null)
+          ) {
+            this._commitStreamingByPunctPause();
+            offset += 512;
+            continue;
+          }
         }
 
         // 安静房间唤醒锚定快路径：Silero VAD 已完成整句尾静音判定并产段时立即收尾发包并 reset VAD，
@@ -427,6 +539,10 @@ export class VoiceStreamSession {
           this._vad.pop();
         }
       }
+
+      if (this._streamingAsrEnabled && (this._vadDetected || this._wakeAnchorSample !== null)) {
+        this._maybeTriggerStreamingDecode();
+      }
     } else {
       // 无 Silero VAD 模型时按 3.2 秒滚动窗口处理
       this._fallbackChunks.push(pcm16k);
@@ -435,6 +551,268 @@ export class VoiceStreamSession {
         this._flushFallbackBuffer();
       }
     }
+  }
+
+  /**
+   * 标点+短停顿快速断句（例如说出“打开客厅吸顶灯。”后停顿 ~320ms 即刻断句提交，延迟减半）。
+   */
+  private _commitStreamingByPunctPause(): void {
+    const sentences = this._streamTracker.flush();
+    const lastEngine = this._streamLastEngine || "qwen3-asr-stream";
+    const lastLatencyMs = this._streamLastLatencyMs;
+    const anchor = this._wakeAnchorSample;
+    const anchorHit = this._wakeAnchorHit;
+    const origin =
+      anchor ??
+      this._streamSpeechOriginSample ??
+      Math.max(0, this._rawTotalSamples - TARGET_SR * 2);
+
+    this._wakeAnchorSample = null;
+    this._wakeAnchorHit = null;
+    this._activeSegmentStartSample = null;
+    this._segmenter.reset();
+    this._resetVadState();
+    this._resetStreamingState(true);
+    this._oww?.resetSegmentTracking();
+    this._lastRawOverlap = new Float32Array(0);
+    this._lastDenOverlap = new Float32Array(0);
+
+    if (sentences.length === 0) return;
+
+    const rawStart = Math.max(0, origin - PRE_ROLL_SAMPLES);
+    const rawEnd = this._rawTotalSamples;
+    if (rawEnd - rawStart < TARGET_SR * 0.16) return;
+
+    const rawSlice = this._readRingRange(this._rawRing, this._rawTotalSamples, rawStart, rawEnd);
+    const denSlice = this._readRingTail(this._denRing, this._denTotalSamples, rawSlice.length);
+    this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, rawEnd);
+
+    const inputSnrDb = estimateSnrDb(rawSlice, TARGET_SR);
+    const outputSnrDb = estimateSnrDb(denSlice, TARGET_SR);
+    const basePayload: VoiceStreamSegmentPayload = {
+      rawSamples: rawSlice,
+      denoisedSamples: denSlice,
+      denoiseEngine: this._denoiseEngine,
+      inputSnrDb,
+      outputSnrDb,
+      snrGainDb: Number((outputSnrDb - inputSnrDb).toFixed(2)),
+      startSec: Number((rawStart / TARGET_SR).toFixed(2)),
+      durationSec: Number((rawSlice.length / TARGET_SR).toFixed(2)),
+      forcedRoll: false,
+      acousticWake: anchorHit,
+      wakeAnchored: anchor !== null,
+      precomputedAsrEngine: lastEngine,
+      precomputedAsrMs: lastLatencyMs,
+      commitReason: "punctuation_pause",
+    };
+
+    for (const sentence of sentences) {
+      this._enqueueSegment({
+        ...basePayload,
+        precomputedTranscript: sentence,
+      });
+    }
+  }
+
+  /**
+   * 按自适应步进触发非阻塞流式假设解码（GPU ~360ms 步进 + SSE 逐 token，CPU ~850ms 步进），
+   * 实时推送字幕并在句中检测到多句标点边界时立即切分输出。
+   */
+  private _maybeTriggerStreamingDecode(): void {
+    if (!this._streamingAsrEnabled || this._disposed || this._streamDecodeInFlight || this._inFlight) {
+      return;
+    }
+    if (this._opts.engine === "whisper") {
+      return;
+    }
+    const status = this._opts.localEngine.getStatus();
+    if (!status.readyForLocalAsr) {
+      return;
+    }
+    // 待机持续高音量背景音乐下跳过投机流式解码，防止无谓占满 GPU/CPU
+    if (
+      !this._opts.bypassWakeWord &&
+      !this._opts.isInConversation?.() &&
+      this._wakeAnchorSample === null &&
+      this._segmenter.ambientRmsFloor >= 0.025
+    ) {
+      return;
+    }
+
+    const origin =
+      this._wakeAnchorSample ?? this._streamSpeechOriginSample ?? this._activeSegmentStartSample;
+    if (origin === null) return;
+
+    const isGpu = status.activeQwen3Device === "gpu";
+    const pollMs = this._opts.streamingPollIntervalMs ?? (isGpu ? 360 : 850);
+    const minAudioMs =
+      this._opts.streamingPollIntervalMs !== undefined
+        ? Math.min(320, pollMs)
+        : isGpu
+          ? 480
+          : 700;
+
+    const windowSamples = this._rawTotalSamples - origin;
+    const newSamples = this._rawTotalSamples - this._streamLastDecodedEndSample;
+    if (
+      windowSamples < Math.round(TARGET_SR * (minAudioMs / 1000)) ||
+      newSamples < Math.round(TARGET_SR * (pollMs / 1000))
+    ) {
+      return;
+    }
+
+    void this._runSpeculativeStreamingDecode(origin, this._rawTotalSamples);
+  }
+
+  private async _runSpeculativeStreamingDecode(
+    originSample: number,
+    endSample: number,
+  ): Promise<void> {
+    if (this._disposed || !this._streamingAsrEnabled || this._streamDecodeInFlight) return;
+    const clampedOrigin = Math.max(originSample, endSample - TARGET_SR * 12);
+    const sliceLen = endSample - clampedOrigin;
+    if (sliceLen < Math.round(TARGET_SR * 0.2)) return;
+
+    const gen = this._streamGen;
+    const abort = new AbortController();
+    this._streamAbort = abort;
+    this._streamDecodeInFlight = true;
+    this._streamLastDecodedEndSample = endSample;
+
+    const rawSlice = this._readRingRange(this._rawRing, this._rawTotalSamples, clampedOrigin, endSample);
+    const denSlice = this._readRingTail(this._denRing, this._denTotalSamples, rawSlice.length);
+    const decodeAudio = denSlice.length >= 3200 ? denSlice : rawSlice;
+    const t0 = performance.now();
+
+    try {
+      const res = await this._opts.localEngine.transcribeLocal(decodeAudio, TARGET_SR, this.lang, {
+        hotwords: this._wakeWords.length > 0 ? this._wakeWords : undefined,
+        signal: abort.signal,
+        onPartial: (partialRaw) => {
+          if (this._disposed || gen !== this._streamGen || abort.signal.aborted) return;
+          const clean = stripCommittedPrefix(partialRaw, this._streamTracker.committedPrefix);
+          if (!clean) return;
+          const stable = this._streamTracker.stableText;
+          const stablePrefix = clean.startsWith(stable) ? stable : "";
+          const unstable = stablePrefix ? clean.slice(stablePrefix.length) : clean;
+          this._opts.onPartialTranscript?.({
+            text: clean,
+            stableText: stablePrefix,
+            unstableText: unstable,
+            engine: this._streamLastEngine || "qwen3-asr-stream",
+            latencyMs: Math.round(performance.now() - t0),
+          });
+        },
+      });
+
+      if (this._disposed || gen !== this._streamGen || abort.signal.aborted) {
+        return;
+      }
+
+      this._streamLastEngine = res.engine;
+      this._streamLastLatencyMs = res.durationMs;
+
+      const ingested = this._streamTracker.ingestHypothesis(res.text, {
+        engine: res.engine,
+        latencyMs: res.durationMs,
+      });
+
+      if (ingested.partial) {
+        this._opts.onPartialTranscript?.(ingested.partial);
+      }
+
+      if (ingested.completedSentences.length > 0) {
+        const inputSnrDb = estimateSnrDb(rawSlice, TARGET_SR);
+        const outputSnrDb = estimateSnrDb(denSlice, TARGET_SR);
+        const basePayload: VoiceStreamSegmentPayload = {
+          rawSamples: rawSlice,
+          denoisedSamples: denSlice,
+          denoiseEngine: this._denoiseEngine,
+          inputSnrDb,
+          outputSnrDb,
+          snrGainDb: Number((outputSnrDb - inputSnrDb).toFixed(2)),
+          startSec: Number((clampedOrigin / TARGET_SR).toFixed(2)),
+          durationSec: Number((rawSlice.length / TARGET_SR).toFixed(2)),
+          forcedRoll: false,
+          acousticWake: this._wakeAnchorHit,
+          wakeAnchored: this._wakeAnchorSample !== null,
+          precomputedAsrEngine: res.engine,
+          precomputedAsrMs: res.durationMs,
+          commitReason: ingested.commitReason ?? "punctuation_split",
+        };
+        for (const sentence of ingested.completedSentences) {
+          this._enqueueSegment({
+            ...basePayload,
+            precomputedTranscript: sentence,
+          });
+        }
+        // 若切句后无残余尾部，顺滑推进流式窗起点，避免连续长说音频窗无限增长
+        if (!ingested.partial) {
+          this._streamSpeechOriginSample = endSample;
+          this._streamTracker.reset();
+        }
+      }
+    } catch {
+      // 流式投机解码被取消或单次失败时静默忽略，交由句尾正式分段兜底
+    } finally {
+      if (this._streamAbort === abort) {
+        this._streamAbort = null;
+        this._streamDecodeInFlight = false;
+      }
+    }
+  }
+
+  /**
+   * 结束当前语音段时将流式追踪状态合并至出队段：
+   * - 若流式假设已覆盖至句尾（<= 280ms 尾差且非强制滚窗），直接按标点分句复用，省去二次解码；
+   * - 否则附带已提交前缀提示（stripCommittedPrefixHint）交由后续识别去重，零漏字、零重复。
+   */
+  private _enqueueWithStreamingHandoff(
+    basePayload: VoiceStreamSegmentPayload,
+    rawEndSample: number,
+    commitReason: StreamingCommitReason,
+  ): void {
+    if (!this._streamingAsrEnabled) {
+      this._enqueueSegment(basePayload);
+      return;
+    }
+
+    const committedPrefix = this._streamTracker.committedPrefix;
+    const latestText = this._streamTracker.latestText;
+    const lastEngine = this._streamLastEngine;
+    const lastLatencyMs = this._streamLastLatencyMs;
+    const lastDecodedEnd = this._streamLastDecodedEndSample;
+    this._resetStreamingState(true);
+
+    const tailUndecodedSamples = rawEndSample - lastDecodedEnd;
+    if (
+      latestText &&
+      !basePayload.forcedRoll &&
+      tailUndecodedSamples <= Math.round(TARGET_SR * 0.28)
+    ) {
+      const split = splitStreamingSentences(latestText, {
+        wakeWords: this._wakeWords,
+        forceFlush: true,
+      });
+      if (split.completed.length > 0) {
+        for (const sentence of split.completed) {
+          this._enqueueSegment({
+            ...basePayload,
+            precomputedTranscript: sentence,
+            precomputedAsrEngine: lastEngine || "qwen3-asr-stream",
+            precomputedAsrMs: lastLatencyMs,
+            commitReason,
+          });
+        }
+        return;
+      }
+    }
+
+    this._enqueueSegment({
+      ...basePayload,
+      ...(committedPrefix ? { stripCommittedPrefixHint: committedPrefix } : {}),
+      commitReason,
+    });
   }
 
   private _emitWakeAnchoredSegment(timedOut: boolean): void {
@@ -463,19 +841,23 @@ export class VoiceStreamSession {
 
     const inputSnrDb = estimateSnrDb(rawSlice, TARGET_SR);
     const outputSnrDb = estimateSnrDb(denSlice, TARGET_SR);
-    this._enqueueSegment({
-      rawSamples: rawSlice,
-      denoisedSamples: denSlice,
-      denoiseEngine: this._denoiseEngine,
-      inputSnrDb,
-      outputSnrDb,
-      snrGainDb: Number((outputSnrDb - inputSnrDb).toFixed(2)),
-      startSec: Number((rawStart / TARGET_SR).toFixed(2)),
-      durationSec: Number((rawSlice.length / TARGET_SR).toFixed(2)),
-      forcedRoll: timedOut,
-      acousticWake: anchorHit,
-      wakeAnchored: true,
-    });
+    this._enqueueWithStreamingHandoff(
+      {
+        rawSamples: rawSlice,
+        denoisedSamples: denSlice,
+        denoiseEngine: this._denoiseEngine,
+        inputSnrDb,
+        outputSnrDb,
+        snrGainDb: Number((outputSnrDb - inputSnrDb).toFixed(2)),
+        startSec: Number((rawStart / TARGET_SR).toFixed(2)),
+        durationSec: Number((rawSlice.length / TARGET_SR).toFixed(2)),
+        forcedRoll: timedOut,
+        acousticWake: anchorHit,
+        wakeAnchored: true,
+      },
+      rawEnd,
+      timedOut ? "max_duration" : "vad_silence",
+    );
   }
 
   /**
@@ -530,19 +912,23 @@ export class VoiceStreamSession {
 
     const inputSnrDb = estimateSnrDb(rawSlice, TARGET_SR);
     const outputSnrDb = estimateSnrDb(denSlice, TARGET_SR);
-    this._enqueueSegment({
-      rawSamples: rawSlice,
-      denoisedSamples: denSlice,
-      denoiseEngine: this._denoiseEngine,
-      inputSnrDb,
-      outputSnrDb,
-      snrGainDb: Number((outputSnrDb - inputSnrDb).toFixed(2)),
-      startSec: Number((rawStart / TARGET_SR).toFixed(2)),
-      durationSec,
-      forcedRoll: timedOut,
-      acousticWake,
-      wakeAnchored: false,
-    });
+    this._enqueueWithStreamingHandoff(
+      {
+        rawSamples: rawSlice,
+        denoisedSamples: denSlice,
+        denoiseEngine: this._denoiseEngine,
+        inputSnrDb,
+        outputSnrDb,
+        snrGainDb: Number((outputSnrDb - inputSnrDb).toFixed(2)),
+        startSec: Number((rawStart / TARGET_SR).toFixed(2)),
+        durationSec,
+        forcedRoll: timedOut,
+        acousticWake,
+        wakeAnchored: false,
+      },
+      rawEnd,
+      timedOut ? "max_duration" : "vad_silence",
+    );
   }
 
   /**
@@ -550,6 +936,9 @@ export class VoiceStreamSession {
    */
   async flush(): Promise<void> {
     if (this._disposed) return;
+    if (this._streamingAsrEnabled) {
+      this._abortStreamingDecode();
+    }
     if (this._onlineDenoiser) {
       try {
         const tail = this._onlineDenoiser.flush();
@@ -752,7 +1141,11 @@ export class VoiceStreamSession {
         wakeAnchored: false,
       };
 
-      this._enqueueSegment(payload);
+      this._enqueueWithStreamingHandoff(
+        payload,
+        rawEnd,
+        isManualFlush ? "manual_flush" : forcedRoll ? "max_duration" : "vad_silence",
+      );
     }
   }
 
@@ -796,8 +1189,9 @@ export class VoiceStreamSession {
       }
       this._pendingWake.push(payload);
     } else {
-      // 有界反压：非唤醒待处理队列最多保留最新 2 段，既不丢相邻语句又彻底防止持续背景音乐下队列无限积压！
-      if (this._pendingNormalQueue.length >= 2) {
+      // 有界反压：非唤醒待处理队列最多保留最新 2 段（流式多句切分放宽至 6 句防吞掉连续指令），彻底防止持续背景音乐下队列无限积压！
+      const maxQueue = payload.precomputedTranscript ? 6 : 2;
+      if (this._pendingNormalQueue.length >= maxQueue) {
         this._pendingNormalQueue.shift();
         this._droppedStaleCount += 1;
       }
@@ -827,7 +1221,8 @@ export class VoiceStreamSession {
       .then(async () => {
         if (this._disposed) return;
         // 若上一条刚成功命中并执行指令，跳过紧随其后的重叠残尾段/滚窗，彻底防止同一句话触发二次执行
-        if (!next.wakeAnchored && this._lastMatchedEndSec >= 0) {
+        // （流式断句产出的独立分句已由 Qwen3StreamingHypothesisTracker 严格去重，豁免时间重叠拦截）
+        if (!next.wakeAnchored && !next.precomputedTranscript && this._lastMatchedEndSec >= 0) {
           const nextStart = next.startSec;
           const nextEnd = next.startSec + next.durationSec;
           const overlapStart = Math.max(nextStart, Math.max(0, this._lastMatchedStartSec));
@@ -871,6 +1266,7 @@ export class VoiceStreamSession {
 
   dispose(): void {
     this._disposed = true;
+    this._resetStreamingState(true);
     this._pendingWake = [];
     this._pendingNormalQueue = [];
     this._wakeAnchorSample = null;

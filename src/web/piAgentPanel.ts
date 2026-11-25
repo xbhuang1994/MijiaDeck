@@ -180,6 +180,22 @@ export interface UiLocalVoiceStatus {
   readyForVad: boolean;
   readyForVoiceprint: boolean;
   readyForQwen3Asr?: boolean;
+  readyForQwen3Gpu?: boolean;
+  activeQwen3Device?: "gpu" | "cpu" | null;
+  qwen3ComputeDevice?: "auto" | "gpu" | "cpu";
+  gpu?: {
+    detected: boolean;
+    backend: "vulkan" | "cuda" | "metal" | "rocm" | "none";
+    deviceId: string | null;
+    deviceName: string | null;
+    vramTotalMb: number | null;
+    vramFreeMb: number | null;
+    runtimeReady: boolean;
+    modelReady: boolean;
+    ready: boolean;
+    serverRunning: boolean;
+    lastError: string | null;
+  };
   readyForSenseVoice?: boolean;
   readyForLocalAsr: boolean;
   primaryAsrEngine?: "qwen3-asr" | "sensevoice" | null;
@@ -207,6 +223,7 @@ export interface UiLocalVoiceStatus {
     sileroVad: boolean;
     speakerCampp: boolean;
     qwen3Asr?: boolean;
+    qwen3AsrGpu?: boolean;
     senseVoice: boolean;
     openWakeWord?: boolean;
     localTts?: boolean;
@@ -227,6 +244,8 @@ export interface UiVoiceSnapshot {
   mode: ClientVoiceMode;
   engine: "local" | "browser" | "whisper" | "manual";
   localAsrEngine?: "auto" | "qwen3-asr" | "sensevoice";
+  qwen3ComputeDevice?: "auto" | "gpu" | "cpu";
+  qwen3StreamingEnabled?: boolean;
   interimTranscript: string;
   lastTranscript: string;
   lastCommand: string;
@@ -611,6 +630,11 @@ export class PiAgentPanelController {
       void this.toggleWakeWordMode();
     });
 
+    const streamingToggleBtn = document.getElementById("pi-streaming-toggle-btn");
+    streamingToggleBtn?.addEventListener("click", () => {
+      void this.toggleStreamingAsrMode();
+    });
+
     const cavemanBtn = document.getElementById("pi-caveman-toggle-btn");
     cavemanBtn?.addEventListener("click", () => {
       void this.cycleCavemanMode();
@@ -760,6 +784,28 @@ export class PiAgentPanelController {
   async triggerOneShotVoice(): Promise<void> {
     this.setOpen(true);
     await this.voiceClient.startOneShot();
+  }
+
+  async toggleStreamingAsrMode(): Promise<void> {
+    const current =
+      (this.voiceState?.qwen3StreamingEnabled ?? this.agentState?.config.qwen3StreamingEnabled ?? true) !==
+      false;
+    const next = !current;
+    try {
+      const res = await this.deps.apiPost<{
+        agent?: UiPiAgentSnapshot;
+        voice?: UiVoiceSnapshot;
+      }>("/api/agent/config", { qwen3StreamingEnabled: next });
+      if (res.agent) this.applyAgentSnapshot(res.agent);
+      if (res.voice) this.applyVoiceSnapshot(res.voice);
+      this.deps.showToast(
+        next ? "已开启流式转写与智能断句" : "已关闭流式转写（切回传统整句模式）",
+        2200,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.deps.showToast(`切换流式转写失败：${msg}`, 3000);
+    }
   }
 
   async toggleWakeWordMode(): Promise<void> {
@@ -1353,6 +1399,7 @@ export class PiAgentPanelController {
     const startBtn = node<HTMLButtonElement>("pi-voice-start-btn");
     const oneShotBtn = node<HTMLButtonElement>("pi-voice-oneshot-btn");
     const wakeBtn = node<HTMLButtonElement>("pi-voice-wake-toggle-btn");
+    const streamingBtn = document.getElementById("pi-streaming-toggle-btn") as HTMLButtonElement | null;
     const cavemanBtn = document.getElementById("pi-caveman-toggle-btn") as HTMLButtonElement | null;
 
     const mode = this.effectiveMode();
@@ -1420,6 +1467,18 @@ export class PiAgentPanelController {
       ? `当前唤醒词：${wakeWords.join("、")}（点击切换免唤醒模式）`
       : "当前监听到的每句话都将直接交给 Pi Agent（点击开启唤醒词）";
 
+    if (streamingBtn) {
+      const streamingOn =
+        (this.voiceState?.qwen3StreamingEnabled ?? this.agentState?.config.qwen3StreamingEnabled ?? true) !==
+        false;
+      streamingBtn.textContent = streamingOn ? "流式：开" : "流式：关";
+      streamingBtn.classList.toggle("active", streamingOn);
+      streamingBtn.setAttribute("aria-pressed", String(streamingOn));
+      streamingBtn.title = streamingOn
+        ? "Qwen3-ASR 实时流式转写与智能断句已开启（点击切换为传统整句模式）"
+        : "流式转写已关闭，当前使用传统静音判停整句识别（点击开启实时流式转写）";
+    }
+
     if (cavemanBtn) {
       const cm = this.currentCavemanMode();
       cavemanBtn.textContent = CAVEMAN_LABELS[cm];
@@ -1448,9 +1507,18 @@ export class PiAgentPanelController {
       subEl.textContent = interim ? `${interim}` : "可直接连续追问，无需重复喊唤醒词";
     } else if (isListening) {
       const localEngine = this.voiceState?.localEngine;
+      const qwen3DevTag =
+        localEngine?.activeQwen3Device === "gpu"
+          ? "GPU"
+          : localEngine?.activeQwen3Device === "cpu"
+            ? "CPU"
+            : "";
+      const streamingOn =
+        (this.voiceState?.qwen3StreamingEnabled ?? this.agentState?.config.qwen3StreamingEnabled ?? true) !==
+        false;
       const localAsrLabel =
         localEngine?.primaryAsrEngine === "qwen3-asr"
-          ? "本地 Qwen3-ASR 0.6B"
+          ? `本地 Qwen3-ASR 0.6B${qwen3DevTag ? ` (${qwen3DevTag})` : ""}${streamingOn ? " · 流式" : ""}`
           : localEngine?.primaryAsrEngine === "sensevoice"
             ? localEngine.activeLocalAsrMode === "sensevoice"
               ? "本地 SenseVoice (备用)"
@@ -1470,11 +1538,20 @@ export class PiAgentPanelController {
           : "免唤醒已开启，直接说出设备控制指令即可执行";
     } else {
       const le = this.voiceState?.localEngine;
+      const devLabel =
+        le?.activeQwen3Device === "gpu"
+          ? "GPU"
+          : le?.activeQwen3Device === "cpu"
+            ? "CPU"
+            : "";
+      const streamingOn =
+        (this.voiceState?.qwen3StreamingEnabled ?? this.agentState?.config.qwen3StreamingEnabled ?? true) !==
+        false;
       const asrReadyPrefix =
         le?.primaryAsrEngine === "qwen3-asr"
           ? le.readyForSenseVoice
-            ? "本地 Qwen3-ASR 0.6B (主) · SenseVoice (备用)"
-            : "本地 Qwen3-ASR 0.6B (CPU)"
+            ? `本地 Qwen3-ASR 0.6B (${devLabel || "主"}${streamingOn ? "·流式" : ""}) · SenseVoice (备用)`
+            : `本地 Qwen3-ASR 0.6B (${devLabel || "主"}${streamingOn ? "·流式" : ""})`
           : le?.primaryAsrEngine === "sensevoice"
             ? "本地 SenseVoice (备用)"
             : "";
@@ -1499,12 +1576,18 @@ export class PiAgentPanelController {
     const tags: Array<{ label: string; warn?: boolean; title?: string }> = [];
 
     if (vs?.localEngine?.readyForLocalAsr) {
+      const streamingOn =
+        (vs?.qwen3StreamingEnabled ?? cfg?.qwen3StreamingEnabled ?? true) !== false;
       if (vs.localEngine.primaryAsrEngine === "qwen3-asr") {
+        const isGpu = vs.localEngine.activeQwen3Device === "gpu";
+        const gpuName = vs.localEngine.gpu?.deviceName;
         tags.push({
-          label: "Qwen3-ASR 0.6B",
-          title: vs.localEngine.readyForSenseVoice
-            ? "主方案 Qwen3-ASR-0.6B (CPU) 已就绪 · SenseVoice 备用热待命"
-            : "主方案 Qwen3-ASR-0.6B (CPU) 已就绪",
+          label: isGpu ? "Qwen3-ASR 0.6B · GPU" : "Qwen3-ASR 0.6B · CPU",
+          title: isGpu
+            ? `主方案 Qwen3-ASR-0.6B GPU 加速 (${gpuName || "GPU"})${vs.localEngine.readyForSenseVoice ? " · SenseVoice 备用热待命" : ""}`
+            : vs.localEngine.readyForSenseVoice
+              ? "主方案 Qwen3-ASR-0.6B (CPU) 已就绪 · SenseVoice 备用热待命"
+              : "主方案 Qwen3-ASR-0.6B (CPU) 已就绪",
         });
       } else {
         tags.push({
@@ -1517,6 +1600,12 @@ export class PiAgentPanelController {
             vs.localEngine.activeLocalAsrMode === "sensevoice"
               ? "当前已手动切换至 SenseVoice 备用方案"
               : "Qwen3-ASR 主模型尚未就绪，当前自动使用 SenseVoice 储备方案",
+        });
+      }
+      if (streamingOn) {
+        tags.push({
+          label: "流式转写",
+          title: "已开启实时流式转写与智能断句（可在设置中随时关闭）",
         });
       }
     }

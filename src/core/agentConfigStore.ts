@@ -26,6 +26,7 @@ export type AgentProviderMode =
 
 export type VoiceEngineMode = "auto" | "local" | "browser" | "whisper";
 export type LocalAsrEngineMode = "auto" | "qwen3-asr" | "sensevoice";
+export type Qwen3ComputeDeviceMode = "auto" | "gpu" | "cpu";
 export type TtsEngineMode = "auto" | "local" | "browser";
 export type TtsVoicePreset = "gentle-zh-en" | "warm-zh-baker";
 export type NoiseSuppressionMode = "auto" | "neural" | "dpdfnet" | "voxlock" | "dsp" | "off";
@@ -159,6 +160,17 @@ const LOCAL_ASR_ENGINE_ALIASES: Readonly<Record<string, LocalAsrEngineMode>> = {
   "sense-voice": "sensevoice",
   sv: "sensevoice",
 };
+const VALID_QWEN3_COMPUTE_DEVICES = new Set<string>(["auto", "gpu", "cpu"]);
+const QWEN3_COMPUTE_DEVICE_ALIASES: Readonly<Record<string, Qwen3ComputeDeviceMode>> = {
+  auto: "auto",
+  gpu: "gpu",
+  vulkan: "gpu",
+  cuda: "gpu",
+  dml: "gpu",
+  directml: "gpu",
+  metal: "gpu",
+  cpu: "cpu",
+};
 const VALID_TTS_ENGINES = new Set<string>(["auto", "local", "browser"]);
 const VALID_TTS_VOICES = new Set<string>(["gentle-zh-en", "warm-zh-baker"]);
 const VALID_NOISE_MODES = new Set<string>(["auto", "neural", "dpdfnet", "voxlock", "dsp", "off"]);
@@ -192,6 +204,8 @@ const VALID_CUSTOM_APIS = new Set<string>([
 export const DEFAULT_WAKE_WORDS = ["小派", "小湃", "小π", "派派", "pi", "米家助手"] as const;
 export const DEFAULT_WAKE_ACK_PHRASE = "嗯?";
 export const DEFAULT_LOCAL_ASR_ENGINE: LocalAsrEngineMode = "auto";
+export const DEFAULT_QWEN3_COMPUTE_DEVICE: Qwen3ComputeDeviceMode = "auto";
+export const DEFAULT_QWEN3_STREAMING_ENABLED = true;
 export const DEFAULT_TTS_ENGINE: TtsEngineMode = "auto";
 export const DEFAULT_TTS_VOICE: TtsVoicePreset = "gentle-zh-en";
 export const DEFAULT_TTS_SPEED = 0.98;
@@ -208,8 +222,12 @@ export interface AgentVoiceConfig {
   maxHistoryTurns: number;
   voiceEnabled: boolean;
   voiceEngine: VoiceEngineMode;
-  /** 本地离线语音转写策略：auto（主用 Qwen3-ASR-0.6B CPU，备用 SenseVoice 自动兜底）/ qwen3-asr / sensevoice */
+  /** 本地离线语音转写策略：auto（主用 Qwen3-ASR-0.6B，备用 SenseVoice 自动兜底）/ qwen3-asr / sensevoice */
   localAsrEngine: LocalAsrEngineMode;
+  /** Qwen3-ASR-0.6B 计算设备：auto（自动识别 GPU 优先，无 GPU 时回落 CPU）/ gpu / cpu */
+  qwen3ComputeDevice: Qwen3ComputeDeviceMode;
+  /** 是否开启 Qwen3-ASR-0.6B 实时流式转写与智能断句（开启后边说边出字、按标点与停顿智能断句） */
+  qwen3StreamingEnabled: boolean;
   voiceLang: string;
   wakeWordEnabled: boolean;
   wakeWords: string[];
@@ -279,6 +297,8 @@ export interface AgentConfigPatch {
   voiceEnabled?: unknown;
   voiceEngine?: unknown;
   localAsrEngine?: unknown;
+  qwen3ComputeDevice?: unknown;
+  qwen3StreamingEnabled?: unknown;
   voiceLang?: unknown;
   wakeWordEnabled?: unknown;
   wakeWords?: unknown;
@@ -332,6 +352,8 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     voiceEnabled: true,
     voiceEngine: "auto",
     localAsrEngine: DEFAULT_LOCAL_ASR_ENGINE,
+    qwen3ComputeDevice: DEFAULT_QWEN3_COMPUTE_DEVICE,
+    qwen3StreamingEnabled: DEFAULT_QWEN3_STREAMING_ENABLED,
     voiceLang: "zh-CN",
     wakeWordEnabled: true,
     wakeWords: [...DEFAULT_WAKE_WORDS],
@@ -443,6 +465,15 @@ export function normalizeLocalAsrEngine(
   return LOCAL_ASR_ENGINE_ALIASES[key] ?? fallback;
 }
 
+export function normalizeQwen3ComputeDevice(
+  value: unknown,
+  fallback: Qwen3ComputeDeviceMode = DEFAULT_QWEN3_COMPUTE_DEVICE,
+): Qwen3ComputeDeviceMode {
+  if (typeof value !== "string") return fallback;
+  const key = value.trim().toLowerCase();
+  return QWEN3_COMPUTE_DEVICE_ALIASES[key] ?? fallback;
+}
+
 export function normalizeCavemanMode(
   value: unknown,
   fallback: CavemanReplyMode = DEFAULT_CAVEMAN_MODE,
@@ -483,6 +514,14 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     : defaults.voiceEngine;
 
   const localAsrEngine = normalizeLocalAsrEngine(raw.localAsrEngine, defaults.localAsrEngine);
+  const qwen3ComputeDevice = normalizeQwen3ComputeDevice(
+    raw.qwen3ComputeDevice,
+    defaults.qwen3ComputeDevice,
+  );
+  const qwen3StreamingEnabled =
+    typeof raw.qwen3StreamingEnabled === "boolean"
+      ? raw.qwen3StreamingEnabled
+      : defaults.qwen3StreamingEnabled;
 
   const voiceLangRaw = typeof raw.voiceLang === "string" ? raw.voiceLang.trim() : "";
   const voiceLang = voiceLangRaw || defaults.voiceLang;
@@ -595,6 +634,8 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     voiceEnabled: typeof raw.voiceEnabled === "boolean" ? raw.voiceEnabled : defaults.voiceEnabled,
     voiceEngine,
     localAsrEngine,
+    qwen3ComputeDevice,
+    qwen3StreamingEnabled,
     voiceLang,
     wakeWordEnabled:
       typeof raw.wakeWordEnabled === "boolean" ? raw.wakeWordEnabled : defaults.wakeWordEnabled,
@@ -883,6 +924,17 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
       throw new Error(`不支持的本地语音识别方案: ${rawAsr}`);
     }
     nextRaw.localAsrEngine = mappedAsr;
+  }
+  if (patch.qwen3ComputeDevice !== undefined) {
+    const rawDev = String(patch.qwen3ComputeDevice).trim().toLowerCase();
+    const mappedDev = QWEN3_COMPUTE_DEVICE_ALIASES[rawDev];
+    if (!mappedDev || !VALID_QWEN3_COMPUTE_DEVICES.has(mappedDev)) {
+      throw new Error(`不支持的 Qwen3 计算设备模式: ${rawDev}`);
+    }
+    nextRaw.qwen3ComputeDevice = mappedDev;
+  }
+  if (patch.qwen3StreamingEnabled !== undefined) {
+    nextRaw.qwen3StreamingEnabled = Boolean(patch.qwen3StreamingEnabled);
   }
   if (patch.voiceLang !== undefined) {
     nextRaw.voiceLang = String(patch.voiceLang).trim();
