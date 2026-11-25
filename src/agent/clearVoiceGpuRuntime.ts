@@ -381,6 +381,10 @@ export class ClearVoiceGpuRuntime {
 
       const proc = Bun.spawn([pythonBin, ...args], {
         cwd: path.dirname(scriptPath),
+        env: {
+          ...process.env,
+          PYTHONDONTWRITEBYTECODE: "1",
+        },
         stdout: "ignore",
         stderr: "pipe",
       });

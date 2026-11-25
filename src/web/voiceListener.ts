@@ -42,6 +42,9 @@ export interface ClientVoiceConfig {
   conversationWindowSec?: number;
   maxConsecutiveSidetalk?: number;
   bargeInEnabled?: boolean;
+  asyncVoicePipeline?: boolean;
+  echoCancellationMode?: "auto" | "aggressive" | "standard" | "off";
+  bargeInDuckingEnabled?: boolean;
   systemOneMode?: "auto" | "on" | "off";
   systemOneBaseUrl?: string;
   systemOneModel?: string;
@@ -55,6 +58,13 @@ export interface ClientVoiceConfig {
   localTtsReady?: boolean;
 }
 
+export interface ClientSpeakMeta {
+  utteranceId?: string;
+  priority?: "ack" | "normal" | "result" | "system";
+  taskId?: string;
+  interrupt?: boolean;
+}
+
 export interface VoiceListenerClientCallbacks {
   onStatusChange: (status: {
     active: boolean;
@@ -63,6 +73,13 @@ export interface VoiceListenerClientCallbacks {
     interimTranscript: string;
     error: string | null;
     oneShot: boolean;
+    speaking: boolean;
+    ducked: boolean;
+    speakingQueueLength: number;
+    speakingText: string | null;
+    aecActive: boolean;
+    erleDb: number;
+    doubleTalk: boolean;
   }) => void;
   onLevelChange: (level: number) => void;
   onSyncServerState: (patch: {
@@ -72,10 +89,25 @@ export interface VoiceListenerClientCallbacks {
     interimTranscript?: string;
     error?: string | null;
   }) => void;
-  onTranscriptFinal: (text: string, options: { bypassWakeWord: boolean; engine: ClientVoiceEngine }) => Promise<void>;
+  onTranscriptFinal: (
+    text: string,
+    options: {
+      bypassWakeWord: boolean;
+      engine: ClientVoiceEngine;
+      asyncDispatch?: boolean;
+      duringTtsPlayback?: boolean;
+    },
+  ) => Promise<void>;
   onUploadAudio: (
     blob: Blob,
-    options: { bypassWakeWord: boolean; lang: string; engine: "local" | "whisper"; filename: string },
+    options: {
+      bypassWakeWord: boolean;
+      lang: string;
+      engine: "local" | "whisper";
+      filename: string;
+      asyncDispatch?: boolean;
+      duringTtsPlayback?: boolean;
+    },
   ) => Promise<void>;
   isVoiceStreamReady?: () => boolean;
   sendVoiceStreamControl?: (msg: Record<string, unknown>) => boolean;
@@ -260,14 +292,290 @@ export function encodeFloat32ToWavBlob(samples: Float32Array, sampleRate = 16000
 }
 
 /**
- * 独立音频线程 AudioWorkletProcessor 源码：
- * 1. 85Hz 一阶高通滤波去除直流偏移与交流电低频嗡声
- * 2. 实时下采样至 16kHz Mono PCM
- * 3. 自适应噪声底噪追踪（在风扇/空调等稳定噪声下不持续误触发）
- * 4. 400ms Pre-roll 环形缓冲（说话前 400ms 自动拼接到句首，绝不切掉唤醒词首字）
- * 5. 切后台/最小化窗口依然稳定运行
+ * 独立音频线程 AudioWorkletProcessor 源码（全双工 + 实时参考信号 PBFDAF/NLMS 声学回声消除）：
+ * 1. 双输入时钟同步下采样至 16kHz Mono PCM（Input 0 = 麦克风，Input 1 = 本机 TTS 播报远端参考信号）
+ * 2. 85Hz 一阶高通滤波去除直流偏移与低频嗡声
+ * 3. 内置 16 分块 × 256 采样 (256ms) PBFDAF 频域自适应回声消除 + 双讲检测 (DTD) + 残余回声抑制 (RES)
+ * 4. 全双工异步流模式：播报期间绝不强行暂停麦克风收音，经实时 AEC 净化后的近端人声持续直推服务端！
+ * 5. 双讲检测仅在真实近端人声出现时通知主线程平滑降音（Ducking）与打断，彻底消除扬声器自回声误打断。
  */
 const VOICE_WORKLET_CODE = `
+function aecFft(re, im, inverse) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i += 1) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      const tr = re[i]; re[i] = re[j]; re[j] = tr;
+      const ti = im[i]; im[i] = im[j]; im[j] = ti;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = ((inverse ? 2 : -2) * Math.PI) / len;
+    const wlenRe = Math.cos(ang);
+    const wlenIm = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let wRe = 1, wIm = 0;
+      const half = len >> 1;
+      for (let j = 0; j < half; j += 1) {
+        const uRe = re[i + j], uIm = im[i + j];
+        const vRe = re[i + j + half] * wRe - im[i + j + half] * wIm;
+        const vIm = re[i + j + half] * wIm + im[i + j + half] * wRe;
+        re[i + j] = uRe + vRe;
+        im[i + j] = uIm + vIm;
+        re[i + j + half] = uRe - vRe;
+        im[i + j + half] = uIm - vIm;
+        const nextWRe = wRe * wlenRe - wIm * wlenIm;
+        wIm = wRe * wlenIm + wIm * wlenRe;
+        wRe = nextWRe;
+      }
+    }
+  }
+  if (inverse) {
+    const invN = 1 / n;
+    for (let i = 0; i < n; i += 1) {
+      re[i] *= invN;
+      im[i] *= invN;
+    }
+  }
+}
+
+class WorkletPbfdafAec {
+  constructor(aggressive) {
+    this.N = 256;
+    this.F = 512;
+    this.B = 257;
+    this.M = 16;
+    this.stepSize = 0.45;
+    this.reg = 1e-4;
+    this.farEndThresh = 0.0025;
+    this.aggressive = Boolean(aggressive);
+    this.prevRef = new Float32Array(this.N);
+    this.xRe = Array.from({ length: this.M }, () => new Float32Array(this.B));
+    this.xIm = Array.from({ length: this.M }, () => new Float32Array(this.B));
+    this.wRe = Array.from({ length: this.M }, () => new Float32Array(this.B));
+    this.wIm = Array.from({ length: this.M }, () => new Float32Array(this.B));
+    this.partHead = 0;
+    this.psdRef = new Float32Array(this.B).fill(this.reg);
+    this.psdErr = new Float32Array(this.B).fill(1e-7);
+    this.psdEcho = new Float32Array(this.B).fill(1e-7);
+    this.prevPostGain = new Float32Array(this.B).fill(1);
+    this.prevErrTime = new Float32Array(this.N);
+    this.tmpRe = new Float32Array(this.F);
+    this.tmpIm = new Float32Array(this.F);
+    this.yRe = new Float32Array(this.F);
+    this.yIm = new Float32Array(this.F);
+    this.eRe = new Float32Array(this.F);
+    this.eIm = new Float32Array(this.F);
+    this.gradRe = new Float32Array(this.F);
+    this.gradIm = new Float32Array(this.F);
+    this.smoothMicPow = 1e-8;
+    this.smoothErrPow = 1e-8;
+    this.farEndHold = 0;
+    this.doubleTalkHold = 0;
+    this.erleDb = 0;
+    this.convergedRatio = 0;
+    this.adaptBlocks = 0;
+    this.constraintTick = 0;
+  }
+
+  processBlock(mic, ref) {
+    const N = this.N, F = this.F, B = this.B, M = this.M;
+    let micSum = 0, refSum = 0;
+    for (let i = 0; i < N; i += 1) {
+      const m = mic[i], r = ref[i];
+      micSum += m * m;
+      refSum += r * r;
+    }
+    const micPow = micSum / N;
+    const refPow = refSum / N;
+    const micRms = Math.sqrt(micPow);
+    const refRms = Math.sqrt(refPow);
+    const refNow = refRms >= this.farEndThresh;
+    if (refNow) this.farEndHold = 14;
+    else if (this.farEndHold > 0) this.farEndHold -= 1;
+    const farEndActive = refNow || this.farEndHold > 0;
+
+    this.tmpRe.set(this.prevRef, 0);
+    this.tmpRe.set(ref, N);
+    this.tmpIm.fill(0);
+    this.prevRef.set(ref, 0);
+    aecFft(this.tmpRe, this.tmpIm, false);
+
+    this.partHead = (this.partHead - 1 + M) % M;
+    const cxRe = this.xRe[this.partHead], cxIm = this.xIm[this.partHead];
+    for (let k = 0; k < B; k += 1) {
+      cxRe[k] = this.tmpRe[k];
+      cxIm[k] = this.tmpIm[k];
+    }
+
+    if (!farEndActive) {
+      this.doubleTalkHold = 0;
+      this.prevErrTime.set(mic, 0);
+      this.prevPostGain.fill(1);
+      return { output: mic, farEndActive: false, doubleTalk: false, erleDb: this.erleDb, outputRms: micRms };
+    }
+
+    this.yRe.fill(0);
+    this.yIm.fill(0);
+    for (let p = 0; p < M; p += 1) {
+      const idx = (this.partHead + p) % M;
+      const xpRe = this.xRe[idx], xpIm = this.xIm[idx];
+      const wpRe = this.wRe[p], wpIm = this.wIm[p];
+      for (let k = 0; k < B; k += 1) {
+        const xr = xpRe[k], xi = xpIm[k], wr = wpRe[k], wi = wpIm[k];
+        this.yRe[k] += wr * xr - wi * xi;
+        this.yIm[k] += wr * xi + wi * xr;
+      }
+    }
+    for (let k = 1; k < B - 1; k += 1) {
+      this.yRe[F - k] = this.yRe[k];
+      this.yIm[F - k] = -this.yIm[k];
+    }
+    aecFft(this.yRe, this.yIm, true);
+
+    const linearErr = new Float32Array(N);
+    let errSum = 0, echoSum = 0, micEchoDot = 0, errEchoDot = 0;
+    for (let i = 0; i < N; i += 1) {
+      const m = mic[i], yh = this.yRe[N + i], e = m - yh;
+      linearErr[i] = e;
+      errSum += e * e;
+      echoSum += yh * yh;
+      micEchoDot += m * yh;
+      errEchoDot += e * yh;
+    }
+    const errPow = errSum / N;
+    const echoPow = echoSum / N;
+    this.smoothMicPow = 0.72 * this.smoothMicPow + 0.28 * micPow;
+    this.smoothErrPow = 0.72 * this.smoothErrPow + 0.28 * errPow;
+
+    const micEchoCorr = micSum > 1e-9 && echoSum > 1e-9 ? Math.abs(micEchoDot) / Math.sqrt(micSum * echoSum) : 0;
+    const errEchoCorr = errSum > 1e-9 && echoSum > 1e-9 ? Math.abs(errEchoDot) / Math.sqrt(errSum * echoSum) : 0;
+    const converged = this.adaptBlocks >= 10 && this.convergedRatio > 0.45;
+    const errRms = Math.sqrt(errPow);
+    const echoRms = Math.sqrt(echoPow);
+
+    const strongNear = converged && errRms > Math.max(0.014, echoRms * 0.42) && errEchoCorr < 0.35 && micPow > echoPow * 1.35;
+    const loudNear = micRms > Math.max(0.035, refRms * 1.45) && errRms > Math.max(0.025, echoRms * 0.85) && micEchoCorr < 0.55;
+    if (strongNear || loudNear) this.doubleTalkHold = 6;
+    else if (this.doubleTalkHold > 0) this.doubleTalkHold -= 1;
+    const doubleTalk = this.doubleTalkHold > 0;
+
+    this.eRe.fill(0);
+    this.eIm.fill(0);
+    for (let i = 0; i < N; i += 1) this.eRe[N + i] = linearErr[i];
+    aecFft(this.eRe, this.eIm, false);
+
+    for (let k = 0; k < B; k += 1) {
+      let totalX = 0;
+      for (let p = 0; p < M; p += 1) {
+        const xr = this.xRe[p][k], xi = this.xIm[p][k];
+        totalX += xr * xr + xi * xi;
+      }
+      this.psdRef[k] = 0.65 * this.psdRef[k] + 0.35 * totalX;
+    }
+
+    if (refNow && !doubleTalk) {
+      if (errPow > micPow * 2.5 && micPow > 1e-6) {
+        for (let p = 0; p < M; p += 1) {
+          for (let k = 0; k < B; k += 1) {
+            this.wRe[p][k] *= 0.5;
+            this.wIm[p][k] *= 0.5;
+          }
+        }
+      } else {
+        const cPart = this.constraintTick % M;
+        this.constraintTick += 1;
+        for (let p = 0; p < M; p += 1) {
+          const idx = (this.partHead + p) % M;
+          const xpRe = this.xRe[idx], xpIm = this.xIm[idx];
+          const wpRe = this.wRe[p], wpIm = this.wIm[p];
+          if (p === cPart) {
+            this.gradRe.fill(0);
+            this.gradIm.fill(0);
+            for (let k = 0; k < B; k += 1) {
+              const norm = this.stepSize / (this.psdRef[k] + this.reg);
+              const er = this.eRe[k], ei = this.eIm[k], xr = xpRe[k], xi = xpIm[k];
+              const gr = (xr * er + xi * ei) * norm;
+              const gi = (xr * ei - xi * er) * norm;
+              this.gradRe[k] = gr;
+              this.gradIm[k] = gi;
+              if (k > 0 && k < B - 1) {
+                this.gradRe[F - k] = gr;
+                this.gradIm[F - k] = -gi;
+              }
+            }
+            aecFft(this.gradRe, this.gradIm, true);
+            for (let i = N; i < F; i += 1) this.gradRe[i] = 0;
+            this.gradIm.fill(0);
+            aecFft(this.gradRe, this.gradIm, false);
+            for (let k = 0; k < B; k += 1) {
+              wpRe[k] += this.gradRe[k];
+              wpIm[k] += this.gradIm[k];
+            }
+          } else {
+            for (let k = 0; k < B; k += 1) {
+              const norm = this.stepSize / (this.psdRef[k] + this.reg);
+              const er = this.eRe[k], ei = this.eIm[k], xr = xpRe[k], xi = xpIm[k];
+              wpRe[k] += (xr * er + xi * ei) * norm;
+              wpIm[k] += (xr * ei - xi * er) * norm;
+            }
+          }
+        }
+        this.adaptBlocks += 1;
+        const ratio = this.smoothMicPow > 1e-8 ? Math.max(0, Math.min(1, 1 - this.smoothErrPow / this.smoothMicPow)) : 0;
+        this.convergedRatio = 0.85 * this.convergedRatio + 0.15 * ratio;
+      }
+    }
+
+    this.tmpRe.set(this.prevErrTime, 0);
+    this.tmpRe.set(linearErr, N);
+    this.tmpIm.fill(0);
+    this.prevErrTime.set(linearErr, 0);
+    aecFft(this.tmpRe, this.tmpIm, false);
+
+    this.gradRe.fill(0);
+    this.gradIm.fill(0);
+    for (let i = 0; i < N; i += 1) this.gradRe[N + i] = this.yRe[N + i];
+    aecFft(this.gradRe, this.gradIm, false);
+
+    const overSub = doubleTalk ? (this.aggressive ? 0.65 : 0.45) : (this.aggressive ? 2.2 : 1.45);
+    const gainFloor = doubleTalk ? 0.35 : (this.aggressive ? 0.025 : 0.06);
+    const leak = converged ? 0.32 : 0.65;
+    for (let k = 0; k < B; k += 1) {
+      const errP = this.tmpRe[k] * this.tmpRe[k] + this.tmpIm[k] * this.tmpIm[k];
+      const echoP = this.gradRe[k] * this.gradRe[k] + this.gradIm[k] * this.gradIm[k];
+      this.psdErr[k] = 0.55 * this.psdErr[k] + 0.45 * errP;
+      this.psdEcho[k] = 0.55 * this.psdEcho[k] + 0.45 * echoP;
+      const resEst = this.psdEcho[k] * leak + (refNow ? this.psdRef[k] * 0.004 : 0);
+      const wiener = this.psdErr[k] > 1e-10 ? Math.max(0, this.psdErr[k] - overSub * resEst) / this.psdErr[k] : gainFloor;
+      const g = 0.35 * this.prevPostGain[k] + 0.65 * Math.max(gainFloor, Math.min(1, wiener));
+      this.prevPostGain[k] = g;
+      this.tmpRe[k] *= g;
+      this.tmpIm[k] *= g;
+      if (k > 0 && k < B - 1) {
+        this.tmpRe[F - k] = this.tmpRe[k];
+        this.tmpIm[F - k] = -this.tmpIm[k];
+      }
+    }
+    aecFft(this.tmpRe, this.tmpIm, true);
+    const out = new Float32Array(N);
+    let outSum = 0;
+    for (let i = 0; i < N; i += 1) {
+      const v = Math.max(-1, Math.min(1, this.tmpRe[N + i]));
+      out[i] = v;
+      outSum += v * v;
+    }
+    const outPow = outSum / N;
+    if (refNow && !doubleTalk && this.smoothMicPow > 1e-7) {
+      const db = Math.max(0, Math.min(45, 10 * Math.log10((this.smoothMicPow + 1e-9) / (outPow + 1e-9))));
+      this.erleDb = Math.round((0.8 * this.erleDb + 0.2 * db) * 10) / 10;
+    }
+    return { output: out, farEndActive: true, doubleTalk, erleDb: this.erleDb, outputRms: Math.sqrt(outPow) };
+  }
+}
+
 class MijiaVoiceProcessor extends AudioWorkletProcessor {
   constructor(options) {
     super();
@@ -289,9 +597,21 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
     this.preRollWrite = 0;
     this.preRollFilled = 0;
 
-    // 连续实时流模式：每 64ms (1024 samples = 2x512 Silero VAD 窗口) 将 16kHz Int16 PCM 推给服务端在线降噪 + Silero VAD
-    // 相比 128ms 帧减半首包等待，同时彻底避免强噪/背景音乐下浏览器 RMS 门限失效或长时卡顿！
+    // 连续实时流模式 + 全双工 AEC 配置
     this.streamMode = Boolean(opts.streamMode);
+    this.fullDuplex = opts.fullDuplex !== false;
+    this.echoMode = typeof opts.echoMode === "string" ? opts.echoMode : "auto";
+    this.aecEnabled = this.echoMode !== "off" && this.echoMode !== "standard";
+    this.aec = new WorkletPbfdafAec(this.echoMode === "aggressive");
+    this.aecBlockSize = 256;
+    this.aecMicBuf = new Float32Array(this.aecBlockSize);
+    this.aecRefBuf = new Float32Array(this.aecBlockSize);
+    this.aecPos = 0;
+    this.ttsActive = false;
+    this.lastDoubleTalk = false;
+    this.aecMetricsTick = 0;
+    this.noRefLoudFrames = 0;
+
     this.streamFrameSize = 1024;
     this.streamBuf = new Int16Array(this.streamFrameSize);
     this.streamPos = 0;
@@ -318,6 +638,21 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
         if (typeof msg.vadThreshold === "number") this.vadThreshold = msg.vadThreshold;
         if (typeof msg.vadSilenceMs === "number") this.vadSilenceMs = msg.vadSilenceMs;
         if (typeof msg.streamMode === "boolean") this.streamMode = msg.streamMode;
+        if (typeof msg.fullDuplex === "boolean") this.fullDuplex = msg.fullDuplex;
+        if (typeof msg.echoMode === "string") {
+          this.echoMode = msg.echoMode;
+          this.aecEnabled = this.echoMode !== "off" && this.echoMode !== "standard";
+          this.aec.aggressive = this.echoMode === "aggressive";
+        }
+      } else if (msg.type === "tts_state") {
+        this.ttsActive = Boolean(msg.active);
+        if (!this.ttsActive) {
+          this.noRefLoudFrames = 0;
+          if (this.lastDoubleTalk) {
+            this.lastDoubleTalk = false;
+            this.port.postMessage({ type: "double_talk", active: false, erleDb: this.aec.erleDb });
+          }
+        }
       } else if (msg.type === "pause") {
         this.paused = Boolean(msg.paused);
         if (this.paused) {
@@ -373,46 +708,21 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
     this.port.postMessage({ type: "utterance", samples: merged, sampleRate: this.targetRate }, [merged.buffer]);
   }
 
-  process(inputs) {
-    const input = inputs[0];
-    if (!input || !input[0] || input[0].length === 0) return true;
-    const channel = input[0];
-
-    // 1. 高通滤波 + 实时抗混叠下采样到 16kHz
-    const outList = [];
-    let phase = this.phase;
-    let sumSq16 = 0;
+  pushToStreamOrVad(cleanSamples) {
+    let sumSq = 0;
     let zcrCount = 0;
-    let prev16 = 0;
-
-    for (let i = 0; i < channel.length; i += 1) {
-      const x = channel[i];
-      const y = this.hpAlpha * (this.hpPrevY + x - this.hpPrevX);
-      this.hpPrevX = x;
-      this.hpPrevY = y;
-
-      phase += 1;
-      if (phase >= this.ratio) {
-        phase -= this.ratio;
-        const clamped = y > 1 ? 1 : y < -1 ? -1 : y;
-        outList.push(clamped);
-        sumSq16 += clamped * clamped;
-        if (outList.length > 1 && ((clamped >= 0 && prev16 < 0) || (clamped < 0 && prev16 >= 0))) {
-          zcrCount += 1;
-        }
-        prev16 = clamped;
-      }
+    let prev = 0;
+    for (let i = 0; i < cleanSamples.length; i += 1) {
+      const s = cleanSamples[i];
+      sumSq += s * s;
+      if (i > 0 && ((s >= 0 && prev < 0) || (s < 0 && prev >= 0))) zcrCount += 1;
+      prev = s;
     }
-    this.phase = phase;
-    if (outList.length === 0) return true;
+    const rms = Math.sqrt(sumSq / Math.max(1, cleanSamples.length));
+    const zcr = zcrCount / Math.max(1, cleanSamples.length);
 
-    const pcm16 = Float32Array.from(outList);
-    const rms = Math.sqrt(sumSq16 / pcm16.length);
-    const zcr = zcrCount / pcm16.length;
-
-    // 定期上报电平（约每 40ms 一次，降低主线程消息负载）
-    this.levelAccumSq += sumSq16;
-    this.levelAccumN += pcm16.length;
+    this.levelAccumSq += sumSq;
+    this.levelAccumN += cleanSamples.length;
     if (this.levelAccumN >= 640) {
       const avgRms = Math.sqrt(this.levelAccumSq / this.levelAccumN);
       this.port.postMessage({
@@ -425,12 +735,11 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
       this.levelAccumN = 0;
     }
 
-    // 自适应噪声底噪慢速跟踪（未说话时向环境底噪收敛）
     const adaptiveThresh = Math.max(this.vadThreshold, this.noiseFloor * 2.55);
     const isVoiceLike = rms >= adaptiveThresh && zcr >= 0.01 && zcr <= 0.48;
 
-    if (this.paused) {
-      // 播报期间检测高能量人声以支持语音打断（Barge-in）
+    // 传统半双工模式（仅当用户主动关闭全双工异步管线时走 paused 逻辑）
+    if (this.paused && !this.fullDuplex) {
       if (rms >= Math.max(this.vadThreshold * 2.6, this.noiseFloor * 4.2) && zcr >= 0.02 && zcr <= 0.42) {
         this.loudFrames += 1;
         if (this.loudFrames >= 6) {
@@ -440,14 +749,14 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
       } else {
         this.loudFrames = Math.max(0, this.loudFrames - 1);
       }
-      this.pushPreRoll(pcm16);
-      return true;
+      this.pushPreRoll(cleanSamples);
+      return;
     }
 
-    // 连续实时流模式：绕过粗糙浏览器能量门限，直接持续将 16kHz Int16 PCM 推给服务端在线神经降噪 + Silero VAD
+    // 连续实时流模式：全双工期间持续将经 AEC 净化后的 16kHz Int16 PCM 推送服务端（永不阻塞对话！）
     if (this.streamMode) {
-      for (let i = 0; i < pcm16.length; i += 1) {
-        const s = pcm16[i];
+      for (let i = 0; i < cleanSamples.length; i += 1) {
+        const s = cleanSamples[i];
         this.streamBuf[this.streamPos] = s < 0 ? Math.round(s * 0x8000) : Math.round(s * 0x7fff);
         this.streamPos += 1;
         if (this.streamPos >= this.streamFrameSize) {
@@ -457,45 +766,123 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
           this.port.postMessage({ type: "pcm_frame", buffer: out.buffer }, [out.buffer]);
         }
       }
-      return true;
+      return;
     }
 
+    // HTTP 降级 VAD 模式
     if (!this.speaking) {
-      // 限制 noiseFloor 上限（0.030），避免背景音乐把阈值拉高到 0.20 导致真人语音无法触发
       const rate = rms < this.noiseFloor ? 0.05 : 0.008;
       this.noiseFloor = Math.max(0.002, Math.min(0.03, this.noiseFloor * (1 - rate) + rms * rate));
-      this.pushPreRoll(pcm16);
+      this.pushPreRoll(cleanSamples);
 
       if (isVoiceLike) {
         this.loudFrames += 1;
-        // 连续 ~32ms（约 4~6 帧）超过动态门限即判定开声，过滤瞬态键盘敲击
         if (this.loudFrames >= 4) {
           this.speaking = true;
           this.silentSamples = 0;
           const pre = this.drainPreRoll();
-          this.speechChunks = [pre, pcm16];
-          this.speechSampleCount = pre.length + pcm16.length;
+          this.speechChunks = [pre, Float32Array.from(cleanSamples)];
+          this.speechSampleCount = pre.length + cleanSamples.length;
           this.port.postMessage({ type: "speech_start" });
         }
       } else {
         this.loudFrames = 0;
       }
     } else {
-      this.speechChunks.push(pcm16);
-      this.speechSampleCount += pcm16.length;
+      this.speechChunks.push(Float32Array.from(cleanSamples));
+      this.speechSampleCount += cleanSamples.length;
       const continueThresh = Math.max(this.vadThreshold * 0.72, this.noiseFloor * 1.85);
-      if (rms >= continueThresh) {
-        this.silentSamples = 0;
-      } else {
-        this.silentSamples += pcm16.length;
-      }
-
+      if (rms >= continueThresh) this.silentSamples = 0;
+      else this.silentSamples += cleanSamples.length;
       const maxSilenceSamples = Math.round((this.vadSilenceMs / 1000) * this.targetRate);
       if (this.silentSamples >= maxSilenceSamples || this.speechSampleCount >= this.maxSpeechSamples) {
         this.finishUtterance();
       }
     }
+  }
 
+  process(inputs) {
+    const micIn = inputs[0];
+    if (!micIn || !micIn[0] || micIn[0].length === 0) return true;
+    const micCh = micIn[0];
+    const refIn = inputs[1];
+    const refCh = refIn && refIn[0] && refIn[0].length === micCh.length ? refIn[0] : null;
+
+    const micOut = [];
+    const refOut = [];
+    let phase = this.phase;
+
+    for (let i = 0; i < micCh.length; i += 1) {
+      const x = micCh[i];
+      const y = this.hpAlpha * (this.hpPrevY + x - this.hpPrevX);
+      this.hpPrevX = x;
+      this.hpPrevY = y;
+
+      phase += 1;
+      if (phase >= this.ratio) {
+        phase -= this.ratio;
+        const clampedMic = y > 1 ? 1 : y < -1 ? -1 : y;
+        const r = refCh ? refCh[i] : 0;
+        const clampedRef = r > 1 ? 1 : r < -1 ? -1 : r;
+        micOut.push(clampedMic);
+        refOut.push(clampedRef);
+      }
+    }
+    this.phase = phase;
+    if (micOut.length === 0) return true;
+
+    // 启用参考信号实时 PBFDAF AEC（全双工 + auto/aggressive 模式）
+    if (this.aecEnabled && this.fullDuplex) {
+      for (let i = 0; i < micOut.length; i += 1) {
+        this.aecMicBuf[this.aecPos] = micOut[i];
+        this.aecRefBuf[this.aecPos] = refOut[i];
+        this.aecPos += 1;
+        if (this.aecPos >= this.aecBlockSize) {
+          this.aecPos = 0;
+          const res = this.aec.processBlock(this.aecMicBuf, this.aecRefBuf);
+          this.aecMetricsTick += 1;
+
+          // 有远端参考信号时，使用 AEC 双讲检测精准驱动降音/打断；
+          // 若走浏览器原生 SpeechSynthesis（无 PCM 参考信号），则使用高门限近端人声检测兜底双讲
+          let dt = res.doubleTalk;
+          if (!res.farEndActive && this.ttsActive) {
+            if (res.outputRms >= Math.max(this.vadThreshold * 2.5, this.noiseFloor * 4.0)) {
+              this.noRefLoudFrames += 1;
+              if (this.noRefLoudFrames >= 4) dt = true;
+            } else {
+              this.noRefLoudFrames = Math.max(0, this.noRefLoudFrames - 1);
+            }
+          } else {
+            this.noRefLoudFrames = 0;
+          }
+
+          if (dt !== this.lastDoubleTalk) {
+            this.lastDoubleTalk = dt;
+            this.port.postMessage({
+              type: "double_talk",
+              active: dt,
+              rms: res.outputRms,
+              erleDb: res.erleDb,
+              farEndActive: res.farEndActive,
+            });
+          } else if (res.farEndActive && this.aecMetricsTick % 16 === 0) {
+            this.port.postMessage({
+              type: "aec_metrics",
+              active: true,
+              erleDb: res.erleDb,
+              doubleTalk: dt,
+              farEndActive: true,
+            });
+          }
+
+          this.pushToStreamOrVad(res.output);
+        }
+      }
+      return true;
+    }
+
+    const pcm16 = Float32Array.from(micOut);
+    this.pushToStreamOrVad(pcm16);
     return true;
   }
 }
@@ -508,6 +895,7 @@ registerProcessor("mijia-voice-processor", MijiaVoiceProcessor);
 export async function recordShortWavSample(
   durationMs = 3000,
   onProgress?: (ratio: number, level: number) => void,
+  stopSignal?: AbortSignal,
 ): Promise<Blob> {
   if (!isMicrophoneAudioSupported()) {
     throw new Error("当前浏览器不支持麦克风录音");
@@ -541,7 +929,20 @@ export async function recordShortWavSample(
 
   try {
     await new Promise<void>((resolve) => {
+      let finished = false;
+      const done = () => {
+        if (finished) return;
+        finished = true;
+        stopSignal?.removeEventListener("abort", done);
+        resolve();
+      };
+      if (stopSignal?.aborted) {
+        done();
+        return;
+      }
+      stopSignal?.addEventListener("abort", done, { once: true });
       proc.onaudioprocess = (ev) => {
+        if (finished) return;
         const data = ev.inputBuffer.getChannelData(0);
         const copy = new Float32Array(data.length);
         let sum = 0;
@@ -555,7 +956,7 @@ export async function recordShortWavSample(
         const elapsed = Date.now() - startAt;
         onProgress?.(Math.min(1, elapsed / durationMs), Math.min(1, rms * 10));
         if (elapsed >= durationMs) {
-          resolve();
+          done();
         }
       };
       source.connect(proc);
@@ -599,7 +1000,10 @@ export async function recordShortWavSample(
 }
 
 interface TtsQueueItem {
+  utteranceId: string;
   text: string;
+  priority: "ack" | "normal" | "result" | "system";
+  taskId?: string;
   engine: "auto" | "local" | "browser";
   voice: "gentle-zh-en" | "warm-zh-baker";
   speed: number;
@@ -631,6 +1035,9 @@ export class VoiceListenerClient {
     conversationWindowSec: 25,
     maxConsecutiveSidetalk: 3,
     bargeInEnabled: true,
+    asyncVoicePipeline: true,
+    echoCancellationMode: "auto",
+    bargeInDuckingEnabled: true,
     effectiveSttConfigured: false,
     localAsrReady: false,
     localTtsReady: undefined,
@@ -644,16 +1051,27 @@ export class VoiceListenerClient {
   private lastError: string | null = null;
   private speakingMuted = false;
 
-  // Streaming Neural TTS Queue + Prefetch + Watchdog（优先本地温柔女声，自动平滑降级浏览器女声）
+  // Streaming Neural TTS Queue + Prefetch + Watchdog + WebAudio AEC Reference Feed
   private ttsQueue: TtsQueueItem[] = [];
   private ttsSpeaking = false;
+  private ttsDucked = false;
   private ttsNotifiedSpeaking = false;
   private ttsSessionGen = 0;
+  private ttsItemSeq = 0;
+  private activeTtsItem: TtsQueueItem | null = null;
+  private lastAckEnqueuedAt = 0;
   private activeAudioEl: HTMLAudioElement | null = null;
   private activeAudioUrl: string | null = null;
+  private activeBufferSource: AudioBufferSourceNode | null = null;
   private activeTtsAbort: AbortController | null = null;
   private ttsWatchdogTimer: number | null = null;
   private ttsReleaseTimer: number | null = null;
+  private doubleTalkConfirmTimer: number | null = null;
+
+  // 实时回声消除与双讲状态
+  private aecActive = false;
+  private erleDb = 0;
+  private doubleTalkActive = false;
 
   // Web Speech API state
   private recognition: SpeechRecognitionLike | null = null;
@@ -666,6 +1084,7 @@ export class VoiceListenerClient {
   private audioCtx: AudioContext | null = null;
   private workletNode: AudioWorkletNode | null = null;
   private workletBlobUrl: string | null = null;
+  private ttsGainNode: GainNode | null = null;
   private fallbackProcessor: ScriptProcessorNode | null = null;
   private silentGain: GainNode | null = null;
   private streamingOverWs = false;
@@ -681,18 +1100,31 @@ export class VoiceListenerClient {
     return this.oneShot;
   }
 
+  isSpeaking(): boolean {
+    return this.ttsSpeaking;
+  }
+
+  private isFullDuplexEnabled(): boolean {
+    return this.config.asyncVoicePipeline !== false;
+  }
+
   updateConfig(next: Partial<ClientVoiceConfig>): void {
     const prevLang = this.config.voiceLang;
     const prevEngine = this.config.voiceEngine;
     this.config = { ...this.config, ...next };
 
-    // 动态热更新 AudioWorklet 参数（无需重启麦克风）
+    // 动态热更新 AudioWorklet 参数（含全双工开关与回声消除档位，无需重启麦克风）
     if (this.workletNode) {
+      const echoMode = this.config.echoCancellationMode ?? "auto";
       this.workletNode.port.postMessage({
         type: "config",
         vadThreshold: this.config.vadThreshold,
         vadSilenceMs: this.config.vadSilenceMs,
+        fullDuplex: this.isFullDuplexEnabled(),
+        echoMode,
       });
+      this.aecActive =
+        this.isFullDuplexEnabled() && echoMode !== "off" && echoMode !== "standard";
     }
 
     if (this.active && (this.config.voiceLang !== prevLang || this.config.voiceEngine !== prevEngine)) {
@@ -781,6 +1213,9 @@ export class VoiceListenerClient {
   }): void {
     if (!this.active) return;
     if (ev.kind === "wake_spot") {
+      if (this.ttsSpeaking && this.config.bargeInEnabled !== false) {
+        this.cancelSpeaking();
+      }
       const word = typeof ev.wakeWord === "string" && ev.wakeWord.trim() ? ev.wakeWord.trim() : "";
       this.interimTranscript = word ? `⚡ 命中「${word}」` : "⚡ 已唤醒";
       this.emitState(false);
@@ -811,6 +1246,97 @@ export class VoiceListenerClient {
     }
   }
 
+  private clearDoubleTalkConfirmTimer(): void {
+    if (this.doubleTalkConfirmTimer !== null) {
+      window.clearTimeout(this.doubleTalkConfirmTimer);
+      this.doubleTalkConfirmTimer = null;
+    }
+  }
+
+  private applyTtsDucking(ducked: boolean): void {
+    this.ttsDucked = ducked;
+    const gainTarget = ducked
+      ? this.config.bargeInDuckingEnabled !== false
+        ? 0.14
+        : 0.35
+      : 1.0;
+    if (this.ttsGainNode && this.audioCtx && this.audioCtx.state !== "closed") {
+      try {
+        const now = this.audioCtx.currentTime;
+        this.ttsGainNode.gain.cancelScheduledValues(now);
+        this.ttsGainNode.gain.setTargetAtTime(gainTarget, now, 0.015);
+      } catch {
+        // ignore
+      }
+    }
+    if (this.activeAudioEl) {
+      try {
+        this.activeAudioEl.volume = ducked ? 0.16 : 1.0;
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  private handleDoubleTalkSignal(active: boolean, erleDb?: number): void {
+    this.doubleTalkActive = active;
+    if (typeof erleDb === "number" && Number.isFinite(erleDb)) {
+      this.erleDb = Math.round(erleDb * 10) / 10;
+    }
+    if (!this.ttsSpeaking) {
+      this.clearDoubleTalkConfirmTimer();
+      if (this.ttsDucked) this.applyTtsDucking(false);
+      this.emitState(false);
+      return;
+    }
+
+    if (active) {
+      if (this.config.bargeInEnabled !== false) {
+        if (this.config.bargeInDuckingEnabled !== false) {
+          this.applyTtsDucking(true);
+        }
+        if (this.doubleTalkConfirmTimer === null) {
+          this.doubleTalkConfirmTimer = window.setTimeout(() => {
+            this.doubleTalkConfirmTimer = null;
+            if (this.ttsSpeaking && this.doubleTalkActive && this.config.bargeInEnabled !== false) {
+              this.cancelSpeaking();
+              this.interimTranscript = "已打断，请说…";
+              this.emitState(false);
+            }
+          }, 280);
+        }
+      }
+      this.cb.sendVoiceStreamControl?.({
+        type: "voice_tts_state",
+        speaking: true,
+        phase: "duck",
+        utteranceId: this.activeTtsItem?.utteranceId,
+        text: this.activeTtsItem?.text,
+        queueLength: this.ttsQueue.length,
+        aecActive: this.aecActive,
+        erleDb: this.erleDb,
+        doubleTalk: true,
+      });
+      this.emitState(false);
+    } else {
+      this.clearDoubleTalkConfirmTimer();
+      if (this.ttsDucked) {
+        this.applyTtsDucking(false);
+      }
+      this.cb.sendVoiceStreamControl?.({
+        type: "voice_tts_state",
+        speaking: this.ttsSpeaking,
+        phase: this.ttsSpeaking ? "start" : "end",
+        utteranceId: this.activeTtsItem?.utteranceId,
+        queueLength: this.ttsQueue.length,
+        aecActive: this.aecActive,
+        erleDb: this.erleDb,
+        doubleTalk: false,
+      });
+      this.emitState(false);
+    }
+  }
+
   private cleanupActiveAudio(): void {
     if (this.activeTtsAbort) {
       try {
@@ -819,6 +1345,16 @@ export class VoiceListenerClient {
         // ignore
       }
       this.activeTtsAbort = null;
+    }
+    if (this.activeBufferSource) {
+      try {
+        this.activeBufferSource.onended = null;
+        this.activeBufferSource.stop();
+        this.activeBufferSource.disconnect();
+      } catch {
+        // ignore
+      }
+      this.activeBufferSource = null;
     }
     if (this.activeAudioEl) {
       try {
@@ -842,10 +1378,11 @@ export class VoiceListenerClient {
   }
 
   /**
-   * 立即打断当前语音播报（Barge-in），让用户随时插话下达新指令。
+   * 立即打断当前语音播报（Barge-in），不影响正在后台执行的任务与对话状态。
    */
   cancelSpeaking(): void {
     this.ttsSessionGen += 1;
+    const cancelledId = this.activeTtsItem?.utteranceId;
     for (const item of this.ttsQueue) {
       try {
         item.abort?.abort();
@@ -854,8 +1391,13 @@ export class VoiceListenerClient {
       }
     }
     this.ttsQueue = [];
+    this.activeTtsItem = null;
     this.ttsSpeaking = false;
     this.speakingMuted = false;
+    this.doubleTalkActive = false;
+    this.clearDoubleTalkConfirmTimer();
+    this.applyTtsDucking(false);
+
     if (this.ttsWatchdogTimer !== null) {
       window.clearTimeout(this.ttsWatchdogTimer);
       this.ttsWatchdogTimer = null;
@@ -872,19 +1414,30 @@ export class VoiceListenerClient {
     } catch {
       // ignore
     }
+    this.workletNode?.port.postMessage({ type: "tts_state", active: false });
     this.workletNode?.port.postMessage({ type: "pause", paused: false });
     if (this.ttsNotifiedSpeaking) {
       this.ttsNotifiedSpeaking = false;
-      this.cb.sendVoiceStreamControl?.({ type: "voice_tts_state", speaking: false });
+      this.cb.sendVoiceStreamControl?.({
+        type: "voice_tts_state",
+        speaking: false,
+        phase: "cancel",
+        utteranceId: cancelledId,
+        queueLength: 0,
+        aecActive: this.aecActive,
+        erleDb: this.erleDb,
+        doubleTalk: false,
+      });
     }
     if (this.active && this.mode === "speaking") {
       this.mode = "listening";
-      this.emitState(false);
     }
+    this.emitState(false);
   }
 
   private buildTtsQueueItem(
     cleaned: string,
+    meta?: ClientSpeakMeta,
     overrides?: {
       ttsEngine?: "auto" | "local" | "browser";
       ttsVoice?: "gentle-zh-en" | "warm-zh-baker";
@@ -895,8 +1448,17 @@ export class VoiceListenerClient {
     const voice = overrides?.ttsVoice ?? this.config.ttsVoice ?? "gentle-zh-en";
     const speedRaw = overrides?.ttsSpeed ?? this.config.ttsSpeed ?? 0.98;
     const speed = Number.isFinite(speedRaw) ? Math.min(1.4, Math.max(0.7, speedRaw)) : 0.98;
+    const utteranceId = meta?.utteranceId || `cli_tts_${++this.ttsItemSeq}_${Date.now()}`;
 
-    const item: TtsQueueItem = { text: cleaned, engine, voice, speed };
+    const item: TtsQueueItem = {
+      utteranceId,
+      text: cleaned,
+      priority: meta?.priority ?? "normal",
+      taskId: meta?.taskId,
+      engine,
+      voice,
+      speed,
+    };
     const shouldTryLocal =
       engine === "local" || (engine === "auto" && this.config.localTtsReady !== false);
 
@@ -948,15 +1510,31 @@ export class VoiceListenerClient {
   }
 
   /**
-   * 整句播报（兼容旧事件）。
+   * 异步独立播报通道入队：默认非破坏性排队，避免多任务结果或确认语互相截断；
+   * 仅当显式传入 interrupt: true（或用户关闭全双工异步管线）时才打断当前播报。
    */
-  speak(text: string): void {
+  speak(text: string, meta?: ClientSpeakMeta): void {
     const cleaned = sanitizeBrowserTts(text);
     if (!cleaned || !this.config.autoSpeakReply) return;
     if (typeof window === "undefined") return;
-    this.cancelSpeaking();
-    this.ttsQueue.push(this.buildTtsQueueItem(cleaned));
-    void this.pumpTtsQueue();
+    if (meta?.interrupt === true || !this.isFullDuplexEnabled()) {
+      this.cancelSpeaking();
+    } else if (meta?.priority === "ack") {
+      const now = Date.now();
+      if ((this.ttsSpeaking || this.ttsQueue.length > 0) && now - this.lastAckEnqueuedAt < 1500) {
+        return;
+      }
+      this.lastAckEnqueuedAt = now;
+    }
+    if (this.ttsReleaseTimer !== null) {
+      window.clearTimeout(this.ttsReleaseTimer);
+      this.ttsReleaseTimer = null;
+    }
+    this.ttsQueue.push(this.buildTtsQueueItem(cleaned, meta));
+    this.emitState(false);
+    if (!this.ttsSpeaking) {
+      void this.pumpTtsQueue();
+    }
   }
 
   /**
@@ -973,22 +1551,30 @@ export class VoiceListenerClient {
     const cleaned = sanitizeBrowserTts(text) || "嗯？客厅吸顶灯已开，亮度调至百分之八十。";
     if (typeof window === "undefined") return;
     this.cancelSpeaking();
-    this.ttsQueue.push(this.buildTtsQueueItem(cleaned, overrides));
+    this.ttsQueue.push(this.buildTtsQueueItem(cleaned, { priority: "system", interrupt: true }, overrides));
     void this.pumpTtsQueue();
   }
 
   /**
    * 流式分句播报：收到 Pi Agent 首句即刻预取并朗读，大幅降低首字语音延迟（TTFA）。
    */
-  enqueueSpeakChunk(text: string): void {
+  enqueueSpeakChunk(text: string, meta?: ClientSpeakMeta): void {
     const cleaned = sanitizeBrowserTts(text);
     if (!cleaned || !this.config.autoSpeakReply) return;
     if (typeof window === "undefined") return;
+    if (meta?.priority === "ack") {
+      const now = Date.now();
+      if ((this.ttsSpeaking || this.ttsQueue.length > 0) && now - this.lastAckEnqueuedAt < 1500) {
+        return;
+      }
+      this.lastAckEnqueuedAt = now;
+    }
     if (this.ttsReleaseTimer !== null) {
       window.clearTimeout(this.ttsReleaseTimer);
       this.ttsReleaseTimer = null;
     }
-    this.ttsQueue.push(this.buildTtsQueueItem(cleaned));
+    this.ttsQueue.push(this.buildTtsQueueItem(cleaned, meta));
+    this.emitState(false);
     if (!this.ttsSpeaking) {
       void this.pumpTtsQueue();
     }
@@ -997,36 +1583,72 @@ export class VoiceListenerClient {
   private async pumpTtsQueue(): Promise<void> {
     if (this.ttsSpeaking) return;
     const next = this.ttsQueue.shift();
+    const fullDuplex = this.isFullDuplexEnabled();
+
     if (!next) {
-      // 所有分段播报结束：延迟 320ms 解除防回声静音，并通过 voice_tts_state 恢复服务端计时（不覆盖 dialogState）
+      // 所有分段播报结束：短尾音保护后通知服务端结束播报（全双工模式下全程未暂停麦克风）
+      const tailMs = fullDuplex ? 200 : 320;
       this.ttsReleaseTimer = window.setTimeout(() => {
         this.ttsReleaseTimer = null;
         this.speakingMuted = false;
-        this.workletNode?.port.postMessage({ type: "pause", paused: false });
+        this.activeTtsItem = null;
+        this.doubleTalkActive = false;
+        this.clearDoubleTalkConfirmTimer();
+        this.applyTtsDucking(false);
+        this.workletNode?.port.postMessage({ type: "tts_state", active: false });
+        if (!fullDuplex) {
+          this.workletNode?.port.postMessage({ type: "pause", paused: false });
+        }
         if (this.ttsNotifiedSpeaking) {
           this.ttsNotifiedSpeaking = false;
-          this.cb.sendVoiceStreamControl?.({ type: "voice_tts_state", speaking: false });
+          this.cb.sendVoiceStreamControl?.({
+            type: "voice_tts_state",
+            speaking: false,
+            phase: "end",
+            queueLength: 0,
+            aecActive: this.aecActive,
+            erleDb: this.erleDb,
+            doubleTalk: false,
+          });
         }
         if (this.active && this.mode === "speaking") {
           this.mode = "listening";
-          this.emitState(false);
         }
-      }, 320);
+        this.emitState(false);
+      }, tailMs);
       return;
     }
 
     const gen = this.ttsSessionGen;
     this.ttsSpeaking = true;
-    this.speakingMuted = true;
-    this.workletNode?.port.postMessage({ type: "pause", paused: true });
-    if (!this.ttsNotifiedSpeaking) {
-      this.ttsNotifiedSpeaking = true;
-      this.cb.sendVoiceStreamControl?.({ type: "voice_tts_state", speaking: true });
+    this.activeTtsItem = next;
+    this.speakingMuted = !fullDuplex;
+    this.applyTtsDucking(false);
+
+    if (fullDuplex) {
+      // 全双工异步模式：绝不暂停麦克风！仅通知 Worklet 开启/维持实时 AEC 与双讲监测
+      this.workletNode?.port.postMessage({ type: "tts_state", active: true });
+    } else {
+      this.workletNode?.port.postMessage({ type: "pause", paused: true });
     }
-    if (this.active && this.mode !== "speaking") {
+
+    this.ttsNotifiedSpeaking = true;
+    this.cb.sendVoiceStreamControl?.({
+      type: "voice_tts_state",
+      speaking: true,
+      phase: "start",
+      utteranceId: next.utteranceId,
+      text: next.text,
+      queueLength: this.ttsQueue.length,
+      aecActive: this.aecActive,
+      erleDb: this.erleDb,
+      doubleTalk: this.doubleTalkActive,
+    });
+
+    if (!fullDuplex && this.active && this.mode !== "speaking") {
       this.mode = "speaking";
-      this.emitState(false);
     }
+    this.emitState(false);
 
     let settled = false;
     const finishChunk = () => {
@@ -1038,16 +1660,41 @@ export class VoiceListenerClient {
       }
       this.cleanupActiveAudio();
       this.ttsSpeaking = false;
+      this.activeTtsItem = null;
+      this.cb.sendVoiceStreamControl?.({
+        type: "voice_tts_state",
+        speaking: this.ttsQueue.length > 0,
+        phase: "end",
+        utteranceId: next.utteranceId,
+        text: next.text,
+        queueLength: this.ttsQueue.length,
+        aecActive: this.aecActive,
+        erleDb: this.erleDb,
+        doubleTalk: false,
+      });
+      this.emitState(false);
       void this.pumpTtsQueue();
     };
 
     try {
-      // 1. 优先播放服务端本地 Matcha 温柔女声 WAV（已预取，流式多句近乎零停顿）
+      // 1. 优先播放服务端本地 Matcha 温柔女声 WAV；若 AudioContext 处于活动状态，走 WebAudio
+      //    同步馈送 ttsGainNode -> destination + Worklet Input 1，提供样本级精确远端参考信号给 AEC！
       if (next.audioPromise) {
         this.activeTtsAbort = next.abort ?? null;
         const wavBlob = await next.audioPromise;
         if (gen !== this.ttsSessionGen) return;
         if (wavBlob) {
+          const playedViaWebAudio = await this.playWavViaWebAudio(
+            wavBlob,
+            next.text.length,
+            gen,
+            finishChunk,
+          );
+          if (playedViaWebAudio) {
+            return;
+          }
+          if (gen !== this.ttsSessionGen) return;
+
           const played = await this.playWavBlob(wavBlob, next.text.length, gen, finishChunk);
           if (played) {
             return;
@@ -1068,6 +1715,49 @@ export class VoiceListenerClient {
     }
   }
 
+  /**
+   * 通过同一个 AudioContext 播放本地 TTS WAV 并同步路由到 AudioWorklet Input 1 作为 AEC 远端参考信号。
+   */
+  private async playWavViaWebAudio(
+    wavBlob: Blob,
+    textLen: number,
+    gen: number,
+    finishChunk: () => void,
+  ): Promise<boolean> {
+    const ctx = this.audioCtx;
+    const gain = this.ttsGainNode;
+    if (!ctx || !gain || ctx.state === "closed" || gen !== this.ttsSessionGen) {
+      return false;
+    }
+    try {
+      if (ctx.state === "suspended") {
+        await ctx.resume();
+      }
+      if (gen !== this.ttsSessionGen || ctx.state !== "running") return false;
+      const arrBuf = await wavBlob.arrayBuffer();
+      if (gen !== this.ttsSessionGen) return false;
+      const audioBuf = await ctx.decodeAudioData(arrBuf.slice(0));
+      if (gen !== this.ttsSessionGen || !this.audioCtx || !this.ttsGainNode) return false;
+
+      const src = ctx.createBufferSource();
+      src.buffer = audioBuf;
+      src.connect(this.ttsGainNode);
+      this.activeBufferSource = src;
+
+      const estMs = Math.max(
+        4000,
+        Math.min(28_000, Math.round(audioBuf.duration * 1000) + 2500, textLen * 360 + 4000),
+      );
+      this.ttsWatchdogTimer = window.setTimeout(finishChunk, estMs);
+      src.onended = finishChunk;
+      src.start(0);
+      return true;
+    } catch {
+      this.cleanupActiveAudio();
+      return false;
+    }
+  }
+
   private playWavBlob(
     wavBlob: Blob,
     textLen: number,
@@ -1083,6 +1773,7 @@ export class VoiceListenerClient {
         const url = URL.createObjectURL(wavBlob);
         const audio = new Audio(url);
         audio.preload = "auto";
+        audio.volume = this.ttsDucked ? 0.16 : 1.0;
         this.activeAudioUrl = url;
         this.activeAudioEl = audio;
 
@@ -1132,7 +1823,7 @@ export class VoiceListenerClient {
       // ignore
     }
 
-    // Watchdog 防止 Chrome/Edge 偶发丢失 onend 导致麦克风永久静音卡死
+    // Watchdog 防止 Chrome/Edge 偶发丢失 onend 导致播报状态卡死
     const estMs = Math.max(4500, Math.min(18_000, text.length * 280 + 2800));
     this.ttsWatchdogTimer = window.setTimeout(finishChunk, estMs);
     utter.onend = finishChunk;
@@ -1164,8 +1855,8 @@ export class VoiceListenerClient {
     }
 
     // auto（深度优化后）：
-    // 1. 优先本地离线 SenseVoice + GTCRN 降噪 + Silero VAD + 声纹（国内零网络报错、高准确率、全链路声学增强）
-    // 2. 其次云端 Whisper STT（同样走 AudioWorklet 16kHz PCM + GTCRN 降噪）
+    // 1. 优先本地离线 Qwen3-ASR / SenseVoice + GTCRN 降噪 + Silero VAD + 声纹
+    // 2. 其次云端 Whisper STT（同样走 AudioWorklet 16kHz PCM + AEC + 降噪）
     // 3. 兜底浏览器原生 Web Speech API
     if (hasMic && localReady) return "local";
     if (hasMic && this.config.effectiveSttConfigured) return "whisper";
@@ -1181,6 +1872,13 @@ export class VoiceListenerClient {
       interimTranscript: this.interimTranscript,
       error: this.lastError,
       oneShot: this.oneShot,
+      speaking: this.ttsSpeaking,
+      ducked: this.ttsDucked,
+      speakingQueueLength: this.ttsQueue.length,
+      speakingText: this.activeTtsItem?.text ?? null,
+      aecActive: this.aecActive,
+      erleDb: this.erleDb,
+      doubleTalk: this.doubleTalkActive,
     });
     if (syncServer) {
       this.cb.onSyncServerState({
@@ -1245,7 +1943,8 @@ export class VoiceListenerClient {
     };
 
     rec.onresult = (ev) => {
-      if (!this.active || this.speakingMuted) return;
+      const fullDuplex = this.isFullDuplexEnabled();
+      if (!this.active || (!fullDuplex && this.speakingMuted)) return;
       let interim = "";
       let finalText = "";
       for (let i = ev.resultIndex; i < ev.results.length; i += 1) {
@@ -1268,6 +1967,7 @@ export class VoiceListenerClient {
       if (finalText) {
         this.interimTranscript = "";
         const bypass = this.oneShot;
+        const duringTts = this.ttsSpeaking;
         if (this.oneShot) {
           this.stop(true);
         } else {
@@ -1276,6 +1976,8 @@ export class VoiceListenerClient {
         void this.cb.onTranscriptFinal(finalText, {
           bypassWakeWord: bypass,
           engine: "browser",
+          asyncDispatch: fullDuplex,
+          duringTtsPlayback: duringTts,
         });
       }
     };
@@ -1364,7 +2066,9 @@ export class VoiceListenerClient {
   }
 
   /**
-   * 高性能 AudioWorklet 16kHz PCM 实时采集管线（切后台不断流、400ms Pre-roll、自适应降噪门限、Barge-in 打断）。
+   * 高性能全双工 AudioWorklet 16kHz PCM 实时采集管线：
+   * - 2 路输入：Input 0 为麦克风，Input 1 为本地 TTS 实时回放参考信号（样本同步 PBFDAF AEC）
+   * - 支持切后台不断流、400ms Pre-roll、双讲平滑降音（Ducking）与真打断（Barge-in）
    */
   private async startPcmAudioPipeline(engine: "local" | "whisper"): Promise<void> {
     if (!isMicrophoneAudioSupported()) {
@@ -1378,11 +2082,14 @@ export class VoiceListenerClient {
 
     try {
       const useNeuralPipeline = this.config.noiseSuppressionMode !== "off" && this.config.noiseSuppressionMode !== "dsp";
+      const echoMode = this.config.echoCancellationMode ?? "auto";
+      const fullDuplex = this.isFullDuplexEnabled();
+
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          // 始终保留硬件回声消除（消除本机扬声器回声）；
-          // 服务端启用神经降噪/双轨抗音乐识别时关闭浏览器粗糙的 NS/AGC，避免音乐场景下人声被浏览器抽泵砍断！
-          echoCancellation: true,
+          // 除用户显式关闭外，始终开启浏览器硬件回声消除（第一层 AEC）；
+          // 服务端启用神经降噪/双轨抗音乐识别时关闭浏览器粗糙的 NS/AGC，避免人声被抽泵砍断！
+          echoCancellation: echoMode !== "off",
           noiseSuppression: !useNeuralPipeline && this.config.noiseSuppressionMode !== "off",
           autoGainControl: !useNeuralPipeline,
           channelCount: 1,
@@ -1411,6 +2118,12 @@ export class VoiceListenerClient {
       silentGain.gain.value = 0;
       this.silentGain = silentGain;
 
+      // 创建 TTS 主输出与 AEC 参考信号分路节点
+      const ttsGain = ctx.createGain();
+      ttsGain.gain.value = this.ttsDucked ? 0.14 : 1.0;
+      ttsGain.connect(ctx.destination);
+      this.ttsGainNode = ttsGain;
+
       const canStreamWs =
         Boolean(this.cb.isVoiceStreamReady?.()) &&
         Boolean(this.cb.sendVoiceStreamControl) &&
@@ -1437,16 +2150,27 @@ export class VoiceListenerClient {
         }
 
         const node = new AudioWorkletNode(ctx, "mijia-voice-processor", {
-          numberOfInputs: 1,
+          numberOfInputs: 2,
           numberOfOutputs: 1,
           channelCount: 1,
           processorOptions: {
             vadThreshold: this.config.vadThreshold,
             vadSilenceMs: this.config.vadSilenceMs,
             streamMode: this.streamingOverWs,
+            fullDuplex,
+            echoMode,
           },
         });
         this.workletNode = node;
+        this.aecActive = fullDuplex && echoMode !== "off" && echoMode !== "standard";
+
+        if (this.ttsSpeaking) {
+          if (fullDuplex) {
+            node.port.postMessage({ type: "tts_state", active: true });
+          } else {
+            node.port.postMessage({ type: "pause", paused: true });
+          }
+        }
 
         node.port.onmessage = (ev) => {
           const msg = ev.data as {
@@ -1455,12 +2179,35 @@ export class VoiceListenerClient {
             samples?: Float32Array;
             sampleRate?: number;
             buffer?: ArrayBuffer;
+            active?: boolean;
+            erleDb?: number;
+            doubleTalk?: boolean;
+            farEndActive?: boolean;
           };
           if (!msg || !this.active) return;
 
           if (msg.type === "level") {
             const level = Math.min(1, (msg.rms ?? 0) * 11);
             this.cb.onLevelChange(this.speakingMuted ? 0 : level);
+          } else if (msg.type === "double_talk") {
+            this.handleDoubleTalkSignal(Boolean(msg.active), msg.erleDb);
+          } else if (msg.type === "aec_metrics") {
+            if (typeof msg.erleDb === "number" && Number.isFinite(msg.erleDb)) {
+              this.erleDb = Math.round(msg.erleDb * 10) / 10;
+            }
+            this.aecActive = Boolean(msg.active);
+            if (this.ttsSpeaking) {
+              this.cb.sendVoiceStreamControl?.({
+                type: "voice_tts_state",
+                speaking: true,
+                utteranceId: this.activeTtsItem?.utteranceId,
+                queueLength: this.ttsQueue.length,
+                aecActive: this.aecActive,
+                erleDb: this.erleDb,
+                doubleTalk: Boolean(msg.doubleTalk),
+              });
+            }
+            this.emitState(false);
           } else if (msg.type === "barge_in") {
             if (this.config.bargeInEnabled !== false && this.speakingMuted) {
               this.cancelSpeaking();
@@ -1493,11 +2240,14 @@ export class VoiceListenerClient {
           }
         };
 
-        source.connect(node);
+        // Input 0: 麦克风采集信号；Input 1: 本地 TTS 远端参考信号（实时自适应回声消除）
+        source.connect(node, 0, 0);
+        ttsGain.connect(node, 0, 1);
         node.connect(silentGain);
         silentGain.connect(ctx.destination);
       } else {
         // 极端旧内核降级（ScriptProcessor + Pre-roll）
+        this.aecActive = false;
         this.setupLegacyPcmCapture(ctx, source, silentGain, engine);
       }
 
@@ -1586,12 +2336,15 @@ export class VoiceListenerClient {
     this.interimTranscript = "识别中…";
     this.emitState(false);
     const bypass = this.oneShot;
+    const duringTts = this.ttsSpeaking;
     try {
       await this.cb.onUploadAudio(blob, {
         bypassWakeWord: bypass,
         lang: this.config.voiceLang || "zh-CN",
         engine,
         filename: "voice.wav",
+        asyncDispatch: this.isFullDuplexEnabled(),
+        duringTtsPlayback: duringTts,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1609,6 +2362,27 @@ export class VoiceListenerClient {
   }
 
   private stopAudioCapture(): void {
+    this.aecActive = false;
+    this.doubleTalkActive = false;
+    this.clearDoubleTalkConfirmTimer();
+    if (this.activeBufferSource) {
+      try {
+        this.activeBufferSource.onended = null;
+        this.activeBufferSource.stop();
+        this.activeBufferSource.disconnect();
+      } catch {
+        // ignore
+      }
+      this.activeBufferSource = null;
+    }
+    if (this.ttsGainNode) {
+      try {
+        this.ttsGainNode.disconnect();
+      } catch {
+        // ignore
+      }
+      this.ttsGainNode = null;
+    }
     if (this.workletNode) {
       try {
         this.workletNode.port.onmessage = null;

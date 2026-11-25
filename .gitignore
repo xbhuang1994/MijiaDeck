@@ -32,6 +32,7 @@ banned_devices.json
 workbench.json
 settings.json
 pi_agent.json
+custom_instructions.json
 agent_skills.json
 agent_skills/
 platforms.json

@@ -41,6 +41,16 @@ import type * as settingsStoreModule from "../core/settingsStore.ts";
 import { isDangerousAction, isSensitivePropertyName } from "../core/specZh.ts";
 import { isMultiPlatformService } from "../platforms/index.ts";
 import type { MainWindowController } from "../ui/controllers/mainWindowController.ts";
+import {
+  addCustomInstruction,
+  clearCustomInstructions,
+  deleteCustomInstruction,
+  deleteCustomInstructionsByQuery,
+  deleteLatestCustomInstruction,
+  detectCustomInstructionConflicts,
+  loadCustomInstructions,
+  type CustomInstructionSource,
+} from "./customInstructionStore.ts";
 
 const PLATFORM_LABELS_ZH: Readonly<Record<string, string>> = {
   mijia: "米家",
@@ -63,6 +73,9 @@ export interface SmartHomeToolDeps {
   mainWindow: MainWindowController;
   settingsStore: typeof settingsStoreModule;
   broadcastState: () => void;
+  getActivePromptSource?: () => "text" | "voice";
+  getActivePromptRawText?: () => string;
+  onCustomInstructionsChanged?: () => void;
 }
 
 function runJob<T>(jobs: IJobExecutor, fn: () => T | Promise<T>, priority = 1): Promise<T> {
@@ -2111,6 +2124,200 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
     },
   };
 
+  const saveCustomInstructionTool: AgentTool<any> = {
+    name: "save_custom_instruction",
+    label: "保存附加指令",
+    description:
+      "持久化保存一条用户的长期附加指令/偏好规则（支持通过语音或文字保存多条规则；若多条规则存在冲突，系统自动以最新保存的规则为准）。当用户说出“以后记得……”“以后我说……你要……”“记住……”等长期偏好、默认模式或条件控制规则时必须调用此工具。",
+    parameters: obj({
+      content: str({
+        description:
+          "清晰完整的附加指令规则内容，例如：“洗衣默认用智洗烘模式”或“以后我说打开空调你要自己判断室外温度，根据室外温度自动选择对应正确的模式和温度”",
+      }),
+      topic: opt(
+        str({
+          description: "适用设备或场景主题标签（如：洗衣机、空调、灯光、音箱、通用；留空自动识别）",
+        }),
+      ),
+    }),
+    execute: async (_id, params: { content: string; topic?: string }) => {
+      const content = String(params.content ?? "").trim();
+      if (!content) {
+        const msg = "附加指令内容不能为空";
+        return textResult(msg, { ok: false, uiSummary: msg }, true);
+      }
+      const promptSource = deps.getActivePromptSource?.();
+      const source: CustomInstructionSource =
+        promptSource === "voice" ? "voice" : promptSource === "text" ? "text" : "manual";
+      const rawText = deps.getActivePromptRawText?.()?.trim() || undefined;
+      try {
+        const saved = addCustomInstruction({
+          content,
+          rawText,
+          topic: params.topic,
+          source,
+        });
+        deps.onCustomInstructionsChanged?.();
+        deps.broadcastState();
+
+        const conflictCount = saved.conflictingRules.length;
+        const uiSummary = saved.bumped
+          ? `已将附加指令更新为最新优先（${saved.rule.topic}）：${saved.rule.content}`
+          : conflictCount > 0
+            ? `已保存第 ${saved.totalCount} 条附加指令（${saved.rule.topic} · 最新优先，冲突时覆盖较早规则）：${saved.rule.content}`
+            : `已保存第 ${saved.totalCount} 条附加指令（${saved.rule.topic}）：${saved.rule.content}`;
+
+        return textResult(uiSummary, {
+          ok: true,
+          created: saved.created,
+          bumped: saved.bumped,
+          rule: saved.rule,
+          totalCount: saved.totalCount,
+          enabledCount: saved.enabledCount,
+          conflictCount,
+          conflictingRuleIds: saved.conflictingRules.map((r) => r.id),
+          uiSummary,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return textResult(msg, { ok: false, uiSummary: msg }, true);
+      }
+    },
+  };
+
+  const listCustomInstructionsTool: AgentTool<any> = {
+    name: "list_custom_instructions",
+    label: "查看附加指令",
+    description:
+      "查看当前已保存的全部用户附加指令规则（按最新保存顺序从新到旧排列；若多条规则冲突，序号靠前的最新规则优先）。",
+    parameters: obj({
+      topic: opt(str({ description: "按设备或场景主题过滤（可选，例如：洗衣机、空调、灯光）" })),
+      include_disabled: opt(bool({ description: "是否包含已停用的规则，默认 true" })),
+    }),
+    execute: async (_id, params: { topic?: string; include_disabled?: boolean }) => {
+      const all = loadCustomInstructions();
+      const conflicts = detectCustomInstructionConflicts(all);
+      const topicFilter = params.topic?.trim() ?? "";
+      const includeDisabled = params.include_disabled !== false;
+      const filtered = all.filter((r) => {
+        if (!includeDisabled && !r.enabled) return false;
+        if (topicFilter && !r.topic.includes(topicFilter) && !r.content.includes(topicFilter)) {
+          return false;
+        }
+        return true;
+      });
+      if (filtered.length === 0) {
+        const uiSummary = topicFilter
+          ? `当前没有关于「${topicFilter}」的附加指令规则`
+          : "当前尚未保存任何附加指令规则";
+        return textResult(uiSummary, { ok: true, count: 0, rules: [], uiSummary });
+      }
+      const lines = filtered.map((r, idx) => {
+        const rank = idx + 1;
+        const status = !r.enabled
+          ? "已停用"
+          : rank === 1
+            ? "最新优先"
+            : conflicts.has(r.id)
+              ? "冲突时以新规则为准"
+              : "已启用";
+        return `${rank}. [${r.topic} · ${status}] ${r.content}`;
+      });
+      const uiSummary = `已保存 ${filtered.length} 条附加指令（按最新优先）：${filtered
+        .slice(0, 3)
+        .map((r) => r.content)
+        .join("；")}${filtered.length > 3 ? "等" : ""}`;
+      return textResult(lines.join("\n"), {
+        ok: true,
+        count: filtered.length,
+        rules: filtered.map((r) => ({
+          ...r,
+          conflict: conflicts.get(r.id) ?? null,
+        })),
+        uiSummary,
+      });
+    },
+  };
+
+  const deleteCustomInstructionTool: AgentTool<any> = {
+    name: "delete_custom_instruction",
+    label: "删除附加指令",
+    description:
+      "删除或清空已保存的用户附加指令规则。支持按规则 id、关键词/主题匹配删除，或删除最新一条（delete_latest=true），或清空全部（clear_all=true）。",
+    parameters: obj({
+      id: opt(str({ description: "要删除的规则 ID（可选）" })),
+      query: opt(str({ description: "按内容或主题关键词匹配删除（例如：洗衣、空调）" })),
+      delete_latest: opt(bool({ description: "是否删除最新保存的一条附加指令规则" })),
+      clear_all: opt(bool({ description: "是否清空全部已保存的附加指令规则" })),
+    }),
+    execute: async (
+      _id,
+      params: { id?: string; query?: string; delete_latest?: boolean; clear_all?: boolean },
+    ) => {
+      if (params.clear_all) {
+        const cleared = clearCustomInstructions();
+        deps.onCustomInstructionsChanged?.();
+        deps.broadcastState();
+        const uiSummary =
+          cleared > 0 ? `已清空全部 ${cleared} 条附加指令规则` : "当前没有已保存的附加指令规则";
+        return textResult(uiSummary, { ok: true, deletedCount: cleared, cleared: true, uiSummary });
+      }
+      if (params.id?.trim()) {
+        const removed = deleteCustomInstruction(params.id.trim());
+        if (!removed) {
+          const msg = "未找到指定 ID 的附加指令规则";
+          return textResult(msg, { ok: false, uiSummary: msg }, true);
+        }
+        deps.onCustomInstructionsChanged?.();
+        deps.broadcastState();
+        const uiSummary = `已删除附加指令：${removed.content}`;
+        return textResult(uiSummary, {
+          ok: true,
+          deletedCount: 1,
+          deletedRules: [removed],
+          uiSummary,
+        });
+      }
+      if (params.delete_latest) {
+        const removed = deleteLatestCustomInstruction();
+        if (!removed) {
+          const msg = "当前没有可删除的附加指令规则";
+          return textResult(msg, { ok: false, uiSummary: msg }, true);
+        }
+        deps.onCustomInstructionsChanged?.();
+        deps.broadcastState();
+        const uiSummary = `已删除最新附加指令：${removed.content}`;
+        return textResult(uiSummary, {
+          ok: true,
+          deletedCount: 1,
+          deletedRules: [removed],
+          uiSummary,
+        });
+      }
+      if (params.query?.trim()) {
+        const removedList = deleteCustomInstructionsByQuery(params.query.trim());
+        if (removedList.length === 0) {
+          const msg = `未找到与「${params.query.trim()}」相关的附加指令规则`;
+          return textResult(msg, { ok: false, uiSummary: msg }, true);
+        }
+        deps.onCustomInstructionsChanged?.();
+        deps.broadcastState();
+        const uiSummary =
+          removedList.length === 1
+            ? `已删除附加指令：${removedList[0]!.content}`
+            : `已删除 ${removedList.length} 条与「${params.query.trim()}」相关的附加指令`;
+        return textResult(uiSummary, {
+          ok: true,
+          deletedCount: removedList.length,
+          deletedRules: removedList,
+          uiSummary,
+        });
+      }
+      const msg = "请指定要删除的规则关键词、规则 ID，或选择删除最新一条 / 清空全部";
+      return textResult(msg, { ok: false, uiSummary: msg }, true);
+    },
+  };
+
   return [
     listDevicesTool,
     listPlatformsTool,
@@ -2122,5 +2329,8 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
     runDeviceActionTool,
     ...(SCENES_FEATURE_ENABLED ? [listScenesTool, runSceneTool] : []),
     sendXiaoAiTool,
+    saveCustomInstructionTool,
+    listCustomInstructionsTool,
+    deleteCustomInstructionTool,
   ];
 }

@@ -22,7 +22,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import type { LocalAsrEngineMode, SourceSeparationMode } from "../core/agentConfigStore.ts";
+import type {
+  EchoCancellationMode,
+  LocalAsrEngineMode,
+  SourceSeparationMode,
+} from "../core/agentConfigStore.ts";
+import type { EchoUtteranceRecord } from "./echoGuard.ts";
 import {
   applyHighPassFilter,
   computeRms,
@@ -111,6 +116,10 @@ export interface SourceSeparationRunOptions {
   recentTurns?: readonly ConversationTurnContext[];
   lastSpokenReply?: string;
   lastSpokenAt?: number;
+  recentSpokenUtterances?: ReadonlyArray<EchoUtteranceRecord>;
+  ttsActive?: boolean;
+  duringTtsPlayback?: boolean;
+  echoCancellationMode?: EchoCancellationMode;
   now?: number;
   voiceprint?: VoiceprintIdentifyResult | null;
   voiceprintMode?: VoiceprintPolicyMode;
@@ -1569,6 +1578,10 @@ export class AudioSourceSeparator {
       recentTurns: opts.recentTurns,
       lastSpokenReply: opts.lastSpokenReply,
       lastSpokenAt: opts.lastSpokenAt,
+      recentSpokenUtterances: opts.recentSpokenUtterances,
+      ttsActive: opts.ttsActive,
+      duringTtsPlayback: opts.duringTtsPlayback,
+      echoCancellationMode: opts.echoCancellationMode,
       now: opts.now,
       acousticEvent: bestEvent,
       acousticWake,
@@ -2113,6 +2126,10 @@ export class AudioSourceSeparator {
               recentTurns: opts.recentTurns,
               lastSpokenReply: opts.lastSpokenReply,
               lastSpokenAt: opts.lastSpokenAt,
+              recentSpokenUtterances: opts.recentSpokenUtterances,
+              ttsActive: opts.ttsActive,
+              duringTtsPlayback: opts.duringTtsPlayback,
+              echoCancellationMode: opts.echoCancellationMode,
               now: opts.now,
               acousticEvent: "<|Speech|>",
               owwActiveForWord: false,

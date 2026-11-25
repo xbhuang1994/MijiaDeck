@@ -8,9 +8,12 @@ import { DeviceDetailModalController } from "./deviceDetailModal.ts";
 import {
   PiAgentPanelController,
   type UiCavemanMode,
+  type UiCustomInstructionConflict,
+  type UiCustomInstructionRule,
   type UiLocalVoiceStatus,
   type UiProviderPreset,
   type UiPublicAgentConfig,
+  type UiThinkingLevel,
   type UiVoiceprintProfile,
   type UiWakeWordHit,
   type UiWakeWordPrototypeSummary,
@@ -266,6 +269,16 @@ const CAVEMAN_PREVIEW_DESCS: Readonly<Record<UiCavemanMode, string>> = {
   full: "简短直给，去掉开场客套与收尾寒暄但保持自然句式 · 例：“客厅吸顶灯已打开，亮度调到85%。”",
   ultra: "电报体极致压缩，语音首字播报最快 · 例：“客厅吸顶灯已开，亮度 85%”",
   off: "温暖自然的完整对话回复，不做压缩 · 例：“好的，已经帮你打开客厅吸顶灯，亮度调到85%了。”",
+};
+
+const THINKING_LEVEL_PREVIEW_DESCS: Readonly<Record<UiThinkingLevel, string>> = {
+  off: "关闭思考以获得最快响应（默认）；若模型仍返回思考内容，仅在对话框展示，不会语音播报",
+  minimal: "极简思考：极少推理开销，适合快速判断；思考过程实时显示在对话框中，不语音播报",
+  low: "低思考：轻量推理，适合常见多设备组合控制；思考过程实时显示在对话框中，不语音播报",
+  medium: "中等思考（均衡推荐）：复杂模糊指令与排错更准确；思考过程实时显示在对话框中，不语音播报",
+  high: "深度思考：更充分的多步分析与自愈规划（响应稍慢）；思考过程实时显示在对话框中，不语音播报",
+  xhigh: "超高思考：仅部分前沿推理模型原生支持，其余模型自动兼容降档至高；思考过程仅展示不播报",
+  max: "最大思考：仅部分前沿推理模型原生支持，其余模型自动兼容降档至支持的最高档；思考过程仅展示不播报",
 };
 
 function safeUrlHost(rawUrl: string): string {
@@ -1169,8 +1182,12 @@ export class MijiaDeckWebApp {
   private localVoiceStatusCache: UiLocalVoiceStatus | null = null;
   private voiceprintProfilesCache: UiVoiceprintProfile[] = [];
   private owwPrototypesCache: UiWakeWordPrototypeSummary[] = [];
+  private customInstructionsCache: UiCustomInstructionRule[] = [];
+  private customInstructionConflictsCache: Record<string, UiCustomInstructionConflict> = {};
   private vpRecordingBusy = false;
   private owwRecordingBusy = false;
+  private instRecordingAbort: AbortController | null = null;
+  private instRecordingBusy = false;
   private lastAutoFilledWakeWord = "";
   private agentClearKeyPending = false;
   private sttClearKeyPending = false;
@@ -1763,6 +1780,11 @@ export class MijiaDeckWebApp {
       if (cfg) this.agentConfigCache = cfg;
       const provs = this.piAgentPanel.getProviders();
       if (provs.length > 0) this.agentProvidersCache = provs;
+      this.customInstructionsCache = this.piAgentPanel.getCustomInstructions();
+      this.customInstructionConflictsCache = this.piAgentPanel.getCustomInstructionConflicts();
+      if (this.activeModal === "settings" && this.settingsDraft.tab === "voice-agent") {
+        this.renderCustomInstructions();
+      }
     }
     if ("voiceListen" in rec && rec.voiceListen) {
       this.piAgentPanel.applyVoiceSnapshot(rec.voiceListen);
@@ -2040,6 +2062,11 @@ export class MijiaDeckWebApp {
           if (cfg) this.agentConfigCache = cfg;
           const provs = this.piAgentPanel.getProviders();
           if (provs.length > 0) this.agentProvidersCache = provs;
+          this.customInstructionsCache = this.piAgentPanel.getCustomInstructions();
+          this.customInstructionConflictsCache = this.piAgentPanel.getCustomInstructionConflicts();
+          if (this.activeModal === "settings" && this.settingsDraft.tab === "voice-agent") {
+            this.renderCustomInstructions();
+          }
         }
         break;
       case "agent_event":
@@ -2062,7 +2089,17 @@ export class MijiaDeckWebApp {
         const p = asRecord(payload) ?? msg;
         const text = readStr(p, "text", "message");
         if (text) {
-          this.piAgentPanel.handleSpeakEvent(text);
+          const priorityRaw = readStr(p, "priority");
+          const priority =
+            priorityRaw === "ack" || priorityRaw === "normal" || priorityRaw === "result" || priorityRaw === "system"
+              ? priorityRaw
+              : undefined;
+          this.piAgentPanel.handleSpeakEvent(text, {
+            utteranceId: readStr(p, "utteranceId"),
+            priority,
+            taskId: readStr(p, "taskId"),
+            interrupt: readBool(p, "interrupt"),
+          });
         }
         break;
       }
@@ -2070,7 +2107,17 @@ export class MijiaDeckWebApp {
         const p = asRecord(payload) ?? msg;
         const text = readStr(p, "text", "message");
         if (text) {
-          this.piAgentPanel.handleSpeakChunkEvent(text);
+          const priorityRaw = readStr(p, "priority");
+          const priority =
+            priorityRaw === "ack" || priorityRaw === "normal" || priorityRaw === "result" || priorityRaw === "system"
+              ? priorityRaw
+              : undefined;
+          this.piAgentPanel.handleSpeakChunkEvent(text, {
+            utteranceId: readStr(p, "utteranceId"),
+            priority,
+            taskId: readStr(p, "taskId"),
+            interrupt: readBool(p, "interrupt"),
+          });
         }
         break;
       }
@@ -3506,8 +3553,14 @@ export class MijiaDeckWebApp {
   }
 
   private cleanupModal(name: ModalName): void {
-    if (name === "settings" && this.settingsOriginal) {
-      void this.revertSettingsPreview();
+    if (name === "settings") {
+      if (this.instRecordingAbort) {
+        this.instRecordingAbort.abort();
+        this.instRecordingAbort = null;
+      }
+      if (this.settingsOriginal) {
+        void this.revertSettingsPreview();
+      }
     } else if (name === "device-detail") {
       this.deviceDetailModal.close();
     } else if (name === "light") {
@@ -3568,6 +3621,22 @@ export class MijiaDeckWebApp {
       }
     } catch {
       // use cached voice snapshot prototypes
+    }
+
+    try {
+      const rawInst = await apiGet<{
+        instructions?: UiCustomInstructionRule[];
+        conflicts?: Record<string, UiCustomInstructionConflict>;
+      }>("/api/agent/instructions");
+      if (Array.isArray(rawInst?.instructions)) {
+        this.customInstructionsCache = rawInst.instructions;
+      }
+      if (rawInst?.conflicts) {
+        this.customInstructionConflictsCache = rawInst.conflicts;
+      }
+    } catch {
+      this.customInstructionsCache = this.piAgentPanel.getCustomInstructions();
+      this.customInstructionConflictsCache = this.piAgentPanel.getCustomInstructionConflicts();
     }
 
     const s = this.state.settings;
@@ -3707,9 +3776,12 @@ export class MijiaDeckWebApp {
     el("set-agent-clear-key-btn").hidden = !cfg?.hasApiKey;
     el<HTMLInputElement>("set-agent-prefer-local-intents").checked =
       cfg?.preferLocalIntents === true;
+    el<HTMLSelectElement>("set-agent-thinking-level").value = cfg?.thinkingLevel || "off";
+    this.syncThinkingLevelDesc();
     el<HTMLSelectElement>("set-agent-caveman-mode").value = cfg?.cavemanMode || "lite";
     this.syncCavemanDesc();
     el<HTMLTextAreaElement>("set-agent-system-prompt").value = cfg?.systemPromptExtra || "";
+    this.renderCustomInstructions();
 
     el<HTMLSelectElement>("set-voice-engine").value = cfg?.voiceEngine || "auto";
     el<HTMLSelectElement>("set-voice-local-asr-engine").value = cfg?.localAsrEngine || "auto";
@@ -3751,6 +3823,9 @@ export class MijiaDeckWebApp {
     el<HTMLSelectElement>("set-voice-tts-engine").value = cfg?.ttsEngine || "auto";
     el<HTMLSelectElement>("set-voice-tts-voice").value = cfg?.ttsVoice || "gentle-zh-en";
     el<HTMLInputElement>("set-voice-tts-speed").value = (cfg?.ttsSpeed ?? 0.98).toFixed(2);
+    el<HTMLInputElement>("set-voice-async-pipeline").checked = cfg?.asyncVoicePipeline !== false;
+    el<HTMLSelectElement>("set-voice-echo-mode").value = cfg?.echoCancellationMode || "auto";
+    el<HTMLInputElement>("set-voice-barge-in-ducking").checked = cfg?.bargeInDuckingEnabled !== false;
 
     el<HTMLInputElement>("set-stt-base-url").value = cfg?.sttBaseUrl || "";
     el<HTMLInputElement>("set-stt-model").value = cfg?.sttModel || "whisper-1";
@@ -3900,6 +3975,29 @@ export class MijiaDeckWebApp {
     const mode: UiCavemanMode =
       raw === "ultra" || raw === "full" || raw === "lite" || raw === "off" ? raw : "lite";
     desc.textContent = CAVEMAN_PREVIEW_DESCS[mode];
+  }
+
+  private syncThinkingLevelDesc(): void {
+    const sel = document.getElementById("set-agent-thinking-level") as HTMLSelectElement | null;
+    const desc = document.getElementById("set-agent-thinking-level-desc");
+    if (!sel || !desc) return;
+    const raw = sel.value;
+    const level: UiThinkingLevel =
+      raw === "off" ||
+      raw === "minimal" ||
+      raw === "low" ||
+      raw === "medium" ||
+      raw === "high" ||
+      raw === "xhigh" ||
+      raw === "max"
+        ? raw
+        : "off";
+    const provId = (document.getElementById("set-agent-provider") as HTMLSelectElement | null)?.value;
+    const baseText = THINKING_LEVEL_PREVIEW_DESCS[level];
+    desc.textContent =
+      provId === "local"
+        ? `当前为「内置本地引擎」，思考等级将在切换云端或自定义大模型后生效 · ${baseText}`
+        : baseText;
   }
 
   private syncSystemOneStatusDesc(): void {
@@ -4327,6 +4425,286 @@ export class MijiaDeckWebApp {
     }
   }
 
+  private renderCustomInstructions(): void {
+    const list = document.getElementById("set-agent-instructions-list");
+    if (!list) return;
+    list.replaceChildren();
+
+    const rules = this.customInstructionsCache;
+    const conflicts = this.customInstructionConflictsCache;
+    if (!rules || rules.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "agent-inst-empty";
+      empty.textContent =
+        "暂无已保存的附加指令规则。可以直接语音说出“以后记得洗衣默认用智洗烘模式”，或点击上方「🎙 语音录入」/ 手动添加。";
+      list.appendChild(empty);
+      return;
+    }
+
+    let enabledRank = 0;
+    for (const rule of rules) {
+      if (rule.enabled) enabledRank += 1;
+      const conflict = rule.enabled ? conflicts[rule.id] : undefined;
+
+      const row = document.createElement("div");
+      row.className = `agent-inst-item${rule.enabled ? "" : " is-disabled"}${
+        conflict ? " is-overridden" : ""
+      }`;
+
+      const main = document.createElement("div");
+      main.className = "agent-inst-item-main";
+
+      const content = document.createElement("div");
+      content.className = "agent-inst-item-text";
+      content.textContent = rule.content;
+
+      const meta = document.createElement("div");
+      meta.className = "agent-inst-item-meta";
+
+      if (rule.enabled && enabledRank === 1) {
+        const latest = document.createElement("span");
+        latest.className = "inst-tag inst-tag-latest";
+        latest.textContent = "最新优先";
+        meta.appendChild(latest);
+      } else if (rule.enabled) {
+        const rank = document.createElement("span");
+        rank.className = "inst-tag";
+        rank.textContent = `#${enabledRank}`;
+        meta.appendChild(rank);
+      } else {
+        const off = document.createElement("span");
+        off.className = "inst-tag";
+        off.textContent = "已停用";
+        meta.appendChild(off);
+      }
+
+      const topicTag = document.createElement("span");
+      topicTag.className = "inst-tag inst-tag-topic";
+      topicTag.textContent = rule.topic || "通用";
+      meta.appendChild(topicTag);
+
+      const srcTag = document.createElement("span");
+      srcTag.className = `inst-tag${rule.source === "voice" ? " inst-tag-voice" : ""}`;
+      srcTag.textContent =
+        rule.source === "voice" ? "语音录入" : rule.source === "text" ? "对话保存" : "手动添加";
+      meta.appendChild(srcTag);
+
+      if (conflict) {
+        const confTag = document.createElement("span");
+        confTag.className = "inst-tag inst-tag-conflict";
+        confTag.textContent = conflict.reason || "冲突时以新规则为准";
+        meta.appendChild(confTag);
+      }
+
+      const dt = new Date(rule.updatedAt);
+      const timeEl = document.createElement("span");
+      timeEl.className = "agent-inst-item-time";
+      timeEl.textContent = `${String(dt.getMonth() + 1).padStart(2, "0")}-${String(
+        dt.getDate(),
+      ).padStart(2, "0")} ${String(dt.getHours()).padStart(2, "0")}:${String(
+        dt.getMinutes(),
+      ).padStart(2, "0")}`;
+      meta.appendChild(timeEl);
+
+      main.append(content, meta);
+
+      const actions = document.createElement("div");
+      actions.className = "agent-inst-item-actions";
+
+      const toggleBtn = document.createElement("button");
+      toggleBtn.type = "button";
+      toggleBtn.className = "pi-skill-mini-btn";
+      toggleBtn.textContent = rule.enabled ? "停用" : "启用";
+      toggleBtn.addEventListener("click", () => {
+        void this.handleToggleCustomInstruction(rule.id, !rule.enabled);
+      });
+
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "pi-skill-mini-btn is-danger";
+      delBtn.textContent = "删除";
+      delBtn.addEventListener("click", () => {
+        void this.handleDeleteCustomInstruction(rule.id);
+      });
+
+      actions.append(toggleBtn, delBtn);
+      row.append(main, actions);
+      list.appendChild(row);
+    }
+  }
+
+  private async saveCustomInstructionFromSettings(
+    content: string,
+    source: "manual" | "voice",
+    rawText?: string,
+  ): Promise<void> {
+    const res = await apiPost<{
+      ok?: boolean;
+      rule?: UiCustomInstructionRule;
+      bumped?: boolean;
+      conflictingRules?: UiCustomInstructionRule[];
+      instructions?: UiCustomInstructionRule[];
+      conflicts?: Record<string, UiCustomInstructionConflict>;
+      agent?: unknown;
+    }>("/api/agent/instructions", {
+      content,
+      source,
+      ...(rawText ? { rawText } : {}),
+    });
+    if (Array.isArray(res?.instructions)) {
+      this.customInstructionsCache = res.instructions;
+    }
+    if (res?.conflicts) {
+      this.customInstructionConflictsCache = res.conflicts;
+    }
+    if (res?.agent) {
+      this.piAgentPanel.applyAgentSnapshot(res.agent);
+    }
+    this.renderCustomInstructions();
+    const conflictCount = Array.isArray(res?.conflictingRules) ? res.conflictingRules.length : 0;
+    const msg = res?.bumped
+      ? "已将该附加指令提升为最新优先"
+      : conflictCount > 0
+        ? "已保存新附加指令（冲突时将优先按本条最新规则执行）"
+        : "已保存附加指令规则";
+    this.showToast(msg, 2400);
+  }
+
+  private async handleAddCustomInstruction(): Promise<void> {
+    const input = el<HTMLInputElement>("set-agent-instruction-input");
+    const text = input.value.trim();
+    if (!text) {
+      this.showToast("请先输入一条附加指令规则", 2000);
+      input.focus();
+      return;
+    }
+    const addBtn = el<HTMLButtonElement>("set-agent-instruction-add-btn");
+    addBtn.disabled = true;
+    try {
+      await this.saveCustomInstructionFromSettings(text, "manual");
+      input.value = "";
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.showToast(`保存附加指令失败：${msg}`, 3500);
+    } finally {
+      addBtn.disabled = false;
+    }
+  }
+
+  private async handleToggleCustomInstruction(id: string, enabled: boolean): Promise<void> {
+    try {
+      const res = await apiPost<{
+        instructions?: UiCustomInstructionRule[];
+        conflicts?: Record<string, UiCustomInstructionConflict>;
+        agent?: unknown;
+      }>(`/api/agent/instructions/${encodeURIComponent(id)}/toggle`, { enabled });
+      if (Array.isArray(res?.instructions)) this.customInstructionsCache = res.instructions;
+      if (res?.conflicts) this.customInstructionConflictsCache = res.conflicts;
+      if (res?.agent) this.piAgentPanel.applyAgentSnapshot(res.agent);
+      this.renderCustomInstructions();
+      this.showToast(enabled ? "已启用附加指令" : "已停用附加指令", 1800);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.showToast(`更新附加指令失败：${msg}`, 3000);
+    }
+  }
+
+  private async handleDeleteCustomInstruction(id: string): Promise<void> {
+    try {
+      const res = await apiPost<{
+        instructions?: UiCustomInstructionRule[];
+        conflicts?: Record<string, UiCustomInstructionConflict>;
+        agent?: unknown;
+      }>(`/api/agent/instructions/${encodeURIComponent(id)}/delete`);
+      if (Array.isArray(res?.instructions)) this.customInstructionsCache = res.instructions;
+      if (res?.conflicts) this.customInstructionConflictsCache = res.conflicts;
+      if (res?.agent) this.piAgentPanel.applyAgentSnapshot(res.agent);
+      this.renderCustomInstructions();
+      this.showToast("已删除附加指令", 1800);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.showToast(`删除附加指令失败：${msg}`, 3000);
+    }
+  }
+
+  private async handleVoiceRecordCustomInstruction(): Promise<void> {
+    // 若正在录音中，再次点击即刻结束录音并进入转写保存
+    if (this.instRecordingAbort) {
+      this.instRecordingAbort.abort();
+      this.instRecordingAbort = null;
+      return;
+    }
+    if (this.instRecordingBusy || this.vpRecordingBusy || this.owwRecordingBusy) return;
+
+    const btn = el<HTMLButtonElement>("set-agent-instruction-voice-btn");
+    const statusEl = el("set-agent-instruction-voice-status");
+    const prevLabel = btn.textContent || "🎙 语音录入";
+    const maxSec = 15;
+    const ac = new AbortController();
+    this.instRecordingAbort = ac;
+    this.instRecordingBusy = true;
+
+    btn.classList.add("is-recording");
+    btn.textContent = `停止并保存 (${maxSec}s)`;
+    statusEl.hidden = false;
+    statusEl.textContent =
+      "正在录音，请说出你的附加指令规则（如“以后记得洗衣默认用智洗烘模式”），说完点击「停止并保存”…";
+
+    try {
+      const wavBlob = await recordShortWavSample(
+        maxSec * 1000,
+        (ratio) => {
+          const rem = Math.max(1, Math.ceil((1 - ratio) * maxSec));
+          if (this.instRecordingAbort === ac) {
+            btn.textContent = `停止并保存 (${rem}s)`;
+          }
+        },
+        ac.signal,
+      );
+      this.instRecordingAbort = null;
+      btn.classList.remove("is-recording");
+      btn.disabled = true;
+      btn.textContent = "转写保存中…";
+      statusEl.textContent = "正在将语音转写为文字并保存为最新附加指令…";
+
+      const lang = el<HTMLSelectElement>("set-voice-lang").value || "zh-CN";
+      const engine = el<HTMLSelectElement>("set-voice-engine").value || "auto";
+      const form = new FormData();
+      form.append("audio", wavBlob, "instruction.wav");
+      form.append("lang", lang);
+      form.append("engine", engine === "browser" ? "auto" : engine);
+      form.append("bypassWakeWord", "true");
+      form.append("autoDispatch", "false");
+
+      const resp = await fetch("/api/voice/audio", { method: "POST", body: form });
+      const data = (await resp.json()) as {
+        ok?: boolean;
+        text?: string;
+        error?: string;
+      };
+      if (!resp.ok || data.ok === false) {
+        throw new Error(data.error || `语音转写失败 (${resp.status})`);
+      }
+      const heard = (data.text ?? "").trim();
+      if (!heard) {
+        throw new Error("未识别到有效语音内容，请靠近麦克风重试");
+      }
+
+      await this.saveCustomInstructionFromSettings(heard, "voice", heard);
+      statusEl.textContent = `✓ 已通过语音保存附加指令：「${heard}」`;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      statusEl.textContent = `语音录入失败：${msg}`;
+      this.showToast(`语音录入附加指令失败：${msg}`, 3500);
+    } finally {
+      this.instRecordingAbort = null;
+      this.instRecordingBusy = false;
+      btn.classList.remove("is-recording");
+      btn.disabled = false;
+      btn.textContent = prevLabel;
+    }
+  }
+
   private async handleRecordVerifyVoiceprint(): Promise<void> {
     if (this.vpRecordingBusy || this.owwRecordingBusy) return;
     const btn = el<HTMLButtonElement>("vp-record-verify-btn");
@@ -4416,6 +4794,7 @@ export class MijiaDeckWebApp {
         ? "当前为「内置本地引擎」，所有指令均由本地规划引擎执行；切换至云端或自定义大模型后，此开关控制常规指令是否优先走本地快路径（默认关闭）"
         : "开启后，常见确定性智能家居指令（如开关设备、调光、调音量、停播音乐）将优先走零延迟本地规划引擎；关闭则统一交由当前大模型理解与执行（默认关闭）";
     }
+    this.syncThinkingLevelDesc();
 
     if (preset) {
       el("set-agent-provider-desc").textContent = preset.description;
@@ -4695,6 +5074,7 @@ export class MijiaDeckWebApp {
       modelId: el<HTMLInputElement>("set-agent-model").value.trim(),
       baseUrl: el<HTMLInputElement>("set-agent-base-url").value.trim(),
       preferLocalIntents: el<HTMLInputElement>("set-agent-prefer-local-intents").checked,
+      thinkingLevel: el<HTMLSelectElement>("set-agent-thinking-level").value,
       cavemanMode: el<HTMLSelectElement>("set-agent-caveman-mode").value,
       systemPromptExtra: el<HTMLTextAreaElement>("set-agent-system-prompt").value.trim(),
       voiceEngine: el<HTMLSelectElement>("set-voice-engine").value,
@@ -4726,6 +5106,9 @@ export class MijiaDeckWebApp {
       ttsEngine: el<HTMLSelectElement>("set-voice-tts-engine").value,
       ttsVoice: el<HTMLSelectElement>("set-voice-tts-voice").value,
       ttsSpeed,
+      asyncVoicePipeline: el<HTMLInputElement>("set-voice-async-pipeline").checked,
+      echoCancellationMode: el<HTMLSelectElement>("set-voice-echo-mode").value,
+      bargeInDuckingEnabled: el<HTMLInputElement>("set-voice-barge-in-ducking").checked,
       sttBaseUrl: el<HTMLInputElement>("set-stt-base-url").value.trim(),
       sttModel: el<HTMLInputElement>("set-stt-model").value.trim(),
     };
@@ -6178,6 +6561,10 @@ export class MijiaDeckWebApp {
       void this.fetchAgentModelsFromApi(false);
     });
 
+    el<HTMLSelectElement>("set-agent-thinking-level").addEventListener("change", () => {
+      this.syncThinkingLevelDesc();
+    });
+
     el<HTMLSelectElement>("set-agent-caveman-mode").addEventListener("change", () => {
       this.syncCavemanDesc();
     });
@@ -6263,6 +6650,20 @@ export class MijiaDeckWebApp {
       input.value = "";
       input.placeholder = "将在保存设置后清除已保存的 API Key";
       el("set-agent-clear-key-btn").hidden = true;
+    });
+
+    const instInput = el<HTMLInputElement>("set-agent-instruction-input");
+    el("set-agent-instruction-add-btn").addEventListener("click", () => {
+      void this.handleAddCustomInstruction();
+    });
+    instInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void this.handleAddCustomInstruction();
+      }
+    });
+    el("set-agent-instruction-voice-btn").addEventListener("click", () => {
+      void this.handleVoiceRecordCustomInstruction();
     });
 
     el("set-stt-clear-key-btn").addEventListener("click", () => {

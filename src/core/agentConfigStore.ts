@@ -36,8 +36,10 @@ export type VadEngineMode = "silero" | "adaptive";
 export type VadSensitivityMode = "aggressive" | "default" | "relaxed";
 export type VoiceprintPolicyMode = "off" | "tag" | "strict";
 export type AttentionMode = "smart" | "strict" | "off";
+export type EchoCancellationMode = "auto" | "aggressive" | "standard" | "off";
 export type SystemOneMode = "auto" | "on" | "off";
 export type CavemanReplyMode = "ultra" | "full" | "lite" | "off";
+export type AgentThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type CustomApiType =
   | "openai-completions"
   | "openai-responses"
@@ -193,6 +195,7 @@ const VALID_VAD_MODES = new Set<string>(["silero", "adaptive"]);
 const VALID_VAD_SENSITIVITIES = new Set<string>(["aggressive", "default", "relaxed"]);
 const VALID_VOICEPRINT_MODES = new Set<string>(["off", "tag", "strict"]);
 const VALID_ATTENTION_MODES = new Set<string>(["smart", "strict", "off"]);
+const VALID_ECHO_MODES = new Set<string>(["auto", "aggressive", "standard", "off"]);
 const VALID_SYSTEMONE_MODES = new Set<string>(["auto", "on", "off"]);
 const VALID_CAVEMAN_MODES = new Set<string>(["ultra", "full", "lite", "off"]);
 const CAVEMAN_MODE_ALIASES: Readonly<Record<string, CavemanReplyMode>> = {
@@ -208,6 +211,33 @@ const CAVEMAN_MODE_ALIASES: Readonly<Record<string, CavemanReplyMode>> = {
 };
 export const DEFAULT_SYSTEMONE_MODEL = "karpo/karpo-decision-31b";
 export const DEFAULT_CAVEMAN_MODE: CavemanReplyMode = "lite";
+export const DEFAULT_THINKING_LEVEL: AgentThinkingLevel = "off";
+export const VALID_THINKING_LEVELS: ReadonlyArray<AgentThinkingLevel> = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+const VALID_THINKING_LEVEL_SET = new Set<string>(VALID_THINKING_LEVELS);
+const THINKING_LEVEL_ALIASES: Readonly<Record<string, AgentThinkingLevel>> = {
+  off: "off",
+  none: "off",
+  disabled: "off",
+  minimal: "minimal",
+  min: "minimal",
+  low: "low",
+  medium: "medium",
+  med: "medium",
+  high: "high",
+  xhigh: "xhigh",
+  "extra-high": "xhigh",
+  extra_high: "xhigh",
+  max: "max",
+  maximum: "max",
+};
 const VALID_CUSTOM_APIS = new Set<string>([
   "openai-completions",
   "openai-responses",
@@ -272,6 +302,12 @@ export interface AgentVoiceConfig {
   conversationWindowSec: number;
   maxConsecutiveSidetalk: number;
   bargeInEnabled: boolean;
+  /** 是否启用执行、播报、对话全双工异步分离管线（默认开启，互不阻塞） */
+  asyncVoicePipeline: boolean;
+  /** 回声消除策略：auto（硬件 AEC + 参考信号自适应 AEC + 服务端多语段语义防回声）/ aggressive / standard / off */
+  echoCancellationMode: EchoCancellationMode;
+  /** 双讲/插话检测时是否先平滑降音（Ducking）再决定打断（默认开启，显著降低自回声误打断） */
+  bargeInDuckingEnabled: boolean;
   // SystemOne 决策模型（karpo/karpo-decision-31b）配置
   systemOneMode: SystemOneMode;
   systemOneBaseUrl: string;
@@ -281,6 +317,8 @@ export interface AgentVoiceConfig {
   systemOneConfidenceThreshold: number;
   // Caveman 极简回复风格（参考 juliusbrussee/caveman）
   cavemanMode: CavemanReplyMode;
+  /** AI 思考/推理等级：off（关闭）/ minimal / low / medium / high / xhigh / max（思考过程仅展示在对话框，不语音播报） */
+  thinkingLevel: AgentThinkingLevel;
   // openWakeWord 独立本地声学唤醒词优化（支持用户自定义唤醒词）
   owwEnabled: boolean;
   owwThreshold: number;
@@ -343,6 +381,9 @@ export interface AgentConfigPatch {
   conversationWindowSec?: unknown;
   maxConsecutiveSidetalk?: unknown;
   bargeInEnabled?: unknown;
+  asyncVoicePipeline?: unknown;
+  echoCancellationMode?: unknown;
+  bargeInDuckingEnabled?: unknown;
   systemOneMode?: unknown;
   systemOneBaseUrl?: unknown;
   systemOneApiKey?: unknown;
@@ -351,6 +392,7 @@ export interface AgentConfigPatch {
   systemOneTimeoutMs?: unknown;
   systemOneConfidenceThreshold?: unknown;
   cavemanMode?: unknown;
+  thinkingLevel?: unknown;
   owwEnabled?: unknown;
   owwThreshold?: unknown;
   sttBaseUrl?: unknown;
@@ -400,6 +442,9 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     conversationWindowSec: 25,
     maxConsecutiveSidetalk: 3,
     bargeInEnabled: true,
+    asyncVoicePipeline: true,
+    echoCancellationMode: "auto",
+    bargeInDuckingEnabled: true,
     systemOneMode: "auto",
     systemOneBaseUrl: "",
     systemOneApiKey: "",
@@ -407,6 +452,7 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     systemOneTimeoutMs: 2000,
     systemOneConfidenceThreshold: 0.65,
     cavemanMode: DEFAULT_CAVEMAN_MODE,
+    thinkingLevel: DEFAULT_THINKING_LEVEL,
     owwEnabled: true,
     owwThreshold: 0.6,
     sttBaseUrl: "",
@@ -515,6 +561,15 @@ export function normalizeCavemanMode(
   return CAVEMAN_MODE_ALIASES[key] ?? fallback;
 }
 
+export function normalizeThinkingLevel(
+  value: unknown,
+  fallback: AgentThinkingLevel = DEFAULT_THINKING_LEVEL,
+): AgentThinkingLevel {
+  if (typeof value !== "string") return fallback;
+  const key = value.trim().toLowerCase();
+  return THINKING_LEVEL_ALIASES[key] ?? fallback;
+}
+
 function normalizeSystemOneBaseUrl(value: unknown): string {
   const urlStr = normalizeUrl(value);
   if (!urlStr) return "";
@@ -615,6 +670,14 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     ? (attModeRaw as AttentionMode)
     : defaults.attentionMode;
 
+  const echoModeRaw =
+    typeof raw.echoCancellationMode === "string"
+      ? raw.echoCancellationMode.trim().toLowerCase()
+      : defaults.echoCancellationMode;
+  const echoCancellationMode: EchoCancellationMode = VALID_ECHO_MODES.has(echoModeRaw)
+    ? (echoModeRaw as EchoCancellationMode)
+    : defaults.echoCancellationMode;
+
   const sysOneModeRaw =
     typeof raw.systemOneMode === "string"
       ? raw.systemOneMode.trim().toLowerCase()
@@ -624,6 +687,7 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     : defaults.systemOneMode;
 
   const cavemanMode = normalizeCavemanMode(raw.cavemanMode, defaults.cavemanMode);
+  const thinkingLevel = normalizeThinkingLevel(raw.thinkingLevel, defaults.thinkingLevel);
   const sysOneModelRaw =
     typeof raw.systemOneModel === "string" ? raw.systemOneModel.trim().slice(0, 128) : "";
 
@@ -708,6 +772,15 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     ),
     bargeInEnabled:
       typeof raw.bargeInEnabled === "boolean" ? raw.bargeInEnabled : defaults.bargeInEnabled,
+    asyncVoicePipeline:
+      typeof raw.asyncVoicePipeline === "boolean"
+        ? raw.asyncVoicePipeline
+        : defaults.asyncVoicePipeline,
+    echoCancellationMode,
+    bargeInDuckingEnabled:
+      typeof raw.bargeInDuckingEnabled === "boolean"
+        ? raw.bargeInDuckingEnabled
+        : defaults.bargeInDuckingEnabled,
     systemOneMode,
     systemOneBaseUrl: normalizeSystemOneBaseUrl(raw.systemOneBaseUrl),
     systemOneApiKey: typeof raw.systemOneApiKey === "string" ? raw.systemOneApiKey.trim() : "",
@@ -724,6 +797,7 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
       ).toFixed(2),
     ),
     cavemanMode,
+    thinkingLevel,
     owwEnabled: typeof raw.owwEnabled === "boolean" ? raw.owwEnabled : defaults.owwEnabled,
     owwThreshold: Number(clampNumber(raw.owwThreshold, 0.25, 0.95, defaults.owwThreshold).toFixed(2)),
     sttBaseUrl: normalizeUrl(raw.sttBaseUrl),
@@ -1092,6 +1166,19 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
   if (patch.bargeInEnabled !== undefined) {
     nextRaw.bargeInEnabled = Boolean(patch.bargeInEnabled);
   }
+  if (patch.asyncVoicePipeline !== undefined) {
+    nextRaw.asyncVoicePipeline = Boolean(patch.asyncVoicePipeline);
+  }
+  if (patch.echoCancellationMode !== undefined) {
+    const em = String(patch.echoCancellationMode).trim().toLowerCase();
+    if (!VALID_ECHO_MODES.has(em)) {
+      throw new Error(`不支持的回声消除模式: ${em}`);
+    }
+    nextRaw.echoCancellationMode = em;
+  }
+  if (patch.bargeInDuckingEnabled !== undefined) {
+    nextRaw.bargeInDuckingEnabled = Boolean(patch.bargeInDuckingEnabled);
+  }
   if (patch.systemOneMode !== undefined) {
     const sm = String(patch.systemOneMode).trim().toLowerCase();
     if (!VALID_SYSTEMONE_MODES.has(sm)) {
@@ -1130,6 +1217,14 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
       throw new Error(`不支持的回复精简模式: ${cmRaw}`);
     }
     nextRaw.cavemanMode = mapped;
+  }
+  if (patch.thinkingLevel !== undefined) {
+    const tlRaw = String(patch.thinkingLevel).trim().toLowerCase();
+    const mapped = THINKING_LEVEL_ALIASES[tlRaw];
+    if (!mapped || !VALID_THINKING_LEVEL_SET.has(mapped)) {
+      throw new Error(`不支持的 AI 思考等级: ${tlRaw}`);
+    }
+    nextRaw.thinkingLevel = mapped;
   }
   if (patch.owwEnabled !== undefined) {
     nextRaw.owwEnabled = Boolean(patch.owwEnabled);

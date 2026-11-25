@@ -258,6 +258,23 @@
           <div id="pi-dialog-timer-fill" class="pi-dialog-timer-fill"></div>
         </div>
       </div>
+      <div id="pi-voice-lanes" class="pi-voice-lanes" aria-label="对话、执行与播报异步通道状态">
+        <button type="button" id="pi-lane-conv" class="pi-lane-chip" title="对话通道：独立持续收音与唤醒，不被执行或播报阻塞（点击切换对话模式）">
+          <span class="pi-lane-dot" aria-hidden="true"></span>
+          <span class="pi-lane-label">对话</span>
+          <span id="pi-lane-conv-val" class="pi-lane-val">待机</span>
+        </button>
+        <button type="button" id="pi-lane-exec" class="pi-lane-chip" title="执行通道：后台并发执行设备控制任务，互不打断（执行中点击可中止）">
+          <span class="pi-lane-dot" aria-hidden="true"></span>
+          <span class="pi-lane-label">执行</span>
+          <span id="pi-lane-exec-val" class="pi-lane-val">空闲</span>
+        </button>
+        <button type="button" id="pi-lane-speak" class="pi-lane-chip" title="播报通道：独立排队播报并启用回声消除（播报中点击仅静音播报）">
+          <span class="pi-lane-dot" aria-hidden="true"></span>
+          <span class="pi-lane-label">播报</span>
+          <span id="pi-lane-speak-val" class="pi-lane-val">静音</span>
+        </button>
+      </div>
       <div class="pi-voice-top">
         <div id="pi-voice-wave" class="pi-voice-wave" aria-hidden="true">
           <span class="pi-wave-bar"></span>
@@ -278,6 +295,15 @@
         <button type="button" id="pi-streaming-toggle-btn" class="pi-wake-pill active" title="点击快速开启或关闭 Qwen3-ASR 实时流式转写与智能断句">流式：开</button>
         <button type="button" id="pi-voice-pipeline-toggle-btn" class="pi-wake-pill" title="点击切换原方案与 ClearVoice GPU 准实时切片 + Qwen3-ASR 新方案">方案：原方案</button>
         <button type="button" id="pi-caveman-toggle-btn" class="pi-caveman-pill active" title="点击切换语音与文字回复风格">自然 · Lite</button>
+        <select id="pi-thinking-level-select" class="pi-thinking-select" aria-label="AI 思考等级" title="设置 AI 思考等级（思考过程显示在对话框，不语音播报）">
+          <option value="off">思考：关</option>
+          <option value="minimal">思考：极简</option>
+          <option value="low">思考：低</option>
+          <option value="medium">思考：中</option>
+          <option value="high">思考：高</option>
+          <option value="xhigh">思考：超高</option>
+          <option value="max">思考：最大</option>
+        </select>
       </div>
       <div id="pi-voice-telemetry" class="pi-voice-telemetry" hidden></div>
     </div>
@@ -294,6 +320,18 @@
       <div id="pi-skills-list" class="pi-skills-list" hidden></div>
     </div>
 
+    <!-- Saved Custom Instruction Rules Bar (newest-first, latest wins on conflict) -->
+    <div id="pi-instructions-bar" class="pi-skills-bar pi-instructions-bar" hidden>
+      <button type="button" id="pi-instructions-toggle-btn" class="pi-skills-toggle-btn" aria-expanded="false">
+        <span class="pi-skills-toggle-left">
+          <span class="pi-skills-icon" aria-hidden="true">📌</span>
+          <span id="pi-instructions-count-label">附加指令规则 (0 · 最新优先)</span>
+        </span>
+        <span id="pi-instructions-chevron" class="pi-skills-chevron" aria-hidden="true">▸</span>
+      </button>
+      <div id="pi-instructions-list" class="pi-skills-list" hidden></div>
+    </div>
+
     <!-- Conversation & Tool Execution Timeline -->
     <div id="pi-agent-scroll" class="pi-agent-scroll">
       <div id="pi-agent-empty" class="pi-agent-empty">
@@ -308,6 +346,7 @@
     <!-- Bottom Prompt Composer -->
     <div class="pi-composer">
       <input type="text" id="pi-agent-input" class="pi-composer-input" placeholder="输入设备控制指令，如“把客厅吸顶灯调到暖光 80%”…" autocomplete="off" spellcheck="false" aria-label="输入 Pi Agent 控制指令">
+      <button type="button" id="pi-agent-stop-btn" class="danger-button btn-compact pi-stop-btn" hidden title="中止正在后台执行的任务">停止执行</button>
       <button type="button" id="pi-agent-send-btn" class="primary-button btn-compact pi-send-btn">发送</button>
     </div>
   </aside>
@@ -689,6 +728,22 @@
             </div>
           </div>
 
+          <div class="setting-card setting-card-wrap" id="setting-row-agent-thinking-level">
+            <div class="setting-info">
+              <div class="setting-label">AI 思考等级</div>
+              <div class="setting-desc" id="set-agent-thinking-level-desc">关闭思考以获得最快响应；开启后思考过程会实时显示在对话框中，且不会进行语音播报</div>
+            </div>
+            <select id="set-agent-thinking-level" class="md-select" aria-label="AI 思考等级">
+              <option value="off">关闭 Off（不思考 · 最快响应）</option>
+              <option value="minimal">极简 Minimal</option>
+              <option value="low">低 Low（轻度推理）</option>
+              <option value="medium">中 Medium（均衡推理）</option>
+              <option value="high">高 High（深度推理）</option>
+              <option value="xhigh">超高 XHigh（部分模型支持）</option>
+              <option value="max">最大 Max（部分模型支持）</option>
+            </select>
+          </div>
+
           <div class="setting-card" id="setting-row-agent-local-fast-path">
             <div class="setting-info">
               <div class="setting-label">本地快路径（常规指令本地优先）</div>
@@ -713,12 +768,24 @@
             </select>
           </div>
 
-          <div class="setting-card setting-card-wrap">
+          <div class="setting-card setting-card-wrap" id="setting-row-agent-instructions">
             <div class="setting-info">
-              <div class="setting-label">附加指令（可选）</div>
-              <div class="setting-desc">告诉 Pi Agent 你的家庭习惯、房间别名或偏好（如“我说睡了就关客厅和餐厅所有灯”）</div>
+              <div class="setting-label">附加指令规则（支持语音保存多条 · 冲突时最新优先）</div>
+              <div class="setting-desc">直接对语音助手说“以后记得洗衣默认用智洗烘模式”或“以后我说打开空调你要自己判断室外温度，根据室外温度自动选择对应正确的模式和温度”即可自动保存；多条规则若存在冲突，始终以最新一条为准。</div>
             </div>
-            <textarea id="set-agent-system-prompt" class="agent-textarea" rows="2" placeholder="可选：补充个性化家居控制习惯…" aria-label="Pi Agent 附加指令"></textarea>
+            <div class="agent-inst-panel">
+              <div class="agent-inst-toolbar">
+                <input type="text" id="set-agent-instruction-input" class="md-text-input agent-inst-input" placeholder="输入一条附加指令规则，如“以后记得洗衣默认用智洗烘模式”…" autocomplete="off" spellcheck="false" aria-label="新增附加指令规则">
+                <button type="button" id="set-agent-instruction-add-btn" class="primary-button btn-compact">添加规则</button>
+                <button type="button" id="set-agent-instruction-voice-btn" class="secondary-button btn-compact" title="点击开始语音录入附加指令，说完再次点击保存">🎙 语音录入</button>
+              </div>
+              <div id="set-agent-instruction-voice-status" class="agent-inst-status" hidden></div>
+              <div id="set-agent-instructions-list" class="agent-inst-list"></div>
+              <div class="agent-inst-legacy-block">
+                <label for="set-agent-system-prompt" class="agent-inst-legacy-label">补充自由文本说明（可选，优先级低于上方规则）</label>
+                <textarea id="set-agent-system-prompt" class="agent-textarea" rows="2" placeholder="可选：补充个性化家居控制习惯…" aria-label="Pi Agent 附加指令"></textarea>
+              </div>
+            </div>
           </div>
 
           <div class="setting-section-title">语音监听、环境降噪、声纹与注意力设置</div>
@@ -989,6 +1056,35 @@
                   <input type="number" id="set-voice-tts-speed" class="md-num-input" min="0.70" max="1.40" step="0.02" value="0.98" aria-label="语音播报语速">
                 </div>
                 <button type="button" id="set-voice-tts-preview-btn" class="secondary-button btn-compact" title="用当前选择的女声音色试听播报效果">试听女声</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="setting-card setting-card-wrap" id="setting-row-async-echo">
+            <div class="tts-settings-stack">
+              <div class="tts-settings-head">
+                <div class="setting-info">
+                  <div class="setting-label">全双工异步分离与回声消除（AEC）</div>
+                  <div class="setting-desc">对话监听、任务执行与语音播报三轨独立异步运行，互不阻塞；启用自适应回声消除与服务端多句回声过滤，播报时仍可随时自然插话</div>
+                </div>
+                <div class="voice-toggle-pair">
+                  <label class="voice-mini-check" title="播报期间检测到你开口时先平滑压低播报音量，确认持续说话后再打断播报">
+                    <input type="checkbox" id="set-voice-barge-in-ducking" checked>
+                    <span>插话降音避让</span>
+                  </label>
+                  <label class="md-switch" title="开启对话、执行与播报全双工异步解耦">
+                    <input type="checkbox" id="set-voice-async-pipeline" checked aria-label="开启全双工异步分离">
+                    <span class="md-switch-track"></span>
+                  </label>
+                </div>
+              </div>
+              <div class="tts-voice-grid">
+                <select id="set-voice-echo-mode" class="md-select" aria-label="回声消除策略">
+                  <option value="auto">回声消除：自动（硬件 AEC + 自适应滤波 + 语义过滤）</option>
+                  <option value="aggressive">回声消除：强效（近距外放音箱推荐）</option>
+                  <option value="standard">回声消除：标准（仅硬件 AEC + 语义过滤）</option>
+                  <option value="off">回声消除：关闭</option>
+                </select>
               </div>
             </div>
           </div>
