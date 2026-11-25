@@ -194,7 +194,7 @@ export function buildCavemanPromptBlock(
         "Reply Style [natural:lite]: Match user language (ZH/EN). Warm, natural, concise spoken reply (1 sentence); drop bureaucratic filler and customer-service closers.",
       );
       lines.push(
-        "Ex: 好的，客厅吸顶灯已经打开，亮度调到80%了。 / Sure, I turned on the living room light to 80%.",
+        "Ex: 客厅吸顶灯已经打开，亮度调到80%了。 / I turned on the living room light to 80%.",
       );
       break;
     case "off":

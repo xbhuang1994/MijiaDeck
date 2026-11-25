@@ -178,7 +178,8 @@ describe("CavemanReplyPolicy — Prompt & Normalization", () => {
     expect(buildCavemanPromptBlock("ultra")).toContain("卧室 23.6°C，湿度 54%");
     expect(buildCavemanPromptBlock("full")).toContain("客厅吸顶灯已打开，亮度调到80%。");
     expect(buildCavemanPromptBlock("full")).toContain("抱歉，卧室灯离线了，暂时无法打开。");
-    expect(buildCavemanPromptBlock("lite")).toContain("好的，客厅吸顶灯已经打开，亮度调到80%了。");
+    expect(buildCavemanPromptBlock("lite")).toContain("客厅吸顶灯已经打开，亮度调到80%了。");
+    expect(buildCavemanPromptBlock("lite")).not.toContain("好的，");
     expect(buildCavemanPromptBlock("off")).toContain("1-2 sentences");
   });
 

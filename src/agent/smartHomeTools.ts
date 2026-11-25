@@ -38,7 +38,7 @@ import {
 } from "../core/models.ts";
 import { formatMetricsText, ServiceError } from "../core/service.ts";
 import type * as settingsStoreModule from "../core/settingsStore.ts";
-import { isSensitivePropertyName } from "../core/specZh.ts";
+import { isDangerousAction, isSensitivePropertyName } from "../core/specZh.ts";
 import { isMultiPlatformService } from "../platforms/index.ts";
 import type { MainWindowController } from "../ui/controllers/mainWindowController.ts";
 
@@ -284,22 +284,23 @@ export function resolveDevices(
     const combined = `${dRoom}${dName}`;
     let score = 0;
 
+    const roomHit = dRoom.length > 0 && dRoom !== "未知" && dRoom !== "未分配" && normTarget.includes(dRoom);
+    const hasConflictingRoom = Boolean(
+      targetRoomHint &&
+        !roomHit &&
+        !dName.includes(targetRoomHint) &&
+        !(dRoom && (dRoom.includes(targetRoomHint) || targetRoomHint.includes(dRoom))),
+    );
+
     if (combined === normTarget) {
       score = 100;
-    } else if (/(小米|小爱)/.test(normTarget) && isSpeaker(d) && /(音箱|音响|小爱)/.test(normTarget)) {
+    } else if (!hasConflictingRoom && /(小米|小爱)/.test(normTarget) && isSpeaker(d) && /(音箱|音响|小爱)/.test(normTarget)) {
       score = 92;
-    } else if (dName.includes(normTarget)) {
+    } else if (!hasConflictingRoom && dName.includes(normTarget)) {
       score = 85;
-    } else if (normTarget.includes(dName) && dName.length >= 2) {
+    } else if (!hasConflictingRoom && normTarget.includes(dName) && dName.length >= 2) {
       score = 80;
     } else {
-      const roomHit = dRoom.length > 0 && dRoom !== "未知" && dRoom !== "未分配" && normTarget.includes(dRoom);
-      const hasConflictingRoom = Boolean(
-        targetRoomHint &&
-          !roomHit &&
-          !dName.includes(targetRoomHint) &&
-          !(dRoom && (dRoom.includes(targetRoomHint) || targetRoomHint.includes(dRoom))),
-      );
       const rest = roomHit
         ? normTarget.replace(dRoom, "").replace(/^(?:里面|里边|里头|里|中|内)?(?:所有|全部)?/, "")
         : normTarget;
@@ -1446,6 +1447,12 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       target: str({ description: "设备 did 或名称" }),
       action: str({ description: "动作名/红外按键名（如 PowerOn、Volume+、Play、pet-food-out）或中文描述（如 开机、音量+、播放、立即出粮、下一首）" }),
       params: opt(arr(unknown(), { description: "可选动作参数数组，例如出粮份数 [2]、红外重复按键次数 [3] 或朗读文本 [\"你好\"]" })),
+      confirm_dangerous: opt(
+        bool({
+          description:
+            "仅在用户已明确二次确认执行高危/不可逆动作（如 reboot、reset-*、set-default、restore、factory-reset、format、delete）后才可设为 true；未经用户明确确认严禁传入 true",
+        }),
+      ),
     }),
     execute: async (_toolCallId, params) => {
       const blocked = ensureAccessReady(deps);
@@ -1475,6 +1482,23 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
 
       const actionName = matched?.name ?? rawAction;
       const actionLabel = matched?.desc || actionName;
+      if ((isDangerousAction(actionName) || isDangerousAction(rawAction)) && params.confirm_dangerous !== true) {
+        const msg = `安全提示：${device.name}的「${actionLabel}」属于高风险不可逆动作，暂未执行。请先向用户说明后果并获明确二次确认后，再携带 confirm_dangerous=true 调用。`;
+        return textResult(
+          msg,
+          {
+            ok: false,
+            blockedDangerousAction: true,
+            requiresConfirmation: true,
+            did: device.did,
+            name: device.name,
+            action: actionName,
+            actionLabel,
+            uiSummary: msg,
+          },
+          true,
+        );
+      }
       await runJob(deps.jobs, () => deps.service.runAction(device.did, actionName, params.params), 1);
 
       if (deps.mainWindow.tray && deps.mainWindow.tray.quick.audioBar.did === device.did) {
@@ -1624,19 +1648,64 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         return textResult("指令文本不能为空。", { ok: false }, true);
       }
       const devices = deps.mainWindow.activeDevices();
-      const onlineSpeakers = devices.filter((d) => isSpeaker(d) && d.online);
+      const allSpeakers = devices.filter((d) => isSpeaker(d));
+      const onlineSpeakers = allSpeakers.filter((d) => d.online);
       let targetSpeaker: DeviceInfo | null = null;
-      if (params.speaker) {
-        targetSpeaker = resolveSingleDevice(onlineSpeakers, params.speaker);
-      }
-      if (!targetSpeaker) {
+      const requestedSpeaker = params.speaker?.trim() ?? "";
+      if (requestedSpeaker) {
+        const normRequested = normalizeQuery(requestedSpeaker);
+        const exactXiaoAi =
+          allSpeakers.find((d) => d.did === requestedSpeaker) ??
+          allSpeakers.find((d) => normalizeQuery(d.name) === normRequested) ??
+          null;
+        const exactNonXiaoAi = !exactXiaoAi
+          ? (devices.find((d) => !isSpeaker(d) && d.did === requestedSpeaker) ??
+              devices.find((d) => !isSpeaker(d) && normalizeQuery(d.name) === normRequested) ??
+              null)
+          : null;
+        if (exactNonXiaoAi) {
+          const msg = `${exactNonXiaoAi.name}不是小爱音箱，不支持转发小爱指令`;
+          return textResult(
+            msg,
+            { ok: false, did: exactNonXiaoAi.did, name: exactNonXiaoAi.name, uiSummary: msg },
+            true,
+          );
+        }
+        const matchedSpeaker = exactXiaoAi ?? resolveSingleDevice(allSpeakers, requestedSpeaker);
+        if (matchedSpeaker) {
+          if (!matchedSpeaker.online) {
+            const msg = `${joinDeviceLabel(matchedSpeaker.name, "离线")}，无法转发小爱指令`;
+            return textResult(
+              msg,
+              { ok: false, did: matchedSpeaker.did, name: matchedSpeaker.name, uiSummary: msg },
+              true,
+            );
+          }
+          targetSpeaker = matchedSpeaker;
+        } else {
+          // 显式指定了 speaker 但未命中任何小爱音箱：严禁静默回退到其他在线小爱！
+          const matchedOther =
+            devices.find((d) => d.did === requestedSpeaker) ??
+            resolveSingleDevice(devices, requestedSpeaker);
+          if (matchedOther) {
+            const msg = `${matchedOther.name}不是小爱音箱，不支持转发小爱指令`;
+            return textResult(
+              msg,
+              { ok: false, did: matchedOther.did, name: matchedOther.name, uiSummary: msg },
+              true,
+            );
+          }
+          const msg = `未找到指定的小爱音箱：${requestedSpeaker}`;
+          return textResult(msg, { ok: false, uiSummary: msg }, true);
+        }
+      } else {
         const prefDid = deps.settingsStore.getDefaultSpeakerDid();
         if (prefDid) {
           targetSpeaker = onlineSpeakers.find((d) => d.did === prefDid) ?? null;
         }
-      }
-      if (!targetSpeaker) {
-        targetSpeaker = onlineSpeakers[0] ?? null;
+        if (!targetSpeaker) {
+          targetSpeaker = onlineSpeakers[0] ?? null;
+        }
       }
       if (!targetSpeaker) {
         return textResult(speakerHint(devices) || "当前没有可用的在线小爱音箱。", { ok: false }, true);
@@ -1698,31 +1767,63 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       if (blocked) return textResult(blocked, { ok: false, error: blocked }, true);
 
       const devices = deps.mainWindow.activeDevices();
-      const onlineSpeakers = devices.filter((d) => isSpeaker(d) && d.online);
-      const onlineIrAudio = devices.filter((d) => isIrAudioDevice(d) && d.online);
+      const allSpeakers = devices.filter((d) => isSpeaker(d));
+      const allIrAudio = devices.filter((d) => isIrAudioDevice(d));
+      const onlineSpeakers = allSpeakers.filter((d) => d.online);
+      const onlineIrAudio = allIrAudio.filter((d) => d.online);
       let speaker: DeviceInfo | null = null;
-      if (params.target) {
-        const wantsXiaoAi = /小米|小爱/i.test(params.target);
+      const requestedTarget = params.target?.trim() ?? "";
+      if (requestedTarget) {
+        const wantsXiaoAi = /小米|小爱/i.test(requestedTarget);
         if (wantsXiaoAi) {
-          speaker = resolveSingleDevice(onlineSpeakers, params.target);
+          speaker =
+            allSpeakers.find((d) => d.did === requestedTarget) ??
+            resolveSingleDevice(allSpeakers, requestedTarget);
         } else {
           // 优先精确匹配 did / 精确设备名（让“音响”精准命中红外音响，而不误落到默认小爱）
-          const normT = normalizeQuery(params.target);
-          const pool = [...onlineIrAudio, ...onlineSpeakers];
+          const normT = normalizeQuery(requestedTarget);
+          const allPool = [...allIrAudio, ...allSpeakers];
+          const exactDid = allPool.find((d) => d.did === requestedTarget);
+          const exactNames = allPool.filter((d) => normalizeQuery(d.name) === normT);
           speaker =
-            pool.find((d) => d.did === params.target.trim()) ??
-            pool.find((d) => normalizeQuery(d.name) === normT) ??
-            resolveSingleDevice(pool, params.target);
+            exactDid ??
+            (exactNames.length > 0
+              ? (exactNames.find((d) => d.online) ?? exactNames[0] ?? null)
+              : resolveSingleDevice(allPool, requestedTarget));
         }
-      }
-      if (!speaker) {
+
+        if (!speaker) {
+          // 显式指定了 target 但未命中音箱/红外音响：严禁静默回退到其他在线小爱！
+          const matchedOther =
+            devices.find((d) => d.did === requestedTarget) ??
+            resolveSingleDevice(devices, requestedTarget);
+          if (matchedOther && !isSpeaker(matchedOther) && !isIrAudioDevice(matchedOther)) {
+            const msg = `${matchedOther.name}不是音箱或红外音响设备，请改用对应设备控制工具`;
+            return textResult(
+              msg,
+              { ok: false, did: matchedOther.did, name: matchedOther.name, uiSummary: msg },
+              true,
+            );
+          }
+          const msg = `未找到指定的音箱或红外音响：${requestedTarget}`;
+          return textResult(msg, { ok: false, uiSummary: msg }, true);
+        }
+        if (!speaker.online) {
+          const msg = `${joinDeviceLabel(speaker.name, "离线")}，无法控制`;
+          return textResult(
+            msg,
+            { ok: false, did: speaker.did, name: speaker.name, uiSummary: msg },
+            true,
+          );
+        }
+      } else {
         const prefDid = deps.settingsStore.getDefaultSpeakerDid();
         if (prefDid) {
           speaker = onlineSpeakers.find((d) => d.did === prefDid) ?? null;
         }
-      }
-      if (!speaker) {
-        speaker = onlineSpeakers[0] ?? (params.target ? null : onlineIrAudio[0] ?? null);
+        if (!speaker) {
+          speaker = onlineSpeakers[0] ?? onlineIrAudio[0] ?? null;
+        }
       }
       if (!speaker) {
         return textResult(speakerHint(devices) || "当前没有可用的在线音箱或红外音响。", { ok: false }, true);
