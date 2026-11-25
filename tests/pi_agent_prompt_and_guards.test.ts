@@ -132,7 +132,7 @@ describe("Pi Agent Merged Prompt & Context Micro-Enhancements (#3 & #4)", () => 
     );
   });
 
-  test("merged system prompt keeps static core prefix before dynamic time/catalog, omits scenes when disabled, and adds multi-home & >80 truncation hints", async () => {
+  test("merged system prompt keeps static core prefix & inventory catalog free of volatile clock/state, omits scenes when disabled, and adds multi-home & >80 truncation hints", async () => {
     const h = createHarness();
     try {
       await h.ready();
@@ -147,15 +147,15 @@ describe("Pi Agent Merged Prompt & Context Micro-Enhancements (#3 & #4)", () => 
       expect(singleHomePrompt).toContain("confirm_dangerous: true");
       expect(singleHomePrompt).not.toContain("当前手动场景：");
 
-      // KV-cache prefix order: static rules precede dynamic Reply Style, local time, and catalog
+      // KV-cache prefix order: static rules precede static Reply Style and static device inventory;
+      // volatile minute-level clock must NOT be embedded in messages[0] (moved to per-turn <runtime_context>)
       const idxRulesEnd = singleHomePrompt.indexOf("## 五、宿主闭环、自愈协议与播报规范");
       const idxReplyStyle = singleHomePrompt.indexOf("Reply Style");
-      const idxLocalTime = singleHomePrompt.indexOf("当前本地时间：");
       const idxCatalog = singleHomePrompt.indexOf("当前设备清单：");
       expect(idxRulesEnd).toBeGreaterThan(0);
       expect(idxReplyStyle).toBeGreaterThan(idxRulesEnd);
-      expect(idxLocalTime).toBeGreaterThan(idxReplyStyle);
-      expect(idxCatalog).toBeGreaterThan(idxLocalTime);
+      expect(idxCatalog).toBeGreaterThan(idxReplyStyle);
+      expect(singleHomePrompt).not.toContain("当前本地时间：");
 
       // Single home stays compact without redundant per-device home column
       expect(singleHomePrompt).not.toContain("| 家庭:");
@@ -175,6 +175,7 @@ describe("Pi Agent Merged Prompt & Context Micro-Enhancements (#3 & #4)", () => 
 
       // Trigger fresh system prompt assembly via a fast zero-tool faux LLM call
       let capturedSystem = "";
+      let capturedUser = "";
       const faux = fauxProvider({ models: [{ id: "faux-prompt-check", name: "Faux Prompt Check" }] });
       faux.setResponses([fauxAssistantMessage("ok", { stopReason: "stop" })]);
       const h2 = createHarness({
@@ -183,6 +184,16 @@ describe("Pi Agent Merged Prompt & Context Micro-Enhancements (#3 & #4)", () => 
           const sysMsg = ctx.messages.find((msg) => msg.role === "system");
           if (sysMsg) {
             capturedSystem = typeof sysMsg.content === "string" ? sysMsg.content : "";
+          }
+          const userMsg = [...ctx.messages].reverse().find((msg) => msg.role === "user");
+          if (userMsg) {
+            capturedUser =
+              typeof userMsg.content === "string"
+                ? userMsg.content
+                : userMsg.content
+                    .filter((b): b is { type: "text"; text: string } => b.type === "text")
+                    .map((b) => b.text)
+                    .join("\n");
           }
           return faux.provider.streamSimple(m, ctx, opts);
         },
@@ -195,7 +206,10 @@ describe("Pi Agent Merged Prompt & Context Micro-Enhancements (#3 & #4)", () => 
         expect(capturedSystem).toContain("当前设备清单（已展示前 80 / 共 85 台，其余请用 list_devices 筛选）：");
         expect(capturedSystem).toContain("| 家庭:方寸别院 |");
         expect(capturedSystem).toContain("| 家庭:红泥的家 |");
-        expect(capturedSystem).toContain("当前本地时间：");
+        expect(capturedSystem).not.toContain("当前本地时间：");
+        expect(capturedUser).toContain("<runtime_context>");
+        expect(capturedUser).toContain("当前本地时间：");
+        expect(capturedUser).toContain("设备盘点");
       } finally {
         await h2.cleanup();
       }

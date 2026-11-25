@@ -45,6 +45,7 @@ import {
   sanitizeForVoiceTts,
   type CavemanReplyMode,
 } from "./cavemanReplyPolicy.ts";
+import { stripRuntimeContextBlock } from "./promptCacheOptimizer.ts";
 
 export type ImplicitActionLabel =
   | "light_brighter"
@@ -291,11 +292,14 @@ function parseChineseNumber(raw: string): number | null {
 
 function extractUserText(msg: Message): string {
   if (msg.role !== "user") return "";
-  if (typeof msg.content === "string") return msg.content;
-  return msg.content
-    .filter((b): b is TextContent => b.type === "text")
-    .map((b) => b.text)
-    .join(" ");
+  const raw =
+    typeof msg.content === "string"
+      ? msg.content
+      : msg.content
+          .filter((b): b is TextContent => b.type === "text")
+          .map((b) => b.text)
+          .join(" ");
+  return stripRuntimeContextBlock(raw);
 }
 
 function extractToolResultText(msg: ToolResultMessage): string {

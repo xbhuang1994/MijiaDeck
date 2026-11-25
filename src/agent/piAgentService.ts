@@ -11,6 +11,7 @@
  * - 实时派发流式文本增量、工具执行状态与最终语音播报事件给 WebSocket 与前端面板
  */
 
+import { randomUUID } from "node:crypto";
 import {
   Agent,
   type AgentEvent,
@@ -19,6 +20,7 @@ import {
   type StreamFn,
 } from "@earendil-works/pi-agent-core";
 import {
+  cleanupSessionResources,
   createAssistantMessageEventStream,
   normalizeContext,
   type Api,
@@ -98,7 +100,20 @@ import {
   planDeterministicLocalCalls,
   summarizeToolResults,
 } from "./localPlannerStream.ts";
-import { BANNED_TAB } from "../ui/controllers/mainWindowController.ts";
+import {
+  buildRuntimeContextBlock,
+  computeCacheFriendlyCompaction,
+  computeEmergencyTrim,
+  createEmptyUsageSummary,
+  formatTurnUserPrompt,
+  recordUsageIntoSummary,
+  snapshotDeviceLiveStates,
+  sortDevicesForStableCatalog,
+  stripRuntimeContextBlock,
+  type AgentPromptCacheStats,
+  type AgentUsageSummary,
+  type DeviceLiveStateEntry,
+} from "./promptCacheOptimizer.ts";
 import { createSmartHomeTools, type SmartHomeToolDeps } from "./smartHomeTools.ts";
 import {
   SystemOneClient,
@@ -130,8 +145,11 @@ import {
 
 export {
   MAX_RECOVERY_ROUNDS,
+  stripRuntimeContextBlock,
   TASK_ACK_TEXT,
+  type AgentPromptCacheStats,
   type AgentSkill,
+  type AgentUsageSummary,
   type CustomInstructionConflictInfo,
   type CustomInstructionRule,
   type SaveAgentSkillInput,
@@ -217,6 +235,8 @@ export interface AgentTimelineEntry {
   skillEvent?: AgentSkillEventRecord | null;
   /** 简单常规控制指令状态核验正常后的静默完成标记（不展示二次回复气泡、不播报二次语音） */
   silentCompleted?: boolean;
+  /** 本任务云端 LLM Token 与 Prompt 缓存命中统计 */
+  usage?: AgentUsageSummary;
   error?: string;
 }
 
@@ -235,6 +255,8 @@ export interface PiAgentSnapshot {
   config: PublicAgentVoiceConfig;
   providers: ReadonlyArray<ProviderPreset>;
   systemOne: SystemOneHealthSnapshot | null;
+  /** 当前会话的 Prompt KV-Cache 命中率与稳定性统计 */
+  cacheStats: AgentPromptCacheStats;
   lastError: string | null;
 }
 
@@ -265,6 +287,8 @@ export interface PiAgentRunResult {
   verification?: TaskVerificationSummary | null;
   skillEvent?: AgentSkillEventRecord | null;
   streamedSpeakChunks?: boolean;
+  /** 本任务云端 LLM Token 与 Prompt 缓存命中统计 */
+  usage?: AgentUsageSummary;
   error?: string;
 }
 
@@ -412,6 +436,28 @@ function sanitizeProxyCompat(
   return copy as Model<Api>["compat"];
 }
 
+function withSessionAffinityCompat(
+  compat: Model<Api>["compat"],
+  api: Api,
+  isOfficialEndpoint: boolean,
+): Model<Api>["compat"] {
+  // 对 OpenAI Chat Completions 及非官方 Anthropic 代理开启会话亲和请求头（仅 HTTP Headers，不会引入 400 未知 body 字段），
+  // 让多副本推理集群 / 聚合网关（如 Magpie、OpenRouter、LiteLLM、vLLM/SGLang）将连续任务路由到同一温缓存节点。
+  const enableAffinity =
+    api === "openai-completions" || (api === "anthropic-messages" && !isOfficialEndpoint);
+  if (!enableAffinity) {
+    return compat;
+  }
+  const existing = (compat as Record<string, unknown> | undefined) ?? {};
+  if (existing.sendSessionAffinityHeaders === false) {
+    return compat;
+  }
+  return {
+    ...existing,
+    sendSessionAffinityHeaders: true,
+  } as Model<Api>["compat"];
+}
+
 export function buildModelForConfig(config: AgentVoiceConfig): Model<Api> {
   const preset = getProviderPreset(config.provider);
   const modelId = config.modelId.trim() || preset.defaultModel;
@@ -490,7 +536,11 @@ export function buildModelForConfig(config: AgentVoiceConfig): Model<Api> {
         : wantThinking
           ? true
           : Boolean(catalog.reasoning);
-    const compat = sanitizeProxyCompat(catalog.compat, isOfficialEndpoint);
+    const compat = withSessionAffinityCompat(
+      sanitizeProxyCompat(catalog.compat, isOfficialEndpoint),
+      api,
+      isOfficialEndpoint,
+    );
     return {
       id: modelId,
       name: modelId,
@@ -507,6 +557,7 @@ export function buildModelForConfig(config: AgentVoiceConfig): Model<Api> {
     };
   }
 
+  const fallbackCompat = withSessionAffinityCompat(undefined, api, isOfficialEndpoint);
   return {
     id: modelId,
     name: modelId,
@@ -516,6 +567,7 @@ export function buildModelForConfig(config: AgentVoiceConfig): Model<Api> {
     input: ["text"],
     cost: ZERO_COST,
     reasoning: wantThinking,
+    ...(fallbackCompat ? { compat: fallbackCompat } : {}),
     contextWindow: defaultContextWindow,
     maxTokens: defaultMaxTokens,
   };
@@ -672,6 +724,19 @@ export function formatLocalTimeContext(now: Date = new Date()): string {
 }
 
 const MAX_CONCURRENT_TASKS = 4;
+const DEVICE_CATALOG_LIMIT = 80;
+
+function createAgentSessionId(): string {
+  return `mijiadeck_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+}
+
+const SESSION_ID_HEADER_PROVIDERS = new Set<AgentProviderMode>([
+  "openai-compatible",
+  "openrouter",
+  "deepseek",
+  "moonshot",
+  "xiaomi",
+]);
 
 interface TaskRunContext {
   taskId: string;
@@ -708,6 +773,7 @@ interface TaskRunContext {
   roundToolTraces: ExecutedToolTrace[];
   roundToolArgs: Map<string, Record<string, unknown>>;
   useLocalFastPath: boolean;
+  usage: AgentUsageSummary;
   resolvePromise: (result: PiAgentRunResult) => void;
 }
 
@@ -721,6 +787,8 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   private readonly _systemOneFetcher?: FetchLike;
 
   private _config: AgentVoiceConfig;
+  private _currentModel: Model<Api>;
+  private _sessionId: string = createAgentSessionId();
   private _systemOne: SystemOneClient | null = null;
   private _agent: Agent;
   private _unsubAgent: (() => void) | null = null;
@@ -729,6 +797,11 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   private readonly _activeTasks = new Map<string, TaskRunContext>();
   private readonly _queuedTasks: TaskRunContext[] = [];
   private _pendingHistoryMerges: AgentMessage[] = [];
+  private _emittedDeviceStates: Map<string, DeviceLiveStateEntry> | null = null;
+  private _sessionUsage: AgentUsageSummary = createEmptyUsageSummary();
+  private _lastCallCacheHitRate: number | null = null;
+  private _systemPromptRefreshes = 0;
+  private _historyCompactions = 0;
   private _lastError: string | null = null;
   private _entrySeq = 0;
   private _taskSeq = 0;
@@ -745,6 +818,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     this._config = options.initialConfig ?? loadAgentVoiceConfig();
     this._customStreamFn = options.customStreamFn;
     this._customModel = options.customModel;
+    this._currentModel = this._customModel ?? buildModelForConfig(this._config);
     this._systemOneFetcher = options.systemOneFetcher;
     this._systemOne = SystemOneClient.fromConfig(this._config, this._systemOneFetcher);
     this._tools = createSmartHomeTools({
@@ -785,6 +859,20 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
 
   get config(): AgentVoiceConfig {
     return this._config;
+  }
+
+  get sessionId(): string {
+    return this._sessionId;
+  }
+
+  getCacheStats(): AgentPromptCacheStats {
+    return {
+      ...this._sessionUsage,
+      sessionId: this._sessionId,
+      systemPromptRefreshes: this._systemPromptRefreshes,
+      historyCompactions: this._historyCompactions,
+      lastCallCacheHitRate: this._lastCallCacheHitRate,
+    };
   }
 
   get systemOneClient(): SystemOneClient | null {
@@ -828,9 +916,15 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     return this._agent;
   }
 
-  private _buildSystemPrompt(ctx?: Pick<TaskRunContext, "source" | "voiceMeta"> | null): string {
+  /**
+   * 构建 100% 静态/准静态的 System Prompt（`messages[0]`）：
+   * - 按稳定度严格从高到低排列：核心规则 -> 静态回复风格 -> 按 did 确定性排序的设备固定台账 -> 技能 -> 附加指令规则；
+   * - 严禁混入分钟级时钟、每轮变动的 Voice/Speaker/Intent hint、UI 家庭筛选或高频变化的在线/电源/传感器读数，
+   *   从而保证连续任务与单任务多步工具循环间 `tools` + `messages[0]` + 已提交历史前缀 100% 字节一致。
+   */
+  private _buildStaticSystemPrompt(): string {
     const mw = this._deps.mainWindow;
-    const devices = mw.activeDevices();
+    const devices = sortDevicesForStableCatalog(mw.activeDevices());
     const scenes = SCENES_FEATURE_ENABLED ? (mw.scenes ?? []) : [];
 
     const distinctHomes = new Set(
@@ -839,7 +933,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         .filter((h) => h.length > 0 && h !== "未知"),
     );
     const showDeviceHome = distinctHomes.size > 1;
-    const catalogLimit = 80;
+    const catalogLimit = DEVICE_CATALOG_LIMIT;
     const catalogHeader =
       devices.length > catalogLimit
         ? `当前设备清单（已展示前 ${catalogLimit} / 共 ${devices.length} 台，其余请用 list_devices 筛选）：`
@@ -851,20 +945,24 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         : devices
             .slice(0, catalogLimit)
             .map((d) => {
-              const pw = mw.knownPower[d.did];
-              const pwText = typeof pw === "boolean" ? (pw ? "开" : "关") : "";
-              const metric = mw.metrics[d.did] ?? "";
               const homePart = showDeviceHome ? ` | 家庭:${d.home_name || "未分配"}` : "";
-              return `- ${d.name}${homePart} | 房间:${d.room_name || "未分配"} | 类型:${deviceCategoryLabel(d)} | ${
-                d.online ? "在线" : "离线"
-              }${pwText ? ` | 电源:${pwText}` : ""}${metric ? ` | ${metric}` : ""} | did=${d.did}`;
+              return `- ${d.name}${homePart} | 房间:${d.room_name || "未分配"} | 类型:${deviceCategoryLabel(d)} | did=${d.did}`;
             })
             .join("\n");
+
+    const distinctRooms = [
+      ...new Set(
+        devices
+          .map((d) => (d.room_name ?? "").trim())
+          .filter((r) => r.length > 0 && r !== "未知" && r !== "未分配" && r !== "未分配房间"),
+      ),
+    ].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 
     const sceneCatalog =
       scenes.length === 0
         ? "（无手动场景）"
-        : scenes
+        : [...scenes]
+            .sort((a, b) => (a.scene_id < b.scene_id ? -1 : a.scene_id > b.scene_id ? 1 : 0))
             .slice(0, 30)
             .map((s) => `- ${s.name}${s.home_name ? ` (${s.home_name})` : ""} | id=${s.scene_id}`)
             .join("\n");
@@ -874,19 +972,11 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       loadCustomInstructions(),
       extra,
     );
-    const vm = ctx?.voiceMeta ?? this._primaryCtx?.voiceMeta ?? null;
-    const effectiveSource = ctx?.source ?? this._primaryCtx?.source ?? "text";
+    // System Prompt 仅承载静态回复风格，不混入每轮变动的语音/声纹/意图上下文（已移至每轮 user <runtime_context>）
     const cavemanBlock = buildCavemanPromptBlock(this._config.cavemanMode, {
-      isVoice: effectiveSource === "voice",
-      speakerName: vm?.speakerName,
-      speakerRole: vm?.speakerRole,
+      isVoice: false,
     });
-    const intentHint = vm?.intent ? `Intent hint: ${vm.intent}.` : "";
     const skillsSection = buildSkillsPromptSection(loadAgentSkills());
-    const roomTabs = mw.tabNames.filter(
-      (name) => name !== BANNED_TAB && (SCENES_FEATURE_ENABLED || name !== "场景"),
-    );
-    const localTimeLine = formatLocalTimeContext();
 
     return [
       SCENES_FEATURE_ENABLED
@@ -897,7 +987,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       SCENES_FEATURE_ENABLED
         ? "1. 真实工具与两阶段编排：控制、改参、执行动作、触发场景与缺失的实时查询必须调工具；支持单轮多调用（宿主按顺序执行），复杂联动第 1 轮合并“确定性控制 + 所需 `get_device_detail` 探测”，第 2 轮精准落盘。"
         : "1. 真实工具与两阶段编排：控制、改参、执行动作与缺失的实时查询必须调工具；支持单轮多调用（宿主按顺序执行），复杂联动第 1 轮合并“确定性控制 + 所需 `get_device_detail` 探测”，第 2 轮精准落盘。",
-      "2. 对内传精确 `did`，对外说人名：下方「当前设备清单」每轮刷新（前缀：无=米家、`tuya:`=涂鸦、`midea:`=美的、`deye:`=德业，多路子路 `.s1/.s2`）。锁定目标后 `target`/`speaker` 优先传精确 `did`（规避同名碰撞、跨家庭误伤与 `默认房间/未分配` 过滤失效）；回复用户严禁出现 `did`/`id`/前缀/`.sN`，统一用「房间+设备名」（同房跨平台可加品牌/方式）。",
+      "2. 对内传精确 `did`，对外说人名：下方「当前设备清单」提供固定设备台账（前缀：无=米家、`tuya:`=涂鸦、`midea:`=美的、`deye:`=德业，多路子路 `.s1/.s2`）；实时在线/离线、电源开关、传感读数、当前本地时间及语音/声纹/意图信息均随每轮用户消息中的 `<runtime_context>`（基准快照或增量更新）及工具返回实时注入，判断设备实时状态始终以最新一轮为准。锁定目标后 `target`/`speaker` 优先传精确 `did`（规避同名碰撞、跨家庭误伤与 `默认房间/未分配` 过滤失效）；回复用户严禁出现 `did`/`id`/前缀/`.sN`，统一用「房间+设备名」（同房跨平台可加品牌/方式）。",
       "3. 零冗余查询与跨家庭隔离：",
       "   - 清单唯一命中且在线的常规控制直接下发；未截断且不涉按家庭筛选的盘点/离线/已标 `电源` 查询直接作答。",
       "   - 必调只读工具情形：① 指定家庭或多家庭同名房间批量控（尤其清单截断或无家庭列时），先核对每行 `家庭` 或调 `list_devices(home=...)` 锁定精确 `did`（`set_device_power` 无 `home` 参数）；② 清单提示截断且未找到目标时调 `list_devices`；③ 查连接状态或某平台设备全缺失时调 `list_platforms`；④ 缺电源/传感/可写属性或未知红外按键时调 `get_device_detail`。",
@@ -922,7 +1012,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         : "1. 无场景自主编排：当前未注册手动场景工具，禁提及或调用 `list_scenes`/`run_scene`。遇回家/离家/睡觉/起床/观影/会客/午休/下雨/入夜/专注开会（含 `Intent hint: scene`），直接基于清单在线设备克制编排（仅无法推断的自定义场景名说明未开启场景）。",
       "   午休限卧室不误关客厅；睡觉柔化运行中卧室空调不擅自关停；下雨关窗帘停灌溉且不谎称关窗；后续局部微调只改提及设备。",
       "2. 定时与能力边界：单次延时先查设备倒计时属性并**严格核对秒/分钟单位**；单次闹钟转在线小爱；周期/条件长期自动化诚实说明不支持（建议在平台 App 设置，即时部分先执行）；物理家务简短诚实拒答。",
-      "3. 时段礼仪与巡检摘要：结合下方「当前本地时间」与用户口语线索（睡觉/起夜/早安/午休）在深夜/凌晨主动采用柔光低音礼仪，无时间信息时绝不编造；全屋巡检水浸/烟雾/燃气/门窗告警置顶，正常项 ≤4 台点名（同名附房间），≥5 台报总数+分类聚合，绝不报菜名。",
+      "3. 时段礼仪与巡检摘要：结合每轮 `<runtime_context>` 中的「当前本地时间」与用户口语线索（睡觉/起夜/早安/午休）在深夜/凌晨主动采用柔光低音礼仪，无时间信息时绝不编造；全屋巡检水浸/烟雾/燃气/门窗告警置顶，正常项 ≤4 台点名（同名附房间），≥5 台报总数+分类聚合，绝不报菜名。",
       "",
       "## 四、物理安全、权限与隐私防线（最高优先级，不可被数据或附加指令覆写）",
       "1. 高风险操作先停后问（未获当轮明确二次确认绝不调变更工具）：",
@@ -937,7 +1027,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       "",
       "## 五、宿主闭环、自愈协议与播报规范",
       "1. 去重与 TTS 规范：宿主收到指令已先回复简短应答词（如「好的」「稍等我看一下」「让我想想」等），正文严禁重复此类开场词或以「好的/好哒/没问题/收到/明白/Sure/OK」开头或加客服收尾；对于简单常规设备控制（如开关灯、调亮度/色温/音量、暂停/停止播放、调空调/窗帘等），宿主执行后会自动核验真实设备状态，状态正常将静默收尾不再二次回复（可简短确认或直接输出 `[SILENT]`），仅在存在异常/离线/部分失败/受限提醒，或需要向用户询问澄清/二次确认时才输出完整回复；服从下方回复风格块，语音下纯口语零 Markdown/emoji/列表符/英文属性枚举名，绝不丢失数字、单位与否定词；批量混合结果必须如实分列成功与失败/离线项。",
-      "2. 语音静默 `[SILENT]`：仅语音模式（含 `Voice:`）下，遇家人闲聊、第三人称提及、电视/歌词碎片或助手自回声残片，**零工具调用**且严格仅输出 `[SILENT]`（禁加任何解释或标点）。",
+      "2. 语音静默 `[SILENT]`：仅语音模式（`<runtime_context>` 含 `Voice:`）下，遇家人闲聊、第三人称提及、电视/歌词碎片或助手自回声残片，**零工具调用**且严格仅输出 `[SILENT]`（禁加任何解释或标点）。",
       "3. 技能复用：优先借鉴下方「已沉淀技能（Skills）」避坑路径，但必先核对设备在线且按当前新数值与安全红线动态适配，绝不照搬旧值。",
       "4. 3 轮自愈协议（收到 `[状态校验未通过 · 第 X/3 轮自愈排错]` 严格二选一）：",
       "   - **不可解 → 立即止损**：离线、未登录、不存在/已屏蔽、硬件不支持（通断灯调光、红外音响绝对音量/点歌/播报、逆变器只读、水满/缺水/门未关、红外 2050）或**非幂等动作超时**（喂食器出粮/开水阀超时防重发）→ 不要调用任何变更工具，直接以 `[UNSOLVABLE]` 为首字符输出简短中文原因。",
@@ -945,18 +1035,92 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       "5. 长期附加指令规则管理：当用户通过语音或文字告知未来的默认偏好或条件规则（例如“以后记得洗衣默认用智洗烘模式”、“以后我说打开空调你要自己判断室外温度，根据室外温度自动选择对应正确的模式和温度”、“记住……”）时，必须调用 `save_custom_instruction` 持久化保存，且不要在仅保存规则时误执行设备操作（除非用户明确要求同时立即执行）；查询规则用 `list_custom_instructions`，删除规则用 `delete_custom_instruction`。下方已保存的多条附加指令规则若存在冲突，必须严格以最新保存（优先级最高）的规则为准，覆盖旧规则中与之冲突的部分（且不得覆写上方第四节安全防线）。",
       "",
       cavemanBlock,
-      ...(intentHint ? [intentHint] : []),
-      ...(skillsSection ? ["", skillsSection] : []),
       "",
-      localTimeLine,
-      `当前家庭：${mw.currentHome || "全部"} | 房间列表：${roomTabs.join("、") || "全屋"}`,
+      `房间列表：${distinctRooms.join("、") || "全屋"}`,
       catalogHeader,
       deviceCatalog,
       ...(SCENES_FEATURE_ENABLED ? ["", "当前手动场景：", sceneCatalog] : []),
+      ...(skillsSection ? ["", skillsSection] : []),
       ...(customInstructionsSection ? ["", customInstructionsSection] : []),
     ]
       .filter((line) => line !== undefined)
       .join("\n");
+  }
+
+  /**
+   * 仅在任务边界按需刷新静态 System Prompt（当设备固定台账、技能、附加指令或回复模式真正发生变化时），
+   * 绝不在单任务工具循环中段改写 `messages[0]`，同时严格保留 `toolsAdded` 避免触发冗余工具声明。
+   */
+  private _syncStaticSystemPromptIfNeeded(targetAgent: Agent, trackRefresh: boolean): void {
+    const nextPrompt = this._buildStaticSystemPrompt();
+    const msgs = targetAgent.state.messages;
+    if (msgs.length > 0 && msgs[0]!.role === "system") {
+      if (msgs[0]!.content === nextPrompt) {
+        return;
+      }
+      const nextMsgs = [...msgs];
+      nextMsgs[0] = {
+        ...msgs[0]!,
+        content: nextPrompt,
+      };
+      targetAgent.state.messages = nextMsgs;
+      if (trackRefresh && this._sessionUsage.llmCalls > 0) {
+        this._systemPromptRefreshes += 1;
+      }
+    }
+  }
+
+  /**
+   * 仅在任务边界执行缓存友好型高水位分批历史压缩：
+   * 达到高水位时一次性按 `user` 轮次边界裁剪最旧批次，并重置实时设备状态基线以便下轮补发完整基准快照。
+   */
+  private _compactPrimaryHistoryIfNeeded(): void {
+    const res = computeCacheFriendlyCompaction(
+      this._agent.state.messages,
+      this._config.maxHistoryTurns,
+    );
+    if (res.compacted) {
+      this._agent.state.messages = res.messages;
+      this._emittedDeviceStates = null;
+      this._historyCompactions += 1;
+    }
+  }
+
+  /**
+   * 构建包含当轮动态运行态上下文的 User Message 文本：
+   * 首轮/重置/压缩后附紧凑设备状态基准快照，后续连续任务仅附状态变化增量，彻底避免改写 System Prompt。
+   */
+  private _prepareTurnPrompt(ctx: TaskRunContext): string {
+    const mw = this._deps.mainWindow;
+    const currentStates = snapshotDeviceLiveStates(
+      mw.activeDevices(),
+      mw.knownPower,
+      mw.metrics,
+      DEVICE_CATALOG_LIMIT,
+    );
+    const runtimeContext = buildRuntimeContextBlock({
+      localTimeLine: formatLocalTimeContext(),
+      source: ctx.source,
+      voiceMeta: ctx.voiceMeta,
+      currentHome: mw.currentHome,
+      currentStates,
+      previousStates: this._emittedDeviceStates,
+    });
+    if (ctx.usesPrimaryAgent) {
+      this._emittedDeviceStates = currentStates;
+    }
+    return formatTurnUserPrompt(ctx.rawText, runtimeContext);
+  }
+
+  private _rotateSessionId(): void {
+    const prev = this._sessionId;
+    if (prev) {
+      cleanupSessionResources(prev);
+    }
+    this._sessionId = createAgentSessionId();
+    if (this._agent) {
+      this._agent.sessionId = this._sessionId;
+    }
   }
 
   private _createStreamFn(getCtx: () => TaskRunContext | null = () => this._primaryCtx): StreamFn {
@@ -993,13 +1157,14 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           return this._localStreamFn(model, context, options);
         }
         if (lastMsg && lastMsg.role === "user") {
-          const userText =
+          const rawUserText =
             typeof lastMsg.content === "string"
               ? lastMsg.content
               : lastMsg.content
                   .filter((b): b is TextContent => b.type === "text")
                   .map((b) => b.text)
                   .join(" ");
+          const userText = stripRuntimeContextBlock(rawUserText);
           const recentTarget = findRecentDeviceFromMessages(msgs.slice(0, -1));
           const deterministicCalls = planDeterministicLocalCalls(
             userText,
@@ -1019,9 +1184,22 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         }
       }
 
+      const effectiveSessionId = options?.sessionId || this._sessionId;
+      const gatewayHeaders =
+        effectiveSessionId &&
+        model.api !== "google-generative-ai" &&
+        SESSION_ID_HEADER_PROVIDERS.has(this._config.provider)
+          ? {
+              "x-session-id": effectiveSessionId,
+              ...(options?.headers ?? {}),
+            }
+          : options?.headers;
+
       const streamOpts = {
         ...options,
         apiKey: effectiveKey,
+        sessionId: effectiveSessionId,
+        ...(gatewayHeaders ? { headers: gatewayHeaders } : {}),
       };
 
       try {
@@ -1082,7 +1260,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     unsub: () => void;
     seedHistoryLen: number;
   } {
-    const model = this._customModel ?? buildModelForConfig(this._config);
+    const model = this._currentModel;
     const tools = createSmartHomeTools({
       ...this._deps,
       getActivePromptSource: () => ctx.source,
@@ -1094,41 +1272,31 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     const seedMessages = this._snapshotCommittedMessages();
     const agent = new Agent({
       initialState: {
-        systemPrompt: this._buildSystemPrompt(ctx),
+        systemPrompt: this._buildStaticSystemPrompt(),
         model,
         thinkingLevel: this._config.thinkingLevel,
         tools,
         ...(seedMessages.length > 0 ? { messages: seedMessages } : {}),
       },
+      sessionId: this._sessionId,
       streamFn: this._createStreamFn(() => ctx),
       getApiKey: () => resolveEffectiveApiKey(this._config),
       toolExecution: "sequential",
       prepareRequest: ({ context, model: reqModel }) => {
-        const msgs = [...context.messages];
-        const freshPrompt = this._buildSystemPrompt(ctx);
-        if (msgs.length > 0 && msgs[0]!.role === "system") {
-          msgs[0] = {
-            ...msgs[0]!,
-            content: freshPrompt,
-          };
-        }
-        const maxMsgs = Math.max(6, this._config.maxHistoryTurns * 4);
-        let trimmed = msgs;
-        if (msgs.length > maxMsgs + 1) {
-          const head = msgs[0]!.role === "system" ? [msgs[0]!] : [];
-          const tail = msgs.slice(-maxMsgs);
-          while (tail.length > 0 && tail[0]!.role === "toolResult") {
-            tail.shift();
-          }
-          trimmed = [...head, ...tail];
-        }
+        // 严禁在请求阶段改写 messages[0] 或按请求滑动裁剪，确保并发任务与主任务共享同一缓存前缀
+        const safeMsgs = computeEmergencyTrim(context.messages, this._config.maxHistoryTurns);
         return {
-          context: { ...context, messages: trimmed },
-          model: this._customModel ?? buildModelForConfig(this._config) ?? reqModel,
+          context:
+            safeMsgs.length !== context.messages.length ? { ...context, messages: safeMsgs } : context,
+          model: this._currentModel ?? reqModel,
           thinkingLevel: this._config.thinkingLevel,
         };
       },
     });
+    // 若尚无历史消息且设备刚加载完成，同步静态台账；若已有历史则完整保留主 Agent 的冻结 messages[0]
+    if (seedMessages.length <= 1) {
+      this._syncStaticSystemPromptIfNeeded(agent, false);
+    }
     const unsub = agent.subscribe((event) => {
       this._handleAgentEvent(event, ctx);
     });
@@ -1142,41 +1310,26 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
 
   private _createAgent(): Agent {
     this._unsubAgent?.();
-    const model = this._customModel ?? buildModelForConfig(this._config);
+    const model = this._currentModel;
     const agent = new Agent({
       initialState: {
-        systemPrompt: this._buildSystemPrompt(),
+        systemPrompt: this._buildStaticSystemPrompt(),
         model,
         thinkingLevel: this._config.thinkingLevel,
         tools: this._tools,
       },
+      sessionId: this._sessionId,
       streamFn: this._createStreamFn(() => this._primaryCtx),
       getApiKey: () => resolveEffectiveApiKey(this._config),
       toolExecution: "sequential",
       prepareRequest: ({ context, model: reqModel }) => {
-        // 每次请求前刷新最新设备目录到首条 system message，同时按 maxHistoryTurns 裁剪过长历史
-        const msgs = [...context.messages];
-        const freshPrompt = this._buildSystemPrompt(this._primaryCtx);
-        if (msgs.length > 0 && msgs[0]!.role === "system") {
-          msgs[0] = {
-            ...msgs[0]!,
-            content: freshPrompt,
-          };
-        }
-        const maxMsgs = Math.max(6, this._config.maxHistoryTurns * 4);
-        let trimmed = msgs;
-        if (msgs.length > maxMsgs + 1) {
-          const head = msgs[0]!.role === "system" ? [msgs[0]!] : [];
-          const tail = msgs.slice(-(maxMsgs));
-          // 确保裁剪后不以孤立 toolResult 开头
-          while (tail.length > 0 && tail[0]!.role === "toolResult") {
-            tail.shift();
-          }
-          trimmed = [...head, ...tail];
-        }
+        // 静态 System Prompt 与高水位历史分批压缩均已在任务边界完成，
+        // 请求阶段严禁改写 messages[0] 或滑动截断，仅在异常超长单轮循环时触发兜底安全上限。
+        const safeMsgs = computeEmergencyTrim(context.messages, this._config.maxHistoryTurns);
         return {
-          context: { ...context, messages: trimmed },
-          model: this._customModel ?? buildModelForConfig(this._config) ?? reqModel,
+          context:
+            safeMsgs.length !== context.messages.length ? { ...context, messages: safeMsgs } : context,
+          model: this._currentModel ?? reqModel,
           thinkingLevel: this._config.thinkingLevel,
         };
       },
@@ -1397,6 +1550,14 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       case "message_end": {
         const msg = event.message;
         if (msg.role === "assistant") {
+          // 采集真实云端 LLM Token 与 Prompt Cache 命中统计（跳过 0 token 本地规划器占位消息）
+          const callHitRate = recordUsageIntoSummary(ctx.usage, msg.usage);
+          if (callHitRate !== null) {
+            recordUsageIntoSummary(this._sessionUsage, msg.usage);
+            this._lastCallCacheHitRate = callHitRate;
+            entry.usage = { ...ctx.usage };
+          }
+
           const tail = ctx.inlineThinkSplitter.flush();
           if (tail.thinking) {
             if (!ctx.thinkingStreamedInMessage && entry.thinking && entry.thinking.trim().length > 0) {
@@ -1973,21 +2134,31 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   }
 
   reconfigure(nextConfig: AgentVoiceConfig): void {
-    const providerOrModelChanged =
+    const endpointOrModelChanged =
       nextConfig.provider !== this._config.provider ||
       nextConfig.customProviderName !== this._config.customProviderName ||
       nextConfig.customApiType !== this._config.customApiType ||
       nextConfig.modelId !== this._config.modelId ||
-      nextConfig.baseUrl !== this._config.baseUrl ||
-      nextConfig.thinkingLevel !== this._config.thinkingLevel;
+      nextConfig.baseUrl !== this._config.baseUrl;
+    const providerOrModelChanged =
+      endpointOrModelChanged || nextConfig.thinkingLevel !== this._config.thinkingLevel;
     this._config = nextConfig;
+    if (providerOrModelChanged) {
+      this._currentModel = this._customModel ?? buildModelForConfig(this._config);
+    }
+    if (endpointOrModelChanged) {
+      this._rotateSessionId();
+    }
     this._systemOne?.reset();
     this._systemOne = SystemOneClient.fromConfig(this._config, this._systemOneFetcher);
     if (this._primaryCtx === null) {
       this._agent.state.thinkingLevel = this._config.thinkingLevel;
       if (providerOrModelChanged) {
         // 保留现有 UI timeline，但更新底层 Agent 的 model 配置
-        this._agent.state.model = this._customModel ?? buildModelForConfig(this._config);
+        this._agent.state.model = this._currentModel;
+      }
+      if (this._agent.state.messages.length <= 1) {
+        this._syncStaticSystemPromptIfNeeded(this._agent, false);
       }
     }
     this.emit("stateChanged", this.snapshot());
@@ -2169,6 +2340,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       roundToolTraces: [],
       roundToolArgs: new Map<string, Record<string, unknown>>(),
       useLocalFastPath: false,
+      usage: createEmptyUsageSummary(),
       resolvePromise,
     };
 
@@ -2227,11 +2399,13 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     // 独占空闲主 Agent，或为并发任务派生独立隔离 Agent（互不中断、互不污染上下文）
     if (this._primaryCtx === null) {
       this._flushPendingHistoryMerges();
+      this._compactPrimaryHistoryIfNeeded();
+      this._syncStaticSystemPromptIfNeeded(this._agent, true);
       this._primaryCtx = ctx;
       ctx.usesPrimaryAgent = true;
       ctx.agent = this._agent;
       ctx.tools = this._tools;
-      this._agent.state.model = this._customModel ?? buildModelForConfig(this._config);
+      this._agent.state.model = this._currentModel;
       this._agent.state.thinkingLevel = this._config.thinkingLevel;
     } else {
       const scoped = this._createScopedAgent(ctx);
@@ -2395,7 +2569,8 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       // Step 2：常规执行（未命中技能时交由本任务专属 Pi Agent 执行）
       if (!handledBySkill && !currentOutcome && !signal.aborted) {
         const activeAgent = ctx.agent!;
-        await activeAgent.prompt(text);
+        const turnPrompt = this._prepareTurnPrompt(ctx);
+        await activeAgent.prompt(turnPrompt);
         await activeAgent.waitForIdle();
 
         const effectiveCloudLlm =
@@ -2704,6 +2879,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           silent: true,
           ...(assistantEntry.thinking?.trim() ? { thinking: assistantEntry.thinking } : {}),
           ...(assistantEntry.thinkingLevel ? { thinkingLevel: assistantEntry.thinkingLevel } : {}),
+          ...(ctx.usage.llmCalls > 0 ? { usage: { ...ctx.usage } } : {}),
           verification: assistantEntry.verification,
           skillEvent: assistantEntry.skillEvent,
         });
@@ -2739,6 +2915,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           text: assistantEntry.text,
           ...(assistantEntry.thinking?.trim() ? { thinking: assistantEntry.thinking } : {}),
           ...(assistantEntry.thinkingLevel ? { thinkingLevel: assistantEntry.thinkingLevel } : {}),
+          ...(ctx.usage.llmCalls > 0 ? { usage: { ...ctx.usage } } : {}),
           verification: assistantEntry.verification,
           skillEvent: assistantEntry.skillEvent,
         });
@@ -2803,6 +2980,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       verification: assistantEntry.verification ?? null,
       ...(assistantEntry.skillEvent ? { skillEvent: { ...assistantEntry.skillEvent } } : {}),
       streamedSpeakChunks: ctx.emittedSpeakChunks,
+      ...(ctx.usage.llmCalls > 0 ? { usage: { ...ctx.usage } } : {}),
       ...(assistantEntry.error ? { error: assistantEntry.error } : {}),
     });
   }
@@ -2874,6 +3052,13 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   reset(): void {
     this.abort();
     this._agent.reset();
+    this._rotateSessionId();
+    this._emittedDeviceStates = null;
+    this._sessionUsage = createEmptyUsageSummary();
+    this._lastCallCacheHitRate = null;
+    this._systemPromptRefreshes = 0;
+    this._historyCompactions = 0;
+    this._syncStaticSystemPromptIfNeeded(this._agent, false);
     this._pendingHistoryMerges = [];
     this._timeline = [];
     this._lastError = null;
@@ -2920,16 +3105,21 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             }
           : {}),
         ...(e.skillEvent ? { skillEvent: { ...e.skillEvent } } : {}),
+        ...(e.usage ? { usage: { ...e.usage } } : {}),
       })),
       config: toPublicAgentVoiceConfig(this._config),
       providers: PROVIDER_PRESETS,
       systemOne: this._systemOne ? this._systemOne.getStatus() : null,
+      cacheStats: this.getCacheStats(),
       lastError: this._lastError,
     };
   }
 
   dispose(): void {
     this.abort();
+    if (this._sessionId) {
+      cleanupSessionResources(this._sessionId);
+    }
     this._unsubAgent?.();
     this._unsubAgent = null;
     this.clear();
