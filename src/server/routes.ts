@@ -2000,6 +2000,8 @@ export function createRequestHandler(
           ok: result.ok,
           entryId: result.entryId,
           ack: result.ack,
+          ...(result.ackScenario ? { ackScenario: result.ackScenario } : {}),
+          ...(result.ackSource ? { ackSource: result.ackSource } : {}),
           reply: result.reply,
           ...(result.thinking ? { thinking: result.thinking } : {}),
           ...(result.thinkingLevel ? { thinkingLevel: result.thinkingLevel } : {}),

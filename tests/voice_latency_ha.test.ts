@@ -250,7 +250,10 @@ describe("Home Assistant prefer_local_intents Fast-Path in PiAgentService", () =
     let cloudCalls = 0;
     const mockCloud = Bun.serve({
       port: 0,
-      async fetch() {
+      async fetch(req) {
+        if (new URL(req.url).pathname.endsWith("/systemone")) {
+          return new Response("Not Found", { status: 404 });
+        }
         cloudCalls += 1;
         const sse = [
           `data: ${JSON.stringify({

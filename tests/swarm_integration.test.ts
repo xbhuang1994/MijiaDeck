@@ -118,8 +118,9 @@ describe("Swarm Integrated E2E: SystemOne + Caveman + openWakeWord + Dual-State 
         };
       }
 
-      if (payload.questions.action) {
-        answers.action = {
+      if (payload.questions.action || payload.questions.implicit_action) {
+        const key = payload.questions.implicit_action ? "implicit_action" : "action";
+        answers[key] = {
           type: "choice",
           choice: utterance.includes("刺眼") ? "light_dimmer" : "needs_llm_agent",
           probabilities: {
@@ -133,6 +134,30 @@ describe("Swarm Integrated E2E: SystemOne + Caveman + openWakeWord + Dual-State 
             needs_llm_agent: utterance.includes("刺眼") ? 0.01 : 0.94,
           },
           confidence: 0.94,
+        };
+      }
+
+      if (payload.questions.task_ack) {
+        const scenario = utterance.includes("多少度")
+          ? "query_status"
+          : utterance.includes("笑话")
+            ? "think_creative"
+            : "execute_control";
+        answers.task_ack = {
+          type: "choice",
+          choice: scenario,
+          probabilities: {
+            execute_control: scenario === "execute_control" ? 0.92 : 0.01,
+            query_status: scenario === "query_status" ? 0.92 : 0.01,
+            think_creative: scenario === "think_creative" ? 0.92 : 0.01,
+            scene_routine: 0.01,
+            troubleshoot: 0.01,
+            urgent_cancel: 0.01,
+            remember_rule: 0.01,
+            safety_confirm: 0.01,
+            greeting_chat: 0.01,
+          },
+          confidence: 0.92,
         };
       }
 

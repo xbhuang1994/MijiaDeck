@@ -901,6 +901,9 @@ describe("Light Target Isolation & Non-Light Recent-Target Regression", () => {
     const mockCloudServer = Bun.serve({
       port: 0,
       async fetch(req) {
+        if (new URL(req.url).pathname.endsWith("/systemone")) {
+          return new Response("Not Found", { status: 404 });
+        }
         const body = (await req.json()) as {
           messages?: Array<{ role?: string; content?: string | Array<{ type?: string; text?: string }> }>;
         };

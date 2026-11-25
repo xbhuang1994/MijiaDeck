@@ -34,6 +34,7 @@ import {
   stripCommittedPrefix,
 } from "./qwen3StreamingTranscriber.ts";
 import type { CommandIntentChoice, SystemOneHealthSnapshot } from "./systemOneClient.ts";
+import { TASK_ACK_PREWARM_PHRASES_ZH } from "./taskAckPolicy.ts";
 import type { VoiceStreamSegmentPayload } from "./voiceStreamSession.ts";
 import {
   evaluateVoiceAttention,
@@ -699,14 +700,16 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   }
 
   /**
-   * 后台预热本地温柔女声神经 TTS 并缓存唤醒词回复短语与任务即时确认“好的”（实现近零延迟播报）。
+   * 后台预热本地温柔女声神经 TTS 并缓存唤醒词回复短语与全部场景化即时应答词（实现近零延迟播报）。
    */
   async prewarmLocalTts(): Promise<void> {
     const cfg = this.config;
     if (cfg.ttsEngine === "browser" || !cfg.autoSpeakReply) return;
     const ack = resolveWakeAckReply(cfg.wakeAckPhrase);
     const exitAck = formatExitConversationAck(cfg.cavemanMode);
-    const prewarmTexts = [...new Set(["好的", ...(ack ? [ack] : []), exitAck])];
+    const prewarmTexts = [
+      ...new Set([...TASK_ACK_PREWARM_PHRASES_ZH, ...(ack ? [ack] : []), exitAck]),
+    ];
     await this._localEngine.tts.warmup({
       voice: cfg.ttsVoice,
       speed: cfg.ttsSpeed,
