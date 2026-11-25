@@ -184,6 +184,10 @@ function handleWsMessage(
         owwThreshold: cfg.owwThreshold,
         streamingAsrEnabled: cfg.qwen3StreamingEnabled,
         voicePipelineMode: cfg.voicePipelineMode,
+        trackMuteManager: vl.trackMuteManager,
+        getSystemOneClient: () => vl.systemOneClient,
+        getRecentHistory: () => vl.getRecentHistoryForSystemOne(5),
+        getDialogEpoch: () => vl.dialogEpoch,
         onPartialTranscript: (partial) => {
           try {
             ws.send(

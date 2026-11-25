@@ -70,15 +70,15 @@ describe("Swarm Integrated E2E: SystemOne + Caveman + openWakeWord + Dual-State 
         if (utterance.includes("聊到Neo")) {
           answers.decision = {
             type: "choice",
-            choice: "ignore",
-            probabilities: { direct_command: 0.04, wake_only: 0.02, ignore: 0.94 },
+            choice: "false_wake",
+            probabilities: { valid_wake: 0.06, false_wake: 0.94 },
             confidence: 0.91,
           };
         } else {
           answers.decision = {
             type: "choice",
-            choice: "direct_command",
-            probabilities: { direct_command: 0.95, wake_only: 0.03, ignore: 0.02 },
+            choice: "valid_wake",
+            probabilities: { valid_wake: 0.95, false_wake: 0.05 },
             confidence: 0.925,
           };
         }
@@ -202,11 +202,18 @@ describe("Swarm Integrated E2E: SystemOne + Caveman + openWakeWord + Dual-State 
     vl.updateRuntimeState({ active: true });
     expect(vl.snapshot().dialogState).toBe("standby");
 
-    // 1. Standby third-person mention -> SystemOne rejects -> stays in standby
+    // 1. Standby third-person mention -> SystemOne rejects as false_wake (pure wake check, no context/background) -> stays in standby
     const mention = await vl.handleTranscript("我刚才聊到Neo挺好用的", { isFinal: true });
     expect(mention.matched).toBe(false);
     expect(mention.attention?.stage).toBe("systemone-attention");
     expect(vl.snapshot().dialogState).toBe("standby");
+    const wakeCall = systemOneCalls.find((c) => Boolean((c.questions as any)?.decision));
+    expect(wakeCall).toBeTruthy();
+    expect(Object.keys((wakeCall!.questions as Record<string, unknown>))).toEqual(["decision"]);
+    expect(Object.keys((wakeCall!.state as Record<string, unknown>)).sort()).toEqual([
+      "utterance",
+      "wake_words",
+    ]);
 
     // 2. Wake-only "Neo" -> enters conversation mode with default gentle wake ack "嗯?"
     const wakeOnly = await vl.handleTranscript("Neo", { isFinal: true });

@@ -5,11 +5,11 @@
 /**
  * SystemOne 决策模型客户端（POST {baseUrl}/systemone）。
  *
- * 面向语音唤醒注意力门控、连续对话判别、双轨 ASR 择优、TTS 回声判别、
+ * 面向唤醒词误听校验、连续对话判别、双轨 ASR 择优、TTS 回声判别、
  * 指令意图分类、隐式家居动作识别与场景化即时应答词分类，提供：
  * - 单次 HTTP 批量多问题决策（choice / score / noul）
  * - 每实例熔断器（404/405/501、401/403 即刻熔断；超时/5xx/429 连续 2 次指数退避）
- * - 负向结果短 TTL LRU 缓存（仅缓存非执行判定，绝不缓存 direct_command / followup）
+ * - 负向结果短 TTL LRU 缓存（仅缓存非执行判定，绝不缓存 valid_wake / followup）
  * - 严格脱敏与健康快照（零密钥暴露）
  */
 
@@ -110,11 +110,12 @@ export interface SystemOneHistoryEntry {
   text: string;
 }
 
-export type WakeAttentionDecision = "direct_command" | "wake_only" | "ignore";
+export type WakeAttentionDecision = "valid_wake" | "false_wake";
 export type ConversationActionChoice = "followup" | "side_talk" | "goodbye";
 export type CommandIntentChoice = "device_control" | "status_query" | "scene" | "general_chat";
 export type DualTrackAsrChoice = "track_a" | "track_b" | "neither_noise";
 export type EchoCheckChoice = "echo" | "user_command";
+export type TrackNoiseClassChoice = "background_noise_tv" | "human_speech";
 export type ImplicitActionChoice =
   | "light_brighter"
   | "light_dimmer"
@@ -127,21 +128,10 @@ export type ImplicitActionChoice =
 
 export interface WakeAttentionInput {
   utterance: string;
-  altUtterance?: string;
   wakeWords: readonly string[];
-  acousticEvent?: string;
-  speakerName?: string | null;
-  acousticWake?: { wakeWord: string; score: number } | null;
-  /** 当前家庭设备的特殊能力清单（例如三筒洗衣机的袜子筒/内裤筒、扫地机、浇花水阀、喂食器等） */
-  homeCapabilities?: readonly string[];
-  /** 已学习的强化决策记忆触发短语示例 */
-  learnedTriggers?: readonly string[];
-  /** 设备能力拓扑哈希（隔离缓存，避免设备变化后复用陈旧负向结果） */
-  capabilityDigestHash?: string;
 }
 
 export interface WakeAttentionOptions {
-  includeIntent?: boolean;
   strict?: boolean;
 }
 
@@ -149,19 +139,10 @@ export interface WakeAttentionResult {
   decision: WakeAttentionDecision;
   confidence: number;
   probabilities: Record<WakeAttentionDecision, number>;
+  /** 非误听（确认有人在叫触发词且置信度达标），可直接进入下一流程 */
   accepted: boolean;
-  wokeOnly: boolean;
-  intent?: {
-    choice: CommandIntentChoice;
-    confidence: number;
-    probabilities: Record<CommandIntentChoice, number>;
-  };
-  asrBest?: {
-    choice: DualTrackAsrChoice;
-    confidence: number;
-    probabilities: Record<DualTrackAsrChoice, number>;
-    selectedText: string;
-  };
+  /** 判定为误听/误唤醒（或置信度不足未放行） */
+  isFalseWake: boolean;
   model: string;
   usage: SystemOneUsage;
   latencyMs: number;
@@ -301,6 +282,46 @@ export interface TaskAckClassificationResult {
   latencyMs: number;
 }
 
+export interface MultiTrackNoiseTrackInput {
+  trackId: string;
+  trackIndex: number;
+  text: string;
+  speakerName?: string | null;
+  acousticEvent?: string;
+  /** 是否需要对该音轨生成独立判别问题（默认 true；设为 false 时仅作为对比上下文放入 state.tracks） */
+  evaluate?: boolean;
+}
+
+export interface MultiTrackNoiseInput {
+  tracks: ReadonlyArray<MultiTrackNoiseTrackInput>;
+  wakeWords?: readonly string[];
+  recentHistory?: ReadonlyArray<SystemOneHistoryEntry>;
+}
+
+export interface MultiTrackNoiseOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  minConfidence?: number;
+}
+
+export interface MultiTrackNoiseTrackVerdict {
+  trackId: string;
+  trackIndex: number;
+  choice: TrackNoiseClassChoice;
+  shouldMute: boolean;
+  confidence: number;
+  probabilities: Record<TrackNoiseClassChoice, number>;
+}
+
+export interface MultiTrackNoiseResult {
+  verdicts: MultiTrackNoiseTrackVerdict[];
+  mutedTrackIds: string[];
+  model: string;
+  usage: SystemOneUsage;
+  latencyMs: number;
+  cached: boolean;
+}
+
 // ==================== Health & Circuit Breaker Types ====================
 
 export type SystemOneCircuitState = "closed" | "open" | "half-open";
@@ -357,14 +378,12 @@ const HISTORY_MAX_CHARS = 80;
 const WAKE_DECISION_QUESTION: SystemOneChoiceQuestion<WakeAttentionDecision> = {
   type: "choice",
   instructions:
-    "你是智能家居语音控制助手（唤醒词见 wake_words，支持中英文及常见同音误差）。请结合 home_capabilities、learned_triggers 与 acoustic_wake 判断用户最新话语是在直接向你下达指令/查询/隐式控制需求、仅呼唤确认你在场，还是与你无关。注意：若 home_capabilities 显示家中有对应专能家电（例如三筒洗衣机的袜子筒/内裤筒、扫地机器人、智能浇花灌溉、宠物喂食器、独立干衣机），像“帮我洗一下袜子”“帮我洗内衣”“浇一下花”“扫一下地”“喂一下猫”均属于合法的设备控制请求 direct_command，绝不可误判为真人跑腿家务。播放背景音乐(BGM)或电视时，唤醒词前后可能夹杂无关歌词或电视台词碎片，只要含对助手的直接命令或提问即视为 direct_command。",
+    "唤醒词检测已触发，仅判断语音转写文本 utterance 是不是误听有人在叫触发词（wake_words，支持中英文及语音识别常见同音/近音/音译误差），不需要做上下文、背景环境、设备能力或后续意图等其它判断。注意：中文语音识别常将句首英文或短触发词误听为发音相近的孤立单字/双字并紧跟逗号或停顿（例如把 Neo 听成“六，/流，/牛，/纽，/钮，/尼，/你，/你哦，/尼奥，/里奥，/呢，/那，”等），这类句首近音呼唤仍属于有人在叫触发词（valid_wake）。",
   criteria: {
-    direct_command:
-      "说话人直接呼唤助手（或声学唤醒命中）并下达显式/隐式设备控制（包括命中 home_capabilities 或 learned_triggers 的洗袜子/洗内衣/烘干/扫地/浇花/喂宠物等需求）、状态查询、保存/查看/删除长期附加指令规则、知识提问或环境抱怨调节需求（如太暗、太吵、太潮、查温度、英文控制指令等）。",
-    wake_only:
-      "说话人仅在呼唤助手名字或询问是否在线，没有具体操作指令或问题（如“小派”、“嘿小派”、“小派在吗”、“Hey Neo”）。",
-    ignore:
-      "第三人称提及、讨论、评价、转述或否定呼叫助手（如“我刚聊到小派很好用”、“你觉得小派怎么样”、“别管小派了”），或对旁人说话、明显无任何对应联网设备的纯手工跑腿家务（如洗碗、做饭、拿快递、倒水）、自言自语、纯背景音乐歌词/噪声/电视声。",
+    valid_wake:
+      "确实有人在呼唤触发词（不是误听）：包括纯呼唤触发词、触发词后接任意说话内容，或句首出现因语音识别同音/近音/音译误差转写出的孤立触发词谐音（如“六，我觉得客厅有点暗呢”句首的“六，”对应 Neo）。",
+    false_wake:
+      "误听或误唤醒：并没有人在叫触发词，包括仅因发音相近把普通日常词句/外语词/杂音碎片误听成触发词，或在与他人聊天、转述、评价、否定中顺带提及该词而并非在呼叫触发词。",
   },
 };
 
@@ -445,6 +464,22 @@ const IMPLICIT_ACTION_QUESTION: SystemOneChoiceQuestion<ImplicitActionChoice> = 
       "多步复合指令、具体数值/色温/定时、多设备编排、场景切换、喂食、普通问答或意图不明确，需交由 LLM Agent 处理。",
   },
 };
+
+function buildMultiTrackNoiseQuestion(
+  trackIndex: number,
+  trackId: string,
+): SystemOneChoiceQuestion<TrackNoiseClassChoice> {
+  return {
+    type: "choice",
+    instructions: `当前处于多音轨分离语音对话中（全部音轨转写见 state.tracks）。请专门判断音轨 ${trackIndex}（track_id=${trackId}）转换出来的文字是不是背景音、旁白、噪音或电视/视频/广播外放声。请结合其他音轨内容、wake_words、speaker 与 history 综合判别；若文字过短或难以确定，宁可判为 human_speech，避免误屏蔽现场真实用户。`,
+    criteria: {
+      background_noise_tv:
+        "该音轨文字是背景音、电视/电影/综艺/新闻/广告/纪录片/视频外放台词、画外音旁白、解说词、背景音乐歌词、环境噪音或无意义识别乱码，并非现场真人在与智能助手交互。",
+      human_speech:
+        "该音轨文字是现场真实用户在向智能家居助手发出控制指令、状态查询、呼唤唤醒词、回应确认或真实人机对话，或文字过短尚不足以确认为背景音/旁白/噪音/电视。",
+    },
+  };
+}
 
 // ==================== Pure Helpers ====================
 
@@ -1070,8 +1105,9 @@ export class SystemOneClient {
   }
 
   /**
-   * (a) 唤醒词注意力评估（单次批量请求：decision + 可选 intent + 可选双轨 asr_best）。
-   * 仅缓存非执行判定（`ignore` / `wake_only`），绝不缓存 `direct_command`。
+   * (a) 唤醒词触发后纯误唤醒校验（单问题二分类：`valid_wake | false_wake`）。
+   * 仅判断是不是误听有人在叫触发词，不附带上下文/背景/设备能力/意图/双轨等其它判断；
+   * 仅缓存负向误听判定（`false_wake`），绝不缓存正向放行判定（`valid_wake`）。
    */
   async evaluateWakeAttention(
     input: WakeAttentionInput,
@@ -1080,27 +1116,15 @@ export class SystemOneClient {
     if (!this._enabled) return null;
 
     const cleanUtterance = collapseWhitespace(input.utterance);
-    const cleanAlt = input.altUtterance ? collapseWhitespace(input.altUtterance) : "";
-    if (!cleanUtterance && !cleanAlt) return null;
+    if (!cleanUtterance) return null;
 
-    const primaryText = cleanUtterance || cleanAlt;
-    const hasDistinctAlt = Boolean(cleanUtterance && cleanAlt && cleanAlt !== cleanUtterance);
     const wakeWords = input.wakeWords.map((w) => w.trim()).filter(Boolean);
-    const includeIntent = Boolean(opts?.includeIntent);
     const strict = Boolean(opts?.strict);
 
     const cacheKey = JSON.stringify([
       "wake",
-      primaryText.toLowerCase(),
-      hasDistinctAlt ? cleanAlt.toLowerCase() : "",
+      cleanUtterance.toLowerCase(),
       wakeWords.map((w) => w.toLowerCase()),
-      input.acousticEvent ?? "",
-      input.speakerName ?? "",
-      input.acousticWake
-        ? `${input.acousticWake.wakeWord.toLowerCase()}:${input.acousticWake.score.toFixed(2)}`
-        : "",
-      input.capabilityDigestHash ?? "",
-      includeIntent,
       strict,
     ]);
 
@@ -1111,90 +1135,40 @@ export class SystemOneClient {
     }
 
     const state: Record<string, unknown> = {
-      utterance: primaryText,
+      utterance: cleanUtterance,
       wake_words: wakeWords,
     };
-    if (hasDistinctAlt) {
-      state.track_a = primaryText;
-      state.track_b = cleanAlt;
-    }
-    if (input.acousticEvent) state.acoustic_event = input.acousticEvent;
-    if (input.speakerName) state.speaker = input.speakerName;
-    if (input.acousticWake) {
-      state.acoustic_wake = {
-        wake_word: input.acousticWake.wakeWord,
-        score: Number(input.acousticWake.score.toFixed(3)),
-      };
-    }
-    if (input.homeCapabilities && input.homeCapabilities.length > 0) {
-      state.home_capabilities = input.homeCapabilities.slice(0, 12);
-    }
-    if (input.learnedTriggers && input.learnedTriggers.length > 0) {
-      state.learned_triggers = input.learnedTriggers.slice(0, 12);
-    }
 
-    const questions: Record<string, SystemOneQuestion> = {
+    const questions = {
       decision: WAKE_DECISION_QUESTION,
     };
-    if (includeIntent) {
-      questions.intent = COMMAND_INTENT_QUESTION;
-    }
-    if (hasDistinctAlt) {
-      questions.asr_best = DUAL_TRACK_ASR_QUESTION;
-    }
 
     const t0 = performance.now();
     const res = await this.decide(state, questions);
     if (!res) return null;
 
     const latencyMs = Math.max(0, Math.round(performance.now() - t0));
-    const decisionAns = res.answers.decision as SystemOneChoiceAnswer<WakeAttentionDecision>;
+    const decisionAns = res.answers.decision;
     const acceptThreshold = this._effectiveAcceptThreshold(strict);
     const decision = decisionAns.choice;
     const confidence = decisionAns.confidence;
-    const accepted =
-      (decision === "direct_command" || decision === "wake_only") &&
-      confidence >= acceptThreshold;
-    const wokeOnly = decision === "wake_only" && accepted;
+    const accepted = decision === "valid_wake" && confidence >= acceptThreshold;
+    const isFalseWake = !accepted;
 
     const result: WakeAttentionResult = {
       decision,
       confidence,
       probabilities: decisionAns.probabilities,
       accepted,
-      wokeOnly,
+      isFalseWake,
       model: res.model,
       usage: res.usage,
       latencyMs,
       cached: false,
     };
 
-    if (includeIntent && res.answers.intent) {
-      const intentAns = res.answers.intent as SystemOneChoiceAnswer<CommandIntentChoice>;
-      result.intent = {
-        choice: intentAns.choice,
-        confidence: intentAns.confidence,
-        probabilities: intentAns.probabilities,
-      };
-    }
-
-    if (hasDistinctAlt && res.answers.asr_best) {
-      const asrAns = res.answers.asr_best as SystemOneChoiceAnswer<DualTrackAsrChoice>;
-      result.asrBest = {
-        choice: asrAns.choice,
-        confidence: asrAns.confidence,
-        probabilities: asrAns.probabilities,
-        selectedText:
-          asrAns.choice === "track_a"
-            ? primaryText
-            : asrAns.choice === "track_b"
-              ? cleanAlt
-              : "",
-      };
-    }
-
-    // 仅缓存非执行判定，绝不缓存 direct_command
-    if (decision === "ignore" || decision === "wake_only") {
+    // 仅缓存误唤醒负向判定，绝不缓存正向放行判定
+    if (decision === "false_wake") {
       this._cache.set(cacheKey, result);
     }
 
@@ -1588,5 +1562,146 @@ export class SystemOneClient {
       usage: res.usage,
       latencyMs,
     };
+  }
+
+  /**
+   * (h) 多轨分离音轨背景音/旁白/噪音/电视批量判别（单次 HTTP 请求同时评估所有待检音轨）。
+   * 仅缓存命中屏蔽（存在 `background_noise_tv`）的负向结果，绝不缓存纯 `human_speech`。
+   */
+  async classifyMultiTrackNoise(
+    input: MultiTrackNoiseInput,
+    opts?: MultiTrackNoiseOptions,
+  ): Promise<MultiTrackNoiseResult | null> {
+    if (!this._enabled || opts?.signal?.aborted) return null;
+
+    const cleanTracks = input.tracks
+      .map((t) => ({
+        trackId: t.trackId.trim() || `cv_track_${t.trackIndex}`,
+        trackIndex: t.trackIndex,
+        text: truncateText(t.text ?? "", 240),
+        speakerName: t.speakerName?.trim() || null,
+        acousticEvent: t.acousticEvent?.trim() || "",
+        evaluate: t.evaluate !== false,
+      }))
+      .filter((t) => t.text.length > 0);
+
+    const targets = cleanTracks.filter((t) => t.evaluate);
+    if (targets.length === 0) return null;
+
+    const wakeWords = (input.wakeWords ?? []).map((w) => w.trim()).filter(Boolean);
+    const compactHistory = formatCompactHistory(
+      input.recentHistory,
+      HISTORY_MAX_ENTRIES,
+      HISTORY_MAX_CHARS,
+    );
+    const threshold =
+      typeof opts?.minConfidence === "number" && Number.isFinite(opts.minConfidence)
+        ? clamp01(opts.minConfidence)
+        : this._confidenceThreshold;
+
+    const cacheKey = JSON.stringify([
+      "mt_noise",
+      cleanTracks.map((t) => [
+        t.trackId,
+        t.trackIndex,
+        t.text.toLowerCase(),
+        t.speakerName ?? "",
+        t.acousticEvent,
+        t.evaluate,
+      ]),
+      wakeWords.map((w) => w.toLowerCase()),
+      compactHistory,
+      Number(threshold.toFixed(2)),
+    ]);
+
+    const cached = this._cache.get(cacheKey) as MultiTrackNoiseResult | undefined;
+    if (cached) {
+      this._cacheHits += 1;
+      return {
+        ...cached,
+        verdicts: cached.verdicts.map((v) => ({ ...v, probabilities: { ...v.probabilities } })),
+        mutedTrackIds: [...cached.mutedTrackIds],
+        latencyMs: 0,
+        cached: true,
+      };
+    }
+
+    const state: Record<string, unknown> = {
+      tracks: cleanTracks.map((t) => ({
+        track_id: t.trackId,
+        track_index: t.trackIndex,
+        text: t.text,
+        ...(t.speakerName ? { speaker: t.speakerName } : {}),
+        ...(t.acousticEvent ? { acoustic_event: t.acousticEvent } : {}),
+      })),
+    };
+    if (wakeWords.length > 0) {
+      state.wake_words = wakeWords;
+    }
+    if (compactHistory.length > 0) {
+      state.history = compactHistory;
+    }
+
+    const questions: Record<string, SystemOneChoiceQuestion<TrackNoiseClassChoice>> = {};
+    const keyToTarget: Array<{
+      qKey: string;
+      trackId: string;
+      trackIndex: number;
+    }> = [];
+    const usedKeys = new Set<string>();
+
+    for (let i = 0; i < targets.length; i += 1) {
+      const t = targets[i]!;
+      let qKey = `track_${t.trackIndex}`;
+      if (usedKeys.has(qKey)) {
+        qKey = `track_${t.trackIndex}_${i}`;
+      }
+      usedKeys.add(qKey);
+      questions[qKey] = buildMultiTrackNoiseQuestion(t.trackIndex, t.trackId);
+      keyToTarget.push({ qKey, trackId: t.trackId, trackIndex: t.trackIndex });
+    }
+
+    const t0 = performance.now();
+    const res = await this.decide(state, questions, {
+      timeoutMs: opts?.timeoutMs,
+      signal: opts?.signal,
+    });
+    if (!res) return null;
+
+    const latencyMs = Math.max(0, Math.round(performance.now() - t0));
+    const verdicts: MultiTrackNoiseTrackVerdict[] = [];
+    const mutedTrackIds: string[] = [];
+
+    for (const item of keyToTarget) {
+      const ans = res.answers[item.qKey];
+      if (!ans) continue;
+      const shouldMute = ans.choice === "background_noise_tv" && ans.confidence >= threshold;
+      verdicts.push({
+        trackId: item.trackId,
+        trackIndex: item.trackIndex,
+        choice: ans.choice,
+        shouldMute,
+        confidence: ans.confidence,
+        probabilities: ans.probabilities,
+      });
+      if (shouldMute) {
+        mutedTrackIds.push(item.trackId);
+      }
+    }
+
+    const result: MultiTrackNoiseResult = {
+      verdicts,
+      mutedTrackIds,
+      model: res.model,
+      usage: res.usage,
+      latencyMs,
+      cached: false,
+    };
+
+    if (mutedTrackIds.length > 0) {
+      this._cache.set(cacheKey, result);
+    }
+
+    return result;
   }
 }

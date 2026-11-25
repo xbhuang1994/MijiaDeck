@@ -1651,8 +1651,13 @@ export class LocalVoiceEngine {
       best = chooseBestAsrCandidate(rawRes, denRes, { wakeWords, inputSnrDb, acousticWake });
     }
 
-    // SystemOne 双轨 ASR 候选择优（双轨出现不同非空候选且分差较近或处于 BGM 场景）
-    if (dualRawRes && dualDenRes && options.systemOneClient?.enabled) {
+    // SystemOne 双轨 ASR 候选择优（仅非唤醒触发阶段的双轨冲突/BGM 场景启用；唤醒触发阶段不做双轨/背景 SystemOne 判断）
+    const wakeTriggered =
+      Boolean(acousticWake?.matched) ||
+      (wakeWords.length > 0 &&
+        (Boolean(findWakeWordSpan(dualRawRes?.text ?? "", wakeWords)) ||
+          Boolean(findWakeWordSpan(dualDenRes?.text ?? "", wakeWords))));
+    if (dualRawRes && dualDenRes && options.systemOneClient?.enabled && !wakeTriggered) {
       const trackA = dualRawRes.text.trim();
       const trackB = dualDenRes.text.trim();
       const isBgm =

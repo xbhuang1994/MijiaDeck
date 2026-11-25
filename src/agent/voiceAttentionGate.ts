@@ -116,6 +116,7 @@ export interface AttentionDecision {
     | "pragmatic-reject"
     | "systemone-attention"
     | "llm-attention"
+    | "noise-track-muted"
     | "no-wake";
   reason: string;
   wakeWord: string | null;
@@ -417,6 +418,24 @@ export function extractCommandAfterAcousticWake(rawText: string, wakeWord: strin
     if (looksLikeDirectDeviceCommand(rest) || (rest.length >= 2 && !/[\u3040-\u30ff\uac00-\ud7af]/.test(rest))) {
       return rest;
     }
+  }
+
+  // 句首孤立近音单/双字后紧跟停顿标点（如中文 ASR 将 "Neo，我觉得客厅有点暗呢" 听成 "六，我觉得客厅有点暗呢" / "流，..." / "那哦，..."），
+  // 必须要求紧跟标点或空白，绝不误伤 "六点叫我起床" 等正常数词短语。
+  const pausedAliasPrefixRe =
+    /^(?:六|流|留|刘|溜|柳|略|呢|那|那哦|那我|你呀|您)[\s,，。!！?？:：、]+/;
+  const pm = pausedAliasPrefixRe.exec(cleaned);
+  if (pm) {
+    const rest = cleaned.slice(pm[0].length).replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
+    if (!rest || isWakeQueryText(rest) || PURE_WAKE_FILLER_RE.test(rest)) {
+      return "";
+    }
+    if (looksLikeDirectDeviceCommand(rest) || (rest.length >= 2 && !/[\u3040-\u30ff\uac00-\ud7af]/.test(rest))) {
+      return rest;
+    }
+  }
+  if (/^(?:六|流|留|刘|溜|柳|略|呢|那|那哦|你呀|尼|妮|牛|妞|钮|纽)$/.test(cleaned)) {
+    return "";
   }
 
   // 4. 若整句仅是日韩假名乱码（"2お" / "ニ요" / "を"）或 1 字拟声残片 -> 判定为纯唤醒
@@ -1426,56 +1445,19 @@ export async function evaluateVoiceAttention(
       });
     }
 
-    // A3-1. 主通道：SystemOne 单次批量唤醒注意力评估（含 intent 与可选双轨 asr_best）
+    // A3-1. 主通道：SystemOne 纯误唤醒校验（仅判断是不是误听有人在叫触发词，不做上下文/背景/意图/双轨等其它判断）
     let sysOneTransientFailure = false;
     if (input.systemOneClient?.enabled) {
       const s1 = await input.systemOneClient.evaluateWakeAttention(
         {
           utterance: cleaned,
-          altUtterance: input.altText,
           wakeWords: input.wakeWords,
-          acousticEvent: input.acousticEvent,
-          speakerName: input.voiceprint?.speakerName ?? null,
-          acousticWake: input.acousticWake
-            ? { wakeWord: input.acousticWake.wakeWord, score: input.acousticWake.score }
-            : null,
-          homeCapabilities: input.capabilityDigest?.summaryLines,
-          learnedTriggers: input.learnedTriggers,
-          capabilityDigestHash: input.capabilityDigest?.topologyHash,
         },
         {
-          includeIntent: true,
           strict: input.attentionMode === "strict",
         },
       );
       if (s1) {
-        if (s1.asrBest?.choice === "neither_noise" && s1.asrBest.confidence >= 0.75) {
-          return wrap({
-            accept: false,
-            wokeOnly: false,
-            addressed: false,
-            inConversation: inConversationEffective,
-            confidence: s1.asrBest.confidence,
-            stage: "systemone-attention",
-            reason: "SystemOne 判定双轨文本均为背景噪声/歌词，已忽略",
-            wakeWord: wakeSpan.wakeWord,
-            command: "",
-            usedLlm: true,
-            selectedText: "",
-          });
-        }
-
-        const selectedText =
-          s1.asrBest &&
-          (s1.asrBest.choice === "track_a" || s1.asrBest.choice === "track_b") &&
-          s1.asrBest.selectedText
-            ? s1.asrBest.selectedText
-            : cleaned;
-        const intentFields = s1.intent
-          ? { intent: s1.intent.choice, intentConfidence: s1.intent.confidence }
-          : {};
-        const selectedFields = selectedText !== cleaned ? { selectedText } : {};
-
         if (!s1.accepted) {
           return wrap({
             accept: false,
@@ -1485,47 +1467,21 @@ export async function evaluateVoiceAttention(
             confidence: s1.confidence,
             stage: "systemone-attention",
             reason:
-              s1.decision === "ignore"
-                ? "SystemOne 判定为非定向提及/旁白/噪声，不执行操作"
-                : "SystemOne 置信度低于阈值，已保守忽略",
+              s1.decision === "false_wake"
+                ? "SystemOne 判定为误听/误唤醒，未在呼叫触发词"
+                : "SystemOne 唤醒校验置信度低于阈值，已保守忽略",
             wakeWord: wakeSpan.wakeWord,
             command: "",
             usedLlm: true,
-            ...intentFields,
-            ...selectedFields,
           });
         }
 
-        if (s1.wokeOnly) {
-          return wrap({
-            accept: true,
-            wokeOnly: true,
-            addressed: true,
-            inConversation: true,
-            confidence: s1.confidence,
-            stage: "systemone-attention",
-            reason: `SystemOne 确认纯唤醒「${wakeSpan.wakeWord}」`,
-            wakeWord: wakeSpan.wakeWord,
-            command: "",
-            usedLlm: true,
-            ...intentFields,
-            ...selectedFields,
-          });
-        }
-
-        const effectiveSpan =
-          selectedText !== cleaned
-            ? (findWakeWordSpan(selectedText, input.wakeWords) ?? wakeSpan)
-            : wakeSpan;
-        const effectiveAfter = effectiveSpan.afterText;
-        const extractedCmd = effectiveAfter
-          ? isBgmContext
-            ? trimTrailingMusicLyrics(effectiveAfter)
-            : effectiveAfter
-          : effectiveSpan.beforeText &&
-              !VOCATIVE_PREFIX_RE.test(effectiveSpan.beforeText) &&
-              !REFERENTIAL_BEFORE_RE.test(effectiveSpan.beforeText)
-            ? effectiveSpan.beforeText
+        const extractedCmd = cleanAfter
+          ? cleanAfter
+          : cleanBefore &&
+              !VOCATIVE_PREFIX_RE.test(cleanBefore) &&
+              !REFERENTIAL_BEFORE_RE.test(cleanBefore)
+            ? cleanBefore
             : "";
 
         return wrap({
@@ -1535,12 +1491,14 @@ export async function evaluateVoiceAttention(
           inConversation: true,
           confidence: s1.confidence,
           stage: "systemone-attention",
-          reason: `SystemOne 确认呼唤「${effectiveSpan.wakeWord}」并下达指令`,
-          wakeWord: effectiveSpan.wakeWord,
+          passSource: "systemone",
+          reason:
+            extractedCmd.length === 0
+              ? `SystemOne 确认触发词「${wakeSpan.wakeWord}」非误听，进入下一流程`
+              : `SystemOne 确认触发词「${wakeSpan.wakeWord}」非误听，直接进入下一流程`,
+          wakeWord: wakeSpan.wakeWord,
           command: extractedCmd,
           usedLlm: true,
-          ...intentFields,
-          ...selectedFields,
         });
       }
       const fk = input.systemOneClient.lastFailureKind;
@@ -1997,16 +1955,20 @@ export async function evaluateVoiceAttention(
     });
   }
 
-  // ==================== 情况 C：待机态无文本唤醒词，但 openWakeWord 声学唤醒命中（ASR 吞掉了“Neo”） ====================
+  // ==================== 情况 C：待机态无文本唤醒词，但 openWakeWord 声学唤醒命中（ASR 吞掉或误听了“Neo”，如“六，我觉得客厅有点暗呢”） ====================
   if (input.acousticWake?.matched) {
     const cmd = cleaned.replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
-    const standbyCapMatch = cmd ? probeImplicitCapabilities(cmd, input.capabilityDigest) : null;
+    const extractedCmd = extractCommandAfterAcousticWake(cleaned, input.acousticWake.wakeWord);
+    const effectiveCmd = extractedCmd || cmd;
+    const standbyCapMatch = effectiveCmd
+      ? probeImplicitCapabilities(effectiveCmd, input.capabilityDigest)
+      : null;
     const standbyDirect =
-      cmd.length > 0 &&
-      (looksLikeDirectDeviceCommand(cmd) ||
-        isCustomInstructionVoiceCommand(cmd) ||
+      effectiveCmd.length > 0 &&
+      (looksLikeDirectDeviceCommand(effectiveCmd) ||
+        isCustomInstructionVoiceCommand(effectiveCmd) ||
         Boolean(standbyCapMatch));
-    if (standbyDirect) {
+    if (standbyDirect && (input.attentionMode !== "strict" || !input.systemOneClient?.enabled)) {
       return wrap({
         accept: true,
         wokeOnly: false,
@@ -2020,10 +1982,106 @@ export async function evaluateVoiceAttention(
           ? `声学唤醒「${input.acousticWake.wakeWord}」并命中设备能力「${standbyCapMatch.matchedCapabilityLabel}」`
           : `声学唤醒「${input.acousticWake.wakeWord}」且后接明确控制指令`,
         wakeWord: input.acousticWake.wakeWord,
-        command: cmd,
+        command: effectiveCmd,
         usedLlm: false,
       });
     }
+
+    // 声学唤醒已触发但未命中文本唤醒词：交由 SystemOne 仅做纯误唤醒校验（不传上下文/背景/设备能力），非误听直接进入下一流程
+    if (input.systemOneClient?.enabled) {
+      const wakeWordsForCheck =
+        input.wakeWords.length > 0 ? input.wakeWords : [input.acousticWake.wakeWord];
+      const s1 = await input.systemOneClient.evaluateWakeAttention(
+        {
+          utterance: cleaned,
+          wakeWords: wakeWordsForCheck,
+        },
+        {
+          strict: input.attentionMode === "strict",
+        },
+      );
+      if (s1) {
+        if (!s1.accepted) {
+          return wrap({
+            accept: false,
+            wokeOnly: false,
+            addressed: false,
+            inConversation: false,
+            confidence: s1.confidence,
+            stage: "systemone-attention",
+            reason:
+              s1.decision === "false_wake"
+                ? "SystemOne 判定为误听/误唤醒，未在呼叫触发词"
+                : "SystemOne 唤醒校验置信度低于阈值，已保守忽略",
+            wakeWord: input.acousticWake.wakeWord,
+            command: "",
+            usedLlm: true,
+          });
+        }
+        return wrap({
+          accept: true,
+          wokeOnly: extractedCmd.length === 0,
+          addressed: true,
+          inConversation: true,
+          confidence: s1.confidence,
+          stage: "systemone-attention",
+          passSource: "systemone",
+          reason:
+            extractedCmd.length === 0
+              ? `SystemOne 确认触发词「${input.acousticWake.wakeWord}」非误听，进入下一流程`
+              : `SystemOne 确认触发词「${input.acousticWake.wakeWord}」非误听，直接进入下一流程`,
+          wakeWord: input.acousticWake.wakeWord,
+          command: extractedCmd,
+          usedLlm: true,
+        });
+      }
+      if (input.attentionMode === "strict") {
+        return wrap({
+          accept: false,
+          wokeOnly: false,
+          addressed: false,
+          inConversation: false,
+          confidence: 0.7,
+          stage: "systemone-attention",
+          reason: "SystemOne 唤醒校验暂不可用，严格模式下已保守忽略",
+          wakeWord: input.acousticWake.wakeWord,
+          command: "",
+          usedLlm: false,
+        });
+      }
+    }
+
+    // 声学唤醒已命中但 SystemOne 未启用或暂不可用时的兜底：绝不再按“有效对话上下文”误拒，除明显第三人称提及外直接放行进入下一流程
+    if (isThirdPersonNeoMention(cleaned)) {
+      return wrap({
+        accept: false,
+        wokeOnly: false,
+        addressed: false,
+        inConversation: false,
+        confidence: 0.85,
+        stage: "pragmatic-reject",
+        reason: `检测到对「${input.acousticWake.wakeWord}」的第三人称提及或讨论，判定为误唤醒`,
+        wakeWord: input.acousticWake.wakeWord,
+        command: "",
+        usedLlm: false,
+      });
+    }
+    return wrap({
+      accept: true,
+      wokeOnly: extractedCmd.length === 0,
+      addressed: true,
+      inConversation: true,
+      confidence: Math.max(0.8, input.acousticWake.score),
+      stage: "fast-wake",
+      passSource: "acoustic_wake_recovery",
+      reason:
+        extractedCmd.length === 0
+          ? `声学唤醒「${input.acousticWake.wakeWord}」命中，进入唤醒聆听`
+          : `声学唤醒「${input.acousticWake.wakeWord}」命中，直接进入下一流程`,
+      wakeWord: input.acousticWake.wakeWord,
+      command: extractedCmd,
+      usedLlm: false,
+    });
   }
 
   return wrap({
@@ -2033,7 +2091,7 @@ export async function evaluateVoiceAttention(
     inConversation: false,
     confidence: 0.92,
     stage: "no-wake",
-    reason: "未检测到唤醒词或有效对话上下文",
+    reason: "未检测到唤醒词",
     wakeWord: null,
     command: "",
     usedLlm: false,

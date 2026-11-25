@@ -31,6 +31,11 @@ import {
 } from "./cavemanReplyPolicy.ts";
 import { TtsEchoGuard } from "./echoGuard.ts";
 import { LocalVoiceEngine, type LocalVoiceEngineStatus } from "./localVoiceEngine.ts";
+import {
+  ConversationTrackMuteManager,
+  resolveTrackMuteKey,
+  type MutedTrackRecord,
+} from "./multiTrackNoiseFilter.ts";
 import type {
   OpenWakeWordBootstrapResult,
   OpenWakeWordEngineStatus,
@@ -44,7 +49,12 @@ import type {
   PiAgentService,
 } from "./piAgentService.ts";
 import { stripCommittedPrefix } from "./qwen3StreamingTranscriber.ts";
-import type { CommandIntentChoice, SystemOneHealthSnapshot } from "./systemOneClient.ts";
+import type {
+  CommandIntentChoice,
+  SystemOneClient,
+  SystemOneHealthSnapshot,
+  SystemOneHistoryEntry,
+} from "./systemOneClient.ts";
 import { TASK_ACK_PREWARM_PHRASES_ZH } from "./taskAckPolicy.ts";
 import type { VoiceStreamSegmentPayload } from "./voiceStreamSession.ts";
 import {
@@ -117,6 +127,8 @@ export interface VoiceTrackProcessingResult {
   trackId: string;
   /** 1-based 独立音轨编号 */
   trackIndex: number;
+  /** 原始盲源分离槽位索引（0-based，用于跨切片/跨轮次屏蔽对齐） */
+  sourceSlot?: number;
   /** 本批次总独立音轨数 */
   trackCount: number;
   batchId: string;
@@ -137,6 +149,12 @@ export interface VoiceTrackProcessingResult {
   acousticWake?: WakeWordAcousticHit | null;
   /** 本音轨独立逻辑判定结果 */
   attention: AttentionDecision | null;
+  /** 当前对话内该音轨是否已被 SystemOne 识别为背景音/旁白/噪音/电视并屏蔽 */
+  muted?: boolean;
+  /** 该音轨是否为本批次首次触发屏蔽（阻断后续触发） */
+  mutedJustNow?: boolean;
+  /** 该音轨被屏蔽的原因说明 */
+  mutedReason?: string;
   matched: boolean;
   wokeOnly: boolean;
   command: string;
@@ -260,6 +278,8 @@ export interface VoiceListenerSnapshot {
   lastMetrics: VoiceLastMetrics | null;
   lastTrackBatch: VoiceTrackBatchSnapshot | null;
   recentTrackBatches: VoiceTrackBatchSnapshot[];
+  /** 当前对话内已被 SystemOne 屏蔽的背景音/旁白/噪音/电视音轨列表 */
+  mutedTracks: MutedTrackRecord[];
   history: VoiceTranscriptEntry[];
 }
 
@@ -416,6 +436,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   private readonly _fetcher: FetchLike;
   private readonly _localEngine: LocalVoiceEngine;
   private readonly _echoGuard = new TtsEchoGuard();
+  private readonly _trackMuteManager = new ConversationTrackMuteManager();
   private readonly _unsubAgentSpeak: () => void;
   private readonly _unsubConfirmationPending: () => void;
   private _lastDedupPendingId: string | null = null;
@@ -527,6 +548,25 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
 
   get dialogState(): VoiceDialogState {
     return this._dialogState;
+  }
+
+  get dialogEpoch(): number {
+    return this._dialogEpoch;
+  }
+
+  get systemOneClient(): SystemOneClient | null {
+    return this._agent.systemOneClient;
+  }
+
+  get trackMuteManager(): ConversationTrackMuteManager {
+    return this._trackMuteManager;
+  }
+
+  getRecentHistoryForSystemOne(limit = 5): SystemOneHistoryEntry[] {
+    return this._agent.recentConversationTurns(limit).map((t) => ({
+      role: t.role,
+      text: t.text,
+    }));
   }
 
   private _clearConversationTimer(): void {
@@ -667,6 +707,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const ttsGraceMs = willSpeakAck ? 1200 : 0;
     this._dialogEpoch += 1;
     const epoch = this._dialogEpoch;
+    if (reason === "manual_toggle") {
+      this._trackMuteManager.reset();
+    }
     this._clearTtsPauseWatchdog();
     this._dialogState = "conversation";
     this._consecutiveSidetalkCount = 0;
@@ -726,6 +769,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._consecutiveAmbientNoiseCount = 0;
     this._speechGraceSuppressed = false;
     this._lastTransitionReason = reason;
+    this._trackMuteManager.reset();
     this._resetDedupState();
     if (this._mode !== "processing" && this._mode !== "error") {
       this._mode = this._active ? "listening" : "idle";
@@ -1003,6 +1047,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         this._consecutiveAmbientNoiseCount = 0;
         this._consecutiveSidetalkCount = 0;
         this._lastTransitionReason = "stopped";
+        this._trackMuteManager.reset();
         this._resetDedupState();
       } else if (this._mode === "idle" || this._mode === "error") {
         this._mode = "listening";
@@ -1147,6 +1192,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       this._consecutiveAmbientNoiseCount = 0;
       this._speechGraceSuppressed = false;
       this._lastTransitionReason = "timeout";
+      this._trackMuteManager.reset();
       if (this._mode !== "processing" && this._mode !== "error") {
         this._mode = this._active ? "listening" : "idle";
       }
@@ -1519,6 +1565,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           this._clearConversationTimer();
           this._clearTtsPauseWatchdog();
           this._lastTransitionReason = "command_done_no_window";
+          this._trackMuteManager.reset();
         }
         if (this._agent.activeTaskCount === 0) {
           this._mode = this._active
@@ -1692,6 +1739,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       (uploadNow < this._conversationUntil || uploadSpeechStartedAt < this._conversationUntil);
     const uploadInConversation =
       this._dialogState === "conversation" || uploadAwakeActive || uploadConvActive;
+    let uploadWakeGateHit: WakeWordAcousticHit | null = null;
     if (
       autoDispatch &&
       cfg.wakeWordEnabled &&
@@ -1740,6 +1788,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           voiceState: this.snapshot(),
         };
       }
+      uploadWakeGateHit = gateHit;
     }
 
     // ---- Stage 1.5: 本地自适应多级声源分离与说话人隔离主通道（S_Fused 最终方案） ----
@@ -1774,6 +1823,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
             cvRes.tracks.map((tr) => ({
               trackId: tr.trackId,
               trackIndex: tr.trackIndex,
+              sourceSlot: tr.sourceSlot,
               samples: tr.samples,
               rms: tr.rms,
               energyRatio: tr.energyRatio,
@@ -1788,6 +1838,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
               vadLabelPrefix: "clearvoice",
               rawDurationMs: Math.round((pcm16k.length / 16000) * 1000),
               preVadSegmented: false,
+              streamAcousticWake: uploadWakeGateHit,
             },
             {
               lang,
@@ -2262,6 +2313,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           ? segment.separatedTracks.map((tr) => ({
               trackId: tr.trackId,
               trackIndex: tr.trackIndex,
+              sourceSlot: tr.sourceSlot,
               samples: tr.samples,
               rms: tr.rms,
               energyRatio: tr.energyRatio,
@@ -2302,6 +2354,11 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           preVadSegmented: true,
           stripCommittedPrefixHint:
             cvTracks.length === 1 ? segment.stripCommittedPrefixHint : undefined,
+          // 多轨独立提前出段本质仍属于多轨分离场景：严禁把混合音频流式声学唤醒共享给单条独立出段音轨
+          streamAcousticWake: segment.clearVoiceMeta?.independentTrackEmit
+            ? null
+            : (segment.acousticWake ?? null),
+          independentTrackEmit: Boolean(segment.clearVoiceMeta?.independentTrackEmit),
         },
         {
           lang,
@@ -2698,6 +2755,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     tracks: ReadonlyArray<{
       trackId: string;
       trackIndex: number;
+      sourceSlot?: number;
       samples: Float32Array;
       rms?: number;
       energyRatio?: number;
@@ -2714,6 +2772,10 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       rawDurationMs: number;
       preVadSegmented: boolean;
       stripCommittedPrefixHint?: string;
+      /** 单轨模式下来自流式 openWakeWord 的声学唤醒命中（严禁跨多轨共享） */
+      streamAcousticWake?: WakeWordAcousticHit | null;
+      /** 是否来自多轨场景下的单轨提前独立出段（保留多轨屏蔽隔离语义） */
+      independentTrackEmit?: boolean;
     },
     options: {
       lang: string;
@@ -2769,6 +2831,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     interface PreparedTrackEval {
       trackId: string;
       trackIndex: number;
+      sourceSlot?: number;
       rms: number;
       energyRatio: number;
       outputSnrDb: number;
@@ -2787,6 +2850,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       asrMs: number;
       runtimeEngine: VoiceRuntimeEngine;
       decision: AttentionDecision | null;
+      muted: boolean;
+      mutedJustNow: boolean;
+      mutedReason?: string;
       trackTotalMs: number;
     }
 
@@ -2794,8 +2860,10 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     let sumVadMs = 0;
     let sumVpMs = 0;
     let sumAsrMs = 0;
+    const effectiveTrackCount = meta.independentTrackEmit ? Math.max(2, trackCount) : trackCount;
+    const isMultiTrack = effectiveTrackCount > 1;
 
-    // ---- 阶段 A：每条音轨完全独立执行 VAD -> 声纹识别 -> 声学唤醒 -> 语音转文字 -> 逻辑判定 ----
+    // ---- 阶段 A-I：跳过当前对话已屏蔽音轨，对其余音轨完全独立执行 VAD -> 声纹识别 -> 声学唤醒 -> 语音转文字 ----
     for (let i = 0; i < tracks.length; i += 1) {
       const tr = tracks[i]!;
       const tTrackStart = performance.now();
@@ -2809,6 +2877,56 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       const outputSnrDb = tr.outputSnrDb ?? estimateSnrDb(tr.samples, 16000);
       const snrGainDb = tr.snrGainDb ?? Number((outputSnrDb - meta.inputSnrDb).toFixed(2));
       const durationSec = Number((tr.samples.length / 16000).toFixed(2));
+
+      // A0. 若存在多轨且该音轨已在当前对话中被 SystemOne 屏蔽，直接跳过 VAD/声纹/声学唤醒/ASR 语音转换与后续触发
+      if (isMultiTrack && options.autoDispatch) {
+        const existingMute = this._trackMuteManager.getMutedRecord(
+          { trackId, trackIndex, sourceSlot: tr.sourceSlot },
+          effectiveTrackCount,
+        );
+        if (existingMute) {
+          prepared.push({
+            trackId,
+            trackIndex,
+            ...(typeof tr.sourceSlot === "number" ? { sourceSlot: tr.sourceSlot } : {}),
+            rms,
+            energyRatio,
+            outputSnrDb,
+            snrGainDb,
+            durationSec,
+            speechDetected: false,
+            speechRatio: 0,
+            vadEngine: "skipped-muted-track",
+            vadMs: 0,
+            voiceprint: null,
+            voiceprintMs: 0,
+            acousticWake: null,
+            text: "",
+            acousticEvent: "",
+            asrEngine: "skipped-muted-track",
+            asrMs: 0,
+            runtimeEngine: options.useLocal ? "local" : "whisper",
+            decision: {
+              accept: false,
+              wokeOnly: false,
+              addressed: false,
+              inConversation,
+              confidence: existingMute.confidence,
+              stage: "noise-track-muted",
+              reason: existingMute.reason,
+              wakeWord: null,
+              command: "",
+              usedLlm: false,
+              latencyMs: 0,
+            },
+            muted: true,
+            mutedJustNow: false,
+            mutedReason: existingMute.reason,
+            trackTotalMs: Math.round(performance.now() - tTrackStart),
+          });
+          continue;
+        }
+      }
 
       // A1. 分轨独立 VAD
       let speechSamples = tr.samples;
@@ -2842,6 +2960,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         prepared.push({
           trackId,
           trackIndex,
+          ...(typeof tr.sourceSlot === "number" ? { sourceSlot: tr.sourceSlot } : {}),
           rms,
           energyRatio,
           outputSnrDb,
@@ -2860,6 +2979,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           asrMs: 0,
           runtimeEngine: options.useLocal ? "local" : "whisper",
           decision: null,
+          muted: false,
+          mutedJustNow: false,
           trackTotalMs: Math.round(performance.now() - tTrackStart),
         });
         continue;
@@ -2875,13 +2996,24 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         voiceprint = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
       }
 
-      // A3. 分轨独立 openWakeWord 声学唤醒打分
-      const acousticWake = owwEvaluated
+      // A3. 分轨独立 openWakeWord 声学唤醒打分（仅单轨时兼容保留流式已命中的声学唤醒，多轨严格隔离）
+      const perTrackWake = owwEvaluated
         ? this._localEngine.scoreWakeWordAudio(speechSamples, cfg.wakeWords, {
             threshold: cfg.owwThreshold,
             headOnlySec: 2.0,
           })
         : null;
+      const fallbackStreamWake = trackCount === 1 ? (meta.streamAcousticWake ?? null) : null;
+      const acousticWake =
+        perTrackWake && fallbackStreamWake
+          ? perTrackWake.matched && !fallbackStreamWake.matched
+            ? perTrackWake
+            : fallbackStreamWake.matched && !perTrackWake.matched
+              ? fallbackStreamWake
+              : perTrackWake.score >= fallbackStreamWake.score
+                ? perTrackWake
+                : fallbackStreamWake
+          : (perTrackWake ?? fallbackStreamWake);
       if (acousticWake?.matched) {
         this._lastWakeHit = { ...acousticWake, timestamp: now };
       }
@@ -2927,6 +3059,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         prepared.push({
           trackId,
           trackIndex,
+          ...(typeof tr.sourceSlot === "number" ? { sourceSlot: tr.sourceSlot } : {}),
           rms,
           energyRatio,
           outputSnrDb,
@@ -2945,53 +3078,17 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           asrMs,
           runtimeEngine,
           decision: null,
+          muted: false,
+          mutedJustNow: false,
           trackTotalMs: Math.round(performance.now() - tTrackStart),
         });
         continue;
       }
 
-      // A5. 分轨独立逻辑判定（注意力门控、声纹门禁、回声过滤、唤醒提取、SystemOne 决策）
-      let decision: AttentionDecision | null = null;
-      if (options.autoDispatch) {
-        const wakeSpanForOww = findWakeWordSpan(text, cfg.wakeWords);
-        const owwActiveForWord = Boolean(
-          owwEvaluated &&
-            wakeSpanForOww &&
-            getPrototypesForWords([wakeSpanForOww.wakeWord]).length > 0,
-        );
-        decision = await evaluateVoiceAttention({
-          rawText: text,
-          wakeWordEnabled: cfg.wakeWordEnabled,
-          wakeWords: cfg.wakeWords,
-          attentionMode: cfg.attentionMode,
-          bypassWakeWord: options.bypassWakeWord,
-          awakeActive,
-          inConversation,
-          dialogState: preBatchDialogState,
-          acousticWake,
-          owwActiveForWord,
-          systemOneClient: this._agent.systemOneClient,
-          recentTurns,
-          lastSpokenReply: legacySpoken.text || this._lastSpokenReply,
-          lastSpokenAt: legacySpoken.at || this._lastSpokenAt,
-          recentSpokenUtterances,
-          ttsActive: ttsActiveNow,
-          duringTtsPlayback,
-          echoCancellationMode: cfg.echoCancellationMode,
-          now,
-          acousticEvent,
-          voiceprint,
-          voiceprintMode: cfg.voiceprintMode,
-          llmEvaluator,
-          capabilityDigest,
-          learnedTriggers,
-          pendingConfirmation,
-        });
-      }
-
       prepared.push({
         trackId,
         trackIndex,
+        ...(typeof tr.sourceSlot === "number" ? { sourceSlot: tr.sourceSlot } : {}),
         rms,
         energyRatio,
         outputSnrDb,
@@ -3009,13 +3106,138 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         asrEngine,
         asrMs,
         runtimeEngine,
-        decision,
+        decision: null,
+        muted: false,
+        mutedJustNow: false,
         trackTotalMs: Math.round(performance.now() - tTrackStart),
       });
     }
 
-    // ---- 阶段 B：每条有效音轨独立走后续流程（唤醒 / 退出 / Pi Agent 执行 / 历史记录） ----
-    const speakingPrepared = prepared.filter((p) => p.speechDetected && p.text.length > 0);
+    // ---- 阶段 A-II：多轨转写超 20 字后，由 SystemOne 批量判别每条音轨是否为背景音/旁白/噪音/电视，命中音轨在当前对话内直接屏蔽 ----
+    if (isMultiTrack && options.autoDispatch) {
+      const unmutedTranscribed = prepared.filter(
+        (p) => !p.muted && p.speechDetected && p.text.length > 0,
+      );
+      if (unmutedTranscribed.length > 0) {
+        const noiseEval = await this._trackMuteManager.evaluateTracks(
+          unmutedTranscribed.map((p) => ({
+            trackId: p.trackId,
+            trackIndex: p.trackIndex,
+            sourceSlot: p.sourceSlot,
+            text: p.text,
+            speakerName: p.voiceprint?.matched ? p.voiceprint.speakerName : null,
+            acousticEvent: p.acousticEvent,
+          })),
+          {
+            totalTracksInBatch: effectiveTrackCount,
+            mode: "final",
+            systemOneClient: this._agent.systemOneClient,
+            wakeWords: cfg.wakeWords,
+            recentHistory: recentTurns,
+            now,
+            isStale: () => this._dialogEpoch !== preBatchEpoch && this._dialogState === "standby",
+          },
+        );
+        for (const rec of noiseEval.newlyMuted) {
+          const target = unmutedTranscribed.find(
+            (p) =>
+              resolveTrackMuteKey({
+                trackId: p.trackId,
+                trackIndex: p.trackIndex,
+                sourceSlot: p.sourceSlot,
+              }) === rec.trackKey || p.trackId === rec.trackId,
+          );
+          if (!target) continue;
+          target.muted = true;
+          target.mutedJustNow = true;
+          target.mutedReason = rec.reason;
+          target.decision = {
+            accept: false,
+            wokeOnly: false,
+            addressed: false,
+            inConversation,
+            confidence: rec.confidence,
+            stage: "noise-track-muted",
+            reason: rec.reason,
+            wakeWord: null,
+            command: "",
+            usedLlm: true,
+            latencyMs: noiseEval.latencyMs,
+          };
+          target.trackTotalMs += noiseEval.latencyMs;
+        }
+      }
+    }
+
+    // ---- 阶段 A-III：仅对未被屏蔽的有效音轨执行独立逻辑判定（注意力门控、声纹门禁、回声过滤、唤醒提取） ----
+    // 若流式 openWakeWord 在 ClearVoice 强降噪/分轨前已命中，但分轨重打分均跌破阈值且无音轨命中文本唤醒词：
+    // 仅向唯一未屏蔽有效音轨（或得分显著领先且 >= 0.25 的单一音轨）恢复声学唤醒命中，严格保持其余音轨隔离。
+    if (options.autoDispatch && trackCount > 1 && meta.streamAcousticWake?.matched) {
+      const activeTracks = prepared.filter((p) => !p.muted && p.speechDetected && p.text.length > 0);
+      const anyTrackAlreadyWoke = activeTracks.some(
+        (p) => Boolean(p.acousticWake?.matched) || Boolean(findWakeWordSpan(p.text, cfg.wakeWords)),
+      );
+      if (!anyTrackAlreadyWoke && activeTracks.length > 0) {
+        if (activeTracks.length === 1) {
+          activeTracks[0]!.acousticWake = meta.streamAcousticWake;
+        } else {
+          const ranked = [...activeTracks].sort(
+            (a, b) => (b.acousticWake?.score ?? 0) - (a.acousticWake?.score ?? 0),
+          );
+          const best = ranked[0]!;
+          const secondScore = ranked[1]?.acousticWake?.score ?? 0;
+          const bestScore = best.acousticWake?.score ?? 0;
+          if (bestScore >= 0.25 && bestScore > secondScore) {
+            best.acousticWake = meta.streamAcousticWake;
+          }
+        }
+      }
+    }
+
+    if (options.autoDispatch) {
+      for (const p of prepared) {
+        if (p.muted || !p.speechDetected || !p.text) continue;
+        const wakeSpanForOww = findWakeWordSpan(p.text, cfg.wakeWords);
+        const owwActiveForWord = Boolean(
+          owwEvaluated &&
+            wakeSpanForOww &&
+            getPrototypesForWords([wakeSpanForOww.wakeWord]).length > 0,
+        );
+        const decision = await evaluateVoiceAttention({
+          rawText: p.text,
+          wakeWordEnabled: cfg.wakeWordEnabled,
+          wakeWords: cfg.wakeWords,
+          attentionMode: cfg.attentionMode,
+          bypassWakeWord: options.bypassWakeWord,
+          awakeActive,
+          inConversation,
+          dialogState: preBatchDialogState,
+          acousticWake: p.acousticWake,
+          owwActiveForWord,
+          systemOneClient: this._agent.systemOneClient,
+          recentTurns,
+          lastSpokenReply: legacySpoken.text || this._lastSpokenReply,
+          lastSpokenAt: legacySpoken.at || this._lastSpokenAt,
+          recentSpokenUtterances,
+          ttsActive: ttsActiveNow,
+          duringTtsPlayback,
+          echoCancellationMode: cfg.echoCancellationMode,
+          now,
+          acousticEvent: p.acousticEvent,
+          voiceprint: p.voiceprint,
+          voiceprintMode: cfg.voiceprintMode,
+          llmEvaluator,
+          capabilityDigest,
+          learnedTriggers,
+          pendingConfirmation,
+        });
+        p.decision = decision;
+        p.trackTotalMs += decision.latencyMs;
+      }
+    }
+
+    // ---- 阶段 B：仅对未被屏蔽的有效音轨独立走后续流程（唤醒 / 退出 / Pi Agent 执行 / 历史记录） ----
+    const speakingPrepared = prepared.filter((p) => !p.muted && p.speechDetected && p.text.length > 0);
     const anyAcceptedInBatch = speakingPrepared.some((p) => p.decision?.accept === true);
     const dispatchResults = new Map<string, HandleTranscriptResult>();
 
@@ -3086,6 +3308,18 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           dispatchResults.set(p.trackId, res);
         }
       }
+
+      // 若本次批次全程处于待机且未唤醒进入对话（需唤醒词模式下），不将待机杂音屏蔽带入未来新对话
+      if (
+        this._trackMuteManager.mutedCount > 0 &&
+        this._dialogState === "standby" &&
+        this._awakeUntil === null &&
+        this._conversationUntil === null &&
+        cfg.wakeWordEnabled &&
+        !options.bypassWakeWord
+      ) {
+        this._trackMuteManager.reset();
+      }
     }
 
     // ---- 阶段 C：汇总各轨独立结构化输出（按原始音轨序号 1..N 保持完全独立，绝不混杂） ----
@@ -3104,6 +3338,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       return {
         trackId: p.trackId,
         trackIndex: p.trackIndex,
+        ...(typeof p.sourceSlot === "number" ? { sourceSlot: p.sourceSlot } : {}),
         trackCount,
         batchId,
         rms: p.rms,
@@ -3119,9 +3354,14 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         voiceprint: p.voiceprint,
         acousticWake: p.acousticWake,
         attention: effectiveDecision,
-        matched: disp?.matched ?? false,
-        wokeOnly: disp?.wokeOnly ?? false,
-        command: disp?.command ?? (effectiveDecision?.accept ? effectiveDecision.command : ""),
+        ...(p.muted ? { muted: true } : {}),
+        ...(p.mutedJustNow ? { mutedJustNow: true } : {}),
+        ...(p.mutedReason ? { mutedReason: p.mutedReason } : {}),
+        matched: !p.muted && (disp?.matched ?? false),
+        wokeOnly: !p.muted && (disp?.wokeOnly ?? false),
+        command: p.muted
+          ? ""
+          : (disp?.command ?? (effectiveDecision?.accept ? effectiveDecision.command : "")),
         ...(disp?.reply ? { reply: disp.reply } : {}),
         ...(disp?.taskId ? { taskId: disp.taskId } : {}),
         ...(disp?.entryId ? { entryId: disp.entryId } : {}),
@@ -3133,10 +3373,16 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     });
 
     const totalMs = Math.round(performance.now() - totalStart);
-    const acceptedTracks = trackResults.filter((t) => t.matched);
-    const speakingTracks = trackResults.filter((t) => t.speechDetected && t.text.length > 0);
-    // 主摘要轨仅用于兼容单字符串旧字段，绝不拼接多轨文字！
-    const primaryTrack = acceptedTracks[0] ?? speakingTracks[0] ?? trackResults[0] ?? null;
+    const acceptedTracks = trackResults.filter((t) => t.matched && !t.muted);
+    const speakingTracks = trackResults.filter((t) => !t.muted && t.speechDetected && t.text.length > 0);
+    // 主摘要轨仅用于兼容单字符串旧字段，绝不拼接多轨文字，亦不透出已屏蔽音轨文字！
+    const primaryTrack =
+      acceptedTracks[0] ??
+      speakingTracks[0] ??
+      trackResults.find((t) => !t.muted) ??
+      trackResults[0] ??
+      null;
+    const primaryText = primaryTrack && !primaryTrack.muted ? primaryTrack.text : "";
     const primaryDispatch = primaryTrack ? dispatchResults.get(primaryTrack.trackId) : undefined;
 
     const batchSnapshot: VoiceTrackBatchSnapshot = {
@@ -3222,7 +3468,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       ...(primaryDispatch?.error ? { error: primaryDispatch.error } : {}),
       timings: batchTimings,
       voiceState: snap,
-      text: primaryTrack?.text ?? "",
+      text: primaryText,
       speechDetected: speakingTracks.length > 0,
       denoiseEngine: meta.denoiseEngine,
       vadEngine: vadEngineLabel,
@@ -3524,6 +3770,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._consecutiveAmbientNoiseCount = 0;
     this._speechGraceSuppressed = false;
     this._lastTransitionReason = "cleared";
+    this._trackMuteManager.reset();
     this._echoGuard.reset();
     this.emit("stateChanged", this.snapshot());
   }
@@ -3637,6 +3884,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         ...b,
         tracks: b.tracks.map((t) => ({ ...t })),
       })),
+      mutedTracks: this._trackMuteManager.getMutedTracks(),
       history: this._history.map((h) => ({ ...h })),
     };
   }
@@ -3662,6 +3910,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._consecutiveAmbientNoiseCount = 0;
     this._lastTrackBatch = null;
     this._recentTrackBatches = [];
+    this._trackMuteManager.reset();
     this._echoGuard.reset();
     this.clear();
   }

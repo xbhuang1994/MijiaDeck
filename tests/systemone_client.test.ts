@@ -355,28 +355,19 @@ describe("SystemOneClient wire protocol & 6 domain methods", () => {
     expect(client.getStatus().circuitState).toBe("open");
   });
 
-  test("(a) evaluateWakeAttention batches decision + intent + asr_best in one HTTP call and respects thresholds", async () => {
+  test("(a) evaluateWakeAttention performs pure false-wake check without context/background/intent/dual-track questions", async () => {
+    let verdict: WakeAttentionDecision = "valid_wake";
+    let conf = 0.72;
     const { fetcher, requests } = createMockFetcher(() =>
       jsonResponse({
         model: DEFAULT_SYSTEMONE_MODEL,
         answers: {
-          decision: makeChoiceAnswer<WakeAttentionDecision>(
-            "direct_command",
-            0.72,
-            ["direct_command", "wake_only", "ignore"],
-          ),
-          intent: makeChoiceAnswer<CommandIntentChoice>(
-            "device_control",
-            0.94,
-            ["device_control", "status_query", "scene", "general_chat"],
-          ),
-          asr_best: makeChoiceAnswer<DualTrackAsrChoice>(
-            "track_b",
-            0.88,
-            ["track_a", "track_b", "neither_noise"],
-          ),
+          decision: makeChoiceAnswer<WakeAttentionDecision>(verdict, conf, [
+            "valid_wake",
+            "false_wake",
+          ]),
         },
-        usage: { input_tokens: 150, output_tokens: 20 },
+        usage: { input_tokens: 90, output_tokens: 8 },
       }),
     );
 
@@ -389,14 +380,10 @@ describe("SystemOneClient wire protocol & 6 domain methods", () => {
 
     const res = await client.evaluateWakeAttention(
       {
-        utterance: "爱走过这世间 小派打开客厅灯",
-        altUtterance: "小派打开客厅吸顶灯",
+        utterance: "小派，明天天气怎么样",
         wakeWords: ["小派", "Neo"],
-        acousticEvent: "<|BGM|>",
-        speakerName: "张三",
-        acousticWake: { wakeWord: "小派", score: 0.87 },
       },
-      { includeIntent: true, strict: false },
+      { strict: false },
     );
 
     expect(requests).toHaveLength(1);
@@ -404,46 +391,48 @@ describe("SystemOneClient wire protocol & 6 domain methods", () => {
     const state = body.state as Record<string, unknown>;
     const questions = body.questions as Record<string, Record<string, unknown>>;
 
-    expect(state.utterance).toBe("爱走过这世间 小派打开客厅灯");
-    expect(state.track_a).toBe("爱走过这世间 小派打开客厅灯");
-    expect(state.track_b).toBe("小派打开客厅吸顶灯");
+    // State must contain ONLY utterance and wake_words — no context, background, history, capabilities, or dual-track fields
+    expect(Object.keys(state).sort()).toEqual(["utterance", "wake_words"]);
+    expect(state.utterance).toBe("小派，明天天气怎么样");
     expect(state.wake_words).toEqual(["小派", "Neo"]);
-    expect(state.acoustic_event).toBe("<|BGM|>");
-    expect(state.speaker).toBe("张三");
-    expect(state.acoustic_wake).toEqual({ wake_word: "小派", score: 0.87 });
 
-    // Verify calibrated BGM + third-person criteria & batched questions
-    expect(Object.keys(questions).sort()).toEqual(["asr_best", "decision", "intent"]);
-    expect(String(questions.decision!.instructions)).toContain("BGM");
-    expect(String(questions.decision!.instructions)).toContain("歌词");
+    // Questions must contain ONLY pure binary wake false-trigger decision (no intent, no asr_best)
+    expect(Object.keys(questions)).toEqual(["decision"]);
     const criteria = questions.decision!.criteria as Record<string, string>;
-    expect(criteria.ignore).toContain("第三人称");
-    expect(criteria.direct_command).toContain("抱怨");
+    expect(Object.keys(criteria).sort()).toEqual(["false_wake", "valid_wake"]);
+    expect(String(questions.decision!.instructions)).toContain("误听");
+    expect(String(questions.decision!.instructions)).not.toContain("home_capabilities");
+    expect(String(questions.decision!.instructions)).not.toContain("BGM");
 
     expect(res).not.toBeNull();
-    expect(res!.decision).toBe("direct_command");
+    expect(res!.decision).toBe("valid_wake");
     expect(res!.accepted).toBe(true);
-    expect(res!.wokeOnly).toBe(false);
-    expect(res!.intent?.choice).toBe("device_control");
-    expect(res!.asrBest?.choice).toBe("track_b");
-    expect(res!.asrBest?.selectedText).toBe("小派打开客厅吸顶灯");
+    expect(res!.isFalseWake).toBe(false);
     expect(res!.cached).toBe(false);
 
     // Same confidence 0.72 under strict mode (threshold 0.75) should NOT be accepted
-    // Also identical altUtterance should NOT batch asr_best
     const strictRes = await client.evaluateWakeAttention(
       {
         utterance: "小派打开客厅灯",
-        altUtterance: "  小派打开客厅灯 ",
         wakeWords: ["小派"],
       },
       { strict: true },
     );
     expect(requests).toHaveLength(2);
-    // Without distinct altUtterance or includeIntent, only `decision` is sent
     expect(Object.keys(requests[1]!.body.questions as Record<string, unknown>)).toEqual(["decision"]);
     expect(strictRes!.accepted).toBe(false);
-    expect(strictRes!.asrBest).toBeUndefined();
+    expect(strictRes!.isFalseWake).toBe(true);
+
+    // Explicit false_wake verdict rejects cleanly
+    verdict = "false_wake";
+    conf = 0.93;
+    const falseRes = await client.evaluateWakeAttention({
+      utterance: "你哦快过来吃饭",
+      wakeWords: ["Neo"],
+    });
+    expect(falseRes!.decision).toBe("false_wake");
+    expect(falseRes!.accepted).toBe(false);
+    expect(falseRes!.isFalseWake).toBe(true);
   });
 
   test("(b) evaluateConversationTurn sends last 5 compact U:/A: turns, role boundary, and goodbye exit flag", async () => {
@@ -1013,9 +1002,9 @@ describe("SystemOneClient circuit breaker & failure classification", () => {
         model: DEFAULT_SYSTEMONE_MODEL,
         answers: {
           decision: makeChoiceAnswer<WakeAttentionDecision>(
-            "ignore",
+            "false_wake",
             0.96,
-            ["direct_command", "wake_only", "ignore"],
+            ["valid_wake", "false_wake"],
           ),
         },
         usage: { input_tokens: 40, output_tokens: 6 },
@@ -1029,9 +1018,9 @@ describe("SystemOneClient circuit breaker & failure classification", () => {
       now: () => nowMs,
     });
 
-    // Populate negative cache with `ignore`
+    // Populate negative cache with `false_wake`
     const r1 = await client.evaluateWakeAttention({ utterance: "聊到小派不错", wakeWords: ["小派"] });
-    expect(r1!.decision).toBe("ignore");
+    expect(r1!.decision).toBe("false_wake");
     expect(r1!.cached).toBe(false);
     expect(fetchCount).toBe(1);
 
@@ -1116,9 +1105,9 @@ describe("SystemOneClient circuit breaker & failure classification", () => {
 });
 
 describe("SystemOneClient negative LRU cache", () => {
-  test("caches ignore/wake_only/side_talk/goodbye, NEVER caches direct_command/followup, expires after 10s", async () => {
+  test("caches false_wake/side_talk/goodbye, NEVER caches valid_wake/followup, expires after 10s", async () => {
     let nowMs = 100_000;
-    let wakeVerdict: WakeAttentionDecision = "ignore";
+    let wakeVerdict: WakeAttentionDecision = "false_wake";
     let convVerdict: ConversationActionChoice = "side_talk";
     let fetchCount = 0;
 
@@ -1132,7 +1121,7 @@ describe("SystemOneClient negative LRU cache", () => {
             decision: makeChoiceAnswer<WakeAttentionDecision>(
               wakeVerdict,
               0.92,
-              ["direct_command", "wake_only", "ignore"],
+              ["valid_wake", "false_wake"],
             ),
           },
           usage: { input_tokens: 50, output_tokens: 8 },
@@ -1158,10 +1147,11 @@ describe("SystemOneClient negative LRU cache", () => {
       now: () => nowMs,
     });
 
-    // 1. `ignore` IS cached
-    wakeVerdict = "ignore";
+    // 1. `false_wake` IS cached
+    wakeVerdict = "false_wake";
     const ig1 = await client.evaluateWakeAttention({ utterance: "背景歌词片段", wakeWords: ["小派"] });
     expect(ig1!.cached).toBe(false);
+    expect(ig1!.isFalseWake).toBe(true);
     expect(fetchCount).toBe(1);
 
     nowMs += 5_000;
@@ -1177,24 +1167,22 @@ describe("SystemOneClient negative LRU cache", () => {
     expect(ig3!.cached).toBe(false);
     expect(fetchCount).toBe(2);
 
-    // 2. `wake_only` IS cached
-    wakeVerdict = "wake_only";
-    const wo1 = await client.evaluateWakeAttention({ utterance: "小派在吗", wakeWords: ["小派"] });
-    expect(wo1!.wokeOnly).toBe(true);
-    expect(wo1!.cached).toBe(false);
-    const wo2 = await client.evaluateWakeAttention({ utterance: "小派在吗", wakeWords: ["小派"] });
-    expect(wo2!.cached).toBe(true);
-    expect(fetchCount).toBe(3);
+    // 2. `valid_wake` is NEVER cached (neither pure wake nor wake+command)
+    wakeVerdict = "valid_wake";
+    const vw1 = await client.evaluateWakeAttention({ utterance: "小派在吗", wakeWords: ["小派"] });
+    const vw2 = await client.evaluateWakeAttention({ utterance: "小派在吗", wakeWords: ["小派"] });
+    expect(vw1!.accepted).toBe(true);
+    expect(vw1!.cached).toBe(false);
+    expect(vw2!.cached).toBe(false);
+    expect(fetchCount).toBe(4);
 
-    // 3. `direct_command` is NEVER cached
-    wakeVerdict = "direct_command";
     const dc1 = await client.evaluateWakeAttention({ utterance: "小派开灯", wakeWords: ["小派"] });
     const dc2 = await client.evaluateWakeAttention({ utterance: "小派开灯", wakeWords: ["小派"] });
     expect(dc1!.cached).toBe(false);
     expect(dc2!.cached).toBe(false);
-    expect(fetchCount).toBe(5);
+    expect(fetchCount).toBe(6);
 
-    // 4. `side_talk` and `goodbye` ARE cached
+    // 3. `side_talk` and `goodbye` ARE cached
     convVerdict = "side_talk";
     const st1 = await client.evaluateConversationTurn({
       utterance: "晚饭吃什么",
@@ -1206,7 +1194,7 @@ describe("SystemOneClient negative LRU cache", () => {
     });
     expect(st1!.cached).toBe(false);
     expect(st2!.cached).toBe(true);
-    expect(fetchCount).toBe(6);
+    expect(fetchCount).toBe(7);
 
     convVerdict = "goodbye";
     const gb1 = await client.evaluateConversationTurn({
@@ -1219,9 +1207,9 @@ describe("SystemOneClient negative LRU cache", () => {
     });
     expect(gb1!.shouldExitConversation).toBe(true);
     expect(gb2!.cached).toBe(true);
-    expect(fetchCount).toBe(7);
+    expect(fetchCount).toBe(8);
 
-    // 5. `followup` is NEVER cached
+    // 4. `followup` is NEVER cached
     convVerdict = "followup";
     const fu1 = await client.evaluateConversationTurn({
       utterance: "再亮一点",
@@ -1234,7 +1222,7 @@ describe("SystemOneClient negative LRU cache", () => {
     expect(fu1!.accepted).toBe(true);
     expect(fu1!.cached).toBe(false);
     expect(fu2!.cached).toBe(false);
-    expect(fetchCount).toBe(9);
+    expect(fetchCount).toBe(10);
   });
 
   test("evicts least-recently-used entry when cache exceeds max 64 entries", async () => {
@@ -1247,9 +1235,9 @@ describe("SystemOneClient negative LRU cache", () => {
         model: DEFAULT_SYSTEMONE_MODEL,
         answers: {
           decision: makeChoiceAnswer<WakeAttentionDecision>(
-            "ignore",
+            "false_wake",
             0.95,
-            ["direct_command", "wake_only", "ignore"],
+            ["valid_wake", "false_wake"],
           ),
         },
         usage: { input_tokens: 30, output_tokens: 5 },

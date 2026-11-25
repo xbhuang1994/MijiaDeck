@@ -1625,7 +1625,9 @@ export class AudioSourceSeparator {
     });
 
     let finalDecision = decision;
-    if (decision.accept && !decision.wokeOnly && decision.command) {
+    const isSystemOneWakeVerified =
+      decision.stage === "systemone-attention" && Boolean(decision.wakeWord);
+    if (decision.accept && !decision.wokeOnly && decision.command && !isSystemOneWakeVerified) {
       let cleanedCmd = trimTrailingMusicLyrics(stripLeadingVocativeOrFragment(decision.command));
       const matchedCapCmd = matchesCapabilityAffordance(cleanedCmd, opts.capabilityDigest);
       const isPendingReply = decision.stage === "pending-confirm";
