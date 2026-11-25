@@ -133,16 +133,44 @@ const IR_ACTION_ALIASES: Readonly<Record<string, readonly string[]>> = {
   previous: ["previous", "prev", "previoustrack", "previous_track", "previous-track", "上一首", "上一曲"],
   "channel+": ["channel+", "ch+", "channelup", "channel_up", "channel-up", "频道+", "频道加", "下一个频道"],
   "channel-": ["channel-", "ch-", "channeldown", "channel_down", "channel-down", "频道-", "频道减", "上一个频道"],
-  up: ["up", "上"],
-  down: ["down", "下"],
-  left: ["left", "左"],
-  right: ["right", "右"],
+  up: ["up", "navigate_up", "上"],
+  down: ["down", "navigate_down", "下"],
+  left: ["left", "navigate_left", "左"],
+  right: ["right", "navigate_right", "右"],
   ok: ["ok", "enter", "select", "确认", "确定"],
   menu: ["menu", "菜单"],
-  home: ["home", "主页", "首页"],
+  home: ["home", "homepage", "主页", "首页"],
   back: ["back", "return", "返回"],
   source: ["source", "input", "signal", "信号源", "输入源"],
 };
+
+const TUYA_IR_FALLBACK_ERROR_CODES = new Set(["2050", "2008", "1109", "500", "2006"]);
+
+function isRecoverableIrProtocolError(err: unknown): boolean {
+  if (err instanceof TuyaOpenApiError) {
+    const code = String(err.code ?? "");
+    if (TUYA_IR_FALLBACK_ERROR_CODES.has(code)) return true;
+    const msg = err.message.toLowerCase();
+    return msg.includes("not support") || msg.includes("illegal") || msg.includes("not exist");
+  }
+  return false;
+}
+
+function formatIrOpenApiErrorZh(err: unknown, sanitize: (e: unknown) => string): string {
+  if (err instanceof TuyaOpenApiError) {
+    const code = String(err.code ?? "");
+    if (code === "28841002" || err.message.toLowerCase().includes("trial")) {
+      return "涂鸦云项目 IoT Core / 红外开放能力试用已到期（28841002）";
+    }
+    if (code === "28841105" || code === "28841106" || code === "1106") {
+      return `涂鸦云项目未开通 IR Control Hub（万能红外开放能力）或未关联涂鸦 App 账号（${code}）`;
+    }
+    if (code === "1004" || code === "2009" || code === "2017") {
+      return `涂鸦 OpenAPI Access ID / Secret 校验失败（${code}）`;
+    }
+  }
+  return sanitize(err);
+}
 
 function normalizeIrActionToken(raw: string): string {
   return raw.trim().toLowerCase().replace(/[\s]+/g, "");
@@ -299,6 +327,7 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
   private _lastSceneCount = 0;
   private _lastSyncAt: number | null = null;
   private _lastError: string | null = null;
+  private _lastIrOpenApiError: string | null = null;
 
   constructor(options: TuyaProviderOptions = {}) {
     this._httpFetch = options.httpFetch;
@@ -623,14 +652,14 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
     this._records.clear();
     this._profiles.clear();
     this._lastError = null;
+    this._lastIrOpenApiError = null;
     this._openApiVerified = false;
 
-    // 若启用了 OpenAPI 且已提供 Access ID / Secret，主动校验并换取 Token
+    // 若启用了 OpenAPI 或混合模式且已提供 Access ID / Secret，主动校验并换取 Token
     if (
       raw.verify !== false &&
       this._config.enabled &&
-      (this._config.mode === "openapi" ||
-        (this._config.mode === "hybrid" && !this._hasSharingCredentials())) &&
+      (this._config.mode === "openapi" || this._config.mode === "hybrid") &&
       this._openApiClient
     ) {
       try {
@@ -641,7 +670,11 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
         }
       } catch (err) {
         this._openApiVerified = false;
-        this._lastError = this._sanitizeErrorText(err);
+        const msg = formatIrOpenApiErrorZh(err, (e) => this._sanitizeErrorText(e));
+        this._lastIrOpenApiError = msg;
+        if (this._config.mode === "openapi" || !this._hasSharingCredentials()) {
+          this._lastError = this._sanitizeErrorText(err);
+        }
       }
     }
 
@@ -657,6 +690,7 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
     this._lastDeviceCount = 0;
     this._lastSceneCount = 0;
     this._lastError = null;
+    this._lastIrOpenApiError = null;
 
     this._config = this._configStore.save({
       ...this._config,
@@ -835,6 +869,7 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
     try {
       const recordsById = new Map<string, TuyaDeviceRecord>();
       const mode = this._config.mode;
+      this._lastIrOpenApiError = null;
 
       const useSharing =
         (mode === "sharing" || mode === "hybrid") && this._hasSharingCredentials();
@@ -1010,8 +1045,11 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
             source: localEntry && mode === "hybrid" ? "hybrid" : "openapi",
           });
         }
+      }
 
-        // OpenAPI v2.0: 若存在万能红外遥控器网关 (wnykq/qt)，尝试补全其下虚拟红外遥控器的按键与学习码元数据
+      // OpenAPI v2.0 (openapi 或 hybrid 模式，即使主设备列表来自扫码共享也执行)：
+      // 若存在万能红外遥控器网关 (wnykq/qt)，通过 IR Control Hub v2.0 补全虚拟红外遥控器的权威按键、标准键标记与 DIY 学习码
+      if (this._canUseOpenApiIr()) {
         await this._enrichOpenApiIrRemotes(recordsById);
       }
 
@@ -1113,8 +1151,9 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
         let remotes;
         try {
           remotes = await client.listInfraredRemotes(hub.id);
-        } catch {
-          // 用户 OpenAPI 项目未开通 IR Control Hub 订阅时静默回退到标准 specifications
+        } catch (err) {
+          // 记录 IR Control Hub OpenAPI 失败原因（如未开通红外服务/试用期到期），供详情页告警与诊断报告展示
+          this._lastIrOpenApiError = formatIrOpenApiErrorZh(err, (e) => this._sanitizeErrorText(e));
           return;
         }
         await runWithConcurrency(remotes, SPEC_CONCURRENCY, async (remote) => {
@@ -1133,7 +1172,7 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
                 rawKeys.some((k) => k.standard_key === false));
             const learningByKey = new Map<string, string>();
             const learningById = new Map<number, string>();
-            const learnedList: Array<{ id?: number; key: string; key_name?: string; code: string }> = [];
+            const learnedList: Array<{ id?: number; learn_id?: number; key: string; key_name?: string; code: string }> = [];
             if (needsLearning) {
               try {
                 const learned = await client.listInfraredLearningCodes(hub.id, remote.remote_id);
@@ -1141,6 +1180,7 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
                   learnedList.push(lc);
                   learningByKey.set(lc.key.toLowerCase(), lc.code);
                   if (lc.id !== undefined) learningById.set(lc.id, lc.code);
+                  if (lc.learn_id !== undefined) learningById.set(lc.learn_id, lc.code);
                 }
               } catch {
                 // learning-codes endpoint is best-effort
@@ -1163,18 +1203,19 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
               mergedKeys.filter((k) => k.keyId !== undefined).map((k) => k.keyId!),
             );
             for (const lc of learnedList) {
+              const lcId = lc.id ?? lc.learn_id;
               if (
                 seenKeys.has(lc.key.toLowerCase()) ||
-                (lc.id !== undefined && seenIds.has(lc.id))
+                (lcId !== undefined && seenIds.has(lcId))
               ) {
                 continue;
               }
               seenKeys.add(lc.key.toLowerCase());
-              if (lc.id !== undefined) seenIds.add(lc.id);
+              if (lcId !== undefined) seenIds.add(lcId);
               mergedKeys.push({
                 key: lc.key,
                 ...(lc.key_name ? { keyName: lc.key_name } : {}),
-                ...(lc.id !== undefined ? { keyId: lc.id } : {}),
+                ...(lcId !== undefined ? { keyId: lcId } : {}),
                 standardKey: false,
                 learningCode: lc.code,
               });
@@ -1187,6 +1228,8 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
                 ? { remoteIndex: keysRes?.remote_index ?? remote.remote_index }
                 : {}),
               ...(remote.brand_name ? { brandName: remote.brand_name } : {}),
+              ...(keysRes?.duplicate_power !== undefined ? { duplicatePower: keysRes.duplicate_power } : {}),
+              ...(keysRes?.single_air !== undefined ? { singleAir: keysRes.single_air } : {}),
               keys: mergedKeys,
             };
             target.irRemote = irMeta;
@@ -1201,19 +1244,20 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
                 // ac/status is best-effort
               }
             }
-          } catch {
-            // individual remote keys lookup is best-effort
+          } catch (err) {
+            if (!this._lastIrOpenApiError) {
+              this._lastIrOpenApiError = formatIrOpenApiErrorZh(err, (e) => this._sanitizeErrorText(e));
+            }
           }
         });
       }),
     );
   }
 
-  private _isOpenApiPrimaryChannel(): boolean {
+  private _canUseOpenApiIr(): boolean {
     return Boolean(
       this._openApiClient &&
-        (this._config.mode === "openapi" ||
-          (this._config.mode === "hybrid" && !this._hasSharingCredentials())),
+        (this._config.mode === "openapi" || this._config.mode === "hybrid"),
     );
   }
 
@@ -1263,11 +1307,72 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
     return null;
   }
 
+  private async _dispatchOpenApiIrKey(
+    client: TuyaOpenApiClient,
+    action: TuyaIrActionBinding,
+  ): Promise<boolean> {
+    const hubId = action.hubId!;
+    const remoteId = action.remoteId!;
+    const categoryId = action.categoryId!;
+
+    const tryStandardV2 = async (): Promise<boolean> =>
+      await client.sendInfraredStandardCommand(hubId, remoteId, {
+        category_id: categoryId,
+        ...(action.remoteIndex !== undefined && action.remoteIndex > 0
+          ? { remote_index: action.remoteIndex }
+          : {}),
+        key: action.dpCode,
+      });
+
+    const tryRawV2 = async (): Promise<boolean> =>
+      await client.sendInfraredRawCommand(hubId, remoteId, {
+        category_id: categoryId,
+        key: action.dpCode,
+        ...(action.keyId !== undefined ? { key_id: action.keyId } : {}),
+      });
+
+    const tryStandardV1 = async (): Promise<boolean> =>
+      await client.sendInfraredV1StandardCommand(hubId, remoteId, action.dpCode);
+
+    // 涂鸦 IR Control Hub 标准遥控器协议：
+    // - standard_key=true 优先走「标准命令下发」/v2.0/infrareds/{hub}/remotes/{remote}/command，失败时按配对规则 /raw/command 与 v1.0 /command 兜底
+    // - standard_key=false（配对规则/扩展按键）优先走「按键命令下发」/v2.0/infrareds/{hub}/remotes/{remote}/raw/command，失败时尝试标准接口兜底
+    const chain: Array<() => Promise<boolean>> =
+      action.standardKey === true
+        ? [
+            tryStandardV2,
+            ...(action.keyId !== undefined ? [tryRawV2] : []),
+            tryStandardV1,
+          ]
+        : [
+            tryRawV2,
+            tryStandardV2,
+            tryStandardV1,
+          ];
+
+    let lastErr: unknown = null;
+    for (let i = 0; i < chain.length; i += 1) {
+      const attempt = chain[i]!;
+      try {
+        const ok = await attempt();
+        if (ok) return true;
+        if (i === chain.length - 1) return false;
+      } catch (err) {
+        lastErr = err;
+        if (!isRecoverableIrProtocolError(err) || i === chain.length - 1) {
+          throw err;
+        }
+      }
+    }
+    if (lastErr) throw lastErr;
+    return false;
+  }
+
   private async _sendIrAction(
     profile: TuyaDeviceProfile,
     action: TuyaIrActionBinding,
   ): Promise<void> {
-    if (this._isOpenApiPrimaryChannel() && this._openApiClient && action.hubId && action.remoteId) {
+    if (this._canUseOpenApiIr() && this._openApiClient && action.hubId && action.remoteId) {
       try {
         if (action.learningCode) {
           const ok = await this._openApiClient.sendInfraredLearningCode(
@@ -1279,16 +1384,7 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
             throw new ServiceError(`涂鸦 OpenAPI 拒绝了红外学习按键「${action.desc}」`);
           }
         } else if (action.categoryId !== undefined) {
-          const ok = await this._openApiClient.sendInfraredRawCommand(
-            action.hubId,
-            action.remoteId,
-            {
-              category_id: action.categoryId,
-              ...(action.remoteIndex !== undefined ? { remote_index: action.remoteIndex } : {}),
-              key: action.dpCode,
-              ...(action.keyId !== undefined ? { key_id: action.keyId } : {}),
-            },
-          );
+          const ok = await this._dispatchOpenApiIrKey(this._openApiClient, action);
           if (!ok) {
             throw new ServiceError(`涂鸦 OpenAPI 拒绝了红外按键「${action.desc}」`);
           }
@@ -1366,6 +1462,42 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
           throw this._wrapError(err, `读取局域网涂鸦设备 ${hardwareId} 状态失败`);
         }
         // hybrid 模式下局域网不可达时自动回退云端
+      }
+    }
+
+    // 红外空调若已具备 OpenAPI IR Control Hub 通道（openapi 或 hybrid），优先拉取 /ac/status 精确状态
+    if (
+      this._canUseOpenApiIr() &&
+      this._openApiClient &&
+      record &&
+      record.category.toLowerCase() === "infrared_ac" &&
+      record.irRemote?.hubId &&
+      record.irRemote?.remoteId
+    ) {
+      try {
+        const acStatus = await this._openApiClient.getInfraredAcStatus(
+          record.irRemote.hubId,
+          record.irRemote.remoteId,
+        );
+        if (acStatus && Object.keys(acStatus).length > 0) {
+          const fresh: Record<string, unknown> = { ...record.status };
+          if (acStatus.power !== undefined) {
+            fresh.power = String(acStatus.power) === "1" || String(acStatus.power) === "true";
+          }
+          if (acStatus.mode !== undefined && Number.isFinite(Number(acStatus.mode))) {
+            fresh.mode = Number(acStatus.mode);
+          }
+          if (acStatus.temp !== undefined && Number.isFinite(Number(acStatus.temp))) {
+            fresh.temp = Number(acStatus.temp);
+          }
+          if (acStatus.wind !== undefined && Number.isFinite(Number(acStatus.wind))) {
+            fresh.wind = Number(acStatus.wind);
+          }
+          record.status = fresh;
+          return fresh;
+        }
+      } catch {
+        // fall through to sharing / generic status
       }
     }
 
@@ -1520,12 +1652,24 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
 
   // ---------- 设备详情与属性读写 ----------
 
+  private _resolveIrControlWarning(profile: TuyaDeviceProfile): string | null {
+    if (!profile.isInfraredRemote || profile.irControlMode !== "sharing-limited") {
+      return null;
+    }
+    if (this._lastIrOpenApiError) {
+      return `涂鸦 OpenAPI 红外控制不可用（${this._lastIrOpenApiError}）；当前回退为扫码共享接口，非空调红外按键可能无法真实发射。`;
+    }
+    return "当前为涂鸦扫码共享模式，非空调红外遥控器（如音响/电视/DIY遥控）的按键无法通过共享接口可靠触发。请在「设置 → 多平台接入 → 涂鸦智能」切换为「云端+局域网混合」模式，保留扫码登录并补充 OpenAPI 凭据（需在涂鸦云项目开通 IR Control Hub 万能红外开放能力），以启用标准遥控器协议真实发射红外码。";
+  }
+
   async deviceDetail(nativeDid: string): Promise<DeviceDetail> {
     const profile = await this._ensureProfile(nativeDid);
+    const controlWarning = this._resolveIrControlWarning(profile);
     return {
       ...profile.detail,
       props: profile.detail.props.map((p) => ({ ...p })),
       actions: profile.detail.actions.map((a) => ({ ...a })),
+      ...(controlWarning ? { control_warning: controlWarning } : {}),
     };
   }
 
@@ -1611,7 +1755,7 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
     const isIrAc = record?.category.toLowerCase() === "infrared_ac";
     if (
       isIrAc &&
-      this._isOpenApiPrimaryChannel() &&
+      this._canUseOpenApiIr() &&
       this._openApiClient &&
       profile.irRemote?.hubId &&
       profile.irRemote?.remoteId
@@ -1697,7 +1841,7 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
       const isIrAc = record?.category.toLowerCase() === "infrared_ac";
       if (
         isIrAc &&
-        this._isOpenApiPrimaryChannel() &&
+        this._canUseOpenApiIr() &&
         this._openApiClient &&
         profile.irRemote?.hubId &&
         profile.irRemote?.remoteId
@@ -2029,8 +2173,21 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
         source: record?.source ?? "",
         hasLocalMapping: Boolean(this._localEntryById(hardwareId)),
         isInfraredRemote: Boolean(profile?.isInfraredRemote),
+        irControlMode: profile?.irControlMode ?? null,
         hasIrPower: Boolean(profile?.irPower),
         irHubId: profile?.irRemote?.hubId ?? null,
+        irCategoryId: profile?.irRemote?.categoryId ?? null,
+        irRemoteIndex: profile?.irRemote?.remoteIndex ?? null,
+        irStandardKeyCount: profile
+          ? [...profile.irActionsByName.values()].filter((a) => a.standardKey === true).length
+          : 0,
+        irNonStandardKeyCount: profile
+          ? [...profile.irActionsByName.values()].filter((a) => a.standardKey === false && !a.learningCode).length
+          : 0,
+        irLearnedKeyCount: profile
+          ? [...profile.irActionsByName.values()].filter((a) => Boolean(a.learningCode)).length
+          : 0,
+        irOpenApiError: this._lastIrOpenApiError,
         irActionCodes: profile ? [...profile.irActionsByName.keys()] : [],
         dpCodes: Object.keys(record?.status ?? {}),
         propNames: profile?.detail.props.map((p) => p.name) ?? [],

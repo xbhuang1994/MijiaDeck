@@ -948,6 +948,7 @@ export function createRequestHandler(
         let values: Record<string, unknown> = {};
         let specError: string | null = null;
         let readWarning: string | null = null;
+        let controlWarning: string | null = null;
         let powerProp: PropInfo | null = null;
         let controls: Partial<Record<"brightness" | "temperature" | "color", PropInfo>> = {};
 
@@ -955,6 +956,7 @@ export function createRequestHandler(
           const detail = await runInJobs(runtime.jobs, () => runtime.service.deviceDetail(did), 2);
           props = detail.props;
           actions = detail.actions;
+          controlWarning = detail.control_warning ?? null;
           powerProp = canCardPower || isCamera(device) ? findPowerProp(props) : null;
           controls = isLight(device) ? lightControls(props) : {};
 
@@ -1067,6 +1069,7 @@ export function createRequestHandler(
           values,
           specError,
           readWarning,
+          controlWarning,
           inTray: runtime.trayStore.load().includes(did),
           banned: mw.isDeviceBanned(did),
           trayEligible: trayEligible(device),

@@ -57,6 +57,8 @@ export interface TuyaIrRemoteMeta {
   categoryId?: number;
   remoteIndex?: number;
   brandName?: string;
+  duplicatePower?: boolean;
+  singleAir?: boolean;
   keys: TuyaIrRemoteKey[];
 }
 
@@ -118,8 +120,11 @@ export interface TuyaIrActionBinding {
   categoryId?: number;
   remoteIndex?: number;
   keyId?: number;
+  standardKey?: boolean;
   learningCode?: string;
 }
+
+export type TuyaIrControlMode = "openapi-ir-hub" | "sharing-ac" | "sharing-limited";
 
 export interface TuyaIrPowerConfig {
   onAction: TuyaIrActionBinding | null;
@@ -135,6 +140,7 @@ export interface TuyaDeviceProfile {
   channel: number | null;
   isSplitParent: boolean;
   isInfraredRemote: boolean;
+  irControlMode: TuyaIrControlMode | null;
   info: DeviceInfo;
   detail: DeviceDetail;
   powerDpCode: string | null;
@@ -433,19 +439,25 @@ const IR_KEY_SORT_ORDER: Readonly<Record<string, number>> = {
   play_pause: 34,
   stop: 35,
   fastforward: 36,
+  forward: 36,
   ff: 36,
   next: 37,
   nexttrack: 37,
   next_track: 37,
   up: 40,
+  navigate_up: 40,
   down: 41,
+  navigate_down: 41,
   left: 42,
+  navigate_left: 42,
   right: 43,
+  navigate_right: 43,
   ok: 44,
   enter: 44,
   select: 44,
   menu: 45,
   home: 46,
+  homepage: 46,
   back: 47,
   return: 47,
   exit: 48,
@@ -1116,40 +1128,62 @@ function mapInfraredRemoteDevice(
   const consumedFuncCodes = new Set<string>();
   const consumedStatusCodes = new Set<string>();
 
-  // 1. 优先从云端 specifications.functions 提取红外遥控按键与红外空调参数
+  // 1. 识别 OpenAPI v2.0 权威按键表 vs 云端 specifications.functions 通用占位按键
   const functions = record.spec?.functions ?? [];
   const isIrAc = category === "infrared_ac";
+  const hasAuthoritativeOpenApiKeys = Boolean(
+    !isIrAc &&
+      record.irRemote &&
+      record.irRemote.hubId &&
+      record.irRemote.remoteId &&
+      record.irRemote.keys.length > 0,
+  );
 
-  for (const fn of functions) {
-    if (!fn.code) continue;
-    if (isInfraredKeyFunction(fn)) {
-      consumedFuncCodes.add(fn.code);
-      const desc = tuyaIrKeyDescZh(fn.code, fn.name || fn.desc);
-      const binding: TuyaIrActionBinding = {
-        actionName: fn.code,
-        desc,
-        dpCode: fn.code,
-        sendValue: resolveIrKeySendValue(fn),
-      };
-      rawActions.push({
-        action: {
-          name: fn.code,
+  // 非空调遥控器若已通过 OpenAPI IR Control Hub 拉取到真实按键表（标准键/配对规则键/DIY学习码），
+  // 以真实按键表为准，避免保留 /specifications 中的通用占位按键（如真实遥控器仅有单键 Power 时残留无效 PowerOn/PowerOff）
+  if (!hasAuthoritativeOpenApiKeys) {
+    for (const fn of functions) {
+      if (!fn.code) continue;
+      if (isInfraredKeyFunction(fn)) {
+        consumedFuncCodes.add(fn.code);
+        const desc = tuyaIrKeyDescZh(fn.code, fn.name || fn.desc);
+        const binding: TuyaIrActionBinding = {
+          actionName: fn.code,
           desc,
-          service: "ir-remote",
-          service_desc: "红外遥控",
-        },
-        binding,
-        index: rawActions.length,
-      });
+          dpCode: fn.code,
+          sendValue: resolveIrKeySendValue(fn),
+        };
+        rawActions.push({
+          action: {
+            name: fn.code,
+            desc,
+            service: "ir-remote",
+            service_desc: "红外遥控",
+          },
+          binding,
+          index: rawActions.length,
+        });
+      }
+    }
+  } else {
+    // 仍标记所有键类 function 已消费，防止在步骤 5 中被渲染成无意义的文本输入属性
+    for (const fn of functions) {
+      if (fn.code && isInfraredKeyFunction(fn)) {
+        consumedFuncCodes.add(fn.code);
+      }
     }
   }
 
-  // 2. 合并 OpenAPI v2.0 /v2.0/infrareds/{hubId}/remotes/{remoteId}/keys 返回的按键元数据（支持学习码/DIY遥控）
+  // 2. 合并 OpenAPI v2.0 /v2.0/infrareds/{hubId}/remotes/{remoteId}/keys 返回的按键元数据（支持标准键/配对规则键/DIY学习码）
   if (record.irRemote) {
     const meta = record.irRemote;
     for (const k of meta.keys) {
       const keyCode = k.key.trim();
       if (!keyCode) continue;
+      // 空调遥控器的 M/T/F 由下方步骤 4 映射为标准空调属性，避免重复作为普通按键展示
+      if (isIrAc && (keyCode === "M" || keyCode === "T" || keyCode === "F")) {
+        continue;
+      }
       const existing = rawActions.find(
         (entry) => entry.binding.actionName.toLowerCase() === keyCode.toLowerCase(),
       );
@@ -1159,11 +1193,14 @@ function mapInfraredRemoteDevice(
         if (meta.categoryId !== undefined) existing.binding.categoryId = meta.categoryId;
         if (meta.remoteIndex !== undefined) existing.binding.remoteIndex = meta.remoteIndex;
         if (k.keyId !== undefined) existing.binding.keyId = k.keyId;
+        if (k.standardKey !== undefined) existing.binding.standardKey = k.standardKey;
         if (k.learningCode) existing.binding.learningCode = k.learningCode;
-        if (k.keyName && k.keyName.trim() && existing.action.desc === existing.action.name) {
+        if (k.keyName && k.keyName.trim()) {
           const nextDesc = tuyaIrKeyDescZh(keyCode, k.keyName);
-          existing.action.desc = nextDesc;
-          existing.binding.desc = nextDesc;
+          if (existing.action.desc === existing.action.name || nextDesc !== keyCode) {
+            existing.action.desc = nextDesc;
+            existing.binding.desc = nextDesc;
+          }
         }
       } else {
         const desc = tuyaIrKeyDescZh(keyCode, k.keyName);
@@ -1177,6 +1214,7 @@ function mapInfraredRemoteDevice(
           ...(meta.categoryId !== undefined ? { categoryId: meta.categoryId } : {}),
           ...(meta.remoteIndex !== undefined ? { remoteIndex: meta.remoteIndex } : {}),
           ...(k.keyId !== undefined ? { keyId: k.keyId } : {}),
+          ...(k.standardKey !== undefined ? { standardKey: k.standardKey } : {}),
           ...(k.learningCode ? { learningCode: k.learningCode } : {}),
         };
         rawActions.push({
@@ -1450,6 +1488,13 @@ function mapInfraredRemoteDevice(
     actions,
   };
 
+  const irControlMode: TuyaIrControlMode =
+    record.irRemote && record.irRemote.hubId && record.irRemote.remoteId
+      ? "openapi-ir-hub"
+      : isIrAc
+        ? "sharing-ac"
+        : "sharing-limited";
+
   const profiles = new Map<string, TuyaDeviceProfile>();
   profiles.set(record.id, {
     did: record.id,
@@ -1457,6 +1502,7 @@ function mapInfraredRemoteDevice(
     channel: null,
     isSplitParent: false,
     isInfraredRemote: true,
+    irControlMode,
     info,
     detail,
     powerDpCode: null,
@@ -1548,6 +1594,7 @@ export function mapTuyaDeviceToCards(record: TuyaDeviceRecord): {
       channel: null,
       isSplitParent: true,
       isInfraredRemote: false,
+      irControlMode: null,
       info: parentInfo,
       detail: parentDetail,
       powerDpCode: null,
@@ -1631,6 +1678,7 @@ export function mapTuyaDeviceToCards(record: TuyaDeviceRecord): {
         channel: ch,
         isSplitParent: false,
         isInfraredRemote: false,
+        irControlMode: null,
         info: childInfo,
         detail: childDetail,
         powerDpCode: dpCode,
@@ -1725,6 +1773,7 @@ export function mapTuyaDeviceToCards(record: TuyaDeviceRecord): {
     channel: null,
     isSplitParent: false,
     isInfraredRemote: false,
+    irControlMode: null,
     info,
     detail,
     powerDpCode,

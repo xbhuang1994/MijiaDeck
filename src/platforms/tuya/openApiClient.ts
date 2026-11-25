@@ -74,11 +74,14 @@ export interface TuyaOpenApiIrRemoteKeysResult {
   category_id?: number;
   remote_index?: number;
   brand_id?: number;
+  single_air?: boolean;
+  duplicate_power?: boolean;
   key_list: TuyaOpenApiIrKey[];
 }
 
 export interface TuyaOpenApiIrLearningCode {
   id?: number;
+  learn_id?: number;
   key: string;
   key_name?: string;
   code: string;
@@ -108,6 +111,20 @@ export interface TuyaOpenApiClientOptions {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function toOptionalFiniteInt(raw: unknown): number | undefined {
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return Math.trunc(raw);
+  }
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (trimmed !== "" && /^-?\d+$/.test(trimmed)) {
+      const n = Number(trimmed);
+      if (Number.isFinite(n)) return Math.trunc(n);
+    }
+  }
+  return undefined;
 }
 
 function stripTrailingSlash(url: string): string {
@@ -456,14 +473,19 @@ export class TuyaOpenApiClient {
     if (!Array.isArray(res)) return [];
     return res
       .filter(isRecord)
-      .map((item) => ({
-        remote_id: String(item.remote_id ?? "").trim(),
-        remote_name: String(item.remote_name ?? item.remote_id ?? "").trim(),
-        category_id: Number(item.category_id ?? 0),
-        ...(typeof item.remote_index === "number" ? { remote_index: item.remote_index } : {}),
-        ...(typeof item.brand_id === "number" ? { brand_id: item.brand_id } : {}),
-        ...(typeof item.brand_name === "string" ? { brand_name: item.brand_name } : {}),
-      }))
+      .map((item) => {
+        const categoryId = toOptionalFiniteInt(item.category_id) ?? 0;
+        const remoteIndex = toOptionalFiniteInt(item.remote_index);
+        const brandId = toOptionalFiniteInt(item.brand_id);
+        return {
+          remote_id: String(item.remote_id ?? "").trim(),
+          remote_name: String(item.remote_name ?? item.remote_id ?? "").trim(),
+          category_id: categoryId,
+          ...(remoteIndex !== undefined ? { remote_index: remoteIndex } : {}),
+          ...(brandId !== undefined ? { brand_id: brandId } : {}),
+          ...(typeof item.brand_name === "string" ? { brand_name: item.brand_name } : {}),
+        };
+      })
       .filter((r) => r.remote_id.length > 0);
   }
 
@@ -480,16 +502,24 @@ export class TuyaOpenApiClient {
     const key_list: TuyaOpenApiIrKey[] = rawList
       .filter(isRecord)
       .filter((k) => typeof k.key === "string" && k.key.trim().length > 0)
-      .map((k) => ({
-        key: String(k.key).trim(),
-        ...(typeof k.key_id === "number" ? { key_id: k.key_id } : {}),
-        ...(typeof k.key_name === "string" ? { key_name: k.key_name } : {}),
-        ...(typeof k.standard_key === "boolean" ? { standard_key: k.standard_key } : {}),
-      }));
+      .map((k) => {
+        const keyId = toOptionalFiniteInt(k.key_id);
+        return {
+          key: String(k.key).trim(),
+          ...(keyId !== undefined ? { key_id: keyId } : {}),
+          ...(typeof k.key_name === "string" ? { key_name: k.key_name } : {}),
+          ...(typeof k.standard_key === "boolean" ? { standard_key: k.standard_key } : {}),
+        };
+      });
+    const categoryId = toOptionalFiniteInt(res.category_id);
+    const remoteIndex = toOptionalFiniteInt(res.remote_index);
+    const brandId = toOptionalFiniteInt(res.brand_id);
     return {
-      ...(typeof res.category_id === "number" ? { category_id: res.category_id } : {}),
-      ...(typeof res.remote_index === "number" ? { remote_index: res.remote_index } : {}),
-      ...(typeof res.brand_id === "number" ? { brand_id: res.brand_id } : {}),
+      ...(categoryId !== undefined ? { category_id: categoryId } : {}),
+      ...(remoteIndex !== undefined ? { remote_index: remoteIndex } : {}),
+      ...(brandId !== undefined ? { brand_id: brandId } : {}),
+      ...(typeof res.single_air === "boolean" ? { single_air: res.single_air } : {}),
+      ...(typeof res.duplicate_power === "boolean" ? { duplicate_power: res.duplicate_power } : {}),
       key_list,
     };
   }
@@ -506,12 +536,17 @@ export class TuyaOpenApiClient {
     return res
       .filter(isRecord)
       .filter((item) => typeof item.code === "string" && item.code.trim().length > 0)
-      .map((item) => ({
-        ...(typeof item.id === "number" ? { id: item.id } : {}),
-        key: String(item.key ?? item.key_name ?? item.id ?? "").trim(),
-        ...(typeof item.key_name === "string" ? { key_name: item.key_name } : {}),
-        code: String(item.code).trim(),
-      }))
+      .map((item) => {
+        const id = toOptionalFiniteInt(item.id);
+        const learnId = toOptionalFiniteInt(item.learn_id);
+        return {
+          ...(id !== undefined ? { id } : {}),
+          ...(learnId !== undefined ? { learn_id: learnId } : {}),
+          key: String(item.key ?? item.key_name ?? item.id ?? "").trim(),
+          ...(typeof item.key_name === "string" ? { key_name: item.key_name } : {}),
+          code: String(item.code).trim(),
+        };
+      })
       .filter((item) => item.key.length > 0);
   }
 
@@ -523,6 +558,55 @@ export class TuyaOpenApiClient {
     return isRecord(res) ? { ...res } : {};
   }
 
+  /**
+   * 涂鸦 IR Control Hub v2.0「标准命令下发」（标准遥控器协议）：
+   * `POST /v2.0/infrareds/{infrared_id}/remotes/{remote_id}/command`
+   */
+  async sendInfraredStandardCommand(
+    infraredId: string,
+    remoteId: string,
+    payload: {
+      category_id: number;
+      remote_index?: number;
+      key: string;
+    },
+  ): Promise<boolean> {
+    const body: Record<string, unknown> = {
+      category_id: payload.category_id,
+      key: payload.key,
+    };
+    if (payload.remote_index !== undefined && payload.remote_index > 0) {
+      body.remote_index = payload.remote_index;
+    }
+    const res = await this._authorizedRequest<unknown>(
+      "POST",
+      `/v2.0/infrareds/${encodeURIComponent(infraredId)}/remotes/${encodeURIComponent(remoteId)}/command`,
+      body,
+    );
+    return res !== false;
+  }
+
+  /**
+   * 涂鸦 IR Control Hub v1.0 标准按键兼容兜底：
+   * `POST /v1.0/infrareds/{infrared_id}/remotes/{remote_id}/command`
+   */
+  async sendInfraredV1StandardCommand(
+    infraredId: string,
+    remoteId: string,
+    key: string,
+  ): Promise<boolean> {
+    const res = await this._authorizedRequest<unknown>(
+      "POST",
+      `/v1.0/infrareds/${encodeURIComponent(infraredId)}/remotes/${encodeURIComponent(remoteId)}/command`,
+      { key },
+    );
+    return res !== false;
+  }
+
+  /**
+   * 涂鸦 IR Control Hub v2.0「按键命令下发」（配对规则 / key_id 协议）：
+   * `POST /v2.0/infrareds/{infrared_id}/remotes/{remote_id}/raw/command`
+   */
   async sendInfraredRawCommand(
     infraredId: string,
     remoteId: string,
@@ -537,8 +621,12 @@ export class TuyaOpenApiClient {
       category_id: payload.category_id,
       key: payload.key,
     };
-    if (payload.remote_index !== undefined) body.remote_index = payload.remote_index;
-    if (payload.key_id !== undefined) body.key_id = payload.key_id;
+    if (payload.remote_index !== undefined && payload.remote_index > 0) {
+      body.remote_index = payload.remote_index;
+    }
+    if (payload.key_id !== undefined) {
+      body.key_id = payload.key_id;
+    }
     const res = await this._authorizedRequest<unknown>(
       "POST",
       `/v2.0/infrareds/${encodeURIComponent(infraredId)}/remotes/${encodeURIComponent(remoteId)}/raw/command`,

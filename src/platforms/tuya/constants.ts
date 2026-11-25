@@ -431,9 +431,14 @@ export const TUYA_IR_KEY_DESC_ZH: Readonly<Record<string, string>> = {
   previoustrack: "上一首",
   previous_track: "上一首",
   fastforward: "快进",
+  forward: "快进",
   ff: "快进",
   rewind: "快退",
   rew: "快退",
+  "open/close": "出碟/放碟",
+  eject: "出碟",
+  display: "显示",
+  info: "信息",
   "channel+": "频道+",
   "ch+": "频道+",
   channelup: "频道+",
@@ -443,14 +448,19 @@ export const TUYA_IR_KEY_DESC_ZH: Readonly<Record<string, string>> = {
   channeldown: "频道-",
   channel_down: "频道-",
   up: "上",
+  navigate_up: "上",
   down: "下",
+  navigate_down: "下",
   left: "左",
+  navigate_left: "左",
   right: "右",
+  navigate_right: "右",
   ok: "确认",
   enter: "确认",
   select: "确认",
   menu: "菜单",
   home: "主页",
+  homepage: "主页",
   back: "返回",
   return: "返回",
   exit: "退出",
@@ -468,12 +478,31 @@ export const TUYA_IR_KEY_DESC_ZH: Readonly<Record<string, string>> = {
   hdmi: "HDMI",
   usb: "USB",
   av: "AV",
+  fm: "收音机",
+  cd: "CD",
+  dvd: "DVD",
+  tuner: "调谐",
   "bass+": "低音+",
   "bass-": "低音-",
   "treble+": "高音+",
   "treble-": "高音-",
   sleep: "定时睡眠",
   timer: "定时",
+  timing: "定时",
+  reservation: "预约",
+  childlock: "儿童锁",
+  negativeion: "负离子",
+  coldlight: "冷色调",
+  warmlight: "暖色调",
+  "brightness+": "亮度+",
+  "brightness-": "亮度-",
+  redlight: "红色灯",
+  greenlight: "绿色灯",
+  bluelight: "蓝色灯",
+  "temperature+": "温度+",
+  "temperature-": "温度-",
+  shutter: "快门",
+  delay: "延时",
   swing: "摆风",
   oscillate: "摇头",
   speed: "风速",
@@ -484,17 +513,45 @@ export const TUYA_IR_KEY_DESC_ZH: Readonly<Record<string, string>> = {
   "-/--": "-/--",
 };
 
+const HAS_CJK_RE = /[\u4e00-\u9fff]/;
+
 export function tuyaIrKeyDescZh(code: string, fallback?: string): string {
   const trimmed = code.trim();
   const key = trimmed.toLowerCase();
+  const cleanFallback = fallback?.trim() ?? "";
+  // OpenAPI / DIY 返回明确中文按键名且与标准基础词不同（如“蓝牙输入”“光纤”“HDMI 1”）时优先保留
+  if (
+    cleanFallback &&
+    cleanFallback !== trimmed &&
+    HAS_CJK_RE.test(cleanFallback) &&
+    !(key in TUYA_IR_KEY_DESC_ZH && TUYA_IR_KEY_DESC_ZH[key] === cleanFallback)
+  ) {
+    // 若属于核心标准通用键（如 PowerOn/PowerOff/Volume+/Volume-/Play/Pause/Next/Previous），仍保持统一文案
+    const coreCanonical =
+      key === "poweron" ||
+      key === "power_on" ||
+      key === "poweroff" ||
+      key === "power_off" ||
+      key === "volume+" ||
+      key === "volume-" ||
+      key === "volume_up" ||
+      key === "volume_down" ||
+      key === "play" ||
+      key === "pause" ||
+      key === "next" ||
+      key === "previous";
+    if (!coreCanonical) {
+      return cleanFallback;
+    }
+  }
   if (key in TUYA_IR_KEY_DESC_ZH) {
     return TUYA_IR_KEY_DESC_ZH[key]!;
   }
   if (/^[0-9]$/.test(trimmed)) {
     return trimmed;
   }
-  if (fallback && fallback.trim() && fallback.trim() !== trimmed) {
-    return fallback.trim();
+  if (cleanFallback && cleanFallback !== trimmed) {
+    return cleanFallback;
   }
   return trimmed;
 }

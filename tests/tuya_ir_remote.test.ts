@@ -287,6 +287,11 @@ describe("Tuya Infrared Remote — Constants, Category Mapping & UI Helpers", ()
     expect(tuyaIrKeyDescZh("Mute")).toBe("静音");
     expect(tuyaIrKeyDescZh("Channel+")).toBe("频道+");
     expect(tuyaIrKeyDescZh("5")).toBe("5");
+    expect(tuyaIrKeyDescZh("navigate_up")).toBe("上");
+    expect(tuyaIrKeyDescZh("homepage")).toBe("主页");
+    expect(tuyaIrKeyDescZh("volume_up")).toBe("音量+");
+    expect(tuyaIrKeyDescZh("bluetooth", "蓝牙输入")).toBe("蓝牙输入");
+    expect(tuyaIrKeyDescZh("Volume+", "音量加")).toBe("音量+");
   });
 
   test("deviceControls & deviceDetailModel recognize IR devices for power toggle and category labels", () => {
@@ -590,8 +595,10 @@ describe("Tuya Infrared Remote — Provider Sharing Mode Control", () => {
 });
 
 describe("Tuya Infrared Remote — Provider OpenAPI v2.0 IR Control Hub", () => {
-  test("discovers remotes/keys/learning-codes and dispatches raw/learning/ac-scene commands", async () => {
+  test("discovers remotes/keys/learning-codes, replaces generic spec keys, and dispatches standard/raw/v1-fallback/learning/ac-scene commands", async () => {
     const calls: Array<{ method: string; path: string; body: any }> = [];
+    let failStdOnKey: string | null = null;
+    let failRawOnKey: string | null = null;
 
     const mockFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -642,9 +649,11 @@ describe("Tuya Infrared Remote — Provider OpenAPI v2.0 IR Control Hub", () => 
           result: {
             category_id: 9,
             remote_index: 1234,
+            duplicate_power: false,
             key_list: [
               { key: "PowerOn", key_id: 1, key_name: "开机", standard_key: true },
               { key: "Volume+", key_id: 2, key_name: "音量加", standard_key: true },
+              { key: "bluetooth", key_id: 42, key_name: "蓝牙输入", standard_key: false },
             ],
           },
         });
@@ -673,7 +682,23 @@ describe("Tuya Infrared Remote — Provider OpenAPI v2.0 IR Control Hub", () => 
           result: { power: "1", mode: "0", temp: "26", wind: "2" },
         });
       }
-      if (u.pathname.includes("/raw/command") || u.pathname.includes("/learning-codes") || u.pathname.includes("/scenes/command")) {
+      if (u.pathname === "/v2.0/infrareds/hub_oa/remotes/amp_oa/command") {
+        if (failStdOnKey && body?.key === failStdOnKey) {
+          return Response.json({ success: false, code: 2050, msg: "command not supported" });
+        }
+        return Response.json({ success: true, result: true });
+      }
+      if (u.pathname === "/v2.0/infrareds/hub_oa/remotes/amp_oa/raw/command") {
+        if (failRawOnKey && body?.key === failRawOnKey) {
+          return Response.json({ success: false, code: 1109, msg: "param illegal" });
+        }
+        return Response.json({ success: true, result: true });
+      }
+      if (
+        u.pathname === "/v1.0/infrareds/hub_oa/remotes/amp_oa/command" ||
+        u.pathname.includes("/learning-codes") ||
+        u.pathname.includes("/scenes/command")
+      ) {
         return Response.json({ success: true, result: true });
       }
       return Response.json({ success: true, result: [] });
@@ -692,18 +717,47 @@ describe("Tuya Infrared Remote — Provider OpenAPI v2.0 IR Control Hub", () => 
 
     await provider.listDevices();
 
-    // 1. Standard IR key via OpenAPI v2.0 raw/command
+    // Authoritative OpenAPI keys replace generic /specifications placeholders (no phantom Pause/Previous)
+    const ampDetail = await provider.deviceDetail("amp_oa");
+    expect(ampDetail.control_warning).toBeUndefined();
+    expect(ampDetail.actions.map((a) => a.name)).toEqual(["PowerOn", "Volume+", "bluetooth"]);
+    expect(ampDetail.actions.find((a) => a.name === "bluetooth")?.desc).toBe("蓝牙输入");
+
+    // 1. Standard key (standard_key: true) -> OpenAPI v2.0 /command (Standard Remote Protocol)
     await provider.runAction("amp_oa", "Volume+");
-    const rawCall = calls.find((c) => c.path === "/v2.0/infrareds/hub_oa/remotes/amp_oa/raw/command");
-    expect(rawCall?.body).toEqual({
+    const stdCall = calls.find((c) => c.path === "/v2.0/infrareds/hub_oa/remotes/amp_oa/command");
+    expect(stdCall?.body).toEqual({
       category_id: 9,
       remote_index: 1234,
       key: "Volume+",
-      key_id: 2,
     });
 
-    // 2. DIY learned key via OpenAPI v2.0 learning-codes POST
+    // 2. Non-standard / pairing-rule key (standard_key: false) -> OpenAPI v2.0 /raw/command
+    await provider.runAction("amp_oa", "bluetooth");
+    const rawCall = calls.find((c) => c.path === "/v2.0/infrareds/hub_oa/remotes/amp_oa/raw/command");
+    expect(rawCall?.body).toEqual({
+      category_id: 9,
+      key: "bluetooth",
+      key_id: 42,
+    });
+
+    // 3. Fallback chain: if v2.0 /command & /raw/command reject with 2050/1109, falls back to v1.0 /command
+    calls.length = 0;
+    failStdOnKey = "PowerOn";
+    failRawOnKey = "PowerOn";
+    await provider.runAction("amp_oa", "PowerOn");
+    expect(calls.map((c) => c.path)).toEqual([
+      "/v2.0/infrareds/hub_oa/remotes/amp_oa/command",
+      "/v2.0/infrareds/hub_oa/remotes/amp_oa/raw/command",
+      "/v1.0/infrareds/hub_oa/remotes/amp_oa/command",
+    ]);
+    expect(calls.at(-1)?.body).toEqual({ key: "PowerOn" });
+    failStdOnKey = null;
+    failRawOnKey = null;
+
+    // 4. DIY learned key via OpenAPI v2.0 learning-codes POST
     const diyDetail = await provider.deviceDetail("diy_oa");
+    expect(diyDetail.control_warning).toBeUndefined();
     expect(diyDetail.actions.map((a) => a.name)).toContain("蓝牙切换");
     await provider.runAction("diy_oa", "蓝牙切换");
     const learnCall = calls.find(
@@ -711,7 +765,7 @@ describe("Tuya Infrared Remote — Provider OpenAPI v2.0 IR Control Hub", () => 
     );
     expect(learnCall?.body).toEqual({ code: "RAW_HEX_BT_CODE" });
 
-    // 3. IR AC status read & scene command
+    // 5. IR AC status read & scene command
     expect(await provider.readProps("ac_oa", ["on", "mode", "target-temperature", "fan-level"])).toEqual({
       on: true,
       mode: 0,
@@ -723,6 +777,187 @@ describe("Tuya Infrared Remote — Provider OpenAPI v2.0 IR Control Hub", () => 
       (c) => c.path === "/v2.0/infrareds/hub_oa/air-conditioners/ac_oa/scenes/command",
     );
     expect(acSceneCall?.body).toMatchObject({ power: 1, mode: 0, temp: 23, wind: 2 });
+  });
+
+  test("hybrid mode combines Sharing QR discovery with OpenAPI v2.0 IR Control Hub without requiring UID", async () => {
+    const { mockFetch: sharingFetch, sentCommands: sharingSent } = createSharingMockFetch();
+    const openApiCalls: Array<{ method: string; path: string; body: any }> = [];
+
+    const hybridFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const u = new URL(url);
+      if (u.hostname.includes("apigw.tuyacn.com")) {
+        return sharingFetch(input, init);
+      }
+      const method = (init?.method ?? "GET").toUpperCase();
+      const body = typeof init?.body === "string" && init.body ? JSON.parse(init.body) : null;
+      openApiCalls.push({ method, path: u.pathname, body });
+
+      if (u.pathname === "/v1.0/token") {
+        return Response.json({
+          success: true,
+          result: { access_token: "hyb_tok", refresh_token: "hyb_rt", uid: "", expire_time: 7200 },
+        });
+      }
+      if (u.pathname === "/v2.0/infrareds/hub_001/remotes") {
+        return Response.json({
+          success: true,
+          result: [
+            { remote_id: "amp_001", remote_name: "音响", category_id: 9, remote_index: 7788 },
+            { remote_id: "ac_001", remote_name: "小空调", category_id: 5, remote_index: 5566 },
+          ],
+        });
+      }
+      if (u.pathname === "/v2.0/infrareds/hub_001/remotes/amp_001/keys") {
+        return Response.json({
+          success: true,
+          result: {
+            category_id: 9,
+            remote_index: 7788,
+            key_list: [
+              { key: "power", key_id: 10, key_name: "电源", standard_key: true },
+              { key: "volume_up", key_id: 11, key_name: "音量+", standard_key: true },
+              { key: "volume_down", key_id: 12, key_name: "音量-", standard_key: true },
+              { key: "mute", key_id: 13, key_name: "静音", standard_key: true },
+              { key: "bt_input", key_id: 99, key_name: "蓝牙输入", standard_key: false },
+            ],
+          },
+        });
+      }
+      if (u.pathname === "/v2.0/infrareds/hub_001/remotes/ac_001/keys") {
+        return Response.json({
+          success: true,
+          result: { category_id: 5, remote_index: 5566, key_list: [] },
+        });
+      }
+      if (u.pathname === "/v2.0/infrareds/hub_001/remotes/ac_001/ac/status") {
+        return Response.json({
+          success: true,
+          result: { power: "0", mode: "0", temp: "24", wind: "0" },
+        });
+      }
+      if (
+        u.pathname.endsWith("/command") ||
+        u.pathname.endsWith("/raw/command") ||
+        u.pathname.endsWith("/scenes/command")
+      ) {
+        return Response.json({ success: true, result: true });
+      }
+      return Response.json({ success: true, result: [] });
+    }) as typeof fetch;
+
+    const provider = new TuyaPlatformProvider({
+      httpFetch: hybridFetch,
+      configStore: makeConfigStore({
+        enabled: true,
+        mode: "hybrid",
+        accessId: "mock_hybrid_id",
+        accessSecret: "mock_hybrid_secret",
+        uid: "",
+        tokenSession: {
+          accessToken: MOCK_ACCESS_TOKEN,
+          refreshToken: MOCK_REFRESH_TOKEN,
+          expireTime: Date.now() + 3600_000,
+          uid: "uid1",
+          endpoint: "https://apigw.tuyacn.com",
+        },
+      }),
+    });
+
+    await provider.listDevices();
+
+    // Sharing discovered devices, OpenAPI enriched authoritative keys & cleared control_warning
+    const ampDetail = await provider.deviceDetail("amp_001");
+    expect(ampDetail.control_warning).toBeUndefined();
+    expect(ampDetail.actions.map((a) => a.name)).toEqual([
+      "power",
+      "volume_up",
+      "volume_down",
+      "mute",
+      "bt_input",
+    ]);
+
+    // Standard key routes to OpenAPI v2.0 /command (never Sharing)
+    await provider.runAction("amp_001", "volume_up");
+    expect(sharingSent).toHaveLength(0);
+    expect(openApiCalls.at(-1)).toMatchObject({
+      method: "POST",
+      path: "/v2.0/infrareds/hub_001/remotes/amp_001/command",
+      body: { category_id: 9, remote_index: 7788, key: "volume_up" },
+    });
+
+    // Non-standard key routes to OpenAPI v2.0 /raw/command
+    await provider.runAction("amp_001", "bt_input");
+    expect(openApiCalls.at(-1)).toMatchObject({
+      method: "POST",
+      path: "/v2.0/infrareds/hub_001/remotes/amp_001/raw/command",
+      body: { category_id: 9, key: "bt_input", key_id: 99 },
+    });
+
+    // IR AC power in hybrid mode also uses OpenAPI v2.0 scenes/command
+    await provider.setPowerState("ac_001", true);
+    expect(openApiCalls.at(-1)).toMatchObject({
+      method: "POST",
+      path: "/v2.0/infrareds/hub_001/air-conditioners/ac_001/scenes/command",
+      body: { power: 1, mode: 0, temp: 24, wind: 0 },
+    });
+  });
+
+  test("hybrid mode keeps Sharing working and surfaces clear warning when OpenAPI IR Control Hub subscription is missing (28841002)", async () => {
+    const { mockFetch: sharingFetch } = createSharingMockFetch();
+
+    const hybridErrFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const u = new URL(url);
+      if (u.hostname.includes("apigw.tuyacn.com")) {
+        return sharingFetch(input, init);
+      }
+      if (u.pathname === "/v1.0/token") {
+        return Response.json({
+          success: true,
+          result: { access_token: "hyb_tok", refresh_token: "hyb_rt", uid: "", expire_time: 7200 },
+        });
+      }
+      if (u.pathname === "/v2.0/infrareds/hub_001/remotes") {
+        return Response.json({
+          success: false,
+          code: 28841002,
+          msg: "No permissions. Your subscription to cloud development plan has expired or IR Control Hub is not subscribed.",
+        });
+      }
+      return Response.json({ success: true, result: [] });
+    }) as typeof fetch;
+
+    const provider = new TuyaPlatformProvider({
+      httpFetch: hybridErrFetch,
+      configStore: makeConfigStore({
+        enabled: true,
+        mode: "hybrid",
+        accessId: "mock_hybrid_id",
+        accessSecret: "mock_hybrid_secret",
+        tokenSession: {
+          accessToken: MOCK_ACCESS_TOKEN,
+          refreshToken: MOCK_REFRESH_TOKEN,
+          expireTime: Date.now() + 3600_000,
+          uid: "uid1",
+          endpoint: "https://apigw.tuyacn.com",
+        },
+      }),
+    });
+
+    const devices = await provider.listDevices();
+    expect(devices.map((d) => d.did)).toContain("amp_001");
+
+    const ampDetail = await provider.deviceDetail("amp_001");
+    expect(ampDetail.control_warning).toContain("红外开放能力");
+    expect(ampDetail.control_warning).toContain("28841002");
+
+    const acDetail = await provider.deviceDetail("ac_001");
+    expect(acDetail.control_warning).toBeUndefined();
+
+    const diag = JSON.parse(await provider.diagnosticReport(devices.find((d) => d.did === "amp_001")!));
+    expect(diag.tuya.irControlMode).toBe("sharing-limited");
+    expect(diag.tuya.irOpenApiError).toContain("28841002");
   });
 });
 
@@ -798,7 +1033,7 @@ describe("Tuya Infrared Remote — HTTP API, Pi Agent Tools & Local Planner Inte
 
       const ampDid = "tuya:amp_001";
 
-      // GET /api/devices/:did/detail returns ir-remote actions cleanly
+      // GET /api/devices/:did/detail returns ir-remote actions cleanly + controlWarning in Sharing-only mode
       const detailRes = await handler(
         new Request(`http://127.0.0.1/api/devices/${encodeURIComponent(ampDid)}/detail`),
       );
@@ -807,6 +1042,16 @@ describe("Tuya Infrared Remote — HTTP API, Pi Agent Tools & Local Planner Inte
       expect(detailJson.ok).toBe(true);
       expect(detailJson.actions.map((a: any) => a.name)).toContain("Volume+");
       expect(detailJson.props.map((p: any) => p.name)).toEqual(["on"]);
+      expect(detailJson.controlWarning).toContain("OpenAPI");
+      expect(detailJson.controlWarning).toContain("标准遥控器协议");
+
+      // IR AC in Sharing-only mode has NO controlWarning
+      const acDetailRes = await handler(
+        new Request(`http://127.0.0.1/api/devices/${encodeURIComponent("tuya:ac_001")}/detail`),
+      );
+      expect(acDetailRes.status).toBe(200);
+      const acDetailJson = (await acDetailRes.json()) as any;
+      expect(acDetailJson.controlWarning).toBeNull();
 
       // POST /api/devices/:did/action for PowerOn syncs mainWindow.knownPower to true
       const actionRes = await handler(
@@ -839,8 +1084,14 @@ describe("Tuya Infrared Remote — HTTP API, Pi Agent Tools & Local Planner Inte
         volume_delta: 20,
       });
       expect(JSON.stringify(volRes.content)).toContain("音量调大（2次）");
+      expect(JSON.stringify(volRes.content)).toContain("涂鸦 OpenAPI");
       expect(sentCommands).toHaveLength(2);
       expect(sentCommands.every((c) => c.commands[0]?.code === "Volume+")).toBe(true);
+
+      const powerTool = tools.find((t) => t.name === "set_device_power")!;
+      const pwrRes = await powerTool.execute("tc_pwr", { target: "音响", state: "on" });
+      expect(JSON.stringify(pwrRes.content)).toContain("已开");
+      expect(JSON.stringify(pwrRes.content)).toContain("涂鸦 OpenAPI");
 
       sentCommands.length = 0;
       const nextRes = await speakerTool.execute("tc2", {
@@ -874,6 +1125,24 @@ describe("Tuya Infrared Remote — HTTP API, Pi Agent Tools & Local Planner Inte
       expect(openAmp?.[0]).toMatchObject({
         name: "set_device_power",
         arguments: { target: ampDid, state: "on" },
+      });
+
+      const bootAmp = planDeterministicLocalCalls("音响开机", plannerDeps);
+      expect(bootAmp?.[0]).toMatchObject({
+        name: "set_device_power",
+        arguments: { target: ampDid, state: "on" },
+      });
+
+      const shutAmp = planDeterministicLocalCalls("音响关机", plannerDeps);
+      expect(shutAmp?.[0]).toMatchObject({
+        name: "set_device_power",
+        arguments: { target: ampDid, state: "off" },
+      });
+
+      const playAmp = planDeterministicLocalCalls("音响播放", plannerDeps);
+      expect(playAmp?.[0]).toMatchObject({
+        name: "control_speaker",
+        arguments: { target: ampDid, playback: "play" },
       });
 
       const nextAmp = planDeterministicLocalCalls("音响下一首", plannerDeps);

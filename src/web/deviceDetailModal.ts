@@ -51,6 +51,7 @@ export interface DeviceDetailApiResponse {
   values: Record<string, unknown>;
   specError: string | null;
   readWarning: string | null;
+  controlWarning?: string | null;
   inTray: boolean;
   trayEligible: boolean;
   metrics: string | null;
@@ -533,6 +534,8 @@ export class DeviceDetailModalController {
       this.showBanner("设备当前离线，仅展示基本信息与功能规格，恢复在线后可读取实时状态并控制。", "warn");
     } else if (data.specError) {
       this.showBanner(data.specError, "info");
+    } else if (data.controlWarning) {
+      this.showBanner(data.controlWarning, "warn");
     } else if (data.readWarning) {
       this.showBanner(`部分实时状态读取受限：${data.readWarning}`, "warn");
     } else {
@@ -1122,16 +1125,16 @@ export class DeviceDetailModalController {
     if (k === "next" || k === "nexttrack" || k === "next_track") {
       return `<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><polygon points="4 5 15 12 4 19 4 5"></polygon><rect x="17.5" y="5" width="2.5" height="14" rx="0.8"></rect></svg>`;
     }
-    if (k === "up") {
+    if (k === "up" || k === "navigate_up") {
       return `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="18 15 12 9 6 15"></polyline></svg>`;
     }
-    if (k === "down") {
+    if (k === "down" || k === "navigate_down") {
       return `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>`;
     }
-    if (k === "left") {
+    if (k === "left" || k === "navigate_left") {
       return `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"></polyline></svg>`;
     }
-    if (k === "right") {
+    if (k === "right" || k === "navigate_right") {
       return `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"></polyline></svg>`;
     }
     return "";
@@ -1151,9 +1154,11 @@ export class DeviceDetailModalController {
       "红外遥控面板",
       !data.online
         ? "设备离线"
-        : hasWritableParams
-          ? `共 ${irActions.length} 个红外按键 · 支持下方参数精细调节`
-          : `共 ${irActions.length} 个红外按键 · 点击即刻发射红外信号`,
+        : data.controlWarning
+          ? `共 ${irActions.length} 个红外按键 · 需配置涂鸦 OpenAPI 启用标准遥控器协议`
+          : hasWritableParams
+            ? `共 ${irActions.length} 个红外按键 · 支持下方参数精细调节`
+            : `共 ${irActions.length} 个红外按键 · 标准遥控器协议已就绪`,
     );
 
     const panel = document.createElement("div");
@@ -1254,7 +1259,7 @@ export class DeviceDetailModalController {
       take("pause"),
       take("playpause", "play/pause", "play_pause"),
       take("stop"),
-      take("fastforward", "ff"),
+      take("fastforward", "forward", "ff"),
       take("next", "nexttrack", "next_track"),
     ].filter((a): a is ActionInfo => a !== null);
 
@@ -1268,7 +1273,8 @@ export class DeviceDetailModalController {
       row.className = "dd-ir-row is-media";
       for (const act of mediaKeys) {
         const lower = act.name.trim().toLowerCase();
-        const isPrimary = lower === "play" || lower === "pause" || lower === "playpause" || lower === "play/pause";
+        const isPrimary =
+          lower === "play" || lower === "pause" || lower === "playpause" || lower === "play/pause" || lower === "play_pause";
         row.appendChild(makeKeyBtn(act, isPrimary ? "is-accent-soft" : ""));
       }
       group.append(lbl, row);
@@ -1276,12 +1282,12 @@ export class DeviceDetailModalController {
     }
 
     // 4. 方向键与菜单区（D-Pad + Menu/Home/Back/Exit）
-    const navUp = take("up");
-    const navDown = take("down");
-    const navLeft = take("left");
-    const navRight = take("right");
+    const navUp = take("up", "navigate_up");
+    const navDown = take("down", "navigate_down");
+    const navLeft = take("left", "navigate_left");
+    const navRight = take("right", "navigate_right");
     const navOk = take("ok", "enter", "select");
-    const navAux = [take("menu"), take("home"), take("back", "return"), take("exit")].filter(
+    const navAux = [take("menu"), take("home", "homepage"), take("back", "return"), take("exit")].filter(
       (a): a is ActionInfo => a !== null,
     );
 

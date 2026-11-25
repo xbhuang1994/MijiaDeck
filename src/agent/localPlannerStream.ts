@@ -622,7 +622,7 @@ const RE_SPEAKER_PAUSE_PLAYBACK =
   /(?:暂停(?:当前|正在)?(?:播放|音乐|歌曲|放歌|放音乐|音箱|音响|小爱|一下)|(?:音乐|歌曲|播放|歌|音箱|音响).{0,6}暂停|^(?:请|帮我|麻烦|先|现在)?暂停(?:一下|吧|呀|哦)?$|\bpause\s+(?:the\s+)?(?:music|song|songs|playing|playback|audio|speaker)\b|^(?:please\s+)?pause(?:\s+it|\s+now)?$)/i;
 
 const RE_SPEAKER_RESUME_PLAYBACK =
-  /(?:取消暂停|解除暂停|继续播放|继续放歌|继续听歌|恢复播放|开始播放|播放音乐|播放歌曲|放歌|放音乐|播音乐|^(?:请|帮我|麻烦)?(?:继续|播放)(?:一下|吧|呀|哦)?$|^(?:please\s+)?(?:resume(?:\s+(?:the\s+)?(?:music|playback|playing))?|continue\s+playing|play(?:\s+(?:the\s+)?music)?)$)/i;
+  /(?:取消暂停|解除暂停|继续播放|继续放歌|继续听歌|恢复播放|开始播放|播放音乐|播放歌曲|放歌|放音乐|播音乐|(?:小爱|小米)?(?:音箱|音响)播放(?:一下|吧|呀|哦)?$|^(?:请|帮我|麻烦)?(?:继续|播放)(?:一下|吧|呀|哦)?$|^(?:please\s+)?(?:resume(?:\s+(?:the\s+)?(?:music|playback|playing))?|continue\s+playing|play(?:\s+(?:the\s+)?music)?)$)/i;
 
 const RE_GENERIC_MUSIC_TARGET = /^(?:音乐|歌曲|歌|一下)?(?:吧|呀|哦|啊)?$/;
 
@@ -649,10 +649,10 @@ function buildFallbackLightTarget(clause: string, explicitRoom: string | undefin
 function stripPowerTargetPhrase(clause: string, explicitRoom?: string): string {
   let out = clause
     .replace(
-      /^(?:请|帮我|麻烦|把|将|给|我要|我想)?(?:打开|开启|关闭|关掉|关上|关了|切换|点亮|熄灭|休眠|turn\s+on|turn\s+off|switch\s+on|switch\s+off)\s*/i,
+      /^(?:请|帮我|麻烦|把|将|给|我要|我想)?(?:打开|开启|开机|关闭|关掉|关上|关了|关机|切换|点亮|熄灭|休眠|turn\s+on|turn\s+off|switch\s+on|switch\s+off)\s*/i,
       "",
     )
-    .replace(/(?:打开|开启|关闭|关掉|关上|关了|切换|点亮|熄灭|休眠|一下|吧|哦|呀)+$/g, "")
+    .replace(/(?:打开|开启|开机|关闭|关掉|关上|关了|关机|切换|点亮|熄灭|休眠|一下|吧|哦|呀)+$/g, "")
     .trim();
   if (explicitRoom) {
     out = out
@@ -918,8 +918,8 @@ function planSingleClause(
   }
 
   // 7. 开关控制（单设备或按房间/类别批量开关）
-  const isTurnOff = /(关闭|关掉|关上|关了|熄灭|休眠|关一下|\bturn\s+off\b|\bswitch\s+off\b|^关(?![于注]))/i.test(clause);
-  const isTurnOn = /(打开|开启|开一下|开了|点亮|唤醒|\bturn\s+on\b|\bswitch\s+on\b|^开(?![始发]))/i.test(clause);
+  const isTurnOff = /(关闭|关掉|关上|关了|关机|熄灭|休眠|关一下|\bturn\s+off\b|\bswitch\s+off\b|^关(?![于注]))/i.test(clause);
+  const isTurnOn = /(打开|开启|开机|开一下|开了|点亮|唤醒|\bturn\s+on\b|\bswitch\s+on\b|^开(?![始发]))/i.test(clause);
   const isToggle = /(切换|翻转|toggle)/i.test(clause);
 
   if (isTurnOff || isTurnOn || isToggle) {
