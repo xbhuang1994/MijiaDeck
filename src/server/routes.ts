@@ -56,6 +56,7 @@ import {
 import {
   ALL_HOMES,
   ALL_ROOMS,
+  BANNED_TAB,
   MainWindowController,
   SCENE_TAB,
   refreshSummary,
@@ -483,13 +484,16 @@ export function serializeState(runtime: AppRuntime): Record<string, unknown> {
   const accessState = mw.accessState();
   const loggedIn = !mw.loggedOut;
   const allDevices = mw.allDevices;
+  const activeDevices = mw.activeDevices();
+  const bannedDevices = mw.bannedDevices();
+  const bannedDeviceIds = mw.bannedDeviceIds();
   const visibleDevices = mw.visibleDevices();
   const roomMenu = mw.buildRoomMenu().entries;
 
-  const speakers = sortedSpeakers(allDevices);
+  const speakers = sortedSpeakers(activeDevices);
   const savedSpeakerDid = s.getDefaultSpeakerDid();
-  const activeSpeaker = accessState === "ready" ? resolveSelectedSpeaker(allDevices, savedSpeakerDid) : null;
-  const hint = accessState === "ready" ? speakerHint(allDevices) : "";
+  const activeSpeaker = accessState === "ready" ? resolveSelectedSpeaker(activeDevices, savedSpeakerDid) : null;
+  const hint = accessState === "ready" ? speakerHint(activeDevices) : "";
   const voiceAvailable = accessState === "ready" && activeSpeaker !== null;
   const audioBase = mw.tray ? mw.tray.quick.audioBar.snapshot() : null;
   const audioProps = activeSpeaker ? runtime.speakerAudioProps?.get(activeSpeaker.did) : undefined;
@@ -522,6 +526,8 @@ export function serializeState(runtime: AppRuntime): Record<string, unknown> {
     roomMenu,
     devices: allDevices.map((d) => ({ ...d })),
     visibleDevices: visibleDevices.map((d) => ({ ...d })),
+    bannedDeviceIds,
+    bannedDevices: bannedDevices.map((d) => ({ ...d })),
     knownPower: { ...mw.knownPower },
     metrics: { ...mw.metrics },
     scenes: (mw.scenes ?? []).map((sc) => ({ ...sc })),
@@ -829,6 +835,46 @@ export function createRequestHandler(
         });
       }
 
+      // ---------- 设备屏蔽（Ban / Unban） ----------
+
+      if (method === "GET" && pathname === "/api/devices/banned") {
+        const mw = runtime.mainWindow;
+        return jsonResponse({
+          ok: true,
+          bannedDeviceIds: mw.bannedDeviceIds(),
+          bannedDevices: mw.bannedDevices().map((d) => ({ ...d })),
+        });
+      }
+
+      const banMatch = /^\/api\/devices\/([^/]+)\/ban$/.exec(pathname);
+      if (method === "POST" && banMatch) {
+        const did = decodeSegment(banMatch[1]!);
+        const body = await readJsonBody(req);
+        if (body.banned !== undefined && typeof body.banned !== "boolean") {
+          throw new HttpError(400, "参数 banned 必须为布尔值");
+        }
+        const targetBanned = body.banned !== undefined ? body.banned : true;
+        const mw = runtime.mainWindow;
+        const device = mw.allDevices.find((d) => d.did === did);
+        if (!device && (targetBanned || !mw.isDeviceBanned(did))) {
+          throw new HttpError(404, "未找到指定设备");
+        }
+        mw.setDeviceBanned(did, targetBanned);
+        emitBroadcast(runtime);
+        const state = serializeState(runtime);
+        const label = device ? `「${device.name}」` : did;
+        return jsonResponse({
+          ...state,
+          ok: true,
+          did,
+          banned: targetBanned,
+          message: targetBanned
+            ? `已屏蔽${label}，已移至「${BANNED_TAB}」栏`
+            : `已取消屏蔽${label}，已恢复至控制列表`,
+          state,
+        });
+      }
+
       const powerMatch = /^\/api\/devices\/([^/]+)\/power$/.exec(pathname);
       if (method === "POST" && powerMatch) {
         const did = decodeSegment(powerMatch[1]!);
@@ -996,6 +1042,7 @@ export function createRequestHandler(
           specError,
           readWarning,
           inTray: runtime.trayStore.load().includes(did),
+          banned: mw.isDeviceBanned(did),
           trayEligible: trayEligible(device),
           metrics: mw.metrics[did] ?? null,
           fetchedAt: Date.now(),
@@ -1263,7 +1310,7 @@ export function createRequestHandler(
         if (!text) {
           throw new HttpError(400, "请输入小爱指令内容");
         }
-        const devices = runtime.mainWindow.allDevices;
+        const devices = runtime.mainWindow.activeDevices();
         const onlineSpeakers = devices.filter((d) => isSpeaker(d) && d.online);
         const requestedDid = typeof body.did === "string" ? body.did.trim() : "";
         const preferredDid = runtime.settingsStore.getDefaultSpeakerDid();
@@ -1368,6 +1415,9 @@ export function createRequestHandler(
 
         if (kind === "device") {
           if (selected) {
+            if (runtime.mainWindow.isDeviceBanned(id)) {
+              throw new HttpError(400, "该设备已被屏蔽，请先取消屏蔽后再添加到托盘窗口");
+            }
             const dev = runtime.mainWindow.allDevices.find((d) => d.did === id);
             if (dev && !trayEligible(dev)) {
               throw new HttpError(400, "该设备不支持添加到托盘快捷窗口");
@@ -1477,7 +1527,7 @@ export function createRequestHandler(
         }
         const did = body.did.trim();
         if (did !== "") {
-          const speaker = runtime.mainWindow.allDevices.find(
+          const speaker = runtime.mainWindow.activeDevices().find(
             (d) => d.did === did && isSpeaker(d) && d.online,
           );
           if (!speaker) {

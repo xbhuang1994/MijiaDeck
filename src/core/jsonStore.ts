@@ -21,6 +21,7 @@ export const _LEGACY_APP_DIR_NAME = "MiHome-Windows";
 export const KNOWN_FILES = [
   "settings.json",
   "tray.json",
+  "banned_devices.json",
   "workbench.json",
   "devices_cache.json",
   "account_profiles.json",

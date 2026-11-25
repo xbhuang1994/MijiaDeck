@@ -140,6 +140,7 @@ export interface AppState {
   currentRoom: string;
   devices: DeviceInfo[];
   visibleDevices: DeviceInfo[] | null;
+  bannedDeviceIds: string[];
   scenes: SceneInfo[];
   knownPower: Record<string, boolean | null>;
   metrics: Record<string, string | null>;
@@ -200,6 +201,7 @@ interface NormalizedLightPayload {
 const ALL_ROOMS = "全屋";
 const ALL_HOMES = "全部";
 const SCENE_TAB = "场景";
+const BANNED_TAB = "已屏蔽";
 const UNASSIGNED_ROOM = "未分配房间";
 const PTZ_MODEL = "chuangmi.camera.029a02";
 const VOICE_FAB_HINT = "对小爱同学下指令，如“打开卧室灯”，回车执行";
@@ -490,6 +492,11 @@ const POWER_ICON_SVG = `<svg viewBox="0 0 24 24" width="20" height="20" fill="no
 const UNKNOWN_ICON_SVG = `<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="7"></circle></svg>`;
 const PLAY_OUTLINE_SVG = `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><polygon points="8 5 19 12 8 19 8 5"></polygon></svg>`;
 const PLAY_SOLID_SVG = `<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><polygon points="8 5 19 12 8 19 8 5"></polygon></svg>`;
+const BAN_ICON_SVG = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><line x1="5.64" y1="5.64" x2="18.36" y2="18.36"></line></svg>`;
+
+type ContextMenuEntry =
+  | { separator: true }
+  | { label: string; onClick: () => void; danger?: boolean; accent?: boolean };
 
 // ---------------------------------------------------------------------------
 // Typewriter Placeholder Animator
@@ -1344,6 +1351,7 @@ export class MijiaDeckWebApp {
       currentRoom: ALL_ROOMS,
       devices: [],
       visibleDevices: null,
+      bannedDeviceIds: [],
       scenes: [],
       knownPower: {},
       metrics: {},
@@ -1542,6 +1550,10 @@ export class MijiaDeckWebApp {
       this.state.visibleDevices = rec.visibleDevices
         .map(normalizeDeviceInfo)
         .filter((d): d is DeviceInfo => d !== null);
+    }
+    const bannedRaw = rec.bannedDeviceIds ?? rec.banned_device_ids;
+    if (Array.isArray(bannedRaw)) {
+      this.state.bannedDeviceIds = bannedRaw.map((id) => String(id)).filter((id) => id.length > 0);
     }
     if (Array.isArray(rec.scenes)) {
       this.state.scenes = rec.scenes
@@ -1779,24 +1791,52 @@ export class MijiaDeckWebApp {
     }
   }
 
+  private isDeviceBanned(did: string): boolean {
+    return this.state.bannedDeviceIds.includes(did);
+  }
+
+  private activeDevices(): DeviceInfo[] {
+    if (this.state.bannedDeviceIds.length === 0) {
+      return this.state.devices;
+    }
+    const bannedSet = new Set(this.state.bannedDeviceIds);
+    return this.state.devices.filter((d) => !bannedSet.has(d.did));
+  }
+
+  private bannedDevices(): DeviceInfo[] {
+    if (this.state.bannedDeviceIds.length === 0) {
+      return [];
+    }
+    const bannedSet = new Set(this.state.bannedDeviceIds);
+    return this.state.devices.filter((d) => bannedSet.has(d.did));
+  }
+
   private pickActiveSpeaker(): DeviceInfo | null {
     if (this.state.accessState !== "ready") return null;
+    const active = this.activeDevices();
     const pref = this.state.settings.default_speaker_did;
     if (pref) {
-      const found = this.state.devices.find((d) => d.did === pref && isSpeaker(d) && d.online);
+      const found = active.find((d) => d.did === pref && isSpeaker(d) && d.online);
       if (found) return found;
     }
-    return this.state.devices.find((d) => isSpeaker(d) && d.online) ?? null;
+    return active.find((d) => isSpeaker(d) && d.online) ?? null;
   }
 
   private devicesInCurrentHome(): DeviceInfo[] {
     const home = this.state.currentHome;
-    return this.state.devices.filter((d) => !home || home === ALL_HOMES || d.home_name === home);
+    return this.activeDevices().filter((d) => !home || home === ALL_HOMES || d.home_name === home);
+  }
+
+  private bannedDevicesInCurrentHome(): DeviceInfo[] {
+    const home = this.state.currentHome;
+    return this.bannedDevices().filter((d) => !home || home === ALL_HOMES || d.home_name === home);
   }
 
   private computeRoomTabs(): string[] {
     if (this.state.rooms.length > 0) {
-      return [...this.state.rooms];
+      return this.state.rooms.includes(BANNED_TAB)
+        ? [...this.state.rooms]
+        : [...this.state.rooms, BANNED_TAB];
     }
     const inHome = this.devicesInCurrentHome();
     const roomSet = new Set<string>();
@@ -1808,7 +1848,7 @@ export class MijiaDeckWebApp {
     if (this.state.settings.show_scene_tab) {
       tabs.push(SCENE_TAB);
     }
-    tabs.push(ALL_ROOMS, ...rooms);
+    tabs.push(ALL_ROOMS, ...rooms, BANNED_TAB);
     return tabs;
   }
 
@@ -2135,9 +2175,16 @@ export class MijiaDeckWebApp {
     const homeLabel = this.state.currentHome || (this.state.homes.length > 1 ? ALL_HOMES : "我的家庭");
     el("home-switcher-text").textContent = homeLabel;
 
-    const inHome = this.devicesInCurrentHome();
-    const onlineCount = inHome.filter((d) => d.online).length;
-    el("device-total-count").textContent = String(inHome.length);
+    const isBannedView = this.state.currentRoom === BANNED_TAB;
+    const summaryList = isBannedView ? this.bannedDevicesInCurrentHome() : this.devicesInCurrentHome();
+    const onlineCount = summaryList.filter((d) => d.online).length;
+    el("device-total-prefix").textContent = isBannedView ? "已屏蔽 " : "共 ";
+    el("device-total-count").textContent = String(summaryList.length);
+    el("device-total-suffix").textContent = " 台设备";
+    const showOnline = !isBannedView || summaryList.length > 0;
+    el("device-summary-divider").hidden = !showOnline;
+    el("device-online-dot").hidden = !showOnline;
+    el("device-summary-online").hidden = !showOnline;
     el("device-online-count").textContent = String(onlineCount);
 
     const refreshBtn = el<HTMLButtonElement>("refresh-btn");
@@ -2160,6 +2207,7 @@ export class MijiaDeckWebApp {
     const strip = el("room-strip");
     strip.replaceChildren();
     for (const name of tabs) {
+      if (name === BANNED_TAB) continue;
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "room-tab";
@@ -2178,6 +2226,20 @@ export class MijiaDeckWebApp {
       });
       strip.appendChild(btn);
     }
+
+    const bannedBtn = el<HTMLButtonElement>("banned-tab-btn");
+    const bannedCount = this.bannedDevicesInCurrentHome().length;
+    const isBannedActive = this.state.currentRoom === BANNED_TAB;
+    bannedBtn.classList.toggle("active", isBannedActive);
+    bannedBtn.classList.toggle("has-banned", bannedCount > 0);
+    bannedBtn.setAttribute("aria-selected", String(isBannedActive));
+    bannedBtn.setAttribute(
+      "aria-label",
+      bannedCount > 0 ? `已屏蔽，${bannedCount} 台设备` : "已屏蔽",
+    );
+    const badge = el("banned-tab-count");
+    badge.textContent = String(bannedCount);
+    badge.hidden = bannedCount === 0;
   }
 
   private renderAccessAndGrid(): void {
@@ -2209,7 +2271,8 @@ export class MijiaDeckWebApp {
 
     scroll.hidden = false;
     banner.classList.remove("full-center");
-    const spkHint = this.state.devices.length > 0 ? speakerHint(this.state.devices) : "";
+    const active = this.activeDevices();
+    const spkHint = active.length > 0 ? speakerHint(active) : "";
     if (spkHint) {
       banner.hidden = false;
       bannerText.textContent = spkHint;
@@ -2226,10 +2289,12 @@ export class MijiaDeckWebApp {
     const emptyBox = el("grid-empty");
     const emptyTitle = el("grid-empty-title");
     const emptyDetail = el("grid-empty-detail");
+    const bannedHintBar = el("banned-hint-bar");
 
     grid.replaceChildren();
 
     if (this.state.currentRoom === SCENE_TAB) {
+      bannedHintBar.hidden = true;
       const home = this.state.currentHome;
       const scenes = this.state.scenes.filter(
         (s) => !home || home === ALL_HOMES || !s.home_name || s.home_name === home,
@@ -2249,11 +2314,34 @@ export class MijiaDeckWebApp {
       return;
     }
 
+    if (this.state.currentRoom === BANNED_TAB) {
+      const banned = this.bannedDevicesInCurrentHome().sort((a, b) => {
+        if (a.online !== b.online) return a.online ? -1 : 1;
+        return a.name.localeCompare(b.name, "zh-CN");
+      });
+      if (banned.length === 0) {
+        bannedHintBar.hidden = true;
+        grid.hidden = true;
+        emptyBox.hidden = false;
+        emptyTitle.textContent = "暂无已屏蔽设备";
+        emptyDetail.textContent = "在设备卡片上点击右键并选择「屏蔽设备」，即可将其从智能控制列表中移入此处";
+        return;
+      }
+      bannedHintBar.hidden = false;
+      grid.hidden = false;
+      emptyBox.hidden = true;
+      for (const device of banned) {
+        grid.appendChild(this.createDeviceCard(device, true));
+      }
+      return;
+    }
+
+    bannedHintBar.hidden = true;
     const inHome = this.devicesInCurrentHome();
     const room = this.state.currentRoom;
     const source = this.state.visibleDevices !== null ? this.state.visibleDevices : inHome;
     const filtered = source
-      .filter((d) => room === ALL_ROOMS || d.room_name === room)
+      .filter((d) => !this.isDeviceBanned(d.did) && (room === ALL_ROOMS || d.room_name === room))
       .sort((a, b) => {
         if (a.online !== b.online) return a.online ? -1 : 1;
         return a.name.localeCompare(b.name, "zh-CN");
@@ -2270,19 +2358,29 @@ export class MijiaDeckWebApp {
     grid.hidden = false;
     emptyBox.hidden = true;
     for (const device of filtered) {
-      grid.appendChild(this.createDeviceCard(device));
+      grid.appendChild(this.createDeviceCard(device, false));
     }
   }
 
-  private createDeviceCard(device: DeviceInfo): HTMLElement {
+  private createDeviceCard(device: DeviceInfo, isBannedView = false): HTMLElement {
     const card = document.createElement("article");
-    card.className = "device-card clickable";
+    card.className = isBannedView ? "device-card is-banned" : "device-card clickable";
     if (!device.online) card.classList.add("offline");
     card.dataset.did = device.did;
-    card.title = device.online ? "点击查看设备详情与完整操作" : "设备离线，点击查看设备信息与规格";
+    card.title = isBannedView
+      ? "设备已屏蔽，点击右键可取消屏蔽"
+      : device.online
+        ? "点击查看设备详情与完整操作"
+        : "设备离线，点击查看设备信息与规格";
 
     // Corner tags
-    if (isCamera(device)) {
+    if (isBannedView) {
+      const tag = document.createElement("span");
+      tag.className = "corner-tag corner-tag-banned";
+      tag.textContent = "已屏蔽";
+      tag.setAttribute("aria-label", "已屏蔽设备");
+      card.appendChild(tag);
+    } else if (isCamera(device)) {
       const tag = document.createElement("span");
       tag.className = "corner-tag corner-tag-camera";
       tag.textContent = "摄像头";
@@ -2336,16 +2434,27 @@ export class MijiaDeckWebApp {
     }
     const subEl = document.createElement("div");
     subEl.className = "device-card-sub";
-    subEl.textContent = deviceSubtitle(
-      device,
-      device.online ? this.state.metrics[device.did] : null,
-      this.state.knownPower,
-    );
+    if (isBannedView) {
+      const roomLabel = device.room_name || UNASSIGNED_ROOM;
+      subEl.textContent = device.online ? `${roomLabel} · 已屏蔽` : `${roomLabel} · 离线 · 已屏蔽`;
+    } else {
+      subEl.textContent = deviceSubtitle(
+        device,
+        device.online ? this.state.metrics[device.did] : null,
+        this.state.knownPower,
+      );
+    }
     textCol.appendChild(subEl);
     card.appendChild(textCol);
 
-    // Right action button (Power or Camera Play)
-    if (isCamera(device)) {
+    // Right action button (or muted shield indicator for banned cards)
+    if (isBannedView) {
+      const ind = document.createElement("span");
+      ind.className = "banned-card-indicator";
+      ind.setAttribute("aria-hidden", "true");
+      ind.innerHTML = BAN_ICON_SVG;
+      card.appendChild(ind);
+    } else if (isCamera(device)) {
       const playBtn = document.createElement("button");
       playBtn.type = "button";
       playBtn.className = "camera-play-btn";
@@ -2367,6 +2476,10 @@ export class MijiaDeckWebApp {
 
     // Card click opens camera preview (for online cameras) or full device detail modal
     card.addEventListener("click", () => {
+      if (isBannedView) {
+        this.showToast(`「${device.name}」已屏蔽，点击右键可取消屏蔽`, 2400);
+        return;
+      }
       if (isCamera(device) && device.online) {
         this.openCameraModal(device);
       } else {
@@ -2374,10 +2487,25 @@ export class MijiaDeckWebApp {
       }
     });
 
-    // Right-click context menu: view details, tray membership (when eligible), diagnostics
+    // Right-click context menu: ban/unban, view details, tray membership (when eligible), diagnostics
     card.addEventListener("contextmenu", (e) => {
       e.preventDefault();
-      const menuItems: Array<{ label: string; onClick: () => void }> = [
+      if (isBannedView) {
+        this.showContextMenu(e.clientX, e.clientY, [
+          {
+            label: "取消屏蔽",
+            accent: true,
+            onClick: () => void this.setDeviceBanned(device, false),
+          },
+          { separator: true },
+          {
+            label: "设备诊断报告",
+            onClick: () => this.openDiagnosticsModal(device.did),
+          },
+        ]);
+        return;
+      }
+      const menuItems: ContextMenuEntry[] = [
         {
           label: "查看详情与操作",
           onClick: () => this.openDeviceDetailModal(device),
@@ -2399,6 +2527,12 @@ export class MijiaDeckWebApp {
       menuItems.push({
         label: "设备诊断报告",
         onClick: () => this.openDiagnosticsModal(device.did),
+      });
+      menuItems.push({ separator: true });
+      menuItems.push({
+        label: "屏蔽设备",
+        danger: true,
+        onClick: () => void this.setDeviceBanned(device, true),
       });
       this.showContextMenu(e.clientX, e.clientY, menuItems);
     });
@@ -2495,7 +2629,7 @@ export class MijiaDeckWebApp {
   private renderVoiceFab(): void {
     const fullLoad = this.state.loading.active && this.state.loading.fullPage;
     const ready = this.state.accessState === "ready";
-    const hasSpeaker = this.state.devices.some((d) => isSpeaker(d) && d.online);
+    const hasSpeaker = this.activeDevices().some((d) => isSpeaker(d) && d.online);
     const shouldShow =
       !fullLoad && ready && hasSpeaker && this.state.settings.voice_fab_enabled;
 
@@ -2569,7 +2703,8 @@ export class MijiaDeckWebApp {
     this.renderTrayCards();
 
     // Speaker hint & Voice bar
-    const hint = ready && this.state.devices.length > 0 ? speakerHint(this.state.devices) : "";
+    const activeDevs = this.activeDevices();
+    const hint = ready && activeDevs.length > 0 ? speakerHint(activeDevs) : "";
     const hintEl = el("tray-speaker-hint");
     hintEl.textContent = hint;
     hintEl.hidden = !hint;
@@ -2629,7 +2764,7 @@ export class MijiaDeckWebApp {
       return;
     }
 
-    const devMap = new Map(this.state.devices.map((d) => [d.did, d]));
+    const devMap = new Map(this.activeDevices().map((d) => [d.did, d]));
     const trayDevSet = new Set(this.state.trayDevices);
     const sceneMap = new Map<string, SceneInfo>();
     for (const s of this.state.trayScenes) sceneMap.set(s.scene_id, s);
@@ -2776,6 +2911,12 @@ export class MijiaDeckWebApp {
         {
           label: "从托盘窗口移除",
           onClick: () => void this.setTrayMembership("device", device.did, false),
+        },
+        { separator: true },
+        {
+          label: "屏蔽设备",
+          danger: true,
+          onClick: () => void this.setDeviceBanned(device, true),
         },
       ]);
     });
@@ -2991,6 +3132,7 @@ export class MijiaDeckWebApp {
     if (this.state.currentRoom === room) return;
     this.state.currentRoom = room;
     this.state.visibleDevices = null;
+    this.renderHeader();
     this.renderRoomTabs();
     this.renderGrid();
     try {
@@ -2998,6 +3140,38 @@ export class MijiaDeckWebApp {
       if (asRecord(res)) this.applyStatePatch(res);
     } catch {
       // optimistic UI already applied
+    }
+  }
+
+  private async setDeviceBanned(device: DeviceInfo, banned: boolean): Promise<void> {
+    try {
+      const res = await apiPost<unknown>(
+        `/api/devices/${encodeURIComponent(device.did)}/ban`,
+        { banned },
+      );
+      const rec = asRecord(res);
+      if (rec && ("state" in rec || "bannedDeviceIds" in rec || "devices" in rec)) {
+        this.applyStatePatch(rec);
+      } else {
+        if (banned) {
+          if (!this.state.bannedDeviceIds.includes(device.did)) {
+            this.state.bannedDeviceIds = [...this.state.bannedDeviceIds, device.did];
+          }
+        } else {
+          this.state.bannedDeviceIds = this.state.bannedDeviceIds.filter((id) => id !== device.did);
+        }
+        this.state.visibleDevices = null;
+        this.renderAll();
+      }
+      const toastMsg =
+        (rec && readStr(rec, "message")) ||
+        (banned
+          ? `已屏蔽「${device.name}」，已移至「${BANNED_TAB}」栏`
+          : `已取消屏蔽「${device.name}」，已恢复至控制列表`);
+      this.showToast(toastMsg, 2600);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.showToast(`${banned ? "屏蔽" : "取消屏蔽"}设备失败：${msg}`, 3200);
     }
   }
 
@@ -3220,15 +3394,24 @@ export class MijiaDeckWebApp {
   private showContextMenu(
     clientX: number,
     clientY: number,
-    items: Array<{ label: string; onClick: () => void }>,
+    items: ContextMenuEntry[],
   ): void {
     this.closeAllMenus();
     const menu = el("context-menu");
     menu.replaceChildren();
     for (const item of items) {
+      if ("separator" in item) {
+        const sep = document.createElement("div");
+        sep.className = "popup-menu-sep";
+        sep.setAttribute("role", "separator");
+        menu.appendChild(sep);
+        continue;
+      }
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "popup-menu-item";
+      if (item.danger) btn.classList.add("danger");
+      if (item.accent) btn.classList.add("accent");
       btn.setAttribute("role", "menuitem");
       btn.textContent = item.label;
       btn.addEventListener("click", () => {
@@ -3366,7 +3549,8 @@ export class MijiaDeckWebApp {
     initialTab: "appearance" | "features" | "voice-agent" | "platforms" = "appearance",
   ): void {
     const s = this.state.settings;
-    const hasSpeaker = this.state.devices.some((d) => isSpeaker(d) && d.online);
+    const activeDevs = this.activeDevices();
+    const hasSpeaker = activeDevs.some((d) => isSpeaker(d) && d.online);
 
     this.platformsPanel.update(this.state.platforms);
     this.switchSettingsTab(initialTab);
@@ -3400,7 +3584,7 @@ export class MijiaDeckWebApp {
     autoOpt.value = "";
     autoOpt.textContent = "自动（第一个在线音箱）";
     spkSelect.appendChild(autoOpt);
-    const speakers = this.state.devices
+    const speakers = activeDevs
       .filter((d) => isSpeaker(d))
       .sort((a, b) => {
         if (a.online !== b.online) return a.online ? -1 : 1;
@@ -4779,7 +4963,7 @@ export class MijiaDeckWebApp {
   }
 
   private populateTrayManagerRoomFilter(): void {
-    const eligible = this.state.devices.filter((d) => trayEligible(d));
+    const eligible = this.activeDevices().filter((d) => trayEligible(d));
     const rooms = [...new Set(eligible.map((d) => d.room_name || UNASSIGNED_ROOM))].sort((a, b) =>
       a.localeCompare(b, "zh-CN"),
     );
@@ -4829,7 +5013,7 @@ export class MijiaDeckWebApp {
     }
 
     if (isDev) {
-      const eligible = this.state.devices.filter((d) => trayEligible(d));
+      const eligible = this.activeDevices().filter((d) => trayEligible(d));
       const devMap = new Map(eligible.map((d) => [d.did, d]));
       const ordered: DeviceInfo[] = [];
       for (const did of this.state.trayDevices) {
@@ -5457,6 +5641,10 @@ export class MijiaDeckWebApp {
       }
     });
 
+    el("banned-tab-btn").addEventListener("click", () => {
+      void this.selectRoom(BANNED_TAB);
+    });
+
     el("room-menu-btn").addEventListener("click", (e) => {
       e.stopPropagation();
       const menu = el("room-menu");
@@ -5467,6 +5655,7 @@ export class MijiaDeckWebApp {
       menu.replaceChildren();
       const tabs = this.computeRoomTabs();
       const inHome = this.devicesInCurrentHome();
+      const bannedInHome = this.bannedDevicesInCurrentHome();
       const serverMenu = this.state.roomMenu;
       const entries: RoomMenuEntry[] =
         serverMenu && serverMenu.length > 0
@@ -5476,11 +5665,19 @@ export class MijiaDeckWebApp {
               count:
                 name === SCENE_TAB
                   ? null
-                  : name === ALL_ROOMS
-                    ? inHome.length
-                    : inHome.filter((d) => d.room_name === name).length,
+                  : name === BANNED_TAB
+                    ? bannedInHome.length
+                    : name === ALL_ROOMS
+                      ? inHome.length
+                      : inHome.filter((d) => d.room_name === name).length,
             }));
       for (const { name, count } of entries) {
+        if (name === BANNED_TAB && menu.childElementCount > 0) {
+          const sep = document.createElement("div");
+          sep.className = "popup-menu-sep";
+          sep.setAttribute("role", "separator");
+          menu.appendChild(sep);
+        }
         const selected = name === this.state.currentRoom;
         const btn = document.createElement("button");
         btn.type = "button";
@@ -5634,7 +5831,7 @@ export class MijiaDeckWebApp {
 
       menu.replaceChildren();
       const pref = this.state.settings.default_speaker_did;
-      const speakers = this.state.devices
+      const speakers = this.activeDevices()
         .filter((d) => isSpeaker(d))
         .sort((a, b) => {
           if (a.online !== b.online) return a.online ? -1 : 1;

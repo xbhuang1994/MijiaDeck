@@ -28,6 +28,7 @@ devices_cache.json
 device_icons.json
 /icons/
 tray.json
+banned_devices.json
 workbench.json
 settings.json
 pi_agent.json

@@ -20,7 +20,6 @@ import {
   isCamera,
   isLight,
   supportsCardPower,
-  trayEligible,
 } from "../../core/deviceControls.ts";
 import type { DeviceInfo } from "../../core/models.ts";
 import { SiColors } from "../theme.ts";
@@ -231,11 +230,8 @@ export class DeviceCardController extends TypedEmitter<DeviceCardEvents> {
   }
 
   contextMenu(pos: Point): boolean {
-    if (trayEligible(this.device)) {
-      this.emit("trayMenuRequested", this.device.did, { x: pos.x, y: pos.y });
-      return true;
-    }
-    return false;
+    this.emit("trayMenuRequested", this.device.did, { x: pos.x, y: pos.y });
+    return true;
   }
 
   dispose(): void {

@@ -56,6 +56,7 @@ import {
   findRecentDeviceFromMessages,
   planDeterministicLocalCalls,
 } from "./localPlannerStream.ts";
+import { BANNED_TAB } from "../ui/controllers/mainWindowController.ts";
 import { createSmartHomeTools, type SmartHomeToolDeps } from "./smartHomeTools.ts";
 import {
   SystemOneClient,
@@ -307,7 +308,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       this._toolLabels.set(tool.name, tool.label || tool.name);
     }
     this._localStreamFn = createLocalSmartHomeStreamFn({
-      getDevices: () => this._deps.mainWindow.allDevices,
+      getDevices: () => this._deps.mainWindow.activeDevices(),
       getScenes: () => this._deps.mainWindow.scenes ?? [],
       getKnownPower: () => this._deps.mainWindow.knownPower,
       getCavemanMode: () => this._config.cavemanMode,
@@ -347,7 +348,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
 
   private _buildSystemPrompt(): string {
     const mw = this._deps.mainWindow;
-    const devices = mw.allDevices;
+    const devices = mw.activeDevices();
     const scenes = mw.scenes ?? [];
 
     const deviceCatalog =
@@ -393,7 +394,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       cavemanBlock,
       ...(intentHint ? [intentHint] : []),
       "",
-      `当前家庭：${mw.currentHome || "全部"} | 房间列表：${mw.tabNames.join("、") || "全屋"}`,
+      `当前家庭：${mw.currentHome || "全部"} | 房间列表：${mw.tabNames.filter((t) => t !== BANNED_TAB).join("、") || "全屋"}`,
       "当前设备清单：",
       deviceCatalog,
       "",
@@ -449,7 +450,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           const deterministicCalls = planDeterministicLocalCalls(
             userText,
             {
-              getDevices: () => this._deps.mainWindow.allDevices,
+              getDevices: () => this._deps.mainWindow.activeDevices(),
               getScenes: () => this._deps.mainWindow.scenes ?? [],
             },
             recentTarget,

@@ -92,10 +92,10 @@
             </div>
 
             <div id="device-summary" class="device-summary" aria-live="polite">
-              <span class="summary-total">共 <span id="device-total-count">0</span> 台设备</span>
-              <span class="summary-divider" aria-hidden="true"></span>
-              <span class="online-dot" aria-hidden="true"></span>
-              <span class="summary-online"><strong id="device-online-count">0</strong> 台设备在线</span>
+              <span class="summary-total"><span id="device-total-prefix">共 </span><span id="device-total-count">0</span><span id="device-total-suffix"> 台设备</span></span>
+              <span id="device-summary-divider" class="summary-divider" aria-hidden="true"></span>
+              <span id="device-online-dot" class="online-dot" aria-hidden="true"></span>
+              <span id="device-summary-online" class="summary-online"><strong id="device-online-count">0</strong> 台设备在线</span>
             </div>
           </div>
 
@@ -126,9 +126,18 @@
           </div>
         </div>
 
-        <!-- Room Tab Strip + Room List Dropdown -->
+        <!-- Room Tab Strip + Banned Devices Tab + Room List Dropdown -->
         <div class="room-bar" id="room-bar">
           <div id="room-strip" class="room-strip" role="tablist" aria-label="房间分类"></div>
+          <div class="room-bar-divider" aria-hidden="true"></div>
+          <button type="button" id="banned-tab-btn" class="room-tab room-tab-banned" role="tab" aria-selected="false" title="查看已屏蔽（Ban）的设备">
+            <svg class="banned-tab-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="9"></circle>
+              <line x1="5.64" y1="5.64" x2="18.36" y2="18.36"></line>
+            </svg>
+            <span class="banned-tab-label">已屏蔽</span>
+            <span id="banned-tab-count" class="banned-tab-count" hidden>0</span>
+          </button>
           <div class="menu-anchor">
             <button type="button" id="room-menu-btn" class="room-menu-btn" title="房间列表与设备数量" aria-label="房间列表与设备数量" aria-haspopup="menu" aria-expanded="false">
               <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -149,6 +158,13 @@
 
         <!-- Responsive Device & Scene Card Grid -->
         <div id="card-grid-scroll" class="card-grid-scroll">
+          <div id="banned-hint-bar" class="banned-hint-bar" hidden>
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="9"></circle>
+              <line x1="5.64" y1="5.64" x2="18.36" y2="18.36"></line>
+            </svg>
+            <span>已屏蔽设备不再出现在智能控制列表、快捷托盘及 Pi Agent 语音控制中；右键点击设备卡片可取消屏蔽。</span>
+          </div>
           <div id="card-grid" class="card-grid" role="region" aria-label="设备与场景列表"></div>
           <div id="grid-empty" class="grid-empty" hidden>
             <p id="grid-empty-title" class="grid-empty-title"></p>

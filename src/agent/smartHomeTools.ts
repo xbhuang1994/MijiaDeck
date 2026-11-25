@@ -743,7 +743,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       const blocked = ensureAccessReady(deps);
       if (blocked) return textResult(blocked, { ok: false, error: blocked }, true);
 
-      let list = deps.mainWindow.allDevices;
+      let list = deps.mainWindow.activeDevices();
       if (params.platform && params.platform !== "all") {
         list = list.filter((d) => devicePlatformId(d) === params.platform);
       }
@@ -795,7 +795,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       const blocked = ensureAccessReady(deps);
       if (blocked) return textResult(blocked, { ok: false, error: blocked }, true);
 
-      const device = resolveSingleDevice(deps.mainWindow.allDevices, params.target);
+      const device = resolveSingleDevice(deps.mainWindow.activeDevices(), params.target);
       if (!device) {
         const msg = `未找到设备：${params.target}`;
         return textResult(msg, { ok: false, uiSummary: msg }, true);
@@ -916,7 +916,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       const blocked = ensureAccessReady(deps);
       if (blocked) return textResult(blocked, { ok: false, error: blocked }, true);
 
-      let candidates = resolveDevices(deps.mainWindow.allDevices, {
+      let candidates = resolveDevices(deps.mainWindow.activeDevices(), {
         target: params.target,
         room: params.room,
         category: params.category,
@@ -925,7 +925,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
 
       // 若用户明确点名了音箱/音响（如“关闭小米音响”、“打开小爱音箱”），允许通过软开关控制音箱（关闭=暂停+静音，打开=取消静音+播放/唤醒）
       if (candidates.length === 0 && (params.target || params.category === "speaker")) {
-        const speakerCandidates = resolveDevices(deps.mainWindow.allDevices, {
+        const speakerCandidates = resolveDevices(deps.mainWindow.activeDevices(), {
           target: params.target,
           room: params.room,
           category: "speaker",
@@ -1059,7 +1059,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       const blocked = ensureAccessReady(deps);
       if (blocked) return textResult(blocked, { ok: false, error: blocked }, true);
 
-      const allDevices = deps.mainWindow.allDevices;
+      const allDevices = deps.mainWindow.activeDevices();
       const rawTarget = params.target.trim();
       const normTarget = normalizeQuery(rawTarget);
       const device = rawTarget
@@ -1257,7 +1257,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       const blocked = ensureAccessReady(deps);
       if (blocked) return textResult(blocked, { ok: false, error: blocked }, true);
 
-      const device = resolveSingleDevice(deps.mainWindow.allDevices, params.target);
+      const device = resolveSingleDevice(deps.mainWindow.activeDevices(), params.target);
       if (!device) {
         const msg = `未找到设备：${params.target}`;
         return textResult(msg, { ok: false, uiSummary: msg }, true);
@@ -1361,7 +1361,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       const blocked = ensureAccessReady(deps);
       if (blocked) return textResult(blocked, { ok: false, error: blocked }, true);
 
-      const device = resolveSingleDevice(deps.mainWindow.allDevices, params.target);
+      const device = resolveSingleDevice(deps.mainWindow.activeDevices(), params.target);
       if (!device) {
         const msg = `未找到设备：${params.target}`;
         return textResult(msg, { ok: false, uiSummary: msg }, true);
@@ -1490,7 +1490,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       const scene = createSceneInfo(found);
       await runJob(deps.jobs, () => deps.service.runScene(scene), 1);
 
-      const onlineDids = deps.mainWindow.allDevices.filter((d) => d.online).map((d) => d.did);
+      const onlineDids = deps.mainWindow.activeDevices().filter((d) => d.online).map((d) => d.did);
       if (onlineDids.length > 0) {
         try {
           const states = await runJob(deps.jobs, () => deps.service.powerStates(onlineDids), 5);
@@ -1533,7 +1533,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       if (!directive) {
         return textResult("指令文本不能为空。", { ok: false }, true);
       }
-      const devices = deps.mainWindow.allDevices;
+      const devices = deps.mainWindow.activeDevices();
       const onlineSpeakers = devices.filter((d) => isSpeaker(d) && d.online);
       let targetSpeaker: DeviceInfo | null = null;
       if (params.speaker) {
@@ -1607,7 +1607,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       const blocked = ensureAccessReady(deps);
       if (blocked) return textResult(blocked, { ok: false, error: blocked }, true);
 
-      const devices = deps.mainWindow.allDevices;
+      const devices = deps.mainWindow.activeDevices();
       const onlineSpeakers = devices.filter((d) => isSpeaker(d) && d.online);
       let speaker: DeviceInfo | null = null;
       if (params.target) {
@@ -1796,7 +1796,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
           uiSummary,
         });
       }
-      const total = deps.mainWindow.allDevices.length;
+      const total = deps.mainWindow.activeDevices().length;
       const uiSummary = `当前运行单一/示例模式（米家 ${total} 台设备）`;
       return textResult(uiSummary, {
         ok: true,

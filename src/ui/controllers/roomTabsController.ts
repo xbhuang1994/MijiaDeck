@@ -239,11 +239,16 @@ export function computeRoomMenuCounts(
   devices: ReadonlyArray<Pick<DeviceInfo, "home_name" | "room_name">>,
   currentHome: string,
   tabNames: readonly string[],
+  bannedDevices: ReadonlyArray<Pick<DeviceInfo, "home_name" | "room_name">> = [],
 ): Array<[string, number | null]> {
   const inHome = devices.filter((d) => !currentHome || d.home_name === currentHome);
+  const bannedInHome = bannedDevices.filter((d) => !currentHome || d.home_name === currentHome);
   return tabNames.map((name): [string, number | null] => {
     if (name === "场景") {
       return [name, null];
+    }
+    if (name === "已屏蔽") {
+      return [name, bannedInHome.length];
     }
     if (name === "全屋") {
       return [name, inHome.length];

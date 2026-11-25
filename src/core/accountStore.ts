@@ -8,12 +8,13 @@ import { unlinkSync } from "node:fs";
 import { dataFile, readJson, writeJsonStrict } from "./jsonStore.ts";
 import { getDefaultSpeakerDid, setDefaultSpeakerDid } from "./settingsStore.ts";
 
-const FILES = ["tray.json", "workbench.json"] as const;
+const FILES = ["tray.json", "banned_devices.json", "workbench.json"] as const;
 const PROFILES_FILENAME = "account_profiles.json";
 const DEVICES_CACHE_FILENAME = "devices_cache.json";
 
 interface AccountProfile extends Record<string, unknown> {
   "tray.json"?: Record<string, unknown>;
+  "banned_devices.json"?: Record<string, unknown>;
   "workbench.json"?: Record<string, unknown>;
   speaker?: string;
 }

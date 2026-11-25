@@ -13,6 +13,7 @@ import { statSync } from "node:fs";
 import * as accountStore from "../../core/accountStore.ts";
 import { APP_NAME, trimWorkingSet } from "../../core/appMeta.ts";
 import { MESSAGES, NetworkMonitor, speakerHint } from "../../core/availability.ts";
+import * as banStore from "../../core/banStore.ts";
 import * as deviceCache from "../../core/cache.ts";
 import {
   TypedEmitter,
@@ -73,6 +74,8 @@ export const ALL_ROOMS = "全屋";
 export const ALL_HOMES = "全部";
 // 场景选项卡：位于「全屋」左侧的特殊房间值，选中后网格切换为场景视图
 export const SCENE_TAB = "场景";
+// 已屏蔽选项卡：独立展示被用户右键屏蔽（ban）的设备，不出现在常规智能控制列表
+export const BANNED_TAB = "已屏蔽";
 
 export const GRID_SPACING = 8;
 // 外部（APP/语音）改状态后卡片靠轮询跟随；批量读一次请求
@@ -345,6 +348,12 @@ export interface DeviceTrayMenuAction {
   trigger(): void;
 }
 
+export interface DeviceBanMenuAction {
+  label: string;
+  banned: boolean;
+  trigger(): void;
+}
+
 // ---------- 主窗口构造选项与事件 ----------
 
 export interface MainWindowControllerOptions {
@@ -413,6 +422,7 @@ export class MainWindowController
 
   // 设备、家庭与房间视图状态
   allDevices: DeviceInfo[] = [];
+  bannedDids: string[] = [];
   homes: string[] = [];
   currentHome = "";
   currentRoom = ALL_ROOMS;
@@ -563,6 +573,7 @@ export class MainWindowController
     this.visible = options.initiallyVisible ?? true;
     this.hideNoFunc = settingsStore.getHideNoFuncDevices();
     this.showSceneTab = settingsStore.getShowSceneTab();
+    this.bannedDids = banStore.load();
 
     // 网络与主题控制器
     this._ownsNetworkMonitor = options.networkMonitor === undefined;
@@ -783,7 +794,7 @@ export class MainWindowController
     const state = this.accessState();
     const ready = state === "ready";
     const stateMessage = state === "ready" ? "" : MESSAGES[state];
-    const hint = stateMessage || speakerHint(this.allDevices);
+    const hint = stateMessage || speakerHint(this.activeDevices());
     this.accessHintText = hint;
     this.accessHintVisible = Boolean(hint);
     this.scrollVisible = ready;
@@ -959,6 +970,7 @@ export class MainWindowController
         this.showStatus(`无法读取账号配置：${message}`, 5000);
         return;
       }
+      this.bannedDids = banStore.load();
       this.loggedOut = false;
       this.syncAccessUi();
       this.footer.setLoggedIn(true);
@@ -1075,6 +1087,7 @@ export class MainWindowController
   accountSignedOut(): void {
     this.loggedOut = true;
     this.allDevices = [];
+    this.bannedDids = banStore.load();
     this.knownPower = {};
     this.metrics = {};
     this.scenes = [];
@@ -1175,6 +1188,7 @@ export class MainWindowController
   applyDevices(devices: DeviceInfo[]): void {
     prepareDeviceCards(devices);
     pruneTraySelection(devices);
+    this.bannedDids = banStore.load();
     for (const device of devices) {
       if (!supportsCardPower(device) || !device.online) {
         this.knownPower[device.did] = null;
@@ -1390,8 +1404,14 @@ export class MainWindowController
     if (!this.networkOnline || this.loggedOut) {
       return;
     }
+    if (this.currentRoom === BANNED_TAB) {
+      if (this.loadActive) {
+        this.loadTaskDone("power");
+      }
+      return;
+    }
     const visible = this.visibleDevices();
-    const onlineSet = new Set(this.allDevices.filter((d) => d.online).map((d) => d.did));
+    const onlineSet = new Set(this.activeDevices().filter((d) => d.online).map((d) => d.did));
     const didSet = new Set<string>();
     for (const d of visible) {
       if (d.online) {
@@ -1479,6 +1499,10 @@ export class MainWindowController
     if (!this.networkOnline || this.loggedOut) {
       return;
     }
+    if (this.currentRoom === BANNED_TAB) {
+      this.loadTaskDone("metrics");
+      return;
+    }
     const dids = this.visibleDevices()
       .filter(
         (d) => d.online && (this.knownPower[d.did] === undefined || this.knownPower[d.did] === null),
@@ -1542,26 +1566,62 @@ export class MainWindowController
     }
   }
 
-  // ---------- 家庭、房间与过滤 ----------
+  // ---------- 家庭、房间、屏蔽（Ban）与过滤 ----------
 
   deviceHasFunctions(device: DeviceInfo): boolean {
     const state = this.service.specHasPublishedFunctions(device.spec_type);
     return state !== false;
   }
 
-  displayedDevices(): DeviceInfo[] {
-    if (!this.hideNoFunc) {
+  isDeviceBanned(did: string): boolean {
+    return this.bannedDids.includes(did);
+  }
+
+  bannedDeviceIds(): string[] {
+    return [...this.bannedDids];
+  }
+
+  activeDevices(): DeviceInfo[] {
+    if (this.bannedDids.length === 0) {
       return this.allDevices;
     }
-    return this.allDevices.filter((d) => this.deviceHasFunctions(d));
+    const bannedSet = new Set(this.bannedDids);
+    return this.allDevices.filter((d) => !bannedSet.has(d.did));
+  }
+
+  bannedDevices(): DeviceInfo[] {
+    if (this.bannedDids.length === 0) {
+      return [];
+    }
+    const bannedSet = new Set(this.bannedDids);
+    return this.allDevices.filter((d) => bannedSet.has(d.did));
+  }
+
+  bannedDevicesInCurrentHome(): DeviceInfo[] {
+    return this.bannedDevices().filter(
+      (d) => this.currentHome === ALL_HOMES || d.home_name === this.currentHome,
+    );
+  }
+
+  displayedDevices(): DeviceInfo[] {
+    const active = this.activeDevices();
+    if (!this.hideNoFunc) {
+      return active;
+    }
+    return active.filter((d) => this.deviceHasFunctions(d));
   }
 
   visibleDevices(): DeviceInfo[] {
-    return this.allDevices.filter(
+    if (this.currentRoom === SCENE_TAB) {
+      return [];
+    }
+    if (this.currentRoom === BANNED_TAB) {
+      return this.bannedDevicesInCurrentHome();
+    }
+    return this.displayedDevices().filter(
       (d) =>
         (this.currentHome === ALL_HOMES || d.home_name === this.currentHome) &&
-        (this.currentRoom === ALL_ROOMS || d.room_name === this.currentRoom) &&
-        (!this.hideNoFunc || this.deviceHasFunctions(d)),
+        (this.currentRoom === ALL_ROOMS || d.room_name === this.currentRoom),
     );
   }
 
@@ -1592,7 +1652,7 @@ export class MainWindowController
 
   rebuildTabs(): void {
     const roomSet = new Set<string>();
-    for (const d of this.allDevices) {
+    for (const d of this.activeDevices()) {
       if (
         (this.currentHome === ALL_HOMES || d.home_name === this.currentHome) &&
         d.room_name &&
@@ -1602,7 +1662,15 @@ export class MainWindowController
       }
     }
     const sortedRooms = [...roomSet].sort(lexCompare);
-    this.tabNames = [...(this.showSceneTab ? [SCENE_TAB] : []), ALL_ROOMS, ...sortedRooms];
+    this.tabNames = [
+      ...(this.showSceneTab ? [SCENE_TAB] : []),
+      ALL_ROOMS,
+      ...sortedRooms,
+      BANNED_TAB,
+    ];
+    if (!this.tabNames.includes(this.currentRoom)) {
+      this.currentRoom = ALL_ROOMS;
+    }
     this.roomStrip.refresh();
   }
 
@@ -1618,6 +1686,11 @@ export class MainWindowController
       this.emitStateChanged();
       return;
     }
+    if (room === BANNED_TAB) {
+      this.updateCountLabel();
+      this.emitStateChanged();
+      return;
+    }
     this.refreshPowerStates(false);
     this.updateCountLabel();
     this.emitStateChanged();
@@ -1627,9 +1700,13 @@ export class MainWindowController
     const inHome = this.displayedDevices().filter(
       (d) => this.currentHome === ALL_HOMES || d.home_name === this.currentHome,
     );
+    const bannedInHome = this.bannedDevicesInCurrentHome();
     const entries: Array<[string, number | null]> = this.tabNames.map((room) => {
       if (room === SCENE_TAB) {
         return [room, null];
+      }
+      if (room === BANNED_TAB) {
+        return [room, bannedInHome.length];
       }
       if (room === ALL_ROOMS) {
         return [room, inHome.length];
@@ -1644,6 +1721,14 @@ export class MainWindowController
       const count = (this.scenes ?? []).length;
       this.countLabelText = `共 ${count} 个场景`;
       this.summaryOnlineVisible = false;
+      return;
+    }
+    if (this.currentRoom === BANNED_TAB) {
+      const banned = this.bannedDevicesInCurrentHome();
+      const online = banned.filter((d) => d.online).length;
+      this.countLabelText = `已屏蔽 ${banned.length} 台设备`;
+      this.onlineLabelText = `${online} 台设备在线`;
+      this.summaryOnlineVisible = banned.length > 0;
       return;
     }
     const vis = this.visibleDevices();
@@ -1758,6 +1843,9 @@ export class MainWindowController
   // ---------- 快速开关 ----------
 
   onPowerClicked(did: string): void {
+    if (this.isDeviceBanned(did)) {
+      return;
+    }
     const card = this.cards.get(did);
     if (!card) {
       return;
@@ -1850,6 +1938,9 @@ export class MainWindowController
   // ---------- 设备详情（仅可调灯光与摄像头，无通用属性编辑器） ----------
 
   openDevice(did: string): void {
+    if (this.isDeviceBanned(did)) {
+      return;
+    }
     const device = this.allDevices.find((d) => d.did === did);
     if (!device || !hasDeviceDetails(device) || !device.online) {
       return;
@@ -1923,11 +2014,77 @@ export class MainWindowController
     }
   }
 
-  // ---------- 托盘成员右键菜单、管理对话框、设置、诊断与关于 ----------
+  // ---------- 托盘成员与屏蔽右键菜单、管理对话框、设置、诊断与关于 ----------
+
+  buildDeviceBanMenu(did: string): DeviceBanMenuAction | null {
+    const device = this.allDevices.find((d) => d.did === did);
+    if (!device) {
+      return null;
+    }
+    const banned = this.isDeviceBanned(did);
+    return {
+      label: banned ? "取消屏蔽" : "屏蔽设备",
+      banned,
+      trigger: () => {
+        this.setDeviceBanned(did, !banned);
+      },
+    };
+  }
+
+  setDeviceBanned(did: string, banned: boolean): boolean {
+    const id = String(did ?? "").trim();
+    if (!id) {
+      return false;
+    }
+    const device = this.allDevices.find((d) => d.did === id);
+    if (!device && banned) {
+      return false;
+    }
+    const alreadyBanned = this.isDeviceBanned(id);
+    this.bannedDids = banStore.setBanned(id, banned);
+    if (!device && !alreadyBanned) {
+      return false;
+    }
+    if (alreadyBanned === banned) {
+      return true;
+    }
+
+    if (banned) {
+      const lightWin = this.lightWindows.get(id);
+      if (lightWin !== undefined && lightWin.alive()) {
+        lightWin.reject();
+      }
+      const camWin = this.cameraWindows.get(id);
+      if (camWin !== undefined && !camWin.closed) {
+        camWin.close();
+      }
+    }
+
+    this.rebuildTabs();
+    this.rebuildGrid();
+    this.updateCountLabel();
+    this.updateTrayDevices();
+    this.updateVoiceFab();
+    if (this.tray !== null) {
+      this.tray.refreshSpeaker();
+    }
+    this.syncAccessUi();
+    if (!banned) {
+      this.refreshPowerStates(false);
+      this.refreshMetrics();
+    }
+    const label = device ? `「${device.name}」` : id;
+    this.showToast(
+      banned ? `已屏蔽${label}，已移至「${BANNED_TAB}」栏` : `已取消屏蔽${label}，已恢复至控制列表`,
+      2200,
+    );
+    this.emitStateChanged();
+    return true;
+  }
 
   buildDeviceTrayMenu(did: string): DeviceTrayMenuAction | null {
     const device = this.allDevices.find((d) => d.did === did);
-    if (!device || !trayEligible(device)) {
+    if (!device || this.isDeviceBanned(did) || !trayEligible(device)) {
       return null;
     }
     const selected = trayStore.contains(did);
@@ -1940,7 +2097,7 @@ export class MainWindowController
 
   setDeviceTrayMembership(did: string, selected: boolean): void {
     const device = this.allDevices.find((d) => d.did === did);
-    if (!device || !trayEligible(device)) {
+    if (!device || (selected && this.isDeviceBanned(did)) || !trayEligible(device)) {
       return;
     }
     trayStore.setDeviceSelected(did, selected);
@@ -1965,7 +2122,7 @@ export class MainWindowController
       this.tray.hideQuick();
     }
     const cached = this.currentHome === ALL_HOMES ? this.scenes : null;
-    const dlg = new TrayManagerController(this.allDevices, {
+    const dlg = new TrayManagerController(this.displayedDevices(), {
       scenes: cached,
       sceneLoader: this.showSceneTab ? () => this.service.sceneList(null) : null,
       jobs: this.jobs,
@@ -2060,11 +2217,12 @@ export class MainWindowController
       this.voiceFab.setVisible(false);
       return;
     }
+    const active = this.activeDevices();
     const pref = settingsStore.getDefaultSpeakerDid();
     let speaker =
-      this.allDevices.find((d) => d.did === pref && isSpeaker(d) && d.online) ?? null;
+      active.find((d) => d.did === pref && isSpeaker(d) && d.online) ?? null;
     if (speaker === null) {
-      speaker = this.allDevices.find((d) => isSpeaker(d) && d.online) ?? null;
+      speaker = active.find((d) => isSpeaker(d) && d.online) ?? null;
     }
     this.voiceDid = speaker ? speaker.did : null;
     const show = settingsStore.getVoiceFabEnabled() && speaker !== null;
