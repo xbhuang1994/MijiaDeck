@@ -60,6 +60,20 @@ import {
   SCENE_TAB,
   refreshSummary,
 } from "../ui/controllers/mainWindowController.ts";
+import {
+  DEYE_PLATFORM_METADATA,
+  MIDEA_PLATFORM_METADATA,
+  MIJIA_PLATFORM_METADATA,
+  TUYA_PLATFORM_METADATA,
+  isMultiPlatformService,
+  isPlatformId,
+  loadPlatformsConfig,
+  summarizeDeyeConfig,
+  summarizeMideaConfig,
+  summarizeTuyaConfig,
+  type PlatformId,
+  type PlatformStatus,
+} from "../platforms/index.ts";
 import { renderQrSvg } from "../ui/qrSvg.ts";
 import {
   buildCss,
@@ -146,8 +160,9 @@ export class HttpError extends Error {
 }
 
 const SECRET_PATTERNS: ReadonlyArray<RegExp> = [
-  /(serviceToken|ssecurity|passToken|cUserId|userId|p2p_id|init_string|authorization|cookie|api[_-]?key|sttApiKey|systemOneApiKey)\s*[:=]\s*[^\s,;'"&}]+/gi,
+  /(serviceToken|ssecurity|passToken|cUserId|userId|p2p_id|init_string|authorization|cookie|api[_-]?key|sttApiKey|systemOneApiKey|accessSecret|localKey|refreshToken|authToken|accessToken|password)\s*[:=]\s*[^\s,;'"&}]+/gi,
   /Bearer\s+[A-Za-z0-9._~+/=-]+/gi,
+  /JWT\s+[A-Za-z0-9._~+/=-]+/gi,
   /sk-[A-Za-z0-9_\-]{8,}/g,
 ];
 
@@ -387,6 +402,77 @@ function resolveSelectedSpeaker(
   return devices.find((d) => isSpeaker(d) && d.online) ?? null;
 }
 
+function buildFallbackPlatformStatuses(runtime: AppRuntime): PlatformStatus[] {
+  const mw = runtime.mainWindow;
+  const loggedIn = !mw.loggedOut;
+  const cfg = loadPlatformsConfig();
+  return [
+    {
+      ...MIJIA_PLATFORM_METADATA,
+      enabled: true,
+      connected: loggedIn,
+      state: loggedIn ? "connected" : "disconnected",
+      authMode: "qr",
+      deviceCount: mw.allDevices.filter((d) => !d.platform || d.platform === "mijia").length,
+      sceneCount: (mw.scenes ?? []).filter((s) => !s.platform || s.platform === "mijia").length,
+      lastSyncAt: loggedIn ? Date.now() : null,
+      lastError: null,
+      configSummary: {
+        loggedIn,
+        mode: runtime.mode,
+      },
+    },
+    {
+      ...TUYA_PLATFORM_METADATA,
+      enabled: cfg.tuya.enabled,
+      connected: false,
+      state: "disconnected",
+      authMode: cfg.tuya.mode === "sharing" ? "qr" : cfg.tuya.mode,
+      deviceCount: 0,
+      sceneCount: 0,
+      lastSyncAt: null,
+      lastError: null,
+      configSummary: summarizeTuyaConfig(cfg.tuya),
+    },
+    {
+      ...MIDEA_PLATFORM_METADATA,
+      enabled: cfg.midea.enabled,
+      connected: false,
+      state: "disconnected",
+      authMode: cfg.midea.mode === "cloud" ? "credentials" : cfg.midea.mode,
+      deviceCount: 0,
+      sceneCount: 0,
+      lastSyncAt: null,
+      lastError: null,
+      configSummary: summarizeMideaConfig(cfg.midea),
+    },
+    {
+      ...DEYE_PLATFORM_METADATA,
+      enabled: cfg.deye.enabled,
+      connected: false,
+      state: "disconnected",
+      authMode:
+        cfg.deye.mode === "cloud"
+          ? "credentials"
+          : cfg.deye.mode === "solarman"
+            ? "local"
+            : "hybrid",
+      deviceCount: 0,
+      sceneCount: 0,
+      lastSyncAt: null,
+      lastError: null,
+      configSummary: summarizeDeyeConfig(cfg.deye),
+    },
+  ];
+}
+
+function listPlatformStatuses(runtime: AppRuntime): PlatformStatus[] {
+  if (isMultiPlatformService(runtime.service)) {
+    return runtime.service.listPlatforms();
+  }
+  return buildFallbackPlatformStatuses(runtime);
+}
+
 /**
  * 序列化完整应用状态快照，供 GET /api/state 与 WebSocket 广播共用。
  */
@@ -481,6 +567,7 @@ export function serializeState(runtime: AppRuntime): Record<string, unknown> {
     },
     piAgent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
     voiceListen: runtime.voiceListener ? runtime.voiceListener.snapshot() : null,
+    platforms: listPlatformStatuses(runtime),
   };
 }
 
@@ -2343,6 +2430,179 @@ export function createRequestHandler(
           deleted: true,
           profiles: listPublicVoiceprints(),
           voice: runtime.voiceListener.snapshot(),
+        });
+      }
+
+      // ---------- 多平台接入治理 API（米家 / 涂鸦智能 / 美的智能 / 德业智能） ----------
+
+      if (method === "GET" && pathname === "/api/platforms") {
+        return jsonResponse({
+          ok: true,
+          platforms: listPlatformStatuses(runtime),
+        });
+      }
+
+      const platformConfigMatch = /^\/api\/platforms\/([^/]+)\/config$/.exec(pathname);
+      if (method === "POST" && platformConfigMatch) {
+        const rawId = decodeSegment(platformConfigMatch[1]!);
+        if (!isPlatformId(rawId)) {
+          throw new HttpError(400, `不支持的平台标识：${rawId}`);
+        }
+        const platformId: PlatformId = rawId;
+        if (!isMultiPlatformService(runtime.service)) {
+          throw new HttpError(400, "当前运行在示例/虚拟模式下，请以真实模式启动 MijiaDeck 以接入多平台");
+        }
+        const body = await readJsonBody(req);
+        const multiService = runtime.service;
+        const platform = await runInJobs(
+          runtime.jobs,
+          () => multiService.configurePlatform(platformId, body),
+          2,
+        );
+        const anyLoggedIn = await runInJobs(runtime.jobs, () => runtime.service.loginStatus(), 1);
+        if (anyLoggedIn) {
+          if (runtime.mainWindow.loggedOut) {
+            runtime.mainWindow.loggedOut = false;
+            runtime.mainWindow.footer.setLoggedIn(true);
+            runtime.mainWindow.syncAccessUi();
+          }
+          if (runtime.mainWindow.networkOnline) {
+            runtime.mainWindow.loadDevices({ manual: true });
+          }
+        }
+        emitBroadcast(runtime);
+        return jsonResponse({
+          ok: true,
+          platform,
+          platforms: listPlatformStatuses(runtime),
+          message: platform.connected
+            ? `已连接「${platform.displayName}」`
+            : `已保存「${platform.displayName}」配置`,
+        });
+      }
+
+      const platformDisconnectMatch = /^\/api\/platforms\/([^/]+)\/disconnect$/.exec(pathname);
+      if (method === "POST" && platformDisconnectMatch) {
+        const rawId = decodeSegment(platformDisconnectMatch[1]!);
+        if (!isPlatformId(rawId)) {
+          throw new HttpError(400, `不支持的平台标识：${rawId}`);
+        }
+        const platformId: PlatformId = rawId;
+        if (!isMultiPlatformService(runtime.service)) {
+          throw new HttpError(400, "当前运行在示例/虚拟模式下，不支持断开第三方平台");
+        }
+        const multiService = runtime.service;
+        const platform = await runInJobs(
+          runtime.jobs,
+          () => multiService.disconnectPlatform(platformId),
+          1,
+        );
+        const anyLoggedIn = await runInJobs(runtime.jobs, () => runtime.service.loginStatus(), 1);
+        if (anyLoggedIn && runtime.mainWindow.networkOnline) {
+          runtime.mainWindow.loadDevices({ manual: true });
+        } else if (!anyLoggedIn) {
+          runtime.mainWindow.loggedOut = true;
+          runtime.mainWindow.allDevices = [];
+          runtime.mainWindow.scenes = null;
+          runtime.mainWindow.footer.setLoggedIn(false);
+          runtime.mainWindow.syncAccessUi();
+        }
+        emitBroadcast(runtime);
+        return jsonResponse({
+          ok: true,
+          platform,
+          platforms: listPlatformStatuses(runtime),
+          message: `已断开「${platform.displayName}」`,
+        });
+      }
+
+      const platformQrBeginMatch = /^\/api\/platforms\/([^/]+)\/qr\/begin$/.exec(pathname);
+      if (method === "POST" && platformQrBeginMatch) {
+        const rawId = decodeSegment(platformQrBeginMatch[1]!);
+        if (!isPlatformId(rawId)) {
+          throw new HttpError(400, `不支持的平台标识：${rawId}`);
+        }
+        const platformId: PlatformId = rawId;
+        if (!isMultiPlatformService(runtime.service)) {
+          throw new HttpError(400, "当前运行在示例/虚拟模式下，不支持平台扫码认证");
+        }
+        const body = await readJsonBody(req);
+        const multiService = runtime.service;
+        const session = await runInJobs(
+          runtime.jobs,
+          () => multiService.beginPlatformQrAuth(platformId, body),
+          1,
+        );
+        return jsonResponse({
+          ok: true,
+          session,
+        });
+      }
+
+      const platformQrPollMatch = /^\/api\/platforms\/([^/]+)\/qr\/poll$/.exec(pathname);
+      if (method === "POST" && platformQrPollMatch) {
+        const rawId = decodeSegment(platformQrPollMatch[1]!);
+        if (!isPlatformId(rawId)) {
+          throw new HttpError(400, `不支持的平台标识：${rawId}`);
+        }
+        const platformId: PlatformId = rawId;
+        if (!isMultiPlatformService(runtime.service)) {
+          throw new HttpError(400, "当前运行在示例/虚拟模式下，不支持平台扫码认证");
+        }
+        const body = await readJsonBody(req);
+        const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
+        if (!sessionId) {
+          throw new HttpError(400, "缺少二维码会话标识 sessionId");
+        }
+        const multiService = runtime.service;
+        const result = await runInJobs(
+          runtime.jobs,
+          () => multiService.pollPlatformQrAuth(platformId, sessionId),
+          1,
+        );
+        if (result.status === "success") {
+          if (runtime.mainWindow.loggedOut) {
+            runtime.mainWindow.loggedOut = false;
+            runtime.mainWindow.footer.setLoggedIn(true);
+            runtime.mainWindow.syncAccessUi();
+          }
+          if (runtime.mainWindow.networkOnline) {
+            runtime.mainWindow.loadDevices({ manual: true });
+          }
+          emitBroadcast(runtime);
+        }
+        return jsonResponse({
+          ok: true,
+          result,
+          platforms: listPlatformStatuses(runtime),
+        });
+      }
+
+      const platformDiscoverMatch = /^\/api\/platforms\/([^/]+)\/discover$/.exec(pathname);
+      if (method === "POST" && platformDiscoverMatch) {
+        const rawId = decodeSegment(platformDiscoverMatch[1]!);
+        if (!isPlatformId(rawId)) {
+          throw new HttpError(400, `不支持的平台标识：${rawId}`);
+        }
+        const platformId: PlatformId = rawId;
+        if (!isMultiPlatformService(runtime.service)) {
+          throw new HttpError(400, "当前运行在示例/虚拟模式下，不支持局域网设备扫描");
+        }
+        const body = await readJsonBody(req);
+        const timeoutMs =
+          typeof body.timeoutMs === "number" && Number.isFinite(body.timeoutMs)
+            ? Math.max(500, Math.min(15_000, Math.trunc(body.timeoutMs)))
+            : 3000;
+        const multiService = runtime.service;
+        const devices = await runInJobs(
+          runtime.jobs,
+          () => multiService.discoverPlatformLocal(platformId, { timeoutMs }),
+          2,
+        );
+        return jsonResponse({
+          ok: true,
+          platform: platformId,
+          devices,
         });
       }
 

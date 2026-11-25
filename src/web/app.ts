@@ -14,6 +14,12 @@ import {
   type UiWakeWordHit,
   type UiWakeWordPrototypeSummary,
 } from "./piAgentPanel.ts";
+import {
+  PlatformsPanelController,
+  platformBadgeInfo,
+  type UiPlatformId,
+  type UiPlatformStatus,
+} from "./platformsPanel.ts";
 import { recordShortWavSample } from "./voiceListener.ts";
 
 // ---------------------------------------------------------------------------
@@ -36,6 +42,7 @@ export interface DeviceInfo {
   light_features: string[];
   metric_features: string[] | null;
   firmware: string;
+  platform?: UiPlatformId;
 }
 
 export interface SceneInfo {
@@ -148,6 +155,7 @@ export interface AppState {
   release: ReleaseInfo | null;
   statusText: string;
   audio: SpeakerAudioState;
+  platforms: UiPlatformStatus[];
 }
 
 type ModalName =
@@ -451,8 +459,17 @@ function deviceIconSvg(model: string): string {
   if (m.includes("sensor") || m.includes("htv") || m.includes("thermometer")) {
     return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 14.76V5a2 2 0 1 0-4 0v9.76a4 4 0 1 0 4 0z"></path></svg>`;
   }
-  if (m.includes("humidifier")) {
+  if (m.includes("air-conditioner") || m.includes("aircondition")) {
+    return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="9" rx="2"></rect><line x1="6" y1="10" x2="18" y2="10"></line><path d="M8 16c-.6 1.2-.6 2.3 0 3.5M12 16c-.6 1.2-.6 2.3 0 3.5M16 16c-.6 1.2-.6 2.3 0 3.5"></path></svg>`;
+  }
+  if (m.includes("dehumidifier") || m.includes("humidifier")) {
     return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"></path></svg>`;
+  }
+  if (m.includes("inverter")) {
+    return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"></rect><polyline points="13 7.5 9.5 12.5 13 12.5 11 16.5"></polyline></svg>`;
+  }
+  if (m.includes("water-heater") || m.includes("heater")) {
+    return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2c2.5 3 5 5.5 5 9a5 5 0 0 1-10 0c0-3.5 2.5-6 5-9z"></path><path d="M12 11v5"></path></svg>`;
   }
   if (m.includes("airpurifier") || m.includes("purifier") || m.includes("fan")) {
     return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9.59 4.59A2 2 0 1 1 11 8H2m10.59 11.41A2 2 0 1 0 14 16H2m15.73-8.27A2.5 2.5 0 1 1 19.5 12H2"></path></svg>`;
@@ -1107,7 +1124,7 @@ export class MijiaDeckWebApp {
   // Settings draft & live preview revert snapshot
   private settingsOriginal: { mode: ThemeMode; color: string } | null = null;
   private settingsDraft: {
-    tab: "appearance" | "features" | "voice-agent";
+    tab: "appearance" | "features" | "voice-agent" | "platforms";
     mode: ThemeMode;
     color: string;
     customColor: string;
@@ -1141,11 +1158,12 @@ export class MijiaDeckWebApp {
   private trayMgrOrder: TrayOrderItem[] = [];
   private trayMgrDragKey: string | null = null;
 
-  // Light, full device detail & Pi Agent controllers
+  // Light, full device detail, Pi Agent & Multi-Platform controllers
   private modalLightSession: LightControlSession;
   private trayLightSession: LightControlSession;
   private deviceDetailModal: DeviceDetailModalController;
   private piAgentPanel: PiAgentPanelController;
+  private platformsPanel: PlatformsPanelController;
 
   // Camera preview state
   private cameraDevice: DeviceInfo | null = null;
@@ -1282,6 +1300,25 @@ export class MijiaDeckWebApp {
         void this.openSettingsModal("voice-agent");
       },
     });
+
+    this.platformsPanel = new PlatformsPanelController({
+      container: el("settings-page-platforms"),
+      apiGet,
+      apiPost,
+      onPlatformsChanged: (platforms) => {
+        this.state.platforms = platforms;
+        void this.fetchState();
+      },
+      onToast: (msg, ms) => this.showToast(msg, ms),
+      onOpenMijiaLogin: () => {
+        this.closeModal();
+        void this.openLoginModal();
+      },
+      onMijiaDisconnect: async () => {
+        await apiPost("/api/auth/logout");
+        await this.fetchState();
+      },
+    });
   }
 
   private createDefaultState(): AppState {
@@ -1347,6 +1384,7 @@ export class MijiaDeckWebApp {
         volName: "volume",
         muteName: "mute-2",
       },
+      platforms: [],
     };
   }
 
@@ -1645,6 +1683,11 @@ export class MijiaDeckWebApp {
     const statusText = readStr(rec, "statusText", "status_text");
     if (statusText !== undefined) {
       this.state.statusText = statusText;
+    }
+
+    if (Array.isArray(rec.platforms)) {
+      this.state.platforms = rec.platforms as UiPlatformStatus[];
+      this.platformsPanel.update(this.state.platforms);
     }
 
     // Audio / speaker readout (handles AudioBarSnapshot from tray.audio)
@@ -2277,6 +2320,20 @@ export class MijiaDeckWebApp {
     const nameEl = document.createElement("div");
     nameEl.className = "device-card-name";
     nameEl.textContent = deviceTitle(device);
+    const badge = platformBadgeInfo(device);
+    if (badge.isExternal) {
+      const nameRow = document.createElement("div");
+      nameRow.className = "device-card-name-row";
+      const badgeEl = document.createElement("span");
+      badgeEl.className = "platform-card-badge";
+      badgeEl.style.setProperty("--platform-badge-bg", badge.color);
+      badgeEl.textContent = badge.badgeText;
+      badgeEl.title = `来源平台：${badge.shortLabel}`;
+      nameRow.append(nameEl, badgeEl);
+      textCol.appendChild(nameRow);
+    } else {
+      textCol.appendChild(nameEl);
+    }
     const subEl = document.createElement("div");
     subEl.className = "device-card-sub";
     subEl.textContent = deviceSubtitle(
@@ -2284,7 +2341,7 @@ export class MijiaDeckWebApp {
       device.online ? this.state.metrics[device.did] : null,
       this.state.knownPower,
     );
-    textCol.append(nameEl, subEl);
+    textCol.appendChild(subEl);
     card.appendChild(textCol);
 
     // Right action button (Power or Camera Play)
@@ -3245,7 +3302,7 @@ export class MijiaDeckWebApp {
   // -------------------------------------------------------------------------
 
   private async openSettingsModal(
-    initialTab: "appearance" | "features" | "voice-agent" = "appearance",
+    initialTab: "appearance" | "features" | "voice-agent" | "platforms" = "appearance",
   ): Promise<void> {
     try {
       const raw = await apiGet<unknown>("/api/settings");
@@ -3306,11 +3363,12 @@ export class MijiaDeckWebApp {
   }
 
   private populateSettingsForm(
-    initialTab: "appearance" | "features" | "voice-agent" = "appearance",
+    initialTab: "appearance" | "features" | "voice-agent" | "platforms" = "appearance",
   ): void {
     const s = this.state.settings;
     const hasSpeaker = this.state.devices.some((d) => isSpeaker(d) && d.online);
 
+    this.platformsPanel.update(this.state.platforms);
     this.switchSettingsTab(initialTab);
 
     el<HTMLSelectElement>("set-theme-mode").value = this.settingsDraft.mode;
@@ -4175,11 +4233,19 @@ export class MijiaDeckWebApp {
     }
   }
 
-  private switchSettingsTab(tab: "appearance" | "features" | "voice-agent"): void {
+  private switchSettingsTab(
+    tab: "appearance" | "features" | "voice-agent" | "platforms",
+  ): void {
     this.settingsDraft.tab = tab;
     el("settings-page-appearance").hidden = tab !== "appearance";
     el("settings-page-features").hidden = tab !== "features";
     el("settings-page-voice-agent").hidden = tab !== "voice-agent";
+    el("settings-page-platforms").hidden = tab !== "platforms";
+    el("settings-save-btn").hidden = tab === "platforms";
+    el("settings-cancel-btn").textContent = tab === "platforms" ? "关闭" : "取消";
+    if (tab === "platforms") {
+      void this.platformsPanel.refresh();
+    }
     document.querySelectorAll<HTMLButtonElement>("[data-settings-tab]").forEach((btn) => {
       const active = btn.dataset.settingsTab === tab;
       btn.classList.toggle("active", active);
@@ -5366,6 +5432,9 @@ export class MijiaDeckWebApp {
         case "tray-manager":
           this.openTrayManagerModal();
           break;
+        case "platforms":
+          void this.openSettingsModal("platforms");
+          break;
         case "settings":
           void this.openSettingsModal();
           break;
@@ -5696,8 +5765,14 @@ export class MijiaDeckWebApp {
     document.querySelectorAll<HTMLButtonElement>("[data-settings-tab]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const raw = btn.dataset.settingsTab;
-        const tab: "appearance" | "features" | "voice-agent" =
-          raw === "features" ? "features" : raw === "voice-agent" ? "voice-agent" : "appearance";
+        const tab: "appearance" | "features" | "voice-agent" | "platforms" =
+          raw === "features"
+            ? "features"
+            : raw === "voice-agent"
+              ? "voice-agent"
+              : raw === "platforms"
+                ? "platforms"
+                : "appearance";
         this.switchSettingsTab(tab);
       });
     });
@@ -6046,6 +6121,14 @@ function normalizeDeviceInfo(raw: unknown): DeviceInfo | null {
   if (!rec) return null;
   const did = readStr(rec, "did");
   if (!did) return null;
+  const rawPlatform = readStr(rec, "platform");
+  const platform: UiPlatformId | undefined =
+    rawPlatform === "mijia" ||
+    rawPlatform === "tuya" ||
+    rawPlatform === "midea" ||
+    rawPlatform === "deye"
+      ? rawPlatform
+      : undefined;
   return {
     did,
     name: readStr(rec, "name") ?? did,
@@ -6064,6 +6147,7 @@ function normalizeDeviceInfo(raw: unknown): DeviceInfo | null {
       ? ((rec.metric_features ?? rec.metricFeatures) as unknown[]).map((f) => String(f))
       : null,
     firmware: readStr(rec, "firmware") ?? "",
+    ...(platform ? { platform } : {}),
   };
 }
 

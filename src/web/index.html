@@ -116,6 +116,7 @@
               </button>
               <div id="more-menu" class="popup-menu popup-menu-right" role="menu" hidden>
                 <button type="button" class="popup-menu-item" role="menuitem" data-action="tray-manager">编辑卡片</button>
+                <button type="button" class="popup-menu-item" role="menuitem" data-action="platforms">多平台接入</button>
                 <button type="button" class="popup-menu-item" role="menuitem" data-action="settings">设置</button>
                 <button type="button" class="popup-menu-item" role="menuitem" data-action="diagnostics">设备诊断报告</button>
                 <div class="popup-menu-sep" role="separator"></div>
@@ -448,6 +449,7 @@
         <button type="button" class="settings-tab active" role="tab" aria-selected="true" data-settings-tab="appearance">主题界面</button>
         <button type="button" class="settings-tab" role="tab" aria-selected="false" data-settings-tab="features">应用功能</button>
         <button type="button" class="settings-tab" role="tab" aria-selected="false" data-settings-tab="voice-agent">语音与 Pi Agent</button>
+        <button type="button" class="settings-tab" role="tab" aria-selected="false" data-settings-tab="platforms">多平台接入</button>
       </div>
       <div class="settings-pages">
         <!-- Appearance Tab -->
@@ -916,6 +918,9 @@
             </div>
           </div>
         </div>
+
+        <!-- Multi-Platform Integration Hub Tab (Mijia / Tuya / Midea / Deye) -->
+        <div id="settings-page-platforms" class="settings-page" hidden></div>
       </div>
       <div class="modal-footer">
         <button type="button" id="settings-cancel-btn" class="secondary-button">取消</button>

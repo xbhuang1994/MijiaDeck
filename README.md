@@ -9,6 +9,10 @@
 MijiaDeck 是开源免费的第三方米家桌面客户端。本分支（`refactor/bun-ts`）将原 Python + PySide6 实现完全重构为 **零 Python 依赖的 Bun + TypeScript 全栈桌面控制台**，完整保留了原项目的全部核心协议、业务逻辑、安全/隐私约束与交互体验：
 
 - **纯 TypeScript 米家云端 SDK (`src/mijia/`)**：原生实现 MIoT RC4-drop1024 加解密与 SHA1/SHA256 Nonce 签名、两步扫码登录（`getQrLoginData` + 120s 长轮询）、设备/家庭/共享设备/场景接口、MIoT 规格抓取与本地原子缓存、有界 HTTP 超时保护。
+- **模块化多平台接入层 (`src/platforms/`)**：参考 Home Assistant 与开源社区协议实现，采用统一的 `IDevicePlatformProvider` + `PlatformRegistry` + `MultiPlatformService` 插件架构，并行故障隔离接入：
+  - **涂鸦智能 (`src/platforms/tuya/`)**：支持 Home Assistant Device Sharing 扫码登录（AES-128-GCM + HMAC-SHA256）、Tuya Cloud OpenAPI v2.0 与 LocalTuya/TinyTuya 局域网直连（TCP 6668 v3.3/v3.4/v3.5 三次握手 + UDP 6666/6667 发现）。
+  - **美的智能 (`src/platforms/midea/`)**：支持美的美居 / MSmartHome / NetHomePlus 云端登录与设备/令牌同步、UDP 6445 局域网发现、TCP 6444 V2 (`0x5A5A`) / V3 (`0x8370`) 加密控制与 `0xAA` 串口协议（空调/除湿机/风扇/空净/加湿器/热水器）。
+  - **德业智能 (`src/platforms/deye/`)**：支持德业智能云（`libdeye` Classic / Fog HTTP / Combo MQTT 3.1.1 除湿机与空净协议）与本地 Solarman V5（TCP 8899 Modbus-RTU 光伏逆变器监控）。
 - **核心业务与持久化层 (`src/core/`)**：完整移植设备角色判定（灯/开关/多路拆分面板/温湿度/摄像头/音箱/路由器过滤）、隐私保护的设备诊断报告生成、多账号 SHA-256 配置隔离、旧版 `MiHome-Windows` 无损数据迁移、优先级串行任务队列、网络可用性探测、GitHub Releases 更新检查（含公共重定向回退）与 CS2 摄像头远程中继会话管理。
 - **主题引擎与 UI 控制器 (`src/ui/`)**：完整移植深浅双调色板、绿/粉/黄/蓝预设与 WCAG 对比度 `>= 4.5` 自定义 HEX 主题色、主窗口/托盘浮窗/音箱控制栏/灯光控制/摄像头预览与云台拖拽/房间标签/语音悬浮球/托盘管理/设置/诊断/首次引导等全部状态机控制器，以及纯 TypeScript ISO/IEC 18004 二维码 SVG 生成器。
 - **Bun HTTP + WebSocket 服务与桌面 Web UI (`src/server/`, `src/web/`)**：基于 `Bun.serve` 提供实时 WebSocket 状态同步与桌面风格界面，内置离线演示模式（`--demo` / `--virtual-light`），无需真实米家账号即可体验与验收。

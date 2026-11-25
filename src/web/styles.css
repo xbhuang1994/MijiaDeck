@@ -900,6 +900,33 @@ button:disabled {
   background: linear-gradient(135deg, #854bb8 0%, #3a65c7 25%, #168d87 50%, #b57528 75%, #bd456e 100%);
 }
 
+.device-card-name-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.platform-card-badge {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  height: 17px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  color: #fff;
+  background: var(--platform-badge-bg, #00cc92);
+  opacity: 0.92;
+}
+
+.device-card.offline .platform-card-badge {
+  opacity: 0.55;
+}
+
 /* ---------- Scene Card ---------- */
 
 .scene-card {

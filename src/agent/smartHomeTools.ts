@@ -31,7 +31,23 @@ import {
 import { formatMetricsText, ServiceError } from "../core/service.ts";
 import type * as settingsStoreModule from "../core/settingsStore.ts";
 import { isSensitivePropertyName } from "../core/specZh.ts";
+import { isMultiPlatformService } from "../platforms/index.ts";
 import type { MainWindowController } from "../ui/controllers/mainWindowController.ts";
+
+const PLATFORM_LABELS_ZH: Readonly<Record<string, string>> = {
+  mijia: "米家",
+  tuya: "涂鸦",
+  midea: "美的",
+  deye: "德业",
+};
+
+function devicePlatformId(device: Pick<DeviceInfo, "did" | "platform">): string {
+  if (device.platform) return device.platform;
+  if (device.did.startsWith("tuya:")) return "tuya";
+  if (device.did.startsWith("midea:")) return "midea";
+  if (device.did.startsWith("deye:")) return "deye";
+  return "mijia";
+}
 
 export interface SmartHomeToolDeps {
   service: IMijiaService;
@@ -104,6 +120,29 @@ function deviceMatchesCategory(device: DeviceInfo, category: string): boolean {
   }
   if (cat === "feeder" || cat === "喂食器") {
     return device.model.includes("feeder") || device.spec_type.includes("feeder") || device.name.includes("喂食");
+  }
+  if (cat === "ac" || cat === "air-conditioner" || cat === "空调") {
+    return (
+      device.model.includes("air-conditioner") ||
+      device.model.includes("aircondition") ||
+      device.spec_type.includes("air-conditioner") ||
+      device.name.includes("空调")
+    );
+  }
+  if (cat === "dehumidifier" || cat === "除湿机") {
+    return (
+      device.model.includes("dehumidifier") ||
+      device.spec_type.includes("dehumidifier") ||
+      device.name.includes("除湿")
+    );
+  }
+  if (cat === "inverter" || cat === "solar-inverter" || cat === "逆变器" || cat === "光伏") {
+    return (
+      device.model.includes("inverter") ||
+      device.spec_type.includes("inverter") ||
+      device.name.includes("逆变") ||
+      device.name.includes("光伏")
+    );
   }
   if (cat === "appliance" || cat === "家电") {
     return supportsCardPower(device) && !isLight(device) && !isSwitch(device);
@@ -356,9 +395,12 @@ function clampToPropRange(prop: PropInfo, value: number): number {
 function formatDeviceSummary(d: DeviceInfo, mw: MainWindowController): Record<string, unknown> {
   const power = mw.knownPower[d.did];
   const metric = mw.metrics[d.did];
+  const platform = devicePlatformId(d);
   return {
     did: d.did,
     name: d.name,
+    platform,
+    platform_name: PLATFORM_LABELS_ZH[platform] ?? platform,
     room: d.room_name || "未分配房间",
     home: d.home_name || "",
     category: deviceCategoryLabel(d),
@@ -665,15 +707,35 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
     name: "list_devices",
     label: "查看设备列表",
     description:
-      "查询 MijiaDeck 中已同步的智能设备列表，支持按房间、家庭、名称关键词、设备类型或在线状态过滤。",
+      "查询 MijiaDeck 中已同步的智能设备列表（涵盖米家、涂鸦智能、美的智能、德业智能），支持按平台、房间、家庭、名称关键词、设备类型或在线状态过滤。",
     parameters: obj({
+      platform: opt(
+        oneOf(["all", "mijia", "tuya", "midea", "deye"] as const, {
+          description: "平台过滤：mijia（米家）、tuya（涂鸦）、midea（美的）、deye（德业）",
+        }),
+      ),
       room: opt(str({ description: "房间名称过滤，例如：客厅、卧室、餐厅、阳台" })),
       home: opt(str({ description: "家庭名称过滤（可选）" })),
       keyword: opt(str({ description: "设备名称或型号关键词（可选）" })),
       category: opt(
-        oneOf(["all", "light", "switch", "sensor", "speaker", "camera", "feeder", "appliance"] as const, {
-          description: "设备类型筛选",
-        }),
+        oneOf(
+          [
+            "all",
+            "light",
+            "switch",
+            "sensor",
+            "speaker",
+            "camera",
+            "feeder",
+            "appliance",
+            "ac",
+            "dehumidifier",
+            "inverter",
+          ] as const,
+          {
+            description: "设备类型筛选",
+          },
+        ),
       ),
       online_only: opt(bool({ description: "是否仅返回在线设备" })),
     }),
@@ -682,6 +744,9 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       if (blocked) return textResult(blocked, { ok: false, error: blocked }, true);
 
       let list = deps.mainWindow.allDevices;
+      if (params.platform && params.platform !== "all") {
+        list = list.filter((d) => devicePlatformId(d) === params.platform);
+      }
       if (params.home) {
         const h = normalizeQuery(params.home);
         list = list.filter((d) => normalizeQuery(d.home_name).includes(h));
@@ -1702,8 +1767,48 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
     },
   };
 
+  const listPlatformsTool: AgentTool<any> = {
+    name: "list_platforms",
+    label: "查看已接入平台",
+    description:
+      "查询当前 MijiaDeck 已注册的多平台接入状态（米家、涂鸦智能、美的智能、德业智能），返回各平台连接状态与设备数量。",
+    parameters: obj({}),
+    execute: async () => {
+      if (isMultiPlatformService(deps.service)) {
+        const platforms = deps.service.listPlatforms();
+        const connected = platforms.filter((p) => p.connected);
+        const uiSummary =
+          connected.length > 0
+            ? `已接入 ${connected.length} 个平台：${connected.map((p) => `${p.name}(${p.deviceCount}台)`).join("、")}`
+            : "当前暂无已连接的智能家居平台";
+        return textResult(uiSummary, {
+          ok: true,
+          platforms: platforms.map((p) => ({
+            id: p.id,
+            name: p.name,
+            displayName: p.displayName,
+            connected: p.connected,
+            enabled: p.enabled,
+            state: p.state,
+            deviceCount: p.deviceCount,
+            sceneCount: p.sceneCount,
+          })),
+          uiSummary,
+        });
+      }
+      const total = deps.mainWindow.allDevices.length;
+      const uiSummary = `当前运行单一/示例模式（米家 ${total} 台设备）`;
+      return textResult(uiSummary, {
+        ok: true,
+        platforms: [{ id: "mijia", name: "米家", connected: !deps.mainWindow.loggedOut, deviceCount: total }],
+        uiSummary,
+      });
+    },
+  };
+
   return [
     listDevicesTool,
+    listPlatformsTool,
     getDeviceDetailTool,
     setDevicePowerTool,
     controlLightTool,

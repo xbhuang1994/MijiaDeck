@@ -2,6 +2,8 @@
 // MijiaDeck: 米家设备的桌面控制端 (Bun + TypeScript)
 // Copyright (C) 2026 MiHome-Windows contributors
 
+export type PlatformId = "mijia" | "tuya" | "midea" | "deye";
+
 export interface DeviceInfo {
   did: string;
   name: string;
@@ -15,13 +17,15 @@ export interface DeviceInfo {
   /** null = unverified; [] = verified no supported readout */
   metric_features: string[] | null;
   firmware: string;
+  /** 所属智能家居平台；缺省视为 mijia（保持旧缓存与测试 100% 兼容）。 */
+  platform?: PlatformId;
 }
 
 export function createDeviceInfo(
   partial: Pick<DeviceInfo, "did" | "name" | "model" | "home_name" | "room_name" | "online"> &
     Partial<Omit<DeviceInfo, "did" | "name" | "model" | "home_name" | "room_name" | "online">>,
 ): DeviceInfo {
-  return {
+  const result: DeviceInfo = {
     did: partial.did,
     name: partial.name,
     model: partial.model,
@@ -39,6 +43,10 @@ export function createDeviceInfo(
           : [...partial.metric_features],
     firmware: partial.firmware ?? "",
   };
+  if (partial.platform !== undefined) {
+    result.platform = partial.platform;
+  }
+  return result;
 }
 
 export interface PropEnumOption {
@@ -128,17 +136,23 @@ export interface SceneInfo {
   name: string;
   home_id: string;
   home_name: string;
+  platform?: PlatformId;
 }
 
 export function createSceneInfo(
-  partial: Pick<SceneInfo, "scene_id" | "name" | "home_id"> & Partial<Pick<SceneInfo, "home_name">>,
+  partial: Pick<SceneInfo, "scene_id" | "name" | "home_id"> &
+    Partial<Pick<SceneInfo, "home_name" | "platform">>,
 ): SceneInfo {
-  return {
+  const result: SceneInfo = {
     scene_id: partial.scene_id,
     name: partial.name,
     home_id: partial.home_id,
     home_name: partial.home_name ?? "",
   };
+  if (partial.platform !== undefined) {
+    result.platform = partial.platform;
+  }
+  return result;
 }
 
 /**

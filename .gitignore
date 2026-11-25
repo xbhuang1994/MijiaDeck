@@ -31,6 +31,7 @@ tray.json
 workbench.json
 settings.json
 pi_agent.json
+platforms.json
 voiceprints.json
 voiceprint_ref_*.wav
 wakeword_prototypes.json

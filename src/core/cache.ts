@@ -29,7 +29,10 @@ const ALLOWED_DEVICE_KEYS = new Set<string>([
   "light_features",
   "metric_features",
   "firmware",
+  "platform",
 ]);
+
+const VALID_PLATFORMS = new Set<string>(["mijia", "tuya", "midea", "deye"]);
 
 export interface DeviceCacheData {
   devices: DeviceInfo[];
@@ -83,6 +86,12 @@ function parseDeviceInfo(item: unknown): DeviceInfo | null {
   if (item.firmware !== undefined && typeof item.firmware !== "string") {
     return null;
   }
+  if (
+    item.platform !== undefined &&
+    (typeof item.platform !== "string" || !VALID_PLATFORMS.has(item.platform))
+  ) {
+    return null;
+  }
   return createDeviceInfo({
     did: item.did,
     name: item.name,
@@ -95,6 +104,9 @@ function parseDeviceInfo(item: unknown): DeviceInfo | null {
     light_features: item.light_features,
     metric_features: item.metric_features,
     firmware: item.firmware,
+    ...(item.platform !== undefined
+      ? { platform: item.platform as "mijia" | "tuya" | "midea" | "deye" }
+      : {}),
   });
 }
 

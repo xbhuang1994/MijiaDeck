@@ -16,10 +16,10 @@ import * as agentConfigStore from "../core/agentConfigStore.ts";
 import { NetworkMonitor } from "../core/availability.ts";
 import type { IJobExecutor, IMijiaService } from "../core/contracts.ts";
 import { JobExecutor } from "../core/jobs.ts";
-import { MijiaService } from "../core/service.ts";
 import * as settingsStore from "../core/settingsStore.ts";
 import * as trayStore from "../core/trayStore.ts";
 import { VirtualDemoService, VirtualLightService } from "../core/virtualLightService.ts";
+import { createMultiPlatformService, isMultiPlatformService } from "../platforms/index.ts";
 import { MainWindowController } from "../ui/controllers/mainWindowController.ts";
 import { ThemeController, applyTheme } from "../ui/theme.ts";
 import {
@@ -67,7 +67,7 @@ function createServiceForMode(mode: AppMode): IMijiaService {
   if (mode === "virtual-light") {
     return new VirtualLightService();
   }
-  return new MijiaService();
+  return createMultiPlatformService();
 }
 
 async function waitForInitialVirtualLoad(
@@ -589,6 +589,13 @@ export async function startMijiaDeckServer(
     await server.stop(true);
     networkMonitor.stop();
     mainWindow.dispose();
+    if (isMultiPlatformService(service) && typeof service.dispose === "function") {
+      try {
+        await service.dispose();
+      } catch {
+        // ignore provider dispose errors on shutdown
+      }
+    }
     if (ownsJobs) {
       await jobs.shutdown();
     }

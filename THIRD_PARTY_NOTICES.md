@@ -16,6 +16,20 @@ This project is derived from MiHome-Windows. Existing copyright notices are reta
 - QtAwesome: https://github.com/spyder-ide/qtawesome
 - NumPy: https://numpy.org/
 
+## Multi-Platform Protocol References (Home Assistant & Community)
+
+Pure TypeScript protocol implementations in `src/platforms/` reference the following open-source Home Assistant integrations and community protocol libraries (no upstream Python binaries are redistributed):
+
+- **Tuya Smart / Smart Life (`src/platforms/tuya/`)**:
+  - Home Assistant Tuya & `tuya-device-sharing-sdk`: https://github.com/tuya/tuya-device-sharing-sdk
+  - TinyTuya / LocalTuya LAN protocol (v3.1/v3.3/v3.4/v3.5): https://github.com/jasonacox/tinytuya
+- **Midea Smart / 美的美居 (`src/platforms/midea/`)**:
+  - `midea_ac_lan` (Home Assistant community integration): https://github.com/georgezhao2010/midea_ac_lan
+  - `midea-msmart` (Midea SmartHome Cloud & LAN V2/V3 protocol): https://github.com/mill1000/midea-msmart
+- **Deye Smart / 德业智能 (`src/platforms/deye/`)**:
+  - `libdeye` / `ha-deye-dehumidifier` (Deye Cloud Classic/Fog/Combo): https://github.com/stackia/libdeye
+  - `pysolarmanv5` / `ha-solarman` (Solarman V5 local Modbus-TCP protocol): https://github.com/jmccrohan/pysolarmanv5
+
 Dependencies keep their respective licenses and notices. A binary distribution must include the applicable notices and required license materials for its exact bundled versions. Dependency references here do not replace those materials.
 
 ## Experimental camera transport: micam
