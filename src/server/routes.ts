@@ -2022,6 +2022,7 @@ export function createRequestHandler(
           ...(result.ackScenario ? { ackScenario: result.ackScenario } : {}),
           ...(result.ackSource ? { ackSource: result.ackSource } : {}),
           reply: result.reply,
+          ...(result.silentCompleted ? { silentCompleted: true } : {}),
           ...(result.thinking ? { thinking: result.thinking } : {}),
           ...(result.thinkingLevel ? { thinkingLevel: result.thinkingLevel } : {}),
           toolCalls: result.toolCalls,

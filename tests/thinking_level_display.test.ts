@@ -288,6 +288,7 @@ describe("PiAgentService Thinking Stream Display & Strict No-Speak Isolation", (
       autoSpeakReply: true,
       preferLocalIntents: false,
       cavemanMode: "lite" as const,
+      silentSimpleControlReply: false,
     };
 
     const h = createTestHarness({

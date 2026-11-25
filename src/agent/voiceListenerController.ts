@@ -1386,7 +1386,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       const finalSnap = this.snapshot();
       this.emit("stateChanged", finalSnap);
 
-      if (cfg.autoSpeakReply && runResult.reply && !runResult.streamedSpeakChunks) {
+      if (
+        cfg.autoSpeakReply &&
+        runResult.reply &&
+        !runResult.streamedSpeakChunks &&
+        !runResult.silentCompleted
+      ) {
         const rec = this._recordSpoken(runResult.reply, Date.now(), {
           priority: "result",
           taskId: runResult.taskId,

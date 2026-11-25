@@ -108,6 +108,7 @@ export interface UiAgentTimelineEntry {
   taskUpdates?: UiAgentTaskUpdate[];
   verification?: UiAgentVerificationSummary | null;
   skillEvent?: UiAgentSkillEvent | null;
+  silentCompleted?: boolean;
   error?: string;
 }
 
@@ -179,6 +180,7 @@ export interface UiPublicAgentConfig extends ClientVoiceConfig {
   effectiveSystemOneBaseUrl?: string;
   effectiveSystemOneConfigured?: boolean;
   cavemanMode?: UiCavemanMode;
+  silentSimpleControlReply?: boolean;
   thinkingLevel?: UiThinkingLevel;
   preferLocalIntents?: boolean;
   owwEnabled?: boolean;
@@ -1263,6 +1265,9 @@ export class PiAgentPanelController {
       const target = this.agentState.timeline.find((e) => e.id === entryId);
       if (target) {
         target.text = ev.text;
+        if (ev.silent === true) {
+          target.silentCompleted = true;
+        }
         if (typeof ev.thinking === "string") target.thinking = ev.thinking;
         target.thinkingActive = false;
         if (ev.verification) target.verification = ev.verification as UiAgentVerificationSummary;
@@ -2540,7 +2545,9 @@ export class PiAgentPanelController {
           const vPill = document.createElement("span");
           vPill.className = `pi-verify-pill is-${v.status}`;
           if (v.status === "passed") {
-            vPill.textContent = "✓ 状态检查通过";
+            vPill.textContent = entry.silentCompleted
+              ? "✓ 状态检查通过 · 静默完成"
+              : "✓ 状态检查通过";
           } else if (v.status === "recovered") {
             vPill.textContent = `✓ 第 ${v.retriesUsed} 轮自愈后检查通过`;
           } else if (v.status === "unsolvable") {
@@ -2570,17 +2577,20 @@ export class PiAgentPanelController {
         }
       }
 
-      const bubble = document.createElement("div");
-      bubble.className = "pi-msg-bubble";
-      bubble.dataset.agentMsgText = entry.id;
-      bubble.textContent =
+      const bubbleText =
         entry.text ||
         (entry.status === "streaming"
           ? entry.thinkingActive
             ? "正在思考中…"
             : "正在执行并核验设备状态…"
           : "");
-      item.appendChild(bubble);
+      if (bubbleText) {
+        const bubble = document.createElement("div");
+        bubble.className = "pi-msg-bubble";
+        bubble.dataset.agentMsgText = entry.id;
+        bubble.textContent = bubbleText;
+        item.appendChild(bubble);
+      }
 
       list.appendChild(item);
     }

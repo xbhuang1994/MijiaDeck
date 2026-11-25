@@ -107,7 +107,7 @@ afterEach(async () => {
 });
 
 describe("Pi Agent Closed-Loop: Immediate Ack -> Execute -> State Verify -> 3-Round Self-Heal -> Skill", () => {
-  test("replies '好的' immediately BEFORE executing tools, then verifies live state BEFORE delivering final reply", async () => {
+  test("replies '好的' immediately BEFORE executing tools, verifies live state, and stays silent when simple control check passes cleanly", async () => {
     const service = new VirtualDemoService();
     const order: string[] = [];
     const origSetPower = service.setPowerState.bind(service);
@@ -127,8 +127,12 @@ describe("Pi Agent Closed-Loop: Immediate Ack -> Execute -> State Verify -> 3-Ro
       order.length = 0;
 
       const spoken: Array<{ text: string; final: boolean }> = [];
+      const finalReplyEvents: Array<Record<string, unknown>> = [];
       h.agent.on("streamEvent", (ev) => {
         order.push(`event:${String(ev.kind)}`);
+        if (ev.kind === "final_reply") {
+          finalReplyEvents.push(ev);
+        }
       });
       h.agent.on("speakChunk", (chunk) => {
         spoken.push({ text: chunk.text, final: chunk.final });
@@ -138,6 +142,8 @@ describe("Pi Agent Closed-Loop: Immediate Ack -> Execute -> State Verify -> 3-Ro
       const res = await h.agent.prompt("关闭客厅吸顶灯", { source: "voice" });
       expect(res.ok).toBe(true);
       expect(res.ack).toBe(TASK_ACK_TEXT);
+      expect(res.silentCompleted).toBe(true);
+      expect(res.reply).toBe("");
       expect(res.retriesUsed).toBe(0);
       expect(res.verification?.status).toBe("passed");
       expect(res.verification?.passed).toBe(true);
@@ -159,14 +165,14 @@ describe("Pi Agent Closed-Loop: Immediate Ack -> Execute -> State Verify -> 3-Ro
       expect(verifyIdx).toBeGreaterThan(writeIdx);
       expect(verifyEventIdx).toBeGreaterThan(verifyIdx);
       expect(finalReplyIdx).toBeGreaterThan(verifyEventIdx);
+      expect(finalReplyEvents.length).toBe(1);
+      expect(finalReplyEvents[0]?.silent).toBe(true);
+      expect(finalReplyEvents[0]?.text).toBe("");
 
-      // Voice speaks "好的" first, then verified result (without duplicating leading "好的，")
-      expect(spoken.length).toBe(2);
+      // Voice speaks ONLY immediate ack "好的" — no redundant post-verification TTS reply when state is normal!
+      expect(spoken.length).toBe(1);
       expect(spoken[0]?.text).toBe("好的");
       expect(spoken[0]?.final).toBe(false);
-      expect(spoken[1]?.text).toContain("客厅吸顶灯");
-      expect(spoken[1]?.text).not.toStartWith("好的，");
-      expect(spoken[1]?.final).toBe(true);
 
       // 1st-try clean success does NOT spam skill store
       expect(loadAgentSkills().length).toBe(0);
