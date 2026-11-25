@@ -21,8 +21,11 @@ import type { VadSensitivityMode, VoicePipelineMode } from "../core/agentConfigS
 import { computeRms, estimateSnrDb, resampleLinear } from "./audioPcm.ts";
 import {
   ClearVoiceMultiTrackAssembler,
+  ClearVoiceMultiTrackEndpointTracker,
   ClearVoiceRealtimeChunker,
+  pruneInactiveOrDuplicateTracks,
   type ClearVoiceChunkDescriptor,
+  type ClearVoiceReadyTrackSlot,
   type ClearVoiceTriggerReason,
 } from "./clearVoiceChunker.ts";
 import type {
@@ -100,6 +103,10 @@ export interface VoiceStreamSegmentPayload {
     bssUsed?: boolean;
     permutationSwaps?: number;
     gpuName?: string | null;
+    /** 是否由多轨分轨独立判停提前出段（如音轨 1 已说完命令而音轨 2 电视仍在持续发声） */
+    independentTrackEmit?: boolean;
+    /** 独立出段时的原始分离槽位编号（0-based） */
+    sourceSlot?: number;
   };
   /** 该分段是否在 TTS 播报活跃期或刚结束尾窗内采集（供服务端回声防护增强判定） */
   duringTtsPlayback?: boolean;
@@ -245,6 +252,8 @@ export class VoiceStreamSession {
   // ClearVoice GPU 多轨盲源分离 + 分轨降噪准实时切片管线状态（按需惰性初始化，支持运行期无缝热切换）
   private _cvChunker: ClearVoiceRealtimeChunker | null = null;
   private _cvAssembler: ClearVoiceMultiTrackAssembler | null = null;
+  private _cvTrackTracker: ClearVoiceMultiTrackEndpointTracker | null = null;
+  private _cvAnyTrackDrainedInUtterance = false;
   private _cvSliceQueue: ClearVoiceQueuedSlice[] = [];
   private _cvInFlight = false;
   private _cvIdleResolvers: Array<() => void> = [];
@@ -290,6 +299,7 @@ export class VoiceStreamSession {
   private _lastDenOverlap = new Float32Array(0);
   private _lastMatchedStartSec = -1;
   private _lastMatchedEndSec = -1;
+  private _lastMatchedBySlot = new Map<number, { startSec: number; endSec: number }>();
   private _ttsSpeaking = false;
   private _ttsLastEndedAt = 0;
 
@@ -656,6 +666,9 @@ export class VoiceStreamSession {
     if (this._cvChunker && this._opts.clearVoiceUtteranceSilenceMs === undefined) {
       this._cvChunker.setUtteranceSilenceMs(this._utteranceSilenceMs);
     }
+    if (this._cvTrackTracker && this._opts.clearVoiceUtteranceSilenceMs === undefined) {
+      this._cvTrackTracker.setUtteranceSilenceMs(this._utteranceSilenceMs);
+    }
   }
 
   /**
@@ -835,6 +848,7 @@ export class VoiceStreamSession {
       this._legacyFedUpToGlobalSample = this._rawTotalSamples;
       if (explicitExit) {
         this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, this._rawTotalSamples);
+        this._lastMatchedBySlot.clear();
       }
     }
     if (this._cvPendingEmitCount === 0) {
@@ -1076,6 +1090,30 @@ export class VoiceStreamSession {
         lookbackMs: this._opts.clearVoiceLookbackMs ?? 300,
       });
     }
+    if (!this._cvTrackTracker) {
+      const sliceSilenceMs = this._opts.clearVoiceSilenceMs ?? 280;
+      const utteranceSilenceMs = Math.max(
+        sliceSilenceMs,
+        this._opts.clearVoiceUtteranceSilenceMs ?? this._utteranceSilenceMs,
+      );
+      this._cvTrackTracker = new ClearVoiceMultiTrackEndpointTracker({
+        sampleRate: TARGET_SR,
+        frameSizeMs: 32,
+        utteranceSilenceMs,
+        longUtteranceThresholdMs: Math.round(LONG_UTTERANCE_THRESHOLD_SEC * 1000),
+        longUtteranceExtraSilenceMs: this._longUtteranceExtraSilenceMs,
+        incompleteGraceMs: this._incompleteGraceMs,
+        maxTrackUtteranceMs: Math.round((this._clearVoiceMaxUtteranceSamples / TARGET_SR) * 1000),
+        maxChunkMs: this._opts.clearVoiceMaxChunkMs ?? 2000,
+        vadFactory: () =>
+          this._opts.localEngine.createStreamingVad({
+            threshold: this._opts.vadThreshold ?? 0.4,
+            minSilenceDuration: 0.064,
+            minSpeechDuration: 0.064,
+            maxSpeechDuration: MAX_UTTERANCE_SEC,
+          }),
+      });
+    }
   }
 
   private _resetClearVoiceState(): void {
@@ -1089,9 +1127,12 @@ export class VoiceStreamSession {
     this._cvServerSwaps = 0;
     this._cvUtteranceStartSample = null;
     this._cvPendingEmitCount = 0;
+    this._cvAnyTrackDrainedInUtterance = false;
     this._cvChunker?.setIncompleteUtteranceHint(false);
+    this._cvChunker?.setAdaptiveMaxChunkMs(null);
     this._cvChunker?.reset();
     this._cvAssembler?.reset();
+    this._cvTrackTracker?.reset();
     if (!this._cvInFlight) {
       const resolvers = this._cvIdleResolvers;
       this._cvIdleResolvers = [];
@@ -1204,19 +1245,132 @@ export class VoiceStreamSession {
         this._cvTotalSeMs += sliceSeMs;
         this._cvServerSwaps += sliceSwaps;
         this._cvRawChunks.push(next.rawNewSamples);
+        // 持续电视长时段播放期间限制原始混音分片缓冲上限，避免内存随播放时长无限增长
+        const maxRawBufferedSamples = this._clearVoiceMaxUtteranceSamples + TARGET_SR * 4;
+        let rawBuffered = 0;
+        for (const chunk of this._cvRawChunks) {
+          rawBuffered += chunk.length;
+        }
+        while (rawBuffered > maxRawBufferedSamples && this._cvRawChunks.length > 1) {
+          const removed = this._cvRawChunks.shift()!;
+          rawBuffered -= removed.length;
+        }
 
         // 阶段 3（跨切片 PIT 置换对齐 + 裁掉前 0.3s 历史输出）+ 阶段 4（每轨独立 20ms 线性交叉淡入淡出 Overlap-Add）
-        assembler.appendSeparatedSlice({
+        const appendRes = assembler.appendSeparatedSlice({
           tracksWithContext: separatedSliceTracks,
           lookbackSamples: next.lookbackSamples,
           newSamples: next.rawNewSamples.length,
           applyCrossfade: next.needsCrossfade,
         });
 
+        const tracker = this._cvTrackTracker!;
+        const slotStartLocalSamples = appendRes.trimmedSlices.map((sl, idx) =>
+          Math.max(0, assembler.getSlotLength(idx) - sl.length),
+        );
+
         // 若话语仍在继续（2.0s 增量切片或 280ms 短停顿增量降噪切片）：
-        // 1) 仅在已唤醒/授权态且 GPU 就绪或无积压时，对每条有效分离音轨独立做实时流式字幕预览（严禁混轨！），并回传语义未闭合提示以防慢语速句中停顿被截断；
-        // 2) 仅当累计超长达到 30s 安全上限时才兜底提交，绝不中途腰斩正常长语音。
+        // 1) 推进分轨独立端点检测状态机：一旦某条音轨（如用户真实命令）已说完并达到尾静音判停，
+        //    即便另一条音轨（如电视）仍在持续发声导致混合音频 VAD 无法结束，也立刻独立出段执行！
+        // 2) 仅在已唤醒/授权态且无切片积压时，对仍在说话的分离音轨独立做实时流式字幕预览与分轨未闭合宽限提示；
+        // 3) 单轨达到 30s 安全上限时兜底提交；多轨由分轨独立 30s 上限各自提交，绝不连带腰斩另一条活跃音轨。
         if (!next.utteranceEnded) {
+          const trackStep = tracker.ingestAlignedSlices(appendRes.trimmedSlices, {
+            sliceStartGlobalSample: item.startGlobalSample,
+            slotStartLocalSamples,
+          });
+
+          // 多轨场景下另一条新说话人音轨刚刚开声（如持续电视背景中用户突然开始说指令）时，
+          // 刷新说话活动通知，避免混合 VAD 长期常亮触发对话超时防截断过期。
+          if (
+            appendRes.trackCount > 1 &&
+            assembler.sliceCount > 1 &&
+            trackStep.newlyStartedSlots.some((slotIdx) => tracker.hasOtherActiveSpeech(slotIdx))
+          ) {
+            this._opts.onSpeechActivity?.(false);
+            this._opts.onSpeechActivity?.(true);
+          }
+
+          // 分轨独立提前出段：先基于未 drain 的对齐多轨音频完成同时间窗反镜像串音校验，再逐轨独立 drain 并派发！
+          if (trackStep.readySlots.length > 0) {
+            const pendingEmitItems: Array<{
+              ready: ClearVoiceReadyTrackSlot;
+              audio: Float32Array;
+              otherEnergySum: number;
+              isGhost: boolean;
+            }> = [];
+
+            for (const ready of trackStep.readySlots) {
+              const slotAudio = assembler.getSlotAudio(ready.slotIndex);
+              const safeStart = Math.max(0, Math.min(slotAudio.length, ready.trimStartLocalSample));
+              const safeEnd = Math.max(safeStart, Math.min(slotAudio.length, ready.trimEndLocalSample));
+              const candidateAudio = slotAudio.slice(safeStart, safeEnd);
+              const distFromEndStart = slotAudio.length - safeStart;
+              const distFromEndEnd = slotAudio.length - safeEnd;
+              let isGhost = false;
+              let otherEnergySum = 0;
+
+              for (let j = 0; j < assembler.trackSlotCount; j += 1) {
+                if (j === ready.slotIndex) continue;
+                const otherAudio = assembler.getSlotAudio(j);
+                const jStart = otherAudio.length - distFromEndStart;
+                const jEnd = otherAudio.length - distFromEndEnd;
+                const clampedJStart = Math.max(0, jStart);
+                const clampedJEnd = Math.min(otherAudio.length, jEnd);
+                const overlapLen = clampedJEnd - clampedJStart;
+                if (overlapLen >= 1600) {
+                  const candOffset = clampedJStart - jStart;
+                  const candOverlap = candidateAudio.subarray(
+                    Math.max(0, candOffset),
+                    Math.min(candidateAudio.length, candOffset + overlapLen),
+                  );
+                  const otherOverlap = otherAudio.subarray(
+                    clampedJStart,
+                    Math.min(clampedJEnd, clampedJStart + candOverlap.length),
+                  );
+                  if (candOverlap.length >= 1600 && otherOverlap.length >= 1600) {
+                    const otherRms = computeRms(otherOverlap);
+                    otherEnergySum += otherRms * otherRms;
+                    const check = pruneInactiveOrDuplicateTracks([otherOverlap, candOverlap]);
+                    const keptCandidate = check.tracks.some((t) => t.sourceSlot === 1);
+                    if (!keptCandidate) {
+                      isGhost = true;
+                      break;
+                    }
+                  }
+                }
+              }
+
+              pendingEmitItems.push({
+                ready,
+                audio: candidateAudio,
+                otherEnergySum,
+                isGhost,
+              });
+            }
+
+            for (const em of pendingEmitItems) {
+              assembler.drainTrackSlot(em.ready.slotIndex);
+              tracker.resetSlot(em.ready.slotIndex);
+              this._cvAnyTrackDrainedInUtterance = true;
+              if (!em.isGhost && em.audio.length >= Math.round(TARGET_SR * 0.14)) {
+                this._emitClearVoiceSingleTrack(em.ready, em.audio, em.otherEnergySum);
+              }
+            }
+          }
+
+          // 压缩长期空闲静音的槽位（仅保留 160ms pre-roll），防止持续电视期间空闲槽位堆积死静音
+          if (appendRes.trackCount > 1) {
+            const maxIdleSamples = tracker.preRollSamples * 4;
+            for (let i = 0; i < assembler.trackSlotCount; i += 1) {
+              const snap = tracker.getSlotSnapshot(i);
+              if (snap && !snap.hasSpeech && assembler.getSlotLength(i) > maxIdleSamples) {
+                const compactedLen = assembler.compactIdleSlot(i, tracker.preRollSamples);
+                tracker.syncSlotLocalLength(i, compactedLen);
+              }
+            }
+          }
+
           const previewAllowed =
             this._streamingAsrEnabled &&
             (!this._wakeGatedAsr || item.wakeAuthorized || this.isAwake);
@@ -1225,6 +1379,7 @@ export class VoiceStreamSession {
               const status = this._opts.localEngine.getStatus();
               const allowPreview =
                 status.readyForLocalAsr &&
+                this._cvSliceQueue.length < 2 &&
                 (status.activeQwen3Device === "gpu" || this._cvSliceQueue.length === 0);
               if (allowPreview) {
                 const prunedPreview = assembler.getTracks({ prune: true });
@@ -1238,11 +1393,30 @@ export class VoiceStreamSession {
                 let anyIncomplete = false;
                 let previewEngine = "qwen3-asr-stream";
                 let previewLatencyMs = 0;
+                const maxPreviewSamples = TARGET_SR * 8;
 
                 for (const tr of prunedPreview.tracks) {
-                  if (tr.samples.length < TARGET_SR * 0.35) continue;
+                  const slotSnap = tracker.getSlotSnapshot(tr.sourceSlot);
+                  if (
+                    this._cvAnyTrackDrainedInUtterance &&
+                    slotSnap &&
+                    !slotSnap.hasSpeech
+                  ) {
+                    continue;
+                  }
+                  const activeStart =
+                    slotSnap?.hasSpeech && slotSnap.utteranceStartLocalSample !== null
+                      ? Math.max(0, Math.min(tr.samples.length, slotSnap.utteranceStartLocalSample))
+                      : 0;
+                  const activeView = activeStart > 0 ? tr.samples.subarray(activeStart) : tr.samples;
+                  if (activeView.length < TARGET_SR * 0.35) continue;
+                  // 预览字幕限制至近 8 秒尾窗，避免 20s+ 持续电视轨拖慢实时切片队列
+                  const previewAudio =
+                    activeView.length > maxPreviewSamples
+                      ? activeView.subarray(activeView.length - maxPreviewSamples)
+                      : activeView;
                   const asrRes = await this._opts.localEngine.transcribeLocal(
-                    tr.samples,
+                    previewAudio,
                     TARGET_SR,
                     this.lang,
                     {
@@ -1254,13 +1428,19 @@ export class VoiceStreamSession {
                   previewLatencyMs += asrRes.durationMs;
                   const cleanedText = asrRes.text.trim();
                   if (!cleanedText) continue;
+                  const displayIndex =
+                    this._cvAnyTrackDrainedInUtterance || assembler.trackSlotCount > 1
+                      ? tr.sourceSlot + 1
+                      : tr.trackIndex;
                   previewTracks.push({
-                    trackId: `cv_track_${tr.trackIndex}`,
-                    trackIndex: tr.trackIndex,
+                    trackId: `cv_track_${displayIndex}`,
+                    trackIndex: displayIndex,
                     text: cleanedText,
                     energyRatio: tr.energyRatio,
                   });
-                  if (looksLikeIncompleteUtterance(cleanedText, this._wakeWords)) {
+                  const trackIncomplete = looksLikeIncompleteUtterance(cleanedText, this._wakeWords);
+                  tracker.setSlotIncompleteHint(tr.sourceSlot, trackIncomplete);
+                  if (trackIncomplete) {
                     anyIncomplete = true;
                   }
                   if (primaryPartial === null) {
@@ -1269,6 +1449,7 @@ export class VoiceStreamSession {
                       latencyMs: asrRes.durationMs,
                     });
                     if (this._streamTracker.isLatestIncomplete) {
+                      tracker.setSlotIncompleteHint(tr.sourceSlot, true);
                       anyIncomplete = true;
                     }
                     if (ingested.partial) {
@@ -1277,7 +1458,10 @@ export class VoiceStreamSession {
                   }
                 }
 
-                this._cvChunker?.setIncompleteUtteranceHint(anyIncomplete);
+                // 单轨时保持原未闭合整句宽限；多轨时仅由各轨独立 incompleteHint 控制，防止电视未闭合语段拖延用户轨！
+                this._cvChunker?.setIncompleteUtteranceHint(
+                  assembler.trackSlotCount <= 1 ? anyIncomplete : false,
+                );
                 if (previewTracks.length > 0) {
                   const lead = previewTracks[0]!;
                   const partialPayload: StreamingPartialUpdate = primaryPartial
@@ -1302,8 +1486,14 @@ export class VoiceStreamSession {
             }
           }
 
-          // 安全上限：单条连续话语达到上限（默认 30s）时自动提交独立多轨音频
-          if (assembler.totalSamples >= this._clearVoiceMaxUtteranceSamples) {
+          // 若已有某轨停说进入静默倒计时而另一条电视轨仍在发声，动态缩短下一切片步进以降低用户命令执行延迟
+          this._cvChunker?.setAdaptiveMaxChunkMs(tracker.computeAdaptiveNextChunkMs());
+
+          // 单轨安全上限：连续话语达到上限（默认 30s）时自动提交（多轨已由分轨独立 track_timeout 单独处理，绝不误斩另一轨）
+          if (
+            assembler.trackSlotCount <= 1 &&
+            assembler.totalSamples >= this._clearVoiceMaxUtteranceSamples
+          ) {
             const timeoutMeta: ClearVoiceUtteranceMeta = {
               wakeAnchored: this._cvWakeAnchored || this._wakeAnchorSample !== null,
               acousticWake: this._cvWakeHit ?? this._wakeAnchorHit ?? null,
@@ -1318,7 +1508,13 @@ export class VoiceStreamSession {
           return;
         }
 
-        // 整句静音判停或 flush：将每条独立拼接完成的纯净音轨分别送交后续独立声纹/ASR/逻辑判定
+        // 整句静音判停或 flush：若此前曾有分轨独立出段，也推进本尾片分轨状态确保只提交尚未出段的有效音轨
+        if (this._cvAnyTrackDrainedInUtterance) {
+          tracker.ingestAlignedSlices(appendRes.trimmedSlices, {
+            sliceStartGlobalSample: item.startGlobalSample,
+            slotStartLocalSamples,
+          });
+        }
         this._emitClearVoiceUtterance(next.triggerReason, item.utteranceMeta);
       })
       .catch(() => {
@@ -1333,6 +1529,93 @@ export class VoiceStreamSession {
       });
   }
 
+  /**
+   * 多轨场景下独立提交单条已说完（或达单轨上限）的分离音轨：
+   * - 不重置 ClearVoiceMultiTrackAssembler 与其余仍在发声的音轨（如持续电视）；
+   * - 保留待机唤醒锚定上下文，由 _pumpQueue 在命中有效指令或超时后统一清理。
+   */
+  private _emitClearVoiceSingleTrack(
+    ready: ClearVoiceReadyTrackSlot,
+    trackAudio: Float32Array,
+    otherAlignedEnergySum: number,
+  ): void {
+    if (this._disposed || trackAudio.length < Math.round(TARGET_SR * 0.14)) {
+      return;
+    }
+    const assembler = this._cvAssembler;
+    const rawFromRing =
+      ready.endGlobalSample > ready.startGlobalSample
+        ? this._readRingRange(
+            this._rawRing,
+            this._rawTotalSamples,
+            ready.startGlobalSample,
+            ready.endGlobalSample,
+          )
+        : new Float32Array(0);
+    const rawSlice =
+      rawFromRing.length >= Math.round(TARGET_SR * 0.14) ? rawFromRing : trackAudio;
+
+    const inputSnrDb = estimateSnrDb(rawSlice, TARGET_SR);
+    const outSnr = estimateSnrDb(trackAudio, TARGET_SR);
+    const rms = computeRms(trackAudio);
+    const trEnergy = rms * rms;
+    const totalEnergy = trEnergy + Math.max(0, otherAlignedEnergySum);
+    const energyRatio = totalEnergy > 1e-12 ? trEnergy / totalEnergy : 1;
+    const trackIndex = ready.slotIndex + 1;
+    const trackId = `cv_track_${trackIndex}`;
+
+    const separatedTrack: VoiceStreamSeparatedTrack = {
+      trackId,
+      trackIndex,
+      sourceSlot: ready.slotIndex,
+      samples: trackAudio,
+      sampleRate: TARGET_SR,
+      rms: Number(rms.toFixed(5)),
+      energyRatio: Number(energyRatio.toFixed(4)),
+      outputSnrDb: outSnr,
+      snrGainDb: Number((outSnr - inputSnrDb).toFixed(2)),
+    };
+
+    const wakeAnchored = Boolean(this._cvWakeAnchored || this._wakeAnchorSample !== null);
+    const acousticWake = this._cvWakeHit ?? this._wakeAnchorHit ?? null;
+    const triggerReason: ClearVoiceTriggerReason =
+      ready.reason === "track_timeout" ? "timeout" : "silence";
+
+    this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, ready.endGlobalSample);
+
+    const payload: VoiceStreamSegmentPayload = {
+      rawSamples: rawSlice,
+      denoisedSamples: trackAudio,
+      separatedTracks: [separatedTrack],
+      denoiseEngine: this._cvLastEngine,
+      inputSnrDb,
+      outputSnrDb: outSnr,
+      snrGainDb: separatedTrack.snrGainDb,
+      startSec: Number((ready.startGlobalSample / TARGET_SR).toFixed(2)),
+      durationSec: Number((trackAudio.length / TARGET_SR).toFixed(2)),
+      forcedRoll: ready.reason === "track_timeout",
+      acousticWake,
+      wakeAnchored,
+      commitReason: ready.reason === "track_timeout" ? "max_duration" : "vad_silence",
+      pipelineMode: "clearvoice",
+      clearVoiceMeta: {
+        sliceCount: assembler?.sliceCount ?? 1,
+        crossfadeCount: assembler?.crossfadeCount ?? 0,
+        triggerReason,
+        denoiseMs: Math.round(this._cvTotalDenoiseMs),
+        ssMs: Math.round(this._cvTotalSsMs),
+        seMs: Math.round(this._cvTotalSeMs),
+        trackCount: 1,
+        bssUsed: this._cvBssUsed,
+        permutationSwaps: (assembler?.permutationSwaps ?? 0) + this._cvServerSwaps,
+        gpuName: this._cvLastGpuName,
+        independentTrackEmit: true,
+        sourceSlot: ready.slotIndex,
+      },
+    };
+    this._enqueueSegment(payload);
+  }
+
   private _emitClearVoiceUtterance(
     triggerReason: ClearVoiceTriggerReason,
     utteranceMeta?: ClearVoiceUtteranceMeta,
@@ -1342,9 +1625,14 @@ export class VoiceStreamSession {
       this._cvPendingEmitCount = Math.max(0, this._cvPendingEmitCount - 1);
     }
     const assembler = this._cvAssembler;
+    const tracker = this._cvTrackTracker;
+    const anyDrained = this._cvAnyTrackDrainedInUtterance;
     this._cvChunker?.setIncompleteUtteranceHint(false);
+    this._cvChunker?.setAdaptiveMaxChunkMs(null);
     if (!assembler || assembler.totalSamples < Math.round(TARGET_SR * 0.14)) {
       this._cvAssembler?.reset();
+      this._cvTrackTracker?.reset();
+      this._cvAnyTrackDrainedInUtterance = false;
       this._cvRawChunks = [];
       this._cvTotalDenoiseMs = 0;
       this._cvTotalSsMs = 0;
@@ -1356,15 +1644,6 @@ export class VoiceStreamSession {
       return;
     }
 
-    const pruned = assembler.getTracks({ prune: true });
-    const rawLen = this._cvRawChunks.reduce((acc, c) => acc + c.length, 0);
-    const rawSlice = new Float32Array(rawLen);
-    let rawOff = 0;
-    for (const c of this._cvRawChunks) {
-      rawSlice.set(c, rawOff);
-      rawOff += c.length;
-    }
-
     const sliceCount = assembler.sliceCount;
     const crossfadeCount = assembler.crossfadeCount;
     const permutationSwaps = assembler.permutationSwaps + this._cvServerSwaps;
@@ -1372,10 +1651,129 @@ export class VoiceStreamSession {
     const ssMs = Math.round(this._cvTotalSsMs);
     const seMs = Math.round(this._cvTotalSeMs);
     const bssUsed = this._cvBssUsed;
-    const startSample = this._cvUtteranceStartSample ?? 0;
-    const endGlobalSample = utteranceMeta?.endGlobalSample ?? startSample + rawSlice.length;
+    let startSample = this._cvUtteranceStartSample ?? 0;
+
+    interface FinalTrackDraft {
+      trackIndex: number;
+      sourceSlot: number;
+      samples: Float32Array;
+      rms: number;
+      energyRatio: number;
+    }
+    let finalTracks: FinalTrackDraft[] = [];
+
+    if (anyDrained && tracker) {
+      // 已有音轨在本轮提前独立出段：仅提交剩余尚未出段且包含有效语音的音轨，彻底避免已执行音轨被重复触发！
+      const minEmitSamples = Math.round(TARGET_SR * 0.14);
+      const snapshots = tracker.getAllSlotSnapshots();
+      const candidates: Array<{
+        slotIndex: number;
+        samples: Float32Array;
+        startGlobalSample: number | null;
+      }> = [];
+      for (const snap of snapshots) {
+        if (!snap.hasSpeech || snap.speechSamples < tracker.minSpeechSamples) {
+          continue;
+        }
+        const slotAudio = assembler.getSlotAudio(snap.slotIndex);
+        if (slotAudio.length < minEmitSamples) {
+          continue;
+        }
+        const trimStart = Math.max(0, Math.min(slotAudio.length, snap.utteranceStartLocalSample ?? 0));
+        const trimEnd = Math.max(
+          trimStart,
+          Math.min(
+            slotAudio.length,
+            triggerReason === "silence"
+              ? snap.lastSpeechEndLocalSample + tracker.tailPadSamples
+              : slotAudio.length,
+          ),
+        );
+        const sliced = slotAudio.slice(trimStart, trimEnd);
+        if (sliced.length >= minEmitSamples) {
+          candidates.push({
+            slotIndex: snap.slotIndex,
+            samples: sliced,
+            startGlobalSample: snap.utteranceStartGlobalSample,
+          });
+        }
+      }
+
+      if (candidates.length === 1) {
+        const c = candidates[0]!;
+        const r = computeRms(c.samples);
+        finalTracks = [
+          {
+            trackIndex: c.slotIndex + 1,
+            sourceSlot: c.slotIndex,
+            samples: c.samples,
+            rms: Number(r.toFixed(5)),
+            energyRatio: 1,
+          },
+        ];
+        if (c.startGlobalSample !== null) {
+          startSample = c.startGlobalSample;
+        }
+      } else if (candidates.length >= 2) {
+        const prunedRem = pruneInactiveOrDuplicateTracks(candidates.map((c) => c.samples));
+        let earliestGlobal: number | null = null;
+        finalTracks = prunedRem.tracks.map((tr) => {
+          const orig = candidates[tr.sourceSlot]!;
+          if (
+            orig.startGlobalSample !== null &&
+            (earliestGlobal === null || orig.startGlobalSample < earliestGlobal)
+          ) {
+            earliestGlobal = orig.startGlobalSample;
+          }
+          return {
+            trackIndex: orig.slotIndex + 1,
+            sourceSlot: orig.slotIndex,
+            samples: tr.samples,
+            rms: tr.rms,
+            energyRatio: tr.energyRatio,
+          };
+        });
+        if (earliestGlobal !== null) {
+          startSample = earliestGlobal;
+        }
+      }
+    } else {
+      const pruned = assembler.getTracks({ prune: true });
+      finalTracks = pruned.tracks.map((tr) => ({
+        trackIndex: tr.trackIndex,
+        sourceSlot: tr.sourceSlot,
+        samples: tr.samples,
+        rms: tr.rms,
+        energyRatio: tr.energyRatio,
+      }));
+    }
+
+    const rawLen = this._cvRawChunks.reduce((acc, c) => acc + c.length, 0);
+    const endGlobalSample = utteranceMeta?.endGlobalSample ?? startSample + rawLen;
+    let rawSlice: Float32Array;
+    if (anyDrained && endGlobalSample > startSample) {
+      const ranged = this._readRingRange(
+        this._rawRing,
+        this._rawTotalSamples,
+        startSample,
+        endGlobalSample,
+      );
+      rawSlice =
+        ranged.length >= Math.round(TARGET_SR * 0.14)
+          ? ranged
+          : finalTracks[0]?.samples ?? new Float32Array(0);
+    } else {
+      rawSlice = new Float32Array(rawLen);
+      let rawOff = 0;
+      for (const c of this._cvRawChunks) {
+        rawSlice.set(c, rawOff);
+        rawOff += c.length;
+      }
+    }
 
     assembler.reset();
+    tracker?.reset();
+    this._cvAnyTrackDrainedInUtterance = false;
     this._cvRawChunks = [];
     this._cvTotalDenoiseMs = 0;
     this._cvTotalSsMs = 0;
@@ -1387,12 +1785,12 @@ export class VoiceStreamSession {
     this._oww?.resetSegmentTracking();
     this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, endGlobalSample);
 
-    if (pruned.tracks.length === 0) {
+    if (finalTracks.length === 0) {
       return;
     }
 
     const inputSnrDb = estimateSnrDb(rawSlice, TARGET_SR);
-    const separatedTracks: VoiceStreamSeparatedTrack[] = pruned.tracks.map((tr) => {
+    const separatedTracks: VoiceStreamSeparatedTrack[] = finalTracks.map((tr) => {
       const outSnr = estimateSnrDb(tr.samples, TARGET_SR);
       return {
         trackId: `cv_track_${tr.trackIndex}`,
@@ -1440,6 +1838,9 @@ export class VoiceStreamSession {
         bssUsed,
         permutationSwaps,
         gpuName: this._cvLastGpuName,
+        ...(anyDrained && separatedTracks.length === 1
+          ? { sourceSlot: primaryTrack.sourceSlot }
+          : {}),
       },
     };
     this._enqueueSegment(payload);
@@ -2665,33 +3066,99 @@ export class VoiceStreamSession {
       .then(async () => {
         if (this._disposed) return;
         // 若上一条刚成功命中并执行指令，跳过紧随其后的重叠残尾段/滚窗，彻底防止同一句话触发二次执行
-        // （流式断句产出的独立分句已由 Qwen3StreamingHypothesisTracker 严格去重，豁免时间重叠拦截）
-        if (!next.wakeAnchored && !next.precomputedTranscript && this._lastMatchedEndSec >= 0) {
+        // （流式断句产出的独立分句已由 Qwen3StreamingHypothesisTracker 严格去重，豁免时间重叠拦截；
+        // ClearVoice 多轨 BSS 仅在同槽位内做时间重叠拦截，严禁因音轨 1 命中而误杀时间重叠的音轨 2！）
+        const isCvBssSegment =
+          next.pipelineMode === "clearvoice" && Boolean(next.clearVoiceMeta?.bssUsed);
+        const cvSlots: number[] = isCvBssSegment
+          ? typeof next.clearVoiceMeta?.sourceSlot === "number"
+            ? [next.clearVoiceMeta.sourceSlot]
+            : next.separatedTracks && next.separatedTracks.length > 0
+              ? next.separatedTracks.map((t, idx) => t.sourceSlot ?? idx)
+              : [0]
+          : [];
+
+        if (!next.wakeAnchored && !next.precomputedTranscript) {
           const nextStart = next.startSec;
           const nextEnd = next.startSec + next.durationSec;
-          const overlapStart = Math.max(nextStart, Math.max(0, this._lastMatchedStartSec));
-          const overlapEnd = Math.min(nextEnd, this._lastMatchedEndSec);
-          const overlapSec = Math.max(0, overlapEnd - overlapStart);
-          const overlapRatio = next.durationSec > 0 ? overlapSec / next.durationSec : 0;
-          if (
-            (next.forcedRoll && nextStart < this._lastMatchedEndSec) ||
-            overlapRatio >= 0.5 ||
-            (nextStart < this._lastMatchedEndSec && nextEnd <= this._lastMatchedEndSec + 0.35)
+          const isOverlappingRange = (prevStart: number, prevEnd: number): boolean => {
+            const overlapStart = Math.max(nextStart, Math.max(0, prevStart));
+            const overlapEnd = Math.min(nextEnd, prevEnd);
+            const overlapSec = Math.max(0, overlapEnd - overlapStart);
+            const overlapRatio = next.durationSec > 0 ? overlapSec / next.durationSec : 0;
+            return (
+              (next.forcedRoll && nextStart < prevEnd) ||
+              overlapRatio >= 0.5 ||
+              (nextStart < prevEnd && nextEnd <= prevEnd + 0.35)
+            );
+          };
+
+          if (isCvBssSegment) {
+            if (
+              cvSlots.length > 0 &&
+              cvSlots.every((slot) => {
+                const prev = this._lastMatchedBySlot.get(slot);
+                return prev !== undefined && isOverlappingRange(prev.startSec, prev.endSec);
+              })
+            ) {
+              this._droppedStaleCount += 1;
+              return;
+            }
+          } else if (
+            this._lastMatchedEndSec >= 0 &&
+            isOverlappingRange(this._lastMatchedStartSec, this._lastMatchedEndSec)
           ) {
             this._droppedStaleCount += 1;
             return;
           }
         }
+
         const res = await this._opts.onSegmentReady(next);
         if (res?.matched) {
-          this._lastMatchedStartSec = next.startSec;
-          this._lastMatchedEndSec = next.startSec + next.durationSec;
+          if (isCvBssSegment) {
+            const range = { startSec: next.startSec, endSec: next.startSec + next.durationSec };
+            for (const slot of cvSlots) {
+              this._lastMatchedBySlot.set(slot, range);
+            }
+          }
+          if (!next.clearVoiceMeta?.independentTrackEmit) {
+            this._lastMatchedStartSec = next.startSec;
+            this._lastMatchedEndSec = next.startSec + next.durationSec;
+          }
           this._lastRawOverlap = new Float32Array(0);
           this._lastDenOverlap = new Float32Array(0);
+          // 独立分轨唤醒命中后释放待机唤醒锚定（若已切入连续对话则继续保持唤醒，若首句即退出则平稳回归待机）
+          if (next.clearVoiceMeta?.independentTrackEmit && this._cvWakeAnchored) {
+            this._cvWakeAnchored = false;
+            this._cvWakeHit = null;
+            this._wakeAnchorSample = null;
+            this._wakeAnchorHit = null;
+            if (!this.isAwake && this._wasAwake) {
+              this._wasAwake = false;
+              this._onEnterStandby(true);
+            }
+          }
           // 唤醒段命中并切入连续对话后，立即回放在异步 ASR 间隙内写入循环录制缓冲区的续说音频，防止首字丢失
           if (this._opts.isInConversation?.()) {
             this._wasAwake = true;
             this._replayPostWakeGapIfNeeded();
+          }
+        } else if (
+          next.clearVoiceMeta?.independentTrackEmit &&
+          this._cvWakeAnchored &&
+          !this._opts.isInConversation?.() &&
+          (next.forcedRoll ||
+            (this._wakeAnchorSample !== null &&
+              this._rawTotalSamples - this._wakeAnchorSample >= TARGET_SR * 10))
+        ) {
+          // 持续电视期间若待机声学误唤醒且超过 10s（或达单轨上限）仍无任何音轨命中指令，释放锚定回归待机
+          this._cvWakeAnchored = false;
+          this._cvWakeHit = null;
+          this._wakeAnchorSample = null;
+          this._wakeAnchorHit = null;
+          if (!this.isAwake && this._wasAwake) {
+            this._wasAwake = false;
+            this._onEnterStandby(true);
           }
         }
       })
@@ -2727,6 +3194,8 @@ export class VoiceStreamSession {
     this._resetClearVoiceState();
     this._cvChunker = null;
     this._cvAssembler = null;
+    this._cvTrackTracker = null;
+    this._lastMatchedBySlot.clear();
     this._resetStreamingState(true);
     this._pendingWake = [];
     this._pendingNormalQueue = [];

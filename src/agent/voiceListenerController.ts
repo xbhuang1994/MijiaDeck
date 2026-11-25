@@ -2817,7 +2817,10 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       let vadEngine = meta.vadLabelOverride ?? `${meta.vadLabelPrefix ?? "clearvoice"}-silero`;
       let vadMs = 0;
 
-      if (!meta.preVadSegmented || trackCount > 1) {
+      if (
+        (!meta.preVadSegmented || trackCount > 1 || meta.bssUsed) &&
+        typeof this._localEngine.detectSpeechSegments === "function"
+      ) {
         const vad = this._localEngine.detectSpeechSegments(tr.samples, 16000, {
           mode: cfg.vadMode,
         });
@@ -3043,6 +3046,15 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
             !options.bypassWakeWord &&
             cfg.wakeWordEnabled;
 
+          // 同批已有用户真实命令被采纳时，禁止同批另一条未采纳音轨（如电视说出“再见/谢谢”）抢退连续对话
+          const suppressExitConversation =
+            anyAcceptedInBatch && !isAccepted && p.decision?.exitConversation === true;
+          const effectivePrecomputedAttention = staleAfterExit
+            ? undefined
+            : suppressExitConversation && p.decision
+              ? { ...p.decision, exitConversation: false }
+              : (p.decision ?? undefined);
+
           const perTrackDenoiseMs = Math.round(meta.denoiseMs / Math.max(1, trackCount));
           const res = await this.handleTranscript(p.text, {
             isFinal: true,
@@ -3062,7 +3074,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
               asrMs: p.asrMs,
             },
             llmAttentionOverride: options.llmAttentionOverride,
-            precomputedAttention: staleAfterExit ? undefined : (p.decision ?? undefined),
+            precomputedAttention: effectivePrecomputedAttention,
             asyncDispatch: options.asyncDispatch,
             duringTtsPlayback,
             trackIndex: p.trackIndex,

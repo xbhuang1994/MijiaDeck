@@ -405,16 +405,46 @@ export function computeSubbandSpectralCorr(a: Float32Array, b: Float32Array, win
 }
 
 /**
+ * 幅值感知的波形相似度（Dice / Tanimoto 相似度，范围 [-1, 1]）：
+ *   sim(a, b) = 2 * dot(a, b) / (||a||^2 + ||b||^2 + eps)
+ * - 两段均为有效语音且幅值相近时等价于归一化相关性（~+1.0）；
+ * - 当一条音轨已停说进入静音（仅剩微弱串音残影）而另一条持续发声（如电视）时，
+ *   绝不会把微弱串音放大到 1.0 导致换轨打平/误配，确保“持续发声轨 ↔ 持续发声轨、静音轨 ↔ 静音轨”。
+ */
+export function computeAmplitudeAwareWaveformSimilarity(
+  a: Float32Array,
+  b: Float32Array,
+  noiseFloorRms = 0.004,
+): number {
+  const n = Math.min(a.length, b.length);
+  if (n < 16) return 0;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < n; i += 1) {
+    const x = a[i]!;
+    const y = b[i]!;
+    dot += x * y;
+    na += x * x;
+    nb += y * y;
+  }
+  const eps = noiseFloorRms * noiseFloorRms * n;
+  const denom = na + nb + eps;
+  return denom > 1e-12 ? (2 * dot) / denom : 0;
+}
+
+/**
  * 跨切片 PIT 置换对齐（Permutation Invariant Alignment）：
  * ClearVoice MossFormer2_SS_16K 对不同切片输出的音轨顺序可能发生对调（轨0/轨1互换），
  * 若不对齐直接拼接会把两名说话人混杂进同一音轨！
- * 本函数利用当前切片头部 0.3s 历史重叠区与各轨上一段末尾 0.3s 的归一化波形相关性，
- * 自动找出最优无混叠映射，确保每条音轨始终锁定同一声源、绝不串轨混杂。
+ * 本函数利用当前切片头部 0.3s 历史重叠区与各轨上一段末尾 0.3s 的幅值感知波形相似度，
+ * 并在边界恰逢短暂换气停顿时结合各槽位近期活跃能量保持声源槽位连续，确保每条音轨始终锁定同一声源、绝不串轨混杂。
  */
 export function alignSeparatedTracksWithPrevTails(
   prevTails: ReadonlyArray<Float32Array>,
   currTracks: ReadonlyArray<Float32Array>,
   lookbackSamples: number,
+  options: { prevRecentRms?: ReadonlyArray<number> } = {},
 ): { aligned: Float32Array[]; swapped: boolean; permutation: number[] } {
   const count = currTracks.length;
   if (count <= 1 || prevTails.length < count || lookbackSamples < 32) {
@@ -444,11 +474,57 @@ export function alignSeparatedTracksWithPrevTails(
   // 双轨精确全局最优匹配（覆盖 MossFormer2_SS_16K 的主场景）
   if (count === 2) {
     const scoreSame =
-      computeNormalizedWaveformCorr(prevSlice[0]!, currSlice[0]!) +
-      computeNormalizedWaveformCorr(prevSlice[1]!, currSlice[1]!);
+      computeAmplitudeAwareWaveformSimilarity(prevSlice[0]!, currSlice[0]!) +
+      computeAmplitudeAwareWaveformSimilarity(prevSlice[1]!, currSlice[1]!);
     const scoreSwap =
-      computeNormalizedWaveformCorr(prevSlice[0]!, currSlice[1]!) +
-      computeNormalizedWaveformCorr(prevSlice[1]!, currSlice[0]!);
+      computeAmplitudeAwareWaveformSimilarity(prevSlice[0]!, currSlice[1]!) +
+      computeAmplitudeAwareWaveformSimilarity(prevSlice[1]!, currSlice[0]!);
+
+    if (scoreSwap > scoreSame + 0.02) {
+      return {
+        aligned: [currTracks[1]!, currTracks[0]!],
+        swapped: true,
+        permutation: [1, 0],
+      };
+    }
+    if (scoreSame > scoreSwap + 0.02) {
+      return {
+        aligned: [currTracks[0]!, currTracks[1]!],
+        swapped: false,
+        permutation: [0, 1],
+      };
+    }
+
+    // 边界 0.3s 历史重叠区恰好落在声源短暂换气停顿（两轨重叠区均接近静音）时，
+    // 按“近期持续发声槽位 ↔ 新切片主体活跃轨”保持连续性，防止电视音跳入已停说的用户槽位！
+    const prevRecent = options.prevRecentRms;
+    if (prevRecent && prevRecent.length >= 2) {
+      const p0 = prevRecent[0] ?? 0;
+      const p1 = prevRecent[1] ?? 0;
+      const body0 = currTracks[0]!.length > ovLen ? currTracks[0]!.subarray(ovLen) : currTracks[0]!;
+      const body1 = currTracks[1]!.length > ovLen ? currTracks[1]!.subarray(ovLen) : currTracks[1]!;
+      const c0 = computeRms(body0);
+      const c1 = computeRms(body1);
+      const prevAsym = Math.max(p0, p1) >= 0.015 && Math.min(p0, p1) <= Math.max(p0, p1) * 0.28;
+      const currAsym = Math.max(c0, c1) >= 0.015 && Math.min(c0, c1) <= Math.max(c0, c1) * 0.28;
+      if (prevAsym && currAsym) {
+        const prevDominant = p1 > p0 ? 1 : 0;
+        const currDominant = c1 > c0 ? 1 : 0;
+        if (prevDominant !== currDominant) {
+          return {
+            aligned: [currTracks[1]!, currTracks[0]!],
+            swapped: true,
+            permutation: [1, 0],
+          };
+        }
+        return {
+          aligned: [currTracks[0]!, currTracks[1]!],
+          swapped: false,
+          permutation: [0, 1],
+        };
+      }
+    }
+
     if (scoreSwap > scoreSame + 1e-4) {
       return {
         aligned: [currTracks[1]!, currTracks[0]!],
@@ -473,7 +549,7 @@ export function alignSeparatedTracksWithPrevTails(
     let bestScore = -Infinity;
     for (let cIdx = 0; cIdx < count; cIdx += 1) {
       if (usedCurr.has(cIdx)) continue;
-      const sc = computeNormalizedWaveformCorr(prevSlice[pIdx]!, currSlice[cIdx]!);
+      const sc = computeAmplitudeAwareWaveformSimilarity(prevSlice[pIdx]!, currSlice[cIdx]!);
       if (sc > bestScore) {
         bestScore = sc;
         bestC = cIdx;
@@ -486,6 +562,64 @@ export function alignSeparatedTracksWithPrevTails(
     if (chosen !== pIdx) swapped = true;
   }
   return { aligned, swapped, permutation };
+}
+
+/**
+ * 计算单条音轨在有效人声帧（20ms 窗 RMS >= frameThreshold）上的活跃 RMS 与活跃帧数：
+ * 防止“音轨 1 说了 2s 命令后静音，音轨 2 电视连续说 15s”时，整段稀释 RMS 误把音轨 1 当作无效静音轨剔除。
+ */
+function computeActiveSpeechStats(
+  samples: Float32Array,
+  frameSamples = 320,
+  frameThreshold = 0.008,
+): { activeRms: number; activeFrames: number; activeSamples: Float32Array; activeMask: Uint8Array } {
+  const win = Math.max(64, frameSamples);
+  const frameCount = Math.floor(samples.length / win);
+  const mask = new Uint8Array(frameCount);
+  if (frameCount === 0) {
+    return { activeRms: 0, activeFrames: 0, activeSamples: new Float32Array(0), activeMask: mask };
+  }
+  let activeFrames = 0;
+  let activeSumSq = 0;
+  for (let f = 0; f < frameCount; f += 1) {
+    const off = f * win;
+    let sq = 0;
+    for (let i = 0; i < win; i += 1) {
+      const v = samples[off + i]!;
+      sq += v * v;
+    }
+    const r = Math.sqrt(sq / win);
+    if (r >= frameThreshold) {
+      mask[f] = 1;
+      activeFrames += 1;
+      activeSumSq += sq;
+    }
+  }
+  if (activeFrames === 0) {
+    return { activeRms: 0, activeFrames: 0, activeSamples: new Float32Array(0), activeMask: mask };
+  }
+  const activeSamples = new Float32Array(activeFrames * win);
+  let dst = 0;
+  for (let f = 0; f < frameCount; f += 1) {
+    if (mask[f]) {
+      activeSamples.set(samples.subarray(f * win, f * win + win), dst);
+      dst += win;
+    }
+  }
+  return {
+    activeRms: Math.sqrt(activeSumSq / (activeFrames * win)),
+    activeFrames,
+    activeSamples,
+    activeMask: mask,
+  };
+}
+
+function alignTailPair(a: Float32Array, b: Float32Array): [Float32Array, Float32Array] {
+  const n = Math.min(a.length, b.length);
+  return [
+    a.length === n ? a : a.subarray(a.length - n),
+    b.length === n ? b : b.subarray(b.length - n),
+  ];
 }
 
 export interface PrunedTrackItem {
@@ -519,7 +653,7 @@ export interface PruneTracksResult {
 /**
  * 过滤静音残余轨与单说话人镜像串音轨（严禁将多条独立音轨混杂合并！仅剔除无效空轨/镜像残影）：
  * - 单说话人输入 -> 保留主轨（1 轨），不产生重复假指令；
- * - 多说话人或人声+背景歌声 -> 保留全部独立有效音轨（2+ 轨），各自完整保留原始未混叠波形。
+ * - 多说话人或人声+背景歌声/电视 -> 保留全部独立有效音轨（2+ 轨），即使一条轨较短（如 2s 命令）另一条轨较长（如 15s 电视）也不误删！
  */
 export function pruneInactiveOrDuplicateTracks(
   tracks: ReadonlyArray<Float32Array>,
@@ -543,11 +677,15 @@ export function pruneInactiveOrDuplicateTracks(
     }
   }
 
+  const activeStatsList = tracks.map((t) => computeActiveSpeechStats(t));
+  const maxActiveRms = activeStatsList.reduce((m, s) => Math.max(m, s.activeRms), 0);
+
   let pairWcorr = 0;
   let pairEcorr = 0;
   if (tracks.length >= 2) {
-    pairWcorr = Math.abs(computeNormalizedWaveformCorr(tracks[0]!, tracks[1]!));
-    pairEcorr = computeEnvelopeCorr(tracks[0]!, tracks[1]!);
+    const [a0, a1] = alignTailPair(tracks[0]!, tracks[1]!);
+    pairWcorr = Math.abs(computeNormalizedWaveformCorr(a0, a1));
+    pairEcorr = computeEnvelopeCorr(a0, a1);
   }
 
   const keptSlots: number[] = [];
@@ -559,12 +697,45 @@ export function pruneInactiveOrDuplicateTracks(
       keptSlots.push(i);
       continue;
     }
-    if (r < minAbsRms || (maxRms > 1e-6 && r < maxRms * minRelRatio)) {
+    const [strongAligned, trAligned] = alignTailPair(tracks[strongestIdx]!, tr);
+    const activeInfo = activeStatsList[i]!;
+    const belowWholeFloor = r < minAbsRms || (maxRms > 1e-6 && r < maxRms * minRelRatio);
+
+    if (belowWholeFloor) {
+      // 活跃段保护：若某条轨仅在部分时段发声（如 1.5s 真实指令 + 12s 静音，而另一条电视轨全程发声），
+      // 只要其活跃帧累计 >= 160ms（8 帧）、活跃 RMS 足够清晰且在活跃段与主轨互不相关，仍予以保留！
+      const hasSustainedActiveSpeech =
+        activeInfo.activeFrames >= 8 &&
+        activeInfo.activeRms >= Math.max(0.014, maxActiveRms * 0.18);
+      if (!hasSustainedActiveSpeech) {
+        continue;
+      }
+      // 仅提取双方同一活跃时间片校验是否属于单说话人镜像串音
+      const win = 320;
+      const alignedStats = computeActiveSpeechStats(trAligned, win, 0.008);
+      if (alignedStats.activeFrames < 8) {
+        continue;
+      }
+      const strongAtActive = new Float32Array(alignedStats.activeFrames * win);
+      let dst = 0;
+      for (let f = 0; f < alignedStats.activeMask.length; f += 1) {
+        if (alignedStats.activeMask[f]) {
+          strongAtActive.set(strongAligned.subarray(f * win, f * win + win), dst);
+          dst += win;
+        }
+      }
+      const activeWcorr = Math.abs(computeNormalizedWaveformCorr(strongAtActive, alignedStats.activeSamples));
+      const activeScorr = computeSubbandSpectralCorr(strongAtActive, alignedStats.activeSamples);
+      if (activeWcorr >= 0.25 || activeScorr >= 0.62) {
+        continue;
+      }
+      keptSlots.push(i);
       continue;
     }
-    const wCorr = Math.abs(computeNormalizedWaveformCorr(tracks[strongestIdx]!, tr));
-    const eCorr = computeEnvelopeCorr(tracks[strongestIdx]!, tr);
-    const sCorr = computeSubbandSpectralCorr(tracks[strongestIdx]!, tr);
+
+    const wCorr = Math.abs(computeNormalizedWaveformCorr(strongAligned, trAligned));
+    const eCorr = computeEnvelopeCorr(strongAligned, trAligned);
+    const sCorr = computeSubbandSpectralCorr(strongAligned, trAligned);
     const relRatio = maxRms > 1e-6 ? r / maxRms : 0;
     if (
       (wCorr >= dupWcorr && eCorr >= dupEcorr) ||
@@ -617,13 +788,15 @@ export interface ClearVoiceMultiTrackSliceResult {
   swapped: boolean;
   crossfadeApplied: boolean;
   stitchedTotalSamples: number;
+  /** 本切片经 PIT 对齐并裁掉 0.3s 历史上下文后的每轨新增音频（按槽位 0..N-1 排列） */
+  trimmedSlices: Float32Array[];
 }
 
 /**
  * 多轨独立切片装配器：
  * - 为每条盲源分离音轨维护完全独立的 ClearVoiceSliceAssembler（互不混叠、零串轨）；
- * - 每次追加新切片前，利用 0.3s 历史重叠区执行 PIT 置换对齐，防止 MossFormer2_SS 跨切片换轨；
- * - 每条音轨各自执行 20ms 线性交叉淡入淡出平滑拼接，绝不将多轨音轨混杂回单轨！
+ * - 每次追加新切片前，利用 0.3s 历史重叠区执行幅值感知 PIT 置换对齐，防止 MossFormer2_SS 跨切片换轨；
+ * - 支持按槽位独立取出并重置单条已完成说话的音轨，同时完整保留其余仍在说话的音轨（如持续电视）及其 PIT 历史尾窗！
  */
 export class ClearVoiceMultiTrackAssembler {
   readonly sampleRate: number;
@@ -632,6 +805,7 @@ export class ClearVoiceMultiTrackAssembler {
 
   private _assemblers: ClearVoiceSliceAssembler[] = [];
   private _prevTails: Float32Array[] = [];
+  private _prevRecentRms: number[] = [];
   private _sliceCount = 0;
   private _crossfadeCount = 0;
   private _permutationSwaps = 0;
@@ -669,6 +843,55 @@ export class ClearVoiceMultiTrackAssembler {
     return this._assemblers.reduce((maxLen, a) => Math.max(maxLen, a.totalSamples), 0);
   }
 
+  getSlotLength(slotIndex: number): number {
+    return this._assemblers[slotIndex]?.totalSamples ?? 0;
+  }
+
+  getSlotAudio(slotIndex: number): Float32Array {
+    return this._assemblers[slotIndex]?.getStitchedAudio() ?? new Float32Array(0);
+  }
+
+  /**
+   * 独立取出并清空单个槽位当前已积累的音轨音频（支持按有效起止范围裁掉多余前后静音），
+   * 绝不影响其他槽位正在持续积累的音频与跨切片 PIT 对齐尾窗！
+   */
+  drainTrackSlot(
+    slotIndex: number,
+    options: { trimStartSamples?: number; trimEndSamples?: number } = {},
+  ): Float32Array {
+    const asm = this._assemblers[slotIndex];
+    if (!asm) return new Float32Array(0);
+    const full = asm.getStitchedAudio();
+    asm.reset();
+    if (full.length === 0) return full;
+    const s = Math.max(0, Math.min(full.length, options.trimStartSamples ?? 0));
+    const e = Math.max(s, Math.min(full.length, options.trimEndSamples ?? full.length));
+    return s === 0 && e === full.length ? full : full.slice(s, e);
+  }
+
+  /**
+   * 压缩长时间处于空闲静音的槽位缓冲（仅保留末尾 keepSamples 作为下一次开声前导 pre-roll），
+   * 防止电视持续说话期间空闲槽位无限堆积纯静音。
+   */
+  compactIdleSlot(slotIndex: number, keepSamples: number): number {
+    const asm = this._assemblers[slotIndex];
+    if (!asm) return 0;
+    const keep = Math.max(0, Math.round(keepSamples));
+    if (asm.totalSamples <= keep) return asm.totalSamples;
+    const full = asm.getStitchedAudio();
+    const tail = keep > 0 ? full.slice(full.length - keep) : new Float32Array(0);
+    asm.reset();
+    if (tail.length > 0) {
+      asm.appendEnhancedSlice({
+        enhancedWithContext: tail,
+        lookbackSamples: 0,
+        newSamples: tail.length,
+        applyCrossfade: false,
+      });
+    }
+    return asm.totalSamples;
+  }
+
   private _ensureSlots(slotCount: number): void {
     const existingSamples = this.totalSamples;
     while (this._assemblers.length < slotCount) {
@@ -686,7 +909,26 @@ export class ClearVoiceMultiTrackAssembler {
       }
       this._assemblers.push(asm);
       this._prevTails.push(new Float32Array(0));
+      this._prevRecentRms.push(0);
     }
+  }
+
+  private _updatePrevTail(slotIndex: number, trimmedSlice: Float32Array): void {
+    const want = this.lookbackTailSamples;
+    if (trimmedSlice.length >= want) {
+      this._prevTails[slotIndex] = trimmedSlice.slice(trimmedSlice.length - want);
+      return;
+    }
+    const prev = this._prevTails[slotIndex] ?? new Float32Array(0);
+    const keepPrev = Math.min(prev.length, want - trimmedSlice.length);
+    const merged = new Float32Array(keepPrev + trimmedSlice.length);
+    if (keepPrev > 0) {
+      merged.set(prev.subarray(prev.length - keepPrev), 0);
+    }
+    if (trimmedSlice.length > 0) {
+      merged.set(trimmedSlice, keepPrev);
+    }
+    this._prevTails[slotIndex] = merged;
   }
 
   appendSeparatedSlice(input: ClearVoiceMultiTrackSliceInput): ClearVoiceMultiTrackSliceResult {
@@ -697,6 +939,7 @@ export class ClearVoiceMultiTrackAssembler {
         swapped: false,
         crossfadeApplied: false,
         stitchedTotalSamples: this.totalSamples,
+        trimmedSlices: [],
       };
     }
 
@@ -717,6 +960,7 @@ export class ClearVoiceMultiTrackAssembler {
         this._prevTails,
         normalizedTracks,
         input.lookbackSamples,
+        { prevRecentRms: this._prevRecentRms },
       );
       alignedTracks = aligned.aligned;
       swapped = aligned.swapped;
@@ -727,6 +971,7 @@ export class ClearVoiceMultiTrackAssembler {
 
     let anyCrossfade = false;
     let maxTotal = 0;
+    const trimmedSlices: Float32Array[] = [];
     for (let i = 0; i < slotCount; i += 1) {
       const asm = this._assemblers[i]!;
       const res = asm.appendEnhancedSlice({
@@ -739,11 +984,11 @@ export class ClearVoiceMultiTrackAssembler {
         anyCrossfade = true;
       }
       maxTotal = Math.max(maxTotal, res.stitchedTotalSamples);
+      trimmedSlices.push(res.trimmedSlice);
 
-      // 更新该音轨的最近 lookback 尾部，供下一切片做 PIT 置换对齐
-      const fullTrack = asm.getStitchedAudio();
-      const tailLen = Math.min(this.lookbackTailSamples, fullTrack.length);
-      this._prevTails[i] = tailLen > 0 ? fullTrack.slice(fullTrack.length - tailLen) : new Float32Array(0);
+      // 增量更新该音轨的最近 lookback 尾部与近期活跃能量，供下一切片做幅值感知 PIT 置换对齐
+      this._updatePrevTail(i, res.trimmedSlice);
+      this._prevRecentRms[i] = computeRms(res.trimmedSlice);
     }
 
     if (anyCrossfade) {
@@ -756,6 +1001,7 @@ export class ClearVoiceMultiTrackAssembler {
       swapped,
       crossfadeApplied: anyCrossfade,
       stitchedTotalSamples: maxTotal,
+      trimmedSlices,
     };
   }
 
@@ -779,11 +1025,12 @@ export class ClearVoiceMultiTrackAssembler {
           energyRatio: Number(ratio.toFixed(4)),
         };
       });
+      const [a0, a1] = raw.length >= 2 ? alignTailPair(raw[0]!, raw[1]!) : [new Float32Array(0), new Float32Array(0)];
       return {
         tracks,
         droppedCount: 0,
-        pairWcorr: raw.length >= 2 ? Number(Math.abs(computeNormalizedWaveformCorr(raw[0]!, raw[1]!)).toFixed(4)) : 0,
-        pairEcorr: raw.length >= 2 ? Number(computeEnvelopeCorr(raw[0]!, raw[1]!).toFixed(4)) : 0,
+        pairWcorr: raw.length >= 2 ? Number(Math.abs(computeNormalizedWaveformCorr(a0, a1)).toFixed(4)) : 0,
+        pairEcorr: raw.length >= 2 ? Number(computeEnvelopeCorr(a0, a1).toFixed(4)) : 0,
       };
     }
     return pruneInactiveOrDuplicateTracks(raw, options);
@@ -792,9 +1039,486 @@ export class ClearVoiceMultiTrackAssembler {
   reset(): void {
     this._assemblers = [];
     this._prevTails = [];
+    this._prevRecentRms = [];
     this._sliceCount = 0;
     this._crossfadeCount = 0;
     this._permutationSwaps = 0;
+  }
+}
+
+export interface ClearVoiceTrackEndpointConfig {
+  sampleRate?: number;
+  frameSizeMs?: number;
+  utteranceSilenceMs?: number;
+  longUtteranceThresholdMs?: number;
+  longUtteranceExtraSilenceMs?: number;
+  incompleteGraceMs?: number;
+  minSpeechMs?: number;
+  preRollMs?: number;
+  tailPadMs?: number;
+  maxTrackUtteranceMs?: number;
+  maxChunkMs?: number;
+  speechRmsFloor?: number;
+  vadFactory?: () => StreamingVadHandleLike | null;
+}
+
+export interface ClearVoiceTrackSlotSnapshot {
+  slotIndex: number;
+  hasSpeech: boolean;
+  utteranceStartLocalSample: number | null;
+  utteranceStartGlobalSample: number | null;
+  lastSpeechEndLocalSample: number;
+  speechSamples: number;
+  trailingSilenceSamples: number;
+  trailingSilenceMs: number;
+  incompleteHint: boolean;
+  totalLocalSamples: number;
+}
+
+export interface ClearVoiceReadyTrackSlot {
+  slotIndex: number;
+  reason: "track_silence" | "track_timeout";
+  trimStartLocalSample: number;
+  trimEndLocalSample: number;
+  startGlobalSample: number;
+  endGlobalSample: number;
+  speechMs: number;
+  trailingSilenceMs: number;
+}
+
+interface InternalTrackSlotState {
+  slotIndex: number;
+  vad: StreamingVadHandleLike | null;
+  hasSpeech: boolean;
+  utteranceStartLocalSample: number | null;
+  utteranceStartGlobalSample: number | null;
+  lastSpeechEndLocalSample: number;
+  speechSamples: number;
+  trailingSilenceSamples: number;
+  incompleteHint: boolean;
+  totalLocalSamples: number;
+}
+
+/**
+ * 分轨独立端点检测与判停状态机（彻底解决“音轨 1 已说完真实命令，音轨 2 电视持续说话导致音轨 1 永久阻塞”）：
+ * - 在 ClearVoice 多轨盲源分离后，为每条分离音轨维护独立的 Silero/能量 VAD、有效语音起止点、尾静音计时与语义未闭合宽限；
+ * - 通过 160ms 子窗跨轨串音/镜像抑制，防止单人说话时的微弱残影轨误触发独立出段；
+ * - 当某条音轨已说完（尾静音 >= 该轨 effectiveUtteranceSilenceMs）而另一条音轨仍在持续发声（如电视）时，
+ *   立即标记该已完成音轨独立出段执行，绝不等待电视停声或 30s 超时上限！
+ */
+export class ClearVoiceMultiTrackEndpointTracker {
+  private readonly _sampleRate: number;
+  private readonly _frameSizeMs: number;
+  private readonly _frameSamples: number;
+  private _utteranceSilenceMs: number;
+  private readonly _longUtteranceThresholdMs: number;
+  private readonly _longUtteranceExtraSilenceMs: number;
+  private readonly _incompleteGraceMs: number;
+  private readonly _minSpeechSamples: number;
+  private readonly _preRollSamples: number;
+  private readonly _tailPadSamples: number;
+  private readonly _maxTrackUtteranceSamples: number;
+  private readonly _maxChunkMs: number;
+  private readonly _speechRmsFloor: number;
+  private readonly _vadFactory?: () => StreamingVadHandleLike | null;
+
+  private _slots: InternalTrackSlotState[] = [];
+
+  constructor(options: ClearVoiceTrackEndpointConfig = {}) {
+    this._sampleRate = options.sampleRate ?? DEFAULT_CLEARVOICE_CHUNKER_CONFIG.sampleRate;
+    this._frameSizeMs = options.frameSizeMs ?? DEFAULT_CLEARVOICE_CHUNKER_CONFIG.frameSizeMs;
+    this._frameSamples = Math.max(128, Math.round((this._sampleRate * this._frameSizeMs) / 1000));
+    this._utteranceSilenceMs = Math.max(
+      250,
+      Math.min(5000, Math.round(options.utteranceSilenceMs ?? 1000)),
+    );
+    this._longUtteranceThresholdMs = Math.max(
+      800,
+      options.longUtteranceThresholdMs ?? DEFAULT_CLEARVOICE_CHUNKER_CONFIG.longUtteranceThresholdMs,
+    );
+    this._longUtteranceExtraSilenceMs = Math.max(
+      0,
+      Math.min(1500, options.longUtteranceExtraSilenceMs ?? 350),
+    );
+    this._incompleteGraceMs = Math.max(
+      0,
+      Math.min(1800, options.incompleteGraceMs ?? 650),
+    );
+    const minSpeechMs = Math.max(64, Math.min(500, options.minSpeechMs ?? 160));
+    this._minSpeechSamples = Math.round((this._sampleRate * minSpeechMs) / 1000);
+    const preRollMs = Math.max(0, Math.min(500, options.preRollMs ?? 160));
+    this._preRollSamples = Math.round((this._sampleRate * preRollMs) / 1000);
+    const tailPadMs = Math.max(0, Math.min(600, options.tailPadMs ?? 240));
+    this._tailPadSamples = Math.round((this._sampleRate * tailPadMs) / 1000);
+    const maxTrackMs = Math.max(5000, Math.min(60_000, options.maxTrackUtteranceMs ?? 30_000));
+    this._maxTrackUtteranceSamples = Math.round((this._sampleRate * maxTrackMs) / 1000);
+    this._maxChunkMs = Math.max(600, Math.min(5000, options.maxChunkMs ?? 2000));
+    this._speechRmsFloor = Math.max(0.002, options.speechRmsFloor ?? 0.006);
+    this._vadFactory = options.vadFactory;
+  }
+
+  get preRollSamples(): number {
+    return this._preRollSamples;
+  }
+
+  get tailPadSamples(): number {
+    return this._tailPadSamples;
+  }
+
+  get minSpeechSamples(): number {
+    return this._minSpeechSamples;
+  }
+
+  setUtteranceSilenceMs(ms: number): void {
+    if (!Number.isFinite(ms)) return;
+    this._utteranceSilenceMs = Math.max(250, Math.min(5000, Math.round(ms)));
+  }
+
+  setSlotIncompleteHint(slotIndex: number, incomplete: boolean): void {
+    const slot = this._slots[slotIndex];
+    if (slot) {
+      slot.incompleteHint = Boolean(incomplete);
+    }
+  }
+
+  syncSlotLocalLength(slotIndex: number, localLen: number): void {
+    const slot = this._slots[slotIndex];
+    if (!slot) return;
+    slot.totalLocalSamples = Math.max(0, Math.round(localLen));
+  }
+
+  getSlotSnapshot(slotIndex: number): ClearVoiceTrackSlotSnapshot | null {
+    const s = this._slots[slotIndex];
+    if (!s) return null;
+    return {
+      slotIndex: s.slotIndex,
+      hasSpeech: s.hasSpeech,
+      utteranceStartLocalSample: s.utteranceStartLocalSample,
+      utteranceStartGlobalSample: s.utteranceStartGlobalSample,
+      lastSpeechEndLocalSample: s.lastSpeechEndLocalSample,
+      speechSamples: s.speechSamples,
+      trailingSilenceSamples: s.trailingSilenceSamples,
+      trailingSilenceMs: Math.round((s.trailingSilenceSamples / this._sampleRate) * 1000),
+      incompleteHint: s.incompleteHint,
+      totalLocalSamples: s.totalLocalSamples,
+    };
+  }
+
+  getAllSlotSnapshots(): ClearVoiceTrackSlotSnapshot[] {
+    return this._slots.map((_, idx) => this.getSlotSnapshot(idx)!);
+  }
+
+  hasOtherActiveSpeech(excludeSlotIndex: number): boolean {
+    for (let i = 0; i < this._slots.length; i += 1) {
+      if (i === excludeSlotIndex) continue;
+      const s = this._slots[i]!;
+      if (s.hasSpeech && this._trailingSilenceMs(s) < this._effectiveSilenceMs(s)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private _ensureSlots(slotCount: number): void {
+    while (this._slots.length < slotCount) {
+      const idx = this._slots.length;
+      let vad: StreamingVadHandleLike | null = null;
+      if (this._vadFactory) {
+        try {
+          vad = this._vadFactory();
+        } catch {
+          vad = null;
+        }
+      }
+      this._slots.push({
+        slotIndex: idx,
+        vad,
+        hasSpeech: false,
+        utteranceStartLocalSample: null,
+        utteranceStartGlobalSample: null,
+        lastSpeechEndLocalSample: 0,
+        speechSamples: 0,
+        trailingSilenceSamples: 0,
+        incompleteHint: false,
+        totalLocalSamples: 0,
+      });
+    }
+  }
+
+  private _trailingSilenceMs(slot: InternalTrackSlotState): number {
+    return (slot.trailingSilenceSamples / this._sampleRate) * 1000;
+  }
+
+  private _effectiveSilenceMs(slot: InternalTrackSlotState): number {
+    let target = this._utteranceSilenceMs;
+    const speechMs = (slot.speechSamples / this._sampleRate) * 1000;
+    if (speechMs >= this._longUtteranceThresholdMs) {
+      target += this._longUtteranceExtraSilenceMs;
+    }
+    if (slot.incompleteHint) {
+      target += this._incompleteGraceMs;
+    }
+    return Math.min(5000, target);
+  }
+
+  private _detectFrameVoice(slot: InternalTrackSlotState, frame: Float32Array, suppressedAsBleed: boolean): boolean {
+    const rms = computeRms(frame);
+    let vadDetected: boolean | null = null;
+    if (slot.vad) {
+      try {
+        slot.vad.acceptWaveform(frame);
+        while (!slot.vad.isEmpty()) {
+          slot.vad.pop();
+        }
+        vadDetected = slot.vad.isDetected();
+      } catch {
+        vadDetected = null;
+      }
+    }
+    if (suppressedAsBleed || rms < this._speechRmsFloor) {
+      return false;
+    }
+    if (vadDetected !== null) {
+      return vadDetected;
+    }
+    return rms >= Math.max(this._speechRmsFloor, 0.012);
+  }
+
+  /**
+   * 喂入当前切片经 PIT 对齐并裁掉历史上下文后的各轨新增音频，推进每条音轨的独立语音/静音状态机，
+   * 返回本切片内刚刚进入活跃态的槽位与已可立即独立出段的槽位列表。
+   */
+  ingestAlignedSlices(
+    trimmedSlices: ReadonlyArray<Float32Array>,
+    options: {
+      sliceStartGlobalSample: number;
+      slotStartLocalSamples?: ReadonlyArray<number>;
+    },
+  ): {
+    newlyStartedSlots: number[];
+    readySlots: ClearVoiceReadyTrackSlot[];
+  } {
+    const slotCount = trimmedSlices.length;
+    if (slotCount === 0) {
+      return { newlyStartedSlots: [], readySlots: [] };
+    }
+    this._ensureSlots(slotCount);
+
+    const baseLocal = new Array<number>(slotCount);
+    let maxSliceLen = 0;
+    for (let i = 0; i < slotCount; i += 1) {
+      const startLoc = options.slotStartLocalSamples?.[i] ?? this._slots[i]!.totalLocalSamples;
+      baseLocal[i] = startLoc;
+      maxSliceLen = Math.max(maxSliceLen, trimmedSlices[i]!.length);
+    }
+
+    const newlyStartedSlots: number[] = [];
+    const framesPerBlock = 5; // 5 * 32ms = 160ms 子窗跨轨镜像/串音门控
+    const blockSamples = this._frameSamples * framesPerBlock;
+
+    let offset = 0;
+    while (offset + this._frameSamples <= maxSliceLen) {
+      const blockEnd = Math.min(maxSliceLen, offset + blockSamples);
+      // 1. 子窗级跨轨串音/镜像抑制：防止单人说话在次轨产生的低能串音被误判为独立活跃说话人
+      const bleedFlags = new Array<boolean>(slotCount).fill(false);
+      if (slotCount > 1 && blockEnd - offset >= this._frameSamples) {
+        const blockSlices: Float32Array[] = [];
+        const blockRms = new Array<number>(slotCount).fill(0);
+        let maxRms = 0;
+        let loudestSlot = 0;
+        for (let i = 0; i < slotCount; i += 1) {
+          const tr = trimmedSlices[i]!;
+          const sub =
+            offset < tr.length
+              ? tr.subarray(offset, Math.min(tr.length, blockEnd))
+              : new Float32Array(0);
+          blockSlices.push(sub);
+          const r = computeRms(sub);
+          blockRms[i] = r;
+          if (r > maxRms) {
+            maxRms = r;
+            loudestSlot = i;
+          }
+        }
+        if (maxRms >= 0.015) {
+          const refBlock = blockSlices[loudestSlot]!;
+          for (let i = 0; i < slotCount; i += 1) {
+            if (i === loudestSlot) continue;
+            const r = blockRms[i]!;
+            if (r < this._speechRmsFloor) {
+              bleedFlags[i] = true;
+            } else if (r < maxRms * 0.14) {
+              // 极低能量或与主轨高度相关的串音予以抑制；若为远场真实说话人（r >= 0.014 且与主轨互不相关）则保留
+              const cand = blockSlices[i]!;
+              const wC = Math.abs(computeNormalizedWaveformCorr(refBlock, cand));
+              const sC = computeSubbandSpectralCorr(refBlock, cand);
+              if (r < 0.014 || wC >= 0.25 || sC >= 0.6) {
+                bleedFlags[i] = true;
+              }
+            } else if (r < maxRms * 0.52) {
+              const cand = blockSlices[i]!;
+              const wC = Math.abs(computeNormalizedWaveformCorr(refBlock, cand));
+              const sC = computeSubbandSpectralCorr(refBlock, cand);
+              if (wC >= 0.35 || sC >= 0.72) {
+                bleedFlags[i] = true;
+              }
+            }
+          }
+        }
+      }
+
+      // 2. 逐 32ms 帧推进各轨独立 VAD 与语音/静音累计状态
+      let frameOff = offset;
+      while (frameOff + this._frameSamples <= blockEnd) {
+        for (let i = 0; i < slotCount; i += 1) {
+          const tr = trimmedSlices[i]!;
+          if (frameOff + this._frameSamples > tr.length) continue;
+          const slot = this._slots[i]!;
+          const frame = tr.subarray(frameOff, frameOff + this._frameSamples);
+          const isVoice = this._detectFrameVoice(slot, frame, bleedFlags[i]!);
+          const localFrameStart = baseLocal[i]! + frameOff;
+          const localFrameEnd = localFrameStart + this._frameSamples;
+
+          if (isVoice) {
+            if (!slot.hasSpeech) {
+              slot.hasSpeech = true;
+              slot.utteranceStartLocalSample = Math.max(0, localFrameStart - this._preRollSamples);
+              slot.utteranceStartGlobalSample = Math.max(
+                0,
+                options.sliceStartGlobalSample + frameOff - this._preRollSamples,
+              );
+              slot.speechSamples = 0;
+              slot.incompleteHint = false;
+              newlyStartedSlots.push(i);
+            }
+            slot.speechSamples += this._frameSamples;
+            slot.lastSpeechEndLocalSample = localFrameEnd;
+            slot.trailingSilenceSamples = 0;
+          } else if (slot.hasSpeech) {
+            slot.trailingSilenceSamples += this._frameSamples;
+          }
+        }
+        frameOff += this._frameSamples;
+      }
+
+      offset = frameOff > offset ? frameOff : offset + this._frameSamples;
+    }
+
+    for (let i = 0; i < slotCount; i += 1) {
+      const slot = this._slots[i]!;
+      const len = trimmedSlices[i]!.length;
+      const rem = len - offset;
+      if (rem > 0 && slot.hasSpeech && slot.trailingSilenceSamples > 0) {
+        slot.trailingSilenceSamples += rem;
+      }
+      slot.totalLocalSamples = baseLocal[i]! + len;
+    }
+
+    const readySlots = this.evaluateReadySlots(slotCount);
+    return { newlyStartedSlots, readySlots };
+  }
+
+  evaluateReadySlots(activeSlotCount = this._slots.length): ClearVoiceReadyTrackSlot[] {
+    if (activeSlotCount <= 1) {
+      return [];
+    }
+    const ready: ClearVoiceReadyTrackSlot[] = [];
+    for (let i = 0; i < activeSlotCount; i += 1) {
+      const slot = this._slots[i]!;
+      if (!slot.hasSpeech || slot.speechSamples < this._minSpeechSamples) {
+        continue;
+      }
+      const trailingMs = this._trailingSilenceMs(slot);
+      const effSilenceMs = this._effectiveSilenceMs(slot);
+      const trimStart = slot.utteranceStartLocalSample ?? 0;
+      const spanSamples = slot.totalLocalSamples - trimStart;
+
+      let reason: "track_silence" | "track_timeout" | null = null;
+      if (trailingMs >= effSilenceMs && this.hasOtherActiveSpeech(i)) {
+        reason = "track_silence";
+      } else if (spanSamples >= this._maxTrackUtteranceSamples) {
+        reason = "track_timeout";
+      }
+
+      if (reason) {
+        const trimEnd =
+          reason === "track_silence"
+            ? Math.min(slot.totalLocalSamples, slot.lastSpeechEndLocalSample + this._tailPadSamples)
+            : slot.totalLocalSamples;
+        const startGlobal = slot.utteranceStartGlobalSample ?? 0;
+        const endGlobal = startGlobal + Math.max(0, trimEnd - trimStart);
+        ready.push({
+          slotIndex: i,
+          reason,
+          trimStartLocalSample: trimStart,
+          trimEndLocalSample: trimEnd,
+          startGlobalSample: startGlobal,
+          endGlobalSample: endGlobal,
+          speechMs: Math.round((slot.speechSamples / this._sampleRate) * 1000),
+          trailingSilenceMs: Math.round(trailingMs),
+        });
+      }
+    }
+    return ready;
+  }
+
+  /**
+   * 当某条音轨已进入句尾静默等待期而另一条音轨仍在持续发声（如电视）时，
+   * 计算建议的下一次 ClearVoice 增量切片时长（800ms ~ maxChunkMs），避免额外干等满 2.0s 才触发该轨出段。
+   */
+  computeAdaptiveNextChunkMs(): number | null {
+    if (this._slots.length <= 1) return null;
+    let best: number | null = null;
+    for (let i = 0; i < this._slots.length; i += 1) {
+      const slot = this._slots[i]!;
+      if (
+        !slot.hasSpeech ||
+        slot.speechSamples < this._minSpeechSamples ||
+        slot.trailingSilenceSamples <= 0
+      ) {
+        continue;
+      }
+      if (!this.hasOtherActiveSpeech(i)) {
+        continue;
+      }
+      const trailingMs = this._trailingSilenceMs(slot);
+      const effSilenceMs = this._effectiveSilenceMs(slot);
+      const remainingMs = Math.max(0, effSilenceMs - trailingMs);
+      const candidate = Math.max(800, Math.min(this._maxChunkMs, Math.ceil(remainingMs + 220)));
+      if (best === null || candidate < best) {
+        best = candidate;
+      }
+    }
+    return best !== null && best < this._maxChunkMs ? best : null;
+  }
+
+  resetSlot(slotIndex: number): void {
+    const slot = this._slots[slotIndex];
+    if (!slot) return;
+    slot.hasSpeech = false;
+    slot.utteranceStartLocalSample = null;
+    slot.utteranceStartGlobalSample = null;
+    slot.lastSpeechEndLocalSample = 0;
+    slot.speechSamples = 0;
+    slot.trailingSilenceSamples = 0;
+    slot.incompleteHint = false;
+    slot.totalLocalSamples = 0;
+    if (slot.vad) {
+      try {
+        while (!slot.vad.isEmpty()) slot.vad.pop();
+        if (typeof slot.vad.reset === "function") slot.vad.reset();
+        else slot.vad.clear();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  reset(): void {
+    for (let i = 0; i < this._slots.length; i += 1) {
+      this.resetSlot(i);
+    }
+    this._slots = [];
   }
 }
 
@@ -847,6 +1571,7 @@ export class ClearVoiceRealtimeChunker {
   private _speechAccumSamples = 0;
   private _consecutiveSilenceMs = 0;
   private _incompleteHint = false;
+  private _adaptiveMaxChunkSamples: number | null = null;
   private _adaptiveNoiseFloor = 0.006;
 
   constructor(options: ClearVoiceRealtimeChunkerOptions = {}) {
@@ -953,6 +1678,22 @@ export class ClearVoiceRealtimeChunker {
    */
   setIncompleteUtteranceHint(incomplete: boolean): void {
     this._incompleteHint = Boolean(incomplete);
+  }
+
+  /**
+   * 临时设置下一次超时强制切分步进（ms，范围 800ms ~ maxChunkMs；传 null 恢复默认 maxChunkMs）：
+   * 用于多轨场景下某条音轨已停说进入尾静音、而另一条电视音轨仍在持续发声时，更快触发下一片 BSS 分离与分轨判停。
+   */
+  setAdaptiveMaxChunkMs(ms: number | null): void {
+    if (ms === null || !Number.isFinite(ms)) {
+      this._adaptiveMaxChunkSamples = null;
+      return;
+    }
+    const clampedMs = Math.max(800, Math.min(this.config.maxChunkMs, Math.round(ms)));
+    this._adaptiveMaxChunkSamples =
+      clampedMs < this.config.maxChunkMs
+        ? Math.round((this.config.sampleRate * clampedMs) / 1000)
+        : null;
   }
 
   /**
@@ -1114,6 +1855,7 @@ export class ClearVoiceRealtimeChunker {
     this._speechAccumSamples = 0;
     this._consecutiveSilenceMs = 0;
     this._incompleteHint = false;
+    this._adaptiveMaxChunkSamples = null;
     if (wasSpeaking) {
       this._onSpeechActivity?.(false);
     }
@@ -1279,8 +2021,9 @@ export class ClearVoiceRealtimeChunker {
       return chunk;
     }
 
-    // 触发规则 2（兜底）：超时强制触发（连续讲话不停顿达到上限 2.0s 时强制切分给 GPU 增量降噪，绝不提前中断整句）
-    if (sliceLen >= this._maxChunkSamples) {
+    // 触发规则 2（兜底）：超时强制触发（连续讲话不停顿达到上限 2.0s 或自适应多轨步进时强制切分给 GPU 增量降噪，绝不提前中断整句）
+    const effectiveMaxChunkSamples = this._adaptiveMaxChunkSamples ?? this._maxChunkSamples;
+    if (sliceLen >= effectiveMaxChunkSamples) {
       const chunk = this._buildChunk(this._sliceStartSample, this._totalSamples, "timeout", false);
       this._utteranceSliceIndex += 1;
       this._prevSliceForcedTimeout = true;
@@ -1288,6 +2031,7 @@ export class ClearVoiceRealtimeChunker {
       this._sliceStartSample = this._totalSamples;
       this._speechAccumSamples = 0;
       this._consecutiveSilenceMs = 0;
+      this._adaptiveMaxChunkSamples = null;
       return chunk;
     }
 

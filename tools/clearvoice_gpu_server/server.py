@@ -443,6 +443,43 @@ def _norm_corr(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(x, y) / (nx * ny))
 
 
+def _dice_wave_sim(a: np.ndarray, b: np.ndarray, noise_floor_rms: float = 0.004) -> float:
+    """幅值感知的波形相似度 2*dot(a,b)/(||a||^2 + ||b||^2 + floor)：
+    防止音轨 1 静音仅残留微弱电视串音时，归一化余弦相关误将高能电视轨换入音轨 1！"""
+    n = min(a.size, b.size)
+    if n < 32:
+        return 0.0
+    x = a[:n].astype(np.float64, copy=False)
+    y = b[:n].astype(np.float64, copy=False)
+    ex = float(np.dot(x, x))
+    ey = float(np.dot(y, y))
+    floor_e = float(n) * (noise_floor_rms * noise_floor_rms)
+    denom = ex + ey + floor_e
+    if denom <= 1e-12:
+        return 0.0
+    return float((2.0 * float(np.dot(x, y))) / denom)
+
+
+def _active_speech_stats(
+    samples: np.ndarray,
+    frame_samples: int = 320,
+    frame_threshold: float = 0.008,
+) -> tuple[float, int, np.ndarray, np.ndarray]:
+    """计算音轨在有效人声帧上的活跃 RMS 与活跃掩码，避免短命令音轨在持续电视长音轨旁被整段 RMS 稀释误删。"""
+    n_frames = int(samples.size) // frame_samples
+    if n_frames <= 0:
+        return 0.0, 0, np.zeros(0, dtype=np.float32), np.zeros(0, dtype=bool)
+    framed = samples[: n_frames * frame_samples].astype(np.float64, copy=False).reshape(n_frames, frame_samples)
+    frame_rms = np.sqrt(np.mean(framed ** 2, axis=1))
+    mask = frame_rms >= frame_threshold
+    active_frames = int(np.count_nonzero(mask))
+    if active_frames == 0:
+        return 0.0, 0, np.zeros(0, dtype=np.float32), mask
+    active_samples = framed[mask].reshape(-1).astype(np.float32)
+    active_rms = float(np.sqrt(np.mean(framed[mask] ** 2)))
+    return active_rms, active_frames, active_samples, mask
+
+
 def _envelope_corr(a: np.ndarray, b: np.ndarray, win: int = 320) -> float:
     n_frames = min(a.size, b.size) // win
     if n_frames < 2:
@@ -731,8 +768,20 @@ class MossFormer2SeparatorEngine:
                         ov_len = min(ov, seg_len, pos)
                         p0 = out0[pos : pos + ov_len] / np.maximum(wsum[pos : pos + ov_len], 1e-8)
                         p1 = out1[pos : pos + ov_len] / np.maximum(wsum[pos : pos + ov_len], 1e-8)
-                        s_same = _norm_corr(p0, c0[:ov_len]) + _norm_corr(p1, c1[:ov_len])
-                        s_swap = _norm_corr(p0, c1[:ov_len]) + _norm_corr(p1, c0[:ov_len])
+                        s_same = _dice_wave_sim(p0, c0[:ov_len]) + _dice_wave_sim(p1, c1[:ov_len])
+                        s_swap = _dice_wave_sim(p0, c1[:ov_len]) + _dice_wave_sim(p1, c0[:ov_len])
+                        if abs(s_swap - s_same) < 0.05:
+                            # 重叠区恰逢电视换气极短停顿（两轨瞬时均近静音）时，以近 1.5s 能量连续性辅助防止跨窗换轨
+                            recent_len = min(pos, int(round(1.5 * SS_MODEL_SR)))
+                            if recent_len >= 1600:
+                                r0 = _rms(out0[pos - recent_len : pos] / np.maximum(wsum[pos - recent_len : pos], 1e-8))
+                                r1 = _rms(out1[pos - recent_len : pos] / np.maximum(wsum[pos - recent_len : pos], 1e-8))
+                                cr0 = _rms(c0)
+                                cr1 = _rms(c1)
+                                e_same = (r0 * cr0 + r1 * cr1) / (r0 * r0 + cr0 * cr0 + r1 * r1 + cr1 * cr1 + 1e-6)
+                                e_swap = (r0 * cr1 + r1 * cr0) / (r0 * r0 + cr1 * cr1 + r1 * r1 + cr0 * cr0 + 1e-6)
+                                s_same += 0.35 * e_same
+                                s_swap += 0.35 * e_swap
                         if s_swap > s_same + 1e-4:
                             c0, c1 = c1, c0
                             swaps += 1
@@ -864,14 +913,41 @@ def separate_and_enhance_tracks(
     if prune_tracks and len(processed_tracks) >= 2:
         max_rms = max(rms_list) if rms_list else 0.0
         strongest_idx = int(np.argmax(rms_list))
+        active_stats = [_active_speech_stats(t) for t in processed_tracks]
+        max_active_rms = max((s[0] for s in active_stats), default=0.0)
         filtered: list[int] = []
         for idx in keep_indices:
             r = rms_list[idx]
             if idx == strongest_idx:
                 filtered.append(idx)
                 continue
-            # 静音/极低残余音轨剔除
+            # 静音/极低残余音轨剔除（增加短时活跃说话人保护：防止短命令音轨在长电视轨旁被整段稀释 RMS 误删）
             if r < 0.0045 or (max_rms > 1e-6 and r < max_rms * 0.12):
+                act_rms, act_frames, act_samples, act_mask = active_stats[idx]
+                if act_frames < 8 or act_rms < max(0.014, max_active_rms * 0.18):
+                    continue
+                win_len = 320
+                n_frames = min(processed_tracks[strongest_idx].size, processed_tracks[idx].size) // win_len
+                if n_frames < 8:
+                    continue
+                mask_n = act_mask[:n_frames]
+                if int(np.count_nonzero(mask_n)) < 8:
+                    continue
+                strong_at_act = (
+                    processed_tracks[strongest_idx][: n_frames * win_len]
+                    .reshape(n_frames, win_len)[mask_n]
+                    .reshape(-1)
+                )
+                tr_at_act = (
+                    processed_tracks[idx][: n_frames * win_len]
+                    .reshape(n_frames, win_len)[mask_n]
+                    .reshape(-1)
+                )
+                act_w_c = abs(_norm_corr(strong_at_act, tr_at_act))
+                act_m_c = _spectral_mag_corr(strong_at_act, tr_at_act)
+                if act_w_c >= 0.25 or act_m_c >= 0.62:
+                    continue
+                filtered.append(idx)
                 continue
             # 单说话人镜像串音轨剔除（波形+包络高相关，或相位无关的对数幅度谱高度重合）
             w_c = abs(_norm_corr(processed_tracks[strongest_idx], processed_tracks[idx]))
