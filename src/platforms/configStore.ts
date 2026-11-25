@@ -267,9 +267,11 @@ function normalizeTuyaConfig(raw: unknown): TuyaPlatformConfig {
         ? raw.endpoint.trim()
         : base.endpoint,
     tokenSession:
-      tokenRaw && typeof tokenRaw.accessToken === "string" && tokenRaw.accessToken
+      tokenRaw &&
+      ((typeof tokenRaw.accessToken === "string" && tokenRaw.accessToken) ||
+        (typeof tokenRaw.refreshToken === "string" && tokenRaw.refreshToken))
         ? {
-            accessToken: String(tokenRaw.accessToken),
+            accessToken: typeof tokenRaw.accessToken === "string" ? tokenRaw.accessToken : "",
             refreshToken: typeof tokenRaw.refreshToken === "string" ? tokenRaw.refreshToken : "",
             expireTime:
               typeof tokenRaw.expireTime === "number" && Number.isFinite(tokenRaw.expireTime)
@@ -451,7 +453,7 @@ export function summarizeTuyaConfig(cfg: TuyaPlatformConfig): Record<string, unk
     accessId: cfg.accessId,
     hasAccessSecret: Boolean(cfg.accessSecret),
     uid: cfg.uid || cfg.tokenSession?.uid || "",
-    hasTokenSession: Boolean(cfg.tokenSession?.accessToken),
+    hasTokenSession: Boolean(cfg.tokenSession?.accessToken || cfg.tokenSession?.refreshToken),
     username: cfg.tokenSession?.username || "",
     preferLocal: cfg.preferLocal,
     localDevices: cfg.localDevices.map((d) => ({

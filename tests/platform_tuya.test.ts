@@ -1482,3 +1482,563 @@ describe("TuyaPlatformProvider — QR Auth, Encrypted Cloud Sync, Control, Hybri
     expect(byDid.get("oa_dev_3")?.room_name).toBe("默认房间");
   });
 });
+
+describe("TuyaSharingClient — Token Refresh CamelCase, Concurrency & Sign-Invalid Recovery", () => {
+  test("parses real Tuya camelCase refresh payload (accessToken/refreshToken/expireTime) and persists rotated session", async () => {
+    let serverAccess = "at_gen1";
+    let serverRefresh = "rt_gen1";
+    let refreshCalls = 0;
+    const nowMs = 2_000_000_000_000;
+
+    const mem = makeMemoryConfigStore({
+      enabled: true,
+      mode: "sharing",
+      userCode: "UC_CAMEL",
+      endpoint: "https://apigw.tuyacn.com",
+      tokenSession: {
+        accessToken: serverAccess,
+        refreshToken: serverRefresh,
+        expireTime: nowMs - 10_000, // already expired
+        uid: "uid_camel",
+        endpoint: "https://apigw.tuyacn.com",
+        terminalId: "term_001",
+        username: "camel_user",
+      },
+    });
+
+    const mockFetch: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url,
+      );
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const rid = headers["X-requestId"]!;
+      const hashKey = tuyaSharingHashKey(rid, serverRefresh);
+      const secret = tuyaSharingSecret(rid, "", hashKey);
+      const queryEnc = url.searchParams.get("encdata") ?? "";
+      const expectedSign = tuyaSharingRestfulSign(hashKey, queryEnc, "", headers);
+      if (headers["X-sign"] !== expectedSign) {
+        return jsonResponse({ success: false, code: "-9999999", msg: "sign invalid", t: nowMs });
+      }
+
+      if (url.pathname === `/v1.0/m/token/${serverRefresh}`) {
+        refreshCalls += 1;
+        expect(headers["X-token"]).toBeUndefined();
+        serverAccess = "at_gen2_camel";
+        serverRefresh = "rt_gen2_camel";
+        // Real Tuya /v1.0/m/token/{refreshToken} returns camelCase fields!
+        return jsonResponse({
+          success: true,
+          t: nowMs,
+          result: tuyaSharingAesGcmEncrypt(
+            JSON.stringify({
+              accessToken: serverAccess,
+              refreshToken: serverRefresh,
+              expireTime: 7200,
+              uid: "uid_camel",
+            }),
+            secret,
+          ),
+        });
+      }
+
+      expect(headers["X-token"]).toBe(serverAccess);
+      if (url.pathname === "/v1.0/m/life/users/homes") {
+        return jsonResponse({
+          success: true,
+          t: nowMs,
+          result: tuyaSharingAesGcmEncrypt(
+            JSON.stringify([{ ownerId: "h_cn", name: "我的家" }]),
+            secret,
+          ),
+        });
+      }
+      if (url.pathname === "/v1.0/m/life/ha/home/devices") {
+        return jsonResponse({
+          success: true,
+          t: nowMs,
+          result: tuyaSharingAesGcmEncrypt(
+            JSON.stringify([
+              { id: "dev_cn_1", name: "玄关灯", category: "dj", online: true, roomName: "玄关" },
+            ]),
+            secret,
+          ),
+        });
+      }
+      if (url.pathname.endsWith("/specifications")) {
+        return jsonResponse({
+          success: true,
+          t: nowMs,
+          result: tuyaSharingAesGcmEncrypt(JSON.stringify({ functions: [], status: [] }), secret),
+        });
+      }
+      throw new Error(`Unexpected path: ${url.pathname}`);
+    }) as typeof fetch;
+
+    const provider = new TuyaPlatformProvider({
+      httpFetch: mockFetch,
+      configStore: mem.store,
+      now: () => nowMs,
+    });
+
+    const devices = await provider.listDevices();
+    expect(devices).toHaveLength(1);
+    expect(devices[0]!.name).toBe("玄关灯");
+    expect(refreshCalls).toBe(1);
+
+    // Persisted session must carry rotated camelCase tokens & preserve metadata
+    const saved = mem.get().tokenSession;
+    expect(saved?.accessToken).toBe("at_gen2_camel");
+    expect(saved?.refreshToken).toBe("rt_gen2_camel");
+    expect(saved?.expireTime).toBe(nowMs + 7200 * 1000);
+    expect(saved?.terminalId).toBe("term_001");
+    expect(saved?.username).toBe("camel_user");
+  });
+
+  test("coalesces concurrent expired-token requests into a single refresh without sign invalid", async () => {
+    let serverAccess = "at_old";
+    let serverRefresh = "rt_old";
+    let refreshCalls = 0;
+    const nowMs = 2_000_000_000_000;
+
+    const mockFetch: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url,
+      );
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const rid = headers["X-requestId"]!;
+      const hashKey = tuyaSharingHashKey(rid, serverRefresh);
+      const secret = tuyaSharingSecret(rid, "", hashKey);
+      const expectedSign = tuyaSharingRestfulSign(
+        hashKey,
+        url.searchParams.get("encdata") ?? "",
+        "",
+        headers,
+      );
+      if (headers["X-sign"] !== expectedSign) {
+        return jsonResponse({ success: false, code: "-9999999", msg: "sign invalid", t: nowMs });
+      }
+
+      if (url.pathname === `/v1.0/m/token/${serverRefresh}`) {
+        refreshCalls += 1;
+        await new Promise((r) => setTimeout(r, 15));
+        serverAccess = "at_rotated";
+        serverRefresh = "rt_rotated";
+        return jsonResponse({
+          success: true,
+          t: nowMs,
+          result: tuyaSharingAesGcmEncrypt(
+            JSON.stringify({
+              accessToken: serverAccess,
+              refreshToken: serverRefresh,
+              expireTime: 7200,
+              uid: "uid_conc",
+            }),
+            secret,
+          ),
+        });
+      }
+
+      if (headers["X-token"] !== serverAccess) {
+        return jsonResponse({ success: false, code: "-9999999", msg: "sign invalid", t: nowMs });
+      }
+      return jsonResponse({
+        success: true,
+        t: nowMs,
+        result: tuyaSharingAesGcmEncrypt(JSON.stringify([{ ownerId: "h1", name: "Home" }]), secret),
+      });
+    }) as typeof fetch;
+
+    const client = new TuyaSharingClient({
+      httpFetch: mockFetch,
+      now: () => nowMs,
+      tokenSession: {
+        accessToken: serverAccess,
+        refreshToken: serverRefresh,
+        expireTime: nowMs - 1000,
+        uid: "uid_conc",
+        endpoint: "https://apigw.tuyacn.com",
+      },
+    });
+
+    const all = await Promise.all(Array.from({ length: 6 }, () => client.queryHomes()));
+    expect(refreshCalls).toBe(1);
+    for (const homes of all) {
+      expect(homes).toEqual([{ ownerId: "h1", name: "Home" }]);
+    }
+  });
+
+  test("recovers from concurrent -9999999 sign invalid without double-rotating refreshToken", async () => {
+    let serverAccess = "at_early_revoked";
+    let serverRefresh = "rt_v1";
+    let refreshCalls = 0;
+    const nowMs = 2_000_000_000_000;
+
+    const mockFetch: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url,
+      );
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const rid = headers["X-requestId"]!;
+      const hashKey = tuyaSharingHashKey(rid, serverRefresh);
+      const secret = tuyaSharingSecret(rid, "", hashKey);
+
+      if (url.pathname.startsWith("/v1.0/m/token/")) {
+        const expectedSign = tuyaSharingRestfulSign(hashKey, "", "", headers);
+        expect(headers["X-sign"]).toBe(expectedSign);
+        refreshCalls += 1;
+        await new Promise((r) => setTimeout(r, 15));
+        serverAccess = `at_v${refreshCalls + 1}`;
+        serverRefresh = `rt_v${refreshCalls + 1}`;
+        return jsonResponse({
+          success: true,
+          t: nowMs,
+          result: tuyaSharingAesGcmEncrypt(
+            JSON.stringify({
+              accessToken: serverAccess,
+              refreshToken: serverRefresh,
+              expireTime: 7200,
+              uid: "uid_race",
+            }),
+            secret,
+          ),
+        });
+      }
+
+      // Simulate server rejecting old accessToken with -9999999 sign invalid
+      if (headers["X-token"] !== serverAccess || serverAccess === "at_early_revoked") {
+        // Stagger one response slightly so it enters catch AFTER refresh already finished
+        await new Promise((r) => setTimeout(r, 25));
+        return jsonResponse({ success: false, code: "-9999999", msg: "sign invalid", t: nowMs });
+      }
+      const expectedSign = tuyaSharingRestfulSign(hashKey, "", "", headers);
+      expect(headers["X-sign"]).toBe(expectedSign);
+      return jsonResponse({
+        success: true,
+        t: nowMs,
+        result: tuyaSharingAesGcmEncrypt(JSON.stringify([{ ownerId: "h_ok", name: "恢复成功" }]), secret),
+      });
+    }) as typeof fetch;
+
+    const client = new TuyaSharingClient({
+      httpFetch: mockFetch,
+      now: () => nowMs,
+      tokenSession: {
+        accessToken: serverAccess,
+        refreshToken: serverRefresh,
+        expireTime: nowMs + 3600_000, // locally looks valid, server rejects early with -9999999
+        uid: "uid_race",
+        endpoint: "https://apigw.tuyacn.com",
+      },
+    });
+
+    const results = await Promise.all([
+      client.queryHomes(),
+      client.queryHomes(),
+      client.queryHomes(),
+      client.queryHomes(),
+    ]);
+    expect(refreshCalls).toBe(1);
+    expect(client.tokenSession?.accessToken).toBe("at_v2");
+    expect(client.tokenSession?.refreshToken).toBe("rt_v2");
+    for (const r of results) {
+      expect(r).toEqual([{ ownerId: "h_ok", name: "恢复成功" }]);
+    }
+  });
+
+  test("falls back to sending X-token on refresh if gateway rejects X-token-less refresh with sign invalid", async () => {
+    let refreshAttempts = 0;
+    const nowMs = 2_000_000_000_000;
+
+    const mockFetch: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url,
+      );
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const rid = headers["X-requestId"]!;
+
+      if (url.pathname === "/v1.0/m/token/rt_strict") {
+        refreshAttempts += 1;
+        const hashKey = tuyaSharingHashKey(rid, "rt_strict");
+        const secret = tuyaSharingSecret(rid, "", hashKey);
+        expect(headers["X-sign"]).toBe(tuyaSharingRestfulSign(hashKey, "", "", headers));
+        if (!headers["X-token"]) {
+          return jsonResponse({ success: false, code: "-9999999", msg: "sign invalid", t: nowMs });
+        }
+        expect(headers["X-token"]).toBe("at_strict_old");
+        return jsonResponse({
+          success: true,
+          t: nowMs,
+          result: tuyaSharingAesGcmEncrypt(
+            JSON.stringify({
+              accessToken: "at_strict_new",
+              refreshToken: "rt_strict_new",
+              expireTime: 7200,
+              uid: "uid_strict",
+            }),
+            secret,
+          ),
+        });
+      }
+
+      const hashKey = tuyaSharingHashKey(rid, "rt_strict_new");
+      const secret = tuyaSharingSecret(rid, "", hashKey);
+      expect(headers["X-token"]).toBe("at_strict_new");
+      return jsonResponse({
+        success: true,
+        t: nowMs,
+        result: tuyaSharingAesGcmEncrypt(JSON.stringify([{ ownerId: "h_s", name: "Strict" }]), secret),
+      });
+    }) as typeof fetch;
+
+    const client = new TuyaSharingClient({
+      httpFetch: mockFetch,
+      now: () => nowMs,
+      tokenSession: {
+        accessToken: "at_strict_old",
+        refreshToken: "rt_strict",
+        expireTime: nowMs - 1000,
+        uid: "uid_strict",
+        endpoint: "https://apigw.tuyacn.com",
+      },
+    });
+
+    const homes = await client.queryHomes();
+    expect(refreshAttempts).toBe(2);
+    expect(homes).toEqual([{ ownerId: "h_s", name: "Strict" }]);
+    expect(client.tokenSession?.accessToken).toBe("at_strict_new");
+  });
+
+  test("throttles failed proactive refresh during cooldown while keeping requests working with still-valid token", async () => {
+    let nowMs = 2_000_000_000_000;
+    let refreshCalls = 0;
+    let failRefresh = true;
+    let currentRefresh = "rt_cool_1";
+    let currentAccess = "at_cool_1";
+
+    const mockFetch: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url,
+      );
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const rid = headers["X-requestId"]!;
+      const hashKey = tuyaSharingHashKey(rid, currentRefresh);
+      const secret = tuyaSharingSecret(rid, "", hashKey);
+
+      if (url.pathname.startsWith("/v1.0/m/token/")) {
+        refreshCalls += 1;
+        if (failRefresh) {
+          return jsonResponse({
+            success: false,
+            code: "API_QPS_LIMIT_OR_DEGRADE",
+            msg: "rate limited",
+            t: nowMs,
+          });
+        }
+        currentAccess = "at_cool_2";
+        currentRefresh = "rt_cool_2";
+        return jsonResponse({
+          success: true,
+          t: nowMs,
+          result: tuyaSharingAesGcmEncrypt(
+            JSON.stringify({
+              accessToken: currentAccess,
+              refreshToken: currentRefresh,
+              expireTime: 7200,
+              uid: "uid_cool",
+            }),
+            secret,
+          ),
+        });
+      }
+
+      expect(headers["X-token"]).toBe(currentAccess);
+      return jsonResponse({
+        success: true,
+        t: nowMs,
+        result: tuyaSharingAesGcmEncrypt(JSON.stringify([{ ownerId: "h_c", name: "Cool" }]), secret),
+      });
+    }) as typeof fetch;
+
+    const client = new TuyaSharingClient({
+      httpFetch: mockFetch,
+      now: () => nowMs,
+      tokenSession: {
+        accessToken: currentAccess,
+        refreshToken: currentRefresh,
+        expireTime: nowMs + 2 * 60_000, // within 5-min proactive window, but NOT hard-expired
+        uid: "uid_cool",
+        endpoint: "https://apigw.tuyacn.com",
+      },
+    });
+
+    // 4 calls inside the 60s cooldown must only trigger 1 refresh attempt and all succeed!
+    for (let i = 0; i < 4; i += 1) {
+      expect(await client.queryHomes()).toEqual([{ ownerId: "h_c", name: "Cool" }]);
+    }
+    expect(refreshCalls).toBe(1);
+
+    // After 60s cooldown passes and rate limit clears, next call refreshes cleanly
+    nowMs += 61_000;
+    failRefresh = false;
+    expect(await client.queryHomes()).toEqual([{ ownerId: "h_c", name: "Cool" }]);
+    expect(refreshCalls).toBe(2);
+    expect(client.tokenSession?.accessToken).toBe("at_cool_2");
+  });
+
+  test("auto-calibrates X-time clock offset on 1013 request time invalid and retries once", async () => {
+    const localNowMs = 2_000_000_000_000;
+    const serverNowMs = localNowMs + 600_000; // PC clock is 10 minutes behind
+    const seenTimestamps: number[] = [];
+
+    const mockFetch: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const rid = headers["X-requestId"]!;
+      const sentTime = Number(headers["X-time"]);
+      seenTimestamps.push(sentTime);
+      const hashKey = tuyaSharingHashKey(rid, "rt_clock");
+      const secret = tuyaSharingSecret(rid, "", hashKey);
+      expect(headers["X-sign"]).toBe(tuyaSharingRestfulSign(hashKey, "", "", headers));
+
+      if (Math.abs(sentTime - serverNowMs) > 60_000) {
+        return jsonResponse({
+          success: false,
+          code: "1013",
+          msg: "request time is invalid",
+          t: serverNowMs,
+        });
+      }
+      return jsonResponse({
+        success: true,
+        t: serverNowMs,
+        result: tuyaSharingAesGcmEncrypt(
+          JSON.stringify([{ ownerId: "h_clk", name: "校准时钟" }]),
+          secret,
+        ),
+      });
+    }) as typeof fetch;
+
+    const client = new TuyaSharingClient({
+      httpFetch: mockFetch,
+      now: () => localNowMs,
+      tokenSession: {
+        accessToken: "at_clock",
+        refreshToken: "rt_clock",
+        expireTime: localNowMs + 3600_000,
+        uid: "uid_clock",
+        endpoint: "https://apigw.tuyacn.com",
+      },
+    });
+
+    const homes = await client.queryHomes();
+    expect(homes).toEqual([{ ownerId: "h_clk", name: "校准时钟" }]);
+    expect(seenTimestamps).toEqual([localNowMs, serverNowMs]);
+  });
+
+  test("provider surfaces clear Chinese re-auth message when refreshToken is permanently revoked", async () => {
+    const nowMs = 2_000_000_000_000;
+    const mem = makeMemoryConfigStore({
+      enabled: true,
+      mode: "sharing",
+      userCode: "UC_DEAD",
+      tokenSession: {
+        accessToken: "at_dead_secret",
+        refreshToken: "rt_dead_secret",
+        expireTime: nowMs - 10_000,
+        uid: "uid_dead",
+        endpoint: "https://apigw.tuyacn.com",
+      },
+    });
+
+    let callCount = 0;
+    const mockFetch: typeof fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) => {
+      callCount += 1;
+      return jsonResponse({ success: false, code: "-9999999", msg: "sign invalid", t: nowMs });
+    }) as typeof fetch;
+
+    const provider = new TuyaPlatformProvider({
+      httpFetch: mockFetch,
+      configStore: mem.store,
+      now: () => nowMs,
+    });
+
+    await expect(provider.listDevices()).rejects.toThrow(/涂鸦登录授权已失效.*重新扫码授权/);
+    // Primary refresh (no X-token) + single fallback (with X-token) = 2 bounded calls, no infinite loop
+    expect(callCount).toBe(2);
+    expect(provider.status().lastError).toContain("重新扫码授权");
+    expect(provider.status().lastError).not.toContain("rt_dead_secret");
+  });
+
+  test("configure() on unrelated fields preserves active sharing session and disconnect() blocks stale in-flight refresh writes", async () => {
+    const nowMs = 2_000_000_000_000;
+    const mem = makeMemoryConfigStore({
+      enabled: true,
+      mode: "sharing",
+      userCode: "UC_LIFE",
+      tokenSession: {
+        accessToken: "at_life_1",
+        refreshToken: "rt_life_1",
+        expireTime: nowMs - 10_000,
+        uid: "uid_life",
+        endpoint: "https://apigw.tuyacn.com",
+      },
+    });
+
+    let releaseRefresh!: () => void;
+    const refreshStarted = new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    let allowRefreshComplete!: () => void;
+    const waitRefresh = new Promise<void>((resolve) => {
+      allowRefreshComplete = resolve;
+    });
+
+    const mockFetch: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url,
+      );
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const rid = headers["X-requestId"]!;
+      const hashKey = tuyaSharingHashKey(rid, "rt_life_1");
+      const secret = tuyaSharingSecret(rid, "", hashKey);
+      if (url.pathname.startsWith("/v1.0/m/token/")) {
+        releaseRefresh();
+        await waitRefresh;
+        return jsonResponse({
+          success: true,
+          t: nowMs,
+          result: tuyaSharingAesGcmEncrypt(
+            JSON.stringify({
+              accessToken: "at_life_stale_new",
+              refreshToken: "rt_life_stale_new",
+              expireTime: 7200,
+              uid: "uid_life",
+            }),
+            secret,
+          ),
+        });
+      }
+      throw new Error(`Unexpected path: ${url.pathname}`);
+    }) as typeof fetch;
+
+    const provider = new TuyaPlatformProvider({
+      httpFetch: mockFetch,
+      configStore: mem.store,
+      now: () => nowMs,
+    });
+
+    // Updating preferLocal must preserve tokenSession without wiping it
+    await provider.configure({ preferLocal: false });
+    expect(mem.get().tokenSession?.refreshToken).toBe("rt_life_1");
+
+    // Start listDevices() which kicks off an in-flight token refresh, then disconnect mid-flight
+    const pendingList = provider.listDevices().catch(() => null);
+    await refreshStarted;
+    await provider.disconnect();
+    allowRefreshComplete();
+    await pendingList;
+
+    // Disconnected session must NEVER be resurrected by the stale in-flight refresh callback
+    expect(mem.get().tokenSession).toBeNull();
+    expect(provider.isConnected()).toBe(false);
+  });
+});

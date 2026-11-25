@@ -54,6 +54,7 @@ import {
 } from "./mapper.ts";
 import { TuyaOpenApiClient, TuyaOpenApiError, type TuyaOpenApiDevice } from "./openApiClient.ts";
 import {
+  isTuyaSharingAuthError,
   TuyaSharingApiError,
   TuyaSharingClient,
   type TuyaDeviceSpecification,
@@ -314,6 +315,7 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
 
   private _config: TuyaPlatformConfig;
   private _sharingClient: TuyaSharingClient;
+  private _sharingSessionGen = 0;
   private _openApiClient: TuyaOpenApiClient | null = null;
   private _openApiVerified = false;
   private _controlBlockReason = "";
@@ -352,7 +354,8 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
   }
 
   private _buildSharingClient(): TuyaSharingClient {
-    return new TuyaSharingClient({
+    const gen = this._sharingSessionGen;
+    const client = new TuyaSharingClient({
       clientId: this._config.clientId || TUYA_CLIENT_ID,
       schema: this._config.schema || TUYA_SCHEMA,
       // 二维码认证固定走 Tuya HA 共享网关 apigw.iotbing.com；
@@ -362,14 +365,21 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
       httpFetch: this._httpFetch,
       now: this._now,
       onTokenUpdate: (session: TuyaTokenSession) => {
+        if (gen !== this._sharingSessionGen) {
+          return;
+        }
         this._config = {
           ...this._config,
           tokenSession: { ...session },
           endpoint: session.endpoint || this._config.endpoint,
         };
         this._configStore.save(this._config);
+        if (this._sharingClient && this._sharingClient !== client) {
+          this._sharingClient.setTokenSession(session);
+        }
       },
     });
+    return client;
   }
 
   private _buildOpenApiClient(): TuyaOpenApiClient | null {
@@ -385,8 +395,11 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
     });
   }
 
-  private _rebuildClients(): void {
-    this._sharingClient = this._buildSharingClient();
+  private _rebuildClients(options: { resetSharingClient?: boolean } = {}): void {
+    if (options.resetSharingClient !== false) {
+      this._sharingSessionGen += 1;
+      this._sharingClient = this._buildSharingClient();
+    }
     this._openApiClient = this._buildOpenApiClient();
   }
 
@@ -417,6 +430,14 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
     ) {
       return new ServiceError(`${context}: 当前模式不支持该红外参数组合（红外码库无对应指令，错误码 2050）`);
     }
+    if (err instanceof TuyaSharingApiError && isTuyaSharingAuthError(err.code, err.message)) {
+      const safe = this._sanitizeErrorText(err);
+      return new ServiceError(
+        safe.includes("重新扫码")
+          ? `${context}: ${safe}`
+          : `${context}: 涂鸦登录授权已失效（${safe}），请在「设置 → 多平台接入 → 涂鸦智能」重新扫码授权`,
+      );
+    }
     return new ServiceError(`${context}: ${this._sanitizeErrorText(err)}`);
   }
 
@@ -440,7 +461,9 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
   }
 
   private _hasSharingCredentials(): boolean {
-    return Boolean(this._config.tokenSession?.accessToken);
+    return Boolean(
+      this._config.tokenSession?.accessToken || this._config.tokenSession?.refreshToken,
+    );
   }
 
   private _hasOpenApiCredentials(): boolean {
@@ -592,9 +615,12 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
     }
 
     let nextTokenSession = prev.tokenSession ?? null;
+    let tokenSessionExplicitlyChanged = false;
     if (clearSecrets || raw.tokenSession === null) {
       nextTokenSession = null;
+      tokenSessionExplicitlyChanged = true;
     } else if (isRecord(raw.tokenSession) && typeof raw.tokenSession.accessToken === "string") {
+      tokenSessionExplicitlyChanged = true;
       nextTokenSession = {
         accessToken: raw.tokenSession.accessToken,
         refreshToken:
@@ -647,8 +673,13 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
       localDevices: nextLocalDevices,
     };
 
+    const shouldResetSharingClient =
+      tokenSessionExplicitlyChanged ||
+      updated.clientId !== prev.clientId ||
+      updated.schema !== prev.schema;
+
     this._config = this._configStore.save(updated);
-    this._rebuildClients();
+    this._rebuildClients({ resetSharingClient: shouldResetSharingClient });
     this._records.clear();
     this._profiles.clear();
     this._lastError = null;
@@ -737,6 +768,8 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
       schema !== this._config.schema ||
       endpoint !== this._config.endpoint
     ) {
+      const shouldResetSharing =
+        clientId !== this._config.clientId || schema !== this._config.schema;
       this._config = this._configStore.save({
         ...this._config,
         userCode,
@@ -744,7 +777,7 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
         schema,
         endpoint,
       });
-      this._rebuildClients();
+      this._rebuildClients({ resetSharingClient: shouldResetSharing });
     }
 
     let qr: { token: string; qrContent: string };
@@ -814,7 +847,7 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
         endpoint: res.tokenSession.endpoint || this._config.endpoint,
         tokenSession: { ...res.tokenSession },
       });
-      this._rebuildClients();
+      this._rebuildClients({ resetSharingClient: false });
       return {
         platform: "tuya",
         status: "success",

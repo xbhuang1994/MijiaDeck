@@ -35,7 +35,17 @@ export function tuyaSharingHashKey(rid: string, refreshToken: string): string {
  * `HMAC-SHA256(key=rid, msg=message).hex().slice(0, 16)`
  */
 export function tuyaSharingSecret(rid: string, sid: string, hashKey: string): string {
-  const message = sid ? `${hashKey}${sid}` : hashKey;
+  let message = hashKey;
+  if (sid) {
+    const mod = 16;
+    const length = Math.min(sid.length, mod);
+    let ecode = "";
+    for (let i = 0; i < length; i += 1) {
+      const idx = sid.charCodeAt(i) % mod;
+      ecode += sid[idx] ?? "";
+    }
+    message = `${hashKey}_${ecode}`;
+  }
   return createHmac("sha256", Buffer.from(rid, "utf8"))
     .update(message, "utf8")
     .digest("hex")

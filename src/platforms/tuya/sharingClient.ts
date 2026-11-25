@@ -134,11 +134,58 @@ export interface TuyaSharingClientOptions {
   timeoutMs?: number;
 }
 
+const PROACTIVE_REFRESH_MARGIN_MS = 5 * 60_000;
+const PROACTIVE_REFRESH_FAILURE_COOLDOWN_MS = 60_000;
+const CLOCK_SKEW_THRESHOLD_MS = 30_000;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function normalizeExpireTimestampMs(rawExpire: unknown, nowMs: number): number {
+function firstNonEmptyString(...values: unknown[]): string {
+  for (const val of values) {
+    if (typeof val === "string") {
+      const trimmed = val.trim();
+      if (trimmed.length > 0) {
+        return trimmed;
+      }
+    }
+  }
+  return "";
+}
+
+interface ExtractedTokenFields {
+  accessToken: string;
+  refreshToken: string;
+  rawExpire: unknown;
+  uid: string;
+  endpoint: string;
+  terminalId: string;
+  username: string;
+}
+
+/**
+ * 兼容涂鸦不同接口的令牌字段命名：
+ * - 扫码登录接口 `/v1.0/m/life/home-assistant/qrcode/tokens/{token}` 返回 snake_case (`access_token`, `refresh_token`, `expire_time`, `terminal_id`)；
+ * - 令牌刷新接口 `/v1.0/m/token/{refreshToken}` 返回 camelCase (`accessToken`, `refreshToken`, `expireTime`, `uid`)。
+ */
+function extractTokenFields(data: Record<string, unknown>): ExtractedTokenFields {
+  return {
+    accessToken: firstNonEmptyString(data.accessToken, data.access_token),
+    refreshToken: firstNonEmptyString(data.refreshToken, data.refresh_token),
+    rawExpire: data.expireTime ?? data.expire_time,
+    uid: firstNonEmptyString(data.uid),
+    endpoint: firstNonEmptyString(data.endpoint),
+    terminalId: firstNonEmptyString(data.terminalId, data.terminal_id),
+    username: firstNonEmptyString(data.username),
+  };
+}
+
+function normalizeExpireTimestampMs(
+  rawExpire: unknown,
+  nowMs: number,
+  clockOffsetMs = 0,
+): number {
   const num = typeof rawExpire === "number" ? rawExpire : Number(rawExpire);
   if (!Number.isFinite(num) || num <= 0) {
     return nowMs + 7200 * 1000;
@@ -148,22 +195,39 @@ function normalizeExpireTimestampMs(rawExpire: unknown, nowMs: number): number {
     return nowMs + num * 1000;
   }
   if (num < 10_000_000_000) {
-    // Unix timestamp in seconds
-    return num * 1000;
+    // Unix timestamp in seconds (server clock) -> normalize into local clock coordinates
+    return num * 1000 - clockOffsetMs;
   }
-  return num;
+  return num - clockOffsetMs;
 }
 
-function isTokenExpiredError(code: unknown, msg: string): boolean {
-  const codeStr = String(code ?? "");
+export function isTuyaSharingAuthError(code: unknown, msg: string): boolean {
+  const codeStr = String(code ?? "").trim();
   const lower = msg.toLowerCase();
   return (
+    codeStr === "-9999999" ||
     codeStr === "1010" ||
+    codeStr === "1011" ||
     codeStr === "2001" ||
     codeStr === "1004" ||
+    lower.includes("sign invalid") ||
+    lower.includes("invalid sign") ||
     lower.includes("token is invalid") ||
     lower.includes("token invalid") ||
-    lower.includes("token expired")
+    lower.includes("token is expired") ||
+    lower.includes("token expired") ||
+    lower.includes("token is not exist")
+  );
+}
+
+function isClockSkewError(code: unknown, msg: string): boolean {
+  const codeStr = String(code ?? "").trim();
+  const lower = msg.toLowerCase();
+  return (
+    codeStr === "1013" ||
+    lower.includes("request time is invalid") ||
+    lower.includes("time is invalid") ||
+    lower.includes("request time")
   );
 }
 
@@ -183,6 +247,9 @@ export class TuyaSharingClient {
 
   private _tokenSession: TuyaTokenSession | null;
   private _refreshInFlight: Promise<TuyaTokenSession> | null = null;
+  private _proactiveRefreshRetryAt = 0;
+  private _clockOffsetMs = 0;
+  private _sessionGeneration = 0;
 
   constructor(options: TuyaSharingClientOptions = {}) {
     this._clientId = options.clientId?.trim() || TUYA_CLIENT_ID;
@@ -203,11 +270,13 @@ export class TuyaSharingClient {
   }
 
   setTokenSession(session: TuyaTokenSession | null): void {
+    this._sessionGeneration += 1;
     this._tokenSession = session ? { ...session } : null;
+    this._proactiveRefreshRetryAt = 0;
   }
 
   hasSession(): boolean {
-    return Boolean(this._tokenSession?.accessToken);
+    return Boolean(this._tokenSession?.accessToken || this._tokenSession?.refreshToken);
   }
 
   /**
@@ -386,7 +455,8 @@ export class TuyaSharingClient {
     }
 
     const result = isRecord(resp.result) ? resp.result : null;
-    if (!result || typeof result.access_token !== "string" || !result.access_token) {
+    const parsed = result ? extractTokenFields(result) : null;
+    if (!parsed || !parsed.accessToken) {
       return {
         success: false,
         pending: true,
@@ -396,24 +466,18 @@ export class TuyaSharingClient {
 
     const nowMs = this._now();
     const session: TuyaTokenSession = {
-      accessToken: String(result.access_token),
-      refreshToken: typeof result.refresh_token === "string" ? result.refresh_token : "",
-      expireTime: normalizeExpireTimestampMs(result.expire_time, nowMs),
-      uid: typeof result.uid === "string" ? result.uid : "",
-      endpoint: stripTrailingSlash(
-        typeof result.endpoint === "string" && result.endpoint.trim()
-          ? result.endpoint.trim()
-          : this._authEndpoint,
-      ),
-      ...(typeof result.terminal_id === "string" && result.terminal_id
-        ? { terminalId: result.terminal_id }
-        : {}),
-      ...(typeof result.username === "string" && result.username
-        ? { username: result.username }
-        : {}),
+      accessToken: parsed.accessToken,
+      refreshToken: parsed.refreshToken,
+      expireTime: normalizeExpireTimestampMs(parsed.rawExpire, nowMs, this._clockOffsetMs),
+      uid: parsed.uid,
+      endpoint: stripTrailingSlash(parsed.endpoint || this._authEndpoint),
+      ...(parsed.terminalId ? { terminalId: parsed.terminalId } : {}),
+      ...(parsed.username ? { username: parsed.username } : {}),
     };
 
+    this._sessionGeneration += 1;
     this._tokenSession = session;
+    this._proactiveRefreshRetryAt = 0;
     this._onTokenUpdate?.({ ...session });
     return {
       success: true,
@@ -421,59 +485,174 @@ export class TuyaSharingClient {
     };
   }
 
-  /** 使用 refreshToken 刷新访问令牌：`/v1.0/m/token/{refreshToken}` */
-  async refreshAccessToken(): Promise<TuyaTokenSession> {
+  /**
+   * 使用 refreshToken 刷新访问令牌：`GET /v1.0/m/token/{refreshToken}`。
+   * - 并发刷新共享同一在途 Promise（单飞锁）；
+   * - 若传入 `staleSnapshot` 且会话已被其他并发请求刷新，直接复用新会话避免重复轮换。
+   */
+  async refreshAccessToken(
+    staleSnapshot?: { accessToken?: string; refreshToken?: string },
+  ): Promise<TuyaTokenSession> {
     if (this._refreshInFlight) {
       return await this._refreshInFlight;
+    }
+    if (staleSnapshot && this._tokenSession && this._hasSessionRotatedSince(staleSnapshot)) {
+      return { ...this._tokenSession };
     }
     const run = this._doRefreshAccessToken();
     this._refreshInFlight = run;
     try {
       return await run;
     } finally {
-      this._refreshInFlight = null;
+      if (this._refreshInFlight === run) {
+        this._refreshInFlight = null;
+      }
     }
   }
 
+  private _hasSessionRotatedSince(snapshot: {
+    accessToken?: string;
+    refreshToken?: string;
+  }): boolean {
+    if (!this._tokenSession) return false;
+    return (
+      (snapshot.accessToken !== undefined &&
+        this._tokenSession.accessToken !== snapshot.accessToken) ||
+      (snapshot.refreshToken !== undefined &&
+        this._tokenSession.refreshToken !== snapshot.refreshToken)
+    );
+  }
+
+  private _syncClockOffsetFromResponse(resp: Record<string, unknown>): void {
+    const rawT = resp.t;
+    const serverMs = typeof rawT === "number" ? rawT : Number(rawT);
+    if (!Number.isFinite(serverMs) || serverMs <= 1_000_000_000_000) {
+      return;
+    }
+    const delta = serverMs - this._now();
+    this._clockOffsetMs = Math.abs(delta) > CLOCK_SKEW_THRESHOLD_MS ? delta : 0;
+  }
+
   private async _doRefreshAccessToken(): Promise<TuyaTokenSession> {
-    const current = this._tokenSession;
+    const startGen = this._sessionGeneration;
+    const current = this._tokenSession ? { ...this._tokenSession } : null;
     if (!current || !current.refreshToken) {
       throw new TuyaSharingApiError("涂鸦会话缺少 refreshToken，请重新扫码登录");
     }
 
-    const data = await this._signedRequest<Record<string, unknown>>(
-      "GET",
-      `/v1.0/m/token/${encodeURIComponent(current.refreshToken)}`,
-      undefined,
-      undefined,
-      { skipAccessToken: true, allowAutoRefresh: false },
-    );
+    const refreshPath = `/v1.0/m/token/${encodeURIComponent(current.refreshToken)}`;
+    let data: Record<string, unknown>;
+    try {
+      // 刷新请求默认省略 X-token（对齐 tuya-device-sharing-sdk PR #74/#82），
+      // 防止已过期的 accessToken 被涂鸦网关校验触发 sign invalid (-9999999)
+      data = await this._signedRequest<Record<string, unknown>>(
+        "GET",
+        refreshPath,
+        undefined,
+        undefined,
+        { skipAccessToken: true, allowAutoRefresh: false, sessionOverride: current },
+      );
+    } catch (err) {
+      // 兜底兼容：若某些网关节点要求刷新请求携带 X-token 且无 X-token 时拒签（服务端不会轮换令牌），
+      // 在存在 accessToken 时自动携带 X-token 重试一次
+      if (
+        err instanceof TuyaSharingApiError &&
+        current.accessToken &&
+        isTuyaSharingAuthError(err.code, err.message) &&
+        this._sessionGeneration === startGen
+      ) {
+        data = await this._signedRequest<Record<string, unknown>>(
+          "GET",
+          refreshPath,
+          undefined,
+          undefined,
+          { skipAccessToken: false, allowAutoRefresh: false, sessionOverride: current },
+        );
+      } else {
+        throw err;
+      }
+    }
 
-    if (!isRecord(data) || typeof data.access_token !== "string" || !data.access_token) {
+    const parsed = isRecord(data) ? extractTokenFields(data) : null;
+    if (!parsed || !parsed.accessToken) {
       throw new TuyaSharingApiError("刷新涂鸦访问令牌失败，请重新扫码登录");
+    }
+
+    if (this._sessionGeneration !== startGen) {
+      if (this._tokenSession) {
+        return { ...this._tokenSession };
+      }
+      throw new TuyaSharingApiError("涂鸦会话已重置，请重新扫码登录");
     }
 
     const nowMs = this._now();
     const updated: TuyaTokenSession = {
-      accessToken: data.access_token,
-      refreshToken:
-        typeof data.refresh_token === "string" && data.refresh_token
-          ? data.refresh_token
-          : current.refreshToken,
-      expireTime: normalizeExpireTimestampMs(data.expire_time, nowMs),
-      uid: typeof data.uid === "string" && data.uid ? data.uid : current.uid,
-      endpoint: stripTrailingSlash(
-        typeof data.endpoint === "string" && data.endpoint.trim()
-          ? data.endpoint.trim()
-          : current.endpoint || this._authEndpoint,
-      ),
-      ...(current.terminalId ? { terminalId: current.terminalId } : {}),
-      ...(current.username ? { username: current.username } : {}),
+      accessToken: parsed.accessToken,
+      refreshToken: parsed.refreshToken || current.refreshToken,
+      expireTime: normalizeExpireTimestampMs(parsed.rawExpire, nowMs, this._clockOffsetMs),
+      uid: parsed.uid || current.uid,
+      endpoint: stripTrailingSlash(parsed.endpoint || current.endpoint || this._authEndpoint),
+      ...(parsed.terminalId || current.terminalId
+        ? { terminalId: parsed.terminalId || current.terminalId }
+        : {}),
+      ...(parsed.username || current.username
+        ? { username: parsed.username || current.username }
+        : {}),
     };
 
     this._tokenSession = updated;
+    this._proactiveRefreshRetryAt = 0;
     this._onTokenUpdate?.({ ...updated });
     return { ...updated };
+  }
+
+  private async _ensureFreshSessionBeforeRequest(): Promise<void> {
+    // 若已有并发刷新在途，先等待其落盘完成，避免后续请求用旧 refreshToken 签名触发 sign invalid
+    if (this._refreshInFlight) {
+      try {
+        await this._refreshInFlight;
+        return;
+      } catch (err) {
+        const cur = this._tokenSession;
+        const stillValid = Boolean(
+          cur && cur.accessToken && cur.expireTime > 0 && this._now() < cur.expireTime,
+        );
+        if (stillValid) {
+          return;
+        }
+        throw err;
+      }
+    }
+
+    const cur = this._tokenSession;
+    if (!cur || !cur.refreshToken) {
+      return;
+    }
+
+    const nowMs = this._now();
+    const isHardExpired = !cur.accessToken || (cur.expireTime > 0 && nowMs >= cur.expireTime);
+    const isNearExpiry =
+      cur.expireTime > 0 && nowMs >= cur.expireTime - PROACTIVE_REFRESH_MARGIN_MS;
+
+    if (isHardExpired) {
+      await this.refreshAccessToken({
+        accessToken: cur.accessToken,
+        refreshToken: cur.refreshToken,
+      });
+      return;
+    }
+
+    if (isNearExpiry && nowMs >= this._proactiveRefreshRetryAt) {
+      try {
+        await this.refreshAccessToken({
+          accessToken: cur.accessToken,
+          refreshToken: cur.refreshToken,
+        });
+      } catch {
+        // 令牌尚未硬过期：进入冷却期，继续使用当前仍有效的令牌避免临时限流/抖动中断业务
+        this._proactiveRefreshRetryAt = this._now() + PROACTIVE_REFRESH_FAILURE_COOLDOWN_MS;
+      }
+    }
   }
 
   private async _signedRequest<T>(
@@ -481,30 +660,34 @@ export class TuyaSharingClient {
     path: string,
     params?: Record<string, unknown>,
     body?: Record<string, unknown>,
-    options: { skipAccessToken?: boolean; allowAutoRefresh?: boolean } = {},
+    options: {
+      skipAccessToken?: boolean;
+      allowAutoRefresh?: boolean;
+      sessionOverride?: TuyaTokenSession;
+    } = {},
   ): Promise<T> {
     const allowAutoRefresh = options.allowAutoRefresh !== false;
-    if (!this._tokenSession) {
+    if (!options.sessionOverride && !this._tokenSession) {
       throw new TuyaSharingApiError("尚未登录涂鸦账号，请先完成扫码授权");
     }
 
-    // 过期前 60 秒主动刷新 Token
-    if (
-      allowAutoRefresh &&
-      !options.skipAccessToken &&
-      this._tokenSession.refreshToken &&
-      this._tokenSession.expireTime > 0 &&
-      this._now() >= this._tokenSession.expireTime - 60_000
-    ) {
-      await this.refreshAccessToken();
+    if (allowAutoRefresh && !options.skipAccessToken && !options.sessionOverride) {
+      await this._ensureFreshSessionBeforeRequest();
     }
 
-    const execute = async (): Promise<T> => {
-      const session = this._tokenSession!;
+    const getSnapshot = (): TuyaTokenSession => {
+      const src = options.sessionOverride ?? this._tokenSession;
+      if (!src) {
+        throw new TuyaSharingApiError("尚未登录涂鸦账号，请先完成扫码授权");
+      }
+      return { ...src };
+    };
+
+    const execute = async (session: TuyaTokenSession): Promise<T> => {
       const endpoint = stripTrailingSlash(session.endpoint || this._authEndpoint);
       const rid = this._uuid();
       const sid = "";
-      const timestamp = String(this._now());
+      const timestamp = String(this._now() + this._clockOffsetMs);
       const hashKey = tuyaSharingHashKey(rid, session.refreshToken);
       const secret = tuyaSharingSecret(rid, sid, hashKey);
 
@@ -560,18 +743,39 @@ export class TuyaSharingClient {
       return rawResult as T;
     };
 
+    const executeWithClockRetry = async (session: TuyaTokenSession): Promise<T> => {
+      const prevOffset = this._clockOffsetMs;
+      try {
+        return await execute(session);
+      } catch (err) {
+        if (
+          err instanceof TuyaSharingApiError &&
+          isClockSkewError(err.code, err.message) &&
+          this._clockOffsetMs !== prevOffset
+        ) {
+          return await execute(session);
+        }
+        throw err;
+      }
+    };
+
+    const usedSession = getSnapshot();
     try {
-      return await execute();
+      return await executeWithClockRetry(usedSession);
     } catch (err) {
       if (
         allowAutoRefresh &&
         !options.skipAccessToken &&
+        !options.sessionOverride &&
         err instanceof TuyaSharingApiError &&
         this._tokenSession?.refreshToken &&
-        isTokenExpiredError(err.code, err.message)
+        isTuyaSharingAuthError(err.code, err.message)
       ) {
-        await this.refreshAccessToken();
-        return await execute();
+        await this.refreshAccessToken({
+          accessToken: usedSession.accessToken,
+          refreshToken: usedSession.refreshToken,
+        });
+        return await executeWithClockRetry(getSnapshot());
       }
       throw err;
     }
@@ -601,6 +805,7 @@ export class TuyaSharingClient {
       if (!isRecord(parsed)) {
         throw new TuyaSharingApiError("涂鸦云端返回格式异常");
       }
+      this._syncClockOffsetFromResponse(parsed);
       return parsed;
     } catch (err) {
       if (err instanceof TuyaSharingApiError) {
