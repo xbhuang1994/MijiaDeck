@@ -29,6 +29,7 @@ import {
   MideaLanClient,
   MideaLocalSecurity,
   MideaPlatformProvider,
+  buildAcPropertySet,
   buildAcQuery,
   buildAcSet,
   buildAcStatusResponseFrame,
@@ -45,6 +46,7 @@ import {
   mapMideaDeviceToInfo,
   mideaChecksum,
   mideaCrc8,
+  parseAcPropertyResponse,
   parseAcResponse,
   parseDehumidifierResponse,
   parseDiscoveryResponse,
@@ -1316,15 +1318,19 @@ describe("MideaPlatformProvider 端到端集成、降级回退与凭据脱敏", 
     expect(statusCalls).toBe(2);
   });
 
-  test("18. Cloud 模式全链路：0xDC/0xD9 走 Lua 读写，0xAC 透传 1306 回退 Lua，并发 powerStates 合并加载", async () => {
+  test("18. Cloud 模式全链路：MAS 优先走官方 Lua 读写（含 0xAC/0xDC/0xD9）、支持嵌套 status 解包、Lua 失败自动回退透传", async () => {
     const serverSec = new MideaCloudSecurity("meiju");
     const sessionKeyPlain = "aabbccddeeff0011";
     const encryptedSessionKey = serverSec.aesEncryptWithFixedKey(sessionKeyPlain);
     serverSec.setAesKeys(sessionKeyPlain);
 
     let listHomeCalls = 0;
-    let acTransparentFailsWith1306 = true;
-    const luaControls: Array<{ applianceCode: string; control: Record<string, unknown> }> = [];
+    let acLuaUnavailable = false;
+    const luaControls: Array<{
+      applianceCode: string;
+      control: Record<string, unknown>;
+      hasStatus: boolean;
+    }> = [];
     const transparentCodes: string[] = [];
 
     const luaStateByCode: Record<string, Record<string, unknown>> = {
@@ -1419,9 +1425,6 @@ describe("MideaPlatformProvider 端到端集成、降级回退与凭据脱敏", 
         expect(body.applianceId).toBeUndefined();
         expect(typeof body.applianceCode).toBe("string");
         transparentCodes.push(String(body.applianceCode));
-        if (acTransparentFailsWith1306) {
-          return jsonResponse({ code: "1306", msg: "The async reply does not exist " });
-        }
         const replyFrame = buildAcStatusResponseFrame({
           ...defaultAcState(),
           power: false,
@@ -1436,16 +1439,26 @@ describe("MideaPlatformProvider 端到端集成、降级回退与凭据脱敏", 
       }
       if (url.includes("/mjl/v1/device/status/lua/get")) {
         const code = String(body.applianceCode ?? "");
+        if (code === "210006741641007" && acLuaUnavailable) {
+          return jsonResponse({ code: "1014", msg: "lua analysis exception" });
+        }
         const st = luaStateByCode[code];
         if (!st) return jsonResponse({ code: "1014", msg: "lua analysis exception" });
         return jsonResponse({ code: "0", data: st });
       }
       if (url.includes("/mjl/v1/device/lua/control")) {
         const code = String(body.applianceCode ?? "");
+        if (code === "210006741641007" && acLuaUnavailable) {
+          return jsonResponse({ code: "1014", msg: "lua analysis exception" });
+        }
         const ctrl = (body.command?.control ?? {}) as Record<string, unknown>;
-        luaControls.push({ applianceCode: code, control: ctrl });
+        const hasStatus = Boolean(
+          body.command?.status && Object.keys(body.command.status as Record<string, unknown>).length > 0,
+        );
+        luaControls.push({ applianceCode: code, control: ctrl, hasStatus });
         luaStateByCode[code] = { ...(luaStateByCode[code] ?? {}), ...ctrl };
-        return jsonResponse({ code: "0", data: luaStateByCode[code] });
+        // 真实美的美居 /mjl/v1/device/lua/control 返回嵌套 { code: "0", status: { ... } }
+        return jsonResponse({ code: "0", data: { code: "0", status: luaStateByCode[code] } });
       }
       return jsonResponse({ code: "404" }, 404);
     }) as typeof fetch;
@@ -1463,7 +1476,7 @@ describe("MideaPlatformProvider 端到端集成、降级回退与凭据脱敏", 
       },
     });
 
-    // 冷启动并发读取三台不同品类设备的开关状态，只应触发 1 次 listDevices/listHomes
+    // 冷启动并发读取三台不同品类设备的开关状态，只应触发 1 次 listDevices/listHomes，且均直接走 Lua
     const states = await provider.powerStates([
       "210006741641007",
       "210006738408610",
@@ -1471,14 +1484,13 @@ describe("MideaPlatformProvider 端到端集成、降级回退与凭据脱敏", 
     ]);
     expect(listHomeCalls).toBe(1);
     expect(states).toEqual({
-      "210006741641007": true, // 0xAC 透传 1306 后自动回退 Lua 拿到 power=on
-      "210006738408610": true, // 0xDC 直接走 Lua 拿到 power=on
-      "210006741790988": false, // 0xD9 直接走 Lua 拿到 db_power=off
+      "210006741641007": true,
+      "210006738408610": true,
+      "210006741790988": false,
     });
-    // 0xDC 与 0xD9 未触发无意义的通用二进制透传
-    expect(transparentCodes).toEqual(["210006741641007"]);
+    expect(transparentCodes).toEqual([]);
 
-    // 0xAC 回退 Lua 读取实时温控属性无报错
+    // 0xAC 优先 Lua 读取实时温控属性
     const acProps = await provider.readProps("210006741641007", [
       "on",
       "mode",
@@ -1494,24 +1506,289 @@ describe("MideaPlatformProvider 端到端集成、降级回退与凭据脱敏", 
       "aux-heat": true,
     });
 
-    // 0xDC 与 0xD9 开关控制自动走 /mjl/v1/device/lua/control 并匹配对应键名
+    // 0xAC、0xDC 与 0xD9 开关控制均优先走 /mjl/v1/device/lua/control，并携带 status 上下文与正确键名
     await provider.setPowerState("210006738408610", false);
     await provider.setPowerState("210006741790988", true);
-    expect(luaControls).toEqual([
-      { applianceCode: "210006738408610", control: { power: "off" } },
-      { applianceCode: "210006741790988", control: { db_power: "on" } },
-    ]);
-
-    // 0xAC 关机遇到 1306 异步应答缺失也应视作送达成功（不误报控制失败）
     await provider.setPowerState("210006741641007", false);
+    expect(luaControls).toEqual([
+      { applianceCode: "210006738408610", control: { power: "off" }, hasStatus: true },
+      { applianceCode: "210006741790988", control: { db_power: "on" }, hasStatus: true },
+      { applianceCode: "210006741641007", control: { power: "off" }, hasStatus: true },
+    ]);
+    expect(luaStateByCode["210006741641007"]!["power"]).toBe("off");
+    expect(transparentCodes).toEqual([]);
 
-    // 恢复 0xAC 透传正常后，直接读取到最新 0xAA 状态帧
-    acTransparentFailsWith1306 = false;
+    // 当 0xAC 的 Lua 不可用时，自动回退到 /v1/appliance/transparent/send 读取最新 0xAA 状态帧
+    acLuaUnavailable = true;
     const acAfter = await provider.readProps("210006741641007", ["on", "target-temperature", "temperature"]);
+    expect(transparentCodes).toEqual(["210006741641007"]);
     expect(acAfter).toEqual({
       on: false,
       "target-temperature": 26,
       temperature: 22,
     });
+  });
+
+  test("19. 0xAC 新协议 0xB0 属性控制帧编解码与真实 0xB0/0x7E 空调回包解析", () => {
+    // 校验 0xB0 电源关机帧与实机验证帧逐字节一致
+    const offFrame = buildAcPropertySet({ power: false }, "on", { msgId: 0x04 });
+    expect(offFrame).not.toBeNull();
+    expect(offFrame!.toString("hex")).toBe("aa12ac00000000000202b0017f000100047c8d");
+
+    // 校验 0xB0 电源开机、模式、温度、风速、扫风、ECO、辅热、屏显编码
+    const onFrame = buildAcPropertySet({ power: true }, "on", { msgId: 0x05 })!;
+    const onParsed = parseMideaFrame(onFrame);
+    expect(onParsed.protocolVersion).toBe(0x02);
+    expect(onParsed.frameType).toBe(0x02);
+    expect(onParsed.crcValid).toBe(true);
+    expect(Array.from(onParsed.body)).toEqual([0xb0, 0x01, 0x7f, 0x00, 0x01, 0x01, 0x05]);
+
+    const tempFrame = buildAcPropertySet({ targetTemperature: 25.5 }, "target-temperature", { msgId: 0x06 })!;
+    expect(Array.from(parseMideaFrame(tempFrame).body)).toEqual([0xb0, 0x01, 0x03, 0x00, 0x01, 101, 0x06]);
+
+    const modeFrame = buildAcPropertySet({ mode: 4 }, "mode", { msgId: 0x07 })!;
+    expect(Array.from(parseMideaFrame(modeFrame).body)).toEqual([0xb0, 0x01, 0x02, 0x00, 0x01, 0x04, 0x07]);
+
+    const fanFrame = buildAcPropertySet({ fanSpeed: 80 }, "fan-speed", { msgId: 0x08 })!;
+    expect(Array.from(parseMideaFrame(fanFrame).body)).toEqual([0xb0, 0x01, 0x06, 0x00, 0x01, 80, 0x08]);
+
+    expect(buildAcPropertySet({ turbo: true }, "turbo")).toBeNull();
+
+    // 解析真机 0xAC (22013345, protocolVersion=8) 返回的 0xB0 + 0x7E 真实回包
+    const realReplyHex =
+      "aa5eac00000000000802b0027f001001007e000047a02481667f7f0000000800000000000000000078004c00e0000000006400640000000000000000005a070000000020000000000000000000000000000000008000000000000000007a4d";
+    const parsedReal = parseAcResponse(Buffer.from(realReplyHex, "hex"));
+    expect(parsedReal).not.toBeNull();
+    expect(parsedReal).toMatchObject({
+      kind: "ac",
+      power: false,
+      mode: 4,
+      targetTemperature: 30,
+      fanSpeed: 102,
+      auxHeat: true,
+    });
+
+    // 解析单属性 0xB0 开机 ACK（保留已有温度/模式）
+    const ackBody = new Uint8Array([0xb0, 0x01, 0x7f, 0x00, 0x00, 0x01, 0x01]);
+    const ackFrame = buildMideaFrame(0xac, 0x02, ackBody, { protocolVersion: 0x08, includeCrc8: true });
+    const parsedAck = parseAcPropertyResponse(ackFrame, {
+      ...defaultAcState(),
+      power: false,
+      mode: 4,
+      targetTemperature: 28,
+      indoorTemperature: 20.7,
+    });
+    expect(parsedAck).toMatchObject({
+      power: true,
+      mode: 4,
+      targetTemperature: 28,
+      indoorTemperature: 20.7,
+    });
+  });
+
+  test("20. 回归：绝不吞掉 1306 假报已开；Lua 失败时透传/LAN 自动从 0x40 切到 0xB0；设备未响应开机必须报错", async () => {
+    const serverSec = new MideaCloudSecurity("meiju");
+    const sessionKeyPlain = "1020304050607080";
+    const encryptedSessionKey = serverSec.aesEncryptWithFixedKey(sessionKeyPlain);
+    serverSec.setAesKeys(sessionKeyPlain);
+
+    let luaMode: "unavailable" | "inner_1306" | "power_stuck_off" = "unavailable";
+    let transparentMode: "b0_only" | "always_1306" = "b0_only";
+    const sentTransparentBodyTypes: number[] = [];
+    let devicePower = false;
+
+    const buildB0PowerAck = (power: boolean): Buffer =>
+      buildMideaFrame(
+        0xac,
+        0x02,
+        new Uint8Array([0xb0, 0x01, 0x7f, 0x00, 0x00, 0x01, power ? 0x01 : 0x00]),
+        { protocolVersion: 0x08, includeCrc8: true },
+      );
+
+    const mockFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+
+      if (url.includes("/v1/user/login/id/get")) {
+        return jsonResponse({ code: "0", data: { loginId: "login-reg" } });
+      }
+      if (url.includes("/mj/user/login")) {
+        return jsonResponse({
+          code: "0",
+          data: { uid: "u-reg", key: encryptedSessionKey, mdata: { accessToken: "tok-reg" } },
+        });
+      }
+      if (url.includes("/v1/homegroup/list/get")) {
+        return jsonResponse({
+          code: "0",
+          data: { homeList: [{ homegroupId: "h-1", name: "方寸别院", isDefault: "1" }] },
+        });
+      }
+      if (url.includes("/v1/appliance/home/list/get")) {
+        return jsonResponse({
+          code: "0",
+          data: {
+            homeList: [
+              {
+                homegroupId: "h-1",
+                name: "方寸别院",
+                roomList: [
+                  {
+                    name: "卧室",
+                    applianceList: [
+                      {
+                        applianceCode: "211106254203346",
+                        name: "小空调",
+                        type: "0xAC",
+                        onlineStatus: "1",
+                        sn8: "22013345",
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        });
+      }
+      if (url.includes("/mjl/v1/device/status/lua/get")) {
+        if (luaMode === "unavailable") {
+          return jsonResponse({ code: "1014", msg: "lua unavailable" });
+        }
+        return jsonResponse({
+          code: "0",
+          data: { power: devicePower ? "on" : "off", mode: "heat", temperature: 30 },
+        });
+      }
+      if (url.includes("/mjl/v1/device/lua/control")) {
+        if (luaMode === "unavailable") {
+          return jsonResponse({ code: "1014", msg: "lua unavailable" });
+        }
+        if (luaMode === "inner_1306") {
+          return jsonResponse({
+            code: "0",
+            data: { code: "1306", msg: "The async reply does not exist" },
+          });
+        }
+        // power_stuck_off：控制请求返回 code=0，但设备实际回报 power 仍为 off
+        return jsonResponse({
+          code: "0",
+          data: { code: "0", status: { power: "off", mode: "heat", temperature: 30 } },
+        });
+      }
+      if (url.includes("/v1/appliance/transparent/send")) {
+        const signedCsv = serverSec.aesDecrypt(String(body.order));
+        const rawBytes = Buffer.from(signedCsv.split(",").map((n) => Number.parseInt(n, 10) & 0xff));
+        const appFrame = parseMideaFrame(rawBytes);
+        const bodyType = appFrame.body[0]!;
+        sentTransparentBodyTypes.push(bodyType);
+
+        if (bodyType === 0x41) {
+          // 模拟真实 22013345 空调查询回复（protocolVersion=8）
+          const qBody = new Uint8Array(23);
+          qBody[0] = 0xc0;
+          qBody[1] = devicePower ? 0x01 : 0x00;
+          qBody[2] = (4 << 5) | (30 - 16);
+          qBody[3] = 102;
+          const qResp = buildMideaFrame(0xac, 0x03, qBody, { protocolVersion: 0x08, includeCrc8: true });
+          const csv = Array.from(qResp).map((b) => (b > 127 ? b - 256 : b)).join(",");
+          return jsonResponse({ code: "0", data: { reply: serverSec.aesEncrypt(csv) } });
+        }
+        if (transparentMode === "always_1306") {
+          return jsonResponse({ code: "1306", msg: "The async reply does not exist " });
+        }
+        // 新协议空调忽略 0x40 返回 1306，仅接受 0xB0
+        if (bodyType === 0x40) {
+          return jsonResponse({ code: "1306", msg: "The async reply does not exist " });
+        }
+        if (bodyType === 0xb0 && appFrame.body[2] === 0x7f) {
+          devicePower = appFrame.body[5] !== 0;
+          const ack = buildB0PowerAck(devicePower);
+          const csv = Array.from(ack).map((b) => (b > 127 ? b - 256 : b)).join(",");
+          return jsonResponse({ code: "0", data: { reply: serverSec.aesEncrypt(csv) } });
+        }
+        return jsonResponse({ code: "1306", msg: "The async reply does not exist " });
+      }
+      return jsonResponse({ code: "404" }, 404);
+    }) as typeof fetch;
+
+    const provider = new MideaPlatformProvider({
+      httpFetch: mockFetch,
+      skipLoadConfig: true,
+      initialConfig: {
+        enabled: true,
+        mode: "cloud",
+        cloudBrand: "meiju",
+        account: "13800138000",
+        password: "Password!1",
+        useChinaServer: true,
+      },
+    });
+
+    // Case A: Lua 不可用时，先查到 protocolVersion=8，写入直接优先走 0xB0 成功开机（不再发会 1306 的 0x40）
+    await provider.setPowerState("211106254203346", true);
+    expect(devicePower).toBe(true);
+    expect(sentTransparentBodyTypes).toEqual([0x41, 0xb0]);
+
+    // Case B: 当透传全部返回 1306 时，绝不吞错假报成功
+    transparentMode = "always_1306";
+    await expect(provider.setPowerState("211106254203346", false)).rejects.toThrow("1306");
+    expect(devicePower).toBe(true);
+
+    // Case C: Lua 响应内层 data.code=1306 且透传也失败时必须报错
+    luaMode = "inner_1306";
+    await expect(provider.setPowerState("211106254203346", false)).rejects.toThrow("1306");
+
+    // Case D: Lua 响应明确回报 power=off 且复查仍为 off，绝不能谎称已开机
+    devicePower = false;
+    luaMode = "power_stuck_off";
+    await expect(provider.setPowerState("211106254203346", true)).rejects.toThrow("未响应开机指令");
+
+    // Case E: 局域网模式下，未预先识别协议版本的新空调收到 0x40 超时后自动回退 0xB0 并记住偏好
+    const lanSentBodyTypes: number[] = [];
+    let lanPower = false;
+    const lanProvider = new MideaPlatformProvider({
+      skipLoadConfig: true,
+      initialConfig: {
+        enabled: true,
+        mode: "local",
+        localDevices: [
+          {
+            id: "211106254203346",
+            name: "小空调",
+            ip: "192.168.1.88",
+            port: 6444,
+            type: 0xac,
+            protocolVersion: 3,
+          },
+        ],
+      },
+      lanTransport: {
+        async sendFrame(_ep, frame) {
+          const parsed = parseMideaFrame(frame);
+          const bt = parsed.body[0]!;
+          lanSentBodyTypes.push(bt);
+          if (bt === 0x41) {
+            return buildAcStatusResponseFrame({ ...defaultAcState(), power: lanPower });
+          }
+          if (bt === 0x40) {
+            throw new Error("等待美的 V3 设备响应超时");
+          }
+          if (bt === 0xb0 && parsed.body[2] === 0x7f) {
+            lanPower = parsed.body[5] !== 0;
+            return buildB0PowerAck(lanPower);
+          }
+          throw new Error("unsupported");
+        },
+      },
+    });
+    await lanProvider.setPowerState("211106254203346", true);
+    expect(lanPower).toBe(true);
+    expect(lanSentBodyTypes).toEqual([0x41, 0x40, 0xb0]);
+
+    // 第二次关机已记住 0xB0 偏好，直接发送 0xB0，不再浪费 0x40 超时
+    await lanProvider.setPowerState("211106254203346", false);
+    expect(lanPower).toBe(false);
+    expect(lanSentBodyTypes).toEqual([0x41, 0x40, 0xb0, 0xb0]);
   });
 });

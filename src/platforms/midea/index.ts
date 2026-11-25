@@ -39,6 +39,7 @@ export {
 
 export {
   CRC8_854_TABLE,
+  buildAcPropertySet,
   buildAcQuery,
   buildAcSet,
   buildAcStatusResponseFrame,
@@ -68,9 +69,11 @@ export {
   defaultHumidifierState,
   defaultPurifierState,
   defaultWaterHeaterState,
+  extractLuaExplicitPower,
   hasDedicatedBinaryProtocol,
   mideaChecksum,
   mideaCrc8,
+  parseAcPropertyResponse,
   parseAcResponse,
   parseApplianceResponse,
   parseDehumidifierResponse,

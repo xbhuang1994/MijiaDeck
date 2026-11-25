@@ -147,6 +147,25 @@ function isTokenInvalidError(code: string, msg: string): boolean {
   );
 }
 
+function unwrapLuaResponseData(
+  data: Record<string, unknown>,
+  context: string,
+): Record<string, unknown> {
+  const innerCode = data["code"];
+  if (innerCode !== undefined && String(innerCode) !== "0") {
+    const codeStr = String(innerCode);
+    const msg =
+      typeof data["msg"] === "string" && data["msg"].trim()
+        ? data["msg"].trim()
+        : `${context}返回错误`;
+    throw new MideaCloudError(`美的云端错误 (${codeStr}): ${msg}`, codeStr);
+  }
+  if (isRecord(data["status"])) {
+    return data["status"];
+  }
+  return data;
+}
+
 function parseReplyToBuffer(reply: unknown, security: MideaCloudSecurity): Buffer | null {
   if (typeof reply !== "string") {
     return null;
@@ -863,10 +882,11 @@ export class MideaCloudClient {
     const applianceCode = String(applianceId).trim();
 
     if (this.preset.brand === "meiju") {
-      return await this._requestMas("/mjl/v1/device/status/lua/get", {
+      const data = await this._requestMas("/mjl/v1/device/status/lua/get", {
         applianceCode,
         command: { query },
       });
+      return unwrapLuaResponseData(data, "Lua 状态查询");
     }
 
     if (this.preset.brand === "msmarthome") {
@@ -874,7 +894,7 @@ export class MideaCloudClient {
       const encryptedSn = meta?.sn
         ? this.security.aesEncryptWithFixedKey(Buffer.from(meta.sn, "ascii"))
         : "";
-      return await this._requestMas("/v1/device/status/lua/get", {
+      const data = await this._requestMas("/v1/device/status/lua/get", {
         deviceId: this.security.getDeviceId(this._account),
         iotAppId: this.preset.appId,
         applianceMFCode: meta?.manufacturerCode || "0000",
@@ -886,6 +906,7 @@ export class MideaCloudClient {
         applianceCode,
         command: { query },
       });
+      return unwrapLuaResponseData(data, "Lua 状态查询");
     }
 
     throw new MideaCloudError("当前美的云端品牌协议不支持 Lua 状态查询");
@@ -909,10 +930,11 @@ export class MideaCloudClient {
     }
 
     if (this.preset.brand === "meiju") {
-      return await this._requestMas("/mjl/v1/device/lua/control", {
+      const data = await this._requestMas("/mjl/v1/device/lua/control", {
         applianceCode,
         command,
       });
+      return unwrapLuaResponseData(data, "Lua 控制");
     }
 
     if (this.preset.brand === "msmarthome") {
@@ -921,7 +943,7 @@ export class MideaCloudClient {
       const encryptedSn = meta?.sn
         ? this.security.aesEncryptWithFixedKey(Buffer.from(meta.sn, "ascii"))
         : "";
-      return await this._requestMas("/v1/device/lua/control", {
+      const data = await this._requestMas("/v1/device/lua/control", {
         deviceId: this.security.getDeviceId(this._account),
         iotAppId: this.preset.appId,
         applianceMFCode: meta?.manufacturerCode || "0000",
@@ -933,6 +955,7 @@ export class MideaCloudClient {
         applianceCode,
         command,
       });
+      return unwrapLuaResponseData(data, "Lua 控制");
     }
 
     throw new MideaCloudError("当前美的云端品牌协议不支持 Lua 控制");

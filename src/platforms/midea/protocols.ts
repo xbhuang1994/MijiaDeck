@@ -264,9 +264,185 @@ export function buildAcStatusResponseFrame(state: MideaAcState): Buffer {
   });
 }
 
-export function parseAcResponse(frameOrRaw: ParsedMideaFrame | Uint8Array): MideaAcState | null {
+export function buildAcPropertySet(
+  state: Partial<MideaAcState>,
+  propName?: string,
+  options?: { msgId?: number; deviceType?: number },
+): Buffer | null {
+  const merged: MideaAcState = {
+    ...defaultAcState(options?.deviceType ?? state.deviceType ?? 0xac),
+    ...state,
+  };
+  const key = (propName ?? "on").trim().toLowerCase().replaceAll("_", "-");
+  let entry: number[] | null = null;
+
+  switch (key) {
+    case "on":
+    case "power":
+      entry = [0x7f, 0x00, 0x01, merged.power ? 0x01 : 0x00];
+      break;
+    case "mode":
+      entry = [0x02, 0x00, 0x01, merged.mode & 0xff];
+      break;
+    case "target-temperature": {
+      const clampedTemp = clamp(Math.round(merged.targetTemperature * 2) / 2, 16, 30);
+      entry = [0x03, 0x00, 0x01, clamp(Math.round(clampedTemp * 2 + 50), 82, 110)];
+      break;
+    }
+    case "fan-speed":
+      entry = [0x06, 0x00, 0x01, clamp(Math.round(merged.fanSpeed), 1, 102)];
+      break;
+    case "swing-horizontal":
+      entry = [0x80, 0x00, 0x01, merged.swingHorizontal ? 0x01 : 0x00];
+      break;
+    case "swing-vertical":
+      entry = [0x82, 0x00, 0x01, merged.swingVertical ? 0x01 : 0x00];
+      break;
+    case "eco":
+      entry = [0x0d, 0x00, 0x01, merged.eco ? 0x01 : 0x00];
+      break;
+    case "aux-heat":
+      entry = [0x0f, 0x00, 0x01, merged.auxHeat ? 0x01 : 0x00];
+      break;
+    case "screen-display":
+      entry = [0x17, 0x00, 0x01, merged.screenDisplay ? 100 : 0];
+      break;
+    default:
+      return null;
+  }
+
+  const body = new Uint8Array([0xb0, 0x01, ...entry, (options?.msgId ?? 0x04) & 0xff]);
+  return buildMideaFrame(merged.deviceType, 0x02, body, {
+    protocolVersion: 0x02,
+    includeCrc8: true,
+  });
+}
+
+export function parseAcPropertyResponse(
+  frameOrRaw: ParsedMideaFrame | Uint8Array,
+  existing?: MideaAcState | null,
+): MideaAcState | null {
   const frame = frameOrRaw instanceof Uint8Array ? parseMideaFrame(frameOrRaw) : frameOrRaw;
   const body = frame.body;
+  if (body.length < 6 || (body[0] !== 0xb0 && body[0] !== 0xb1)) {
+    return null;
+  }
+
+  const base: MideaAcState = existing
+    ? { ...existing, deviceType: frame.deviceType || existing.deviceType || 0xac }
+    : defaultAcState(frame.deviceType || 0xac);
+  const count = body[1]!;
+  let cursor = 2;
+  let matched = false;
+
+  for (let i = 0; i < count; i++) {
+    if (cursor + 4 > body.length) {
+      break;
+    }
+    const propId = body[cursor]! | (body[cursor + 1]! << 8);
+    const len = body[cursor + 3]!;
+    const valStart = cursor + 4;
+    const valEnd = valStart + len;
+    if (valEnd > body.length) {
+      break;
+    }
+    cursor = valEnd;
+    if (len === 0) {
+      continue;
+    }
+
+    switch (propId) {
+      case 0x007e: {
+        // 新协议空调全量状态块（如 protocol_type="th" / 220133xx / 222517xx）
+        if (len >= 4 && body[valStart] === 0xa0) {
+          const b1 = body[valStart + 1]!;
+          const b2 = body[valStart + 2]!;
+          const b3 = body[valStart + 3]!;
+          base.power = (b1 & 0x01) > 0;
+          const decodedTemp = ((b1 & 0x3e) >> 1) + 12 + ((b1 & 0x40) > 0 ? 0.5 : 0);
+          if (decodedTemp >= 16 && decodedTemp <= 30) {
+            base.targetTemperature = decodedTemp;
+          }
+          const rawMode = (b2 & 0xe0) >> 5;
+          if (rawMode >= 1 && rawMode <= 5) {
+            base.mode = rawMode as MideaAcMode;
+          }
+          const fan = b3 & 0x7f;
+          if (fan > 0) {
+            base.fanSpeed = clamp(fan, 1, 102);
+          }
+          if (len >= 10) {
+            base.auxHeat = (body[valStart + 9]! & 0x08) > 0;
+          }
+          matched = true;
+        }
+        break;
+      }
+      case 0x007f:
+        base.power = body[valStart]! !== 0;
+        matched = true;
+        break;
+      case 0x0002: {
+        const rawMode = body[valStart]!;
+        if (rawMode >= 1 && rawMode <= 5) {
+          base.mode = rawMode as MideaAcMode;
+          matched = true;
+        }
+        break;
+      }
+      case 0x0003: {
+        const rawTemp = body[valStart]!;
+        if (rawTemp >= 82 && rawTemp <= 110) {
+          base.targetTemperature = (rawTemp - 50) / 2;
+          matched = true;
+        }
+        break;
+      }
+      case 0x0006: {
+        const rawFan = body[valStart]!;
+        if (rawFan >= 1 && rawFan <= 102) {
+          base.fanSpeed = rawFan;
+          matched = true;
+        }
+        break;
+      }
+      case 0x0080:
+        base.swingHorizontal = body[valStart]! !== 0;
+        matched = true;
+        break;
+      case 0x0082:
+        base.swingVertical = body[valStart]! !== 0;
+        matched = true;
+        break;
+      case 0x000d:
+        base.eco = body[valStart]! !== 0;
+        matched = true;
+        break;
+      case 0x000f:
+        base.auxHeat = body[valStart]! !== 0;
+        matched = true;
+        break;
+      case 0x0017:
+        base.screenDisplay = body[valStart]! > 0;
+        matched = true;
+        break;
+      default:
+        break;
+    }
+  }
+
+  return matched ? base : null;
+}
+
+export function parseAcResponse(
+  frameOrRaw: ParsedMideaFrame | Uint8Array,
+  existing?: MideaAcState | null,
+): MideaAcState | null {
+  const frame = frameOrRaw instanceof Uint8Array ? parseMideaFrame(frameOrRaw) : frameOrRaw;
+  const body = frame.body;
+  if (body.length >= 6 && (body[0] === 0xb0 || body[0] === 0xb1)) {
+    return parseAcPropertyResponse(frame, existing);
+  }
   if (body.length < 13 || body[0] !== 0xc0) {
     return null;
   }
@@ -819,13 +995,14 @@ export function buildApplianceSet(deviceType: number, state: MideaApplianceState
 export function parseApplianceResponse(
   deviceType: number,
   raw: Uint8Array,
+  existing?: MideaApplianceState | null,
 ): MideaApplianceState | null {
   const frame = parseMideaFrame(raw);
   const type = (deviceType || frame.deviceType) & 0xff;
   switch (type) {
     case 0xac:
     case 0xcc:
-      return parseAcResponse(frame);
+      return parseAcResponse(frame, existing?.kind === "ac" ? existing : undefined);
     case 0xa1:
       return parseDehumidifierResponse(frame);
     case 0xfa:
@@ -1229,6 +1406,32 @@ export function parseLuaApplianceStatus(
       };
     }
   }
+}
+
+/**
+ * 从美的 Lua 状态/控制响应中提取设备明确回报的电源状态（未包含电源字段时返回 undefined）。
+ */
+export function extractLuaExplicitPower(
+  deviceType: number,
+  raw: Record<string, unknown>,
+): boolean | undefined {
+  const direct = parseLuaBool(raw["power"]);
+  if (direct !== undefined) {
+    return direct;
+  }
+  const type = deviceType & 0xff;
+  if (!hasDedicatedBinaryProtocol(type)) {
+    const dbPower = parseLuaBool(raw["db_power"]);
+    const daPower = parseLuaBool(raw["da_power"]);
+    if (dbPower !== undefined || daPower !== undefined) {
+      return Boolean(dbPower) || Boolean(daPower);
+    }
+    const ledPower = parseLuaBool(raw["led_power"]);
+    if (ledPower !== undefined) {
+      return ledPower;
+    }
+  }
+  return undefined;
 }
 
 /**
