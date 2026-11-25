@@ -75,6 +75,68 @@ export function resolveCloudDeviceDisplayName(device: DeyeCloudDeviceInfo): stri
   return prodName ? `德业 ${prodName}` : `德业设备 ${device.device_id}`;
 }
 
+const DEFAULT_DEYE_CLOUD_HOME_NAME = "德业智能";
+const DEFAULT_DEYE_CLOUD_ROOM_NAME = "默认房间";
+
+function pickNonEmptyString(...candidates: ReadonlyArray<unknown>): string | null {
+  for (const candidate of candidates) {
+    if (typeof candidate === "string") {
+      const trimmed = candidate.trim();
+      if (trimmed.length > 0) {
+        return trimmed;
+      }
+    }
+  }
+  return null;
+}
+
+function extractNestedRoomName(room: DeyeCloudDeviceInfo["room"]): string | null {
+  if (typeof room === "string") {
+    return pickNonEmptyString(room);
+  }
+  if (room && typeof room === "object" && !Array.isArray(room)) {
+    return pickNonEmptyString(
+      room.room_display_name,
+      room.display_name,
+      room.room_name,
+      room.roomName,
+      room.name,
+    );
+  }
+  return null;
+}
+
+/** 解析德业云端设备所属家庭名称（默认归类到「德业智能」） */
+export function resolveCloudDeviceHomeName(device: DeyeCloudDeviceInfo): string {
+  return (
+    pickNonEmptyString(
+      device.home_name,
+      device.homeName,
+      device.family_name,
+      device.familyName,
+    ) ?? DEFAULT_DEYE_CLOUD_HOME_NAME
+  );
+}
+
+/**
+ * 解析德业云端设备所在房间名称。
+ * 德业 `/v3/enduser/deviceList/` 实际返回 `has_room` 与 `room_display_name`；
+ * 当 `has_room === false` 或未提供有效房间名时回退到「默认房间」。
+ */
+export function resolveCloudDeviceRoomName(device: DeyeCloudDeviceInfo): string {
+  if (device.has_room === false) {
+    return DEFAULT_DEYE_CLOUD_ROOM_NAME;
+  }
+  return (
+    pickNonEmptyString(
+      device.room_display_name,
+      device.room_name,
+      device.roomName,
+      extractNestedRoomName(device.room),
+    ) ?? DEFAULT_DEYE_CLOUD_ROOM_NAME
+  );
+}
+
 /** 将德业云端设备列表项映射为 MijiaDeck DeviceInfo */
 export function mapCloudDeviceToDeviceInfo(device: DeyeCloudDeviceInfo): DeviceInfo {
   const nativeDid = device.device_id || device.deviceid || device.mac;
@@ -82,8 +144,8 @@ export function mapCloudDeviceToDeviceInfo(device: DeyeCloudDeviceInfo): DeviceI
     did: nativeDid,
     name: resolveCloudDeviceDisplayName(device),
     model: resolveCloudDeviceModel(device),
-    home_name: "德业智能",
-    room_name: "默认房间",
+    home_name: resolveCloudDeviceHomeName(device),
+    room_name: resolveCloudDeviceRoomName(device),
     online: Boolean(device.online),
     spec_type: resolveCloudDeviceSpecType(device),
     metric_features: ["temperature", "relative-humidity"],

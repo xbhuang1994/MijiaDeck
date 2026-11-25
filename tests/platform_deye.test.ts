@@ -51,10 +51,13 @@ import {
   encodeSubscribePacket,
   fogComboFramesFromProperties,
   getProductFeatureConfig,
+  mapCloudDeviceToDeviceInfo,
   parseClassicStateHex,
   parseFogState,
   parseSolarmanV5Response,
   queryInverterTelemetry,
+  resolveCloudDeviceHomeName,
+  resolveCloudDeviceRoomName,
   resolveFogCommandPayloads,
   solarmanV5Checksum,
   stateToCommand,
@@ -723,6 +726,8 @@ describe("DeyePlatformProvider End-to-End (Cloud Fog + Classic/Combo + Solarman 
       is_combo: false,
       online: true,
       product_type: "dehumidifier",
+      has_room: true,
+      room_display_name: "客厅",
     };
 
     const fogProps: Record<string, number> = {
@@ -837,12 +842,15 @@ describe("DeyePlatformProvider End-to-End (Cloud Fog + Classic/Combo + Solarman 
     const dehum = devices.find((d) => d.did === "fog-dev-p40")!;
     const inv = devices.find((d) => d.did === "inv_roof_1")!;
     expect(dehum.model).toBe("deye.dehumidifier.dyd-p40");
+    expect(dehum.home_name).toBe("德业智能");
+    expect(dehum.room_name).toBe("客厅");
     expect(dehum.spec_type).toBe("urn:deye:device:dehumidifier:d71936c6951c11f0a8200242ac480009:1");
     expect(dehum.metric_features).toEqual(["temperature", "relative-humidity"]);
     expect(supportsCardPower(dehum)).toBe(true);
     expect(trayEligible(dehum)).toBe(true);
 
     expect(inv.model).toBe("deye.solar-inverter.v5");
+    expect(inv.room_name).toBe("配电间");
     expect(inv.spec_type).toBe("urn:deye:device:solar-inverter:v5:1");
     expect(inv.metric_features).toEqual(["temperature", "electric-power"]);
     expect(supportsCardPower(inv)).toBe(false);
@@ -1253,5 +1261,144 @@ describe("DeyePlatformProvider End-to-End (Cloud Fog + Classic/Combo + Solarman 
     expect(fogMqtt.mqtt_host).toBe("fog.deye.com.cn");
     expect(hitPaths.some((p) => p.includes("/productlist/?app=new"))).toBe(true);
     expect(hitPaths.some((p) => p.includes("/fogmqttinfo/?random="))).toBe(true);
+  });
+
+  test("maps Deye cloud device rooms from has_room / room_display_name and fallback variants", async () => {
+    const baseDevice: DeyeCloudDeviceInfo = {
+      device_id: "deye-room-base",
+      product_id: "2c4bd0861c3011e89d4c00163e0c1b21",
+      device_name: "除湿机",
+      alias: "除湿机",
+      product_name: "DYD-T22A3",
+      platform: DeyeIotPlatform.Fog,
+      mac: "AA:BB:CC:DD:EE:10",
+      protocol_version: "wifi_V2.4",
+      is_combo: true,
+      online: true,
+      product_type: "除湿机",
+    };
+
+    // 真实德业云端格式：has_room + room_display_name
+    expect(
+      resolveCloudDeviceRoomName({
+        ...baseDevice,
+        has_room: true,
+        room_display_name: "客厅",
+      }),
+    ).toBe("客厅");
+    expect(
+      resolveCloudDeviceRoomName({
+        ...baseDevice,
+        has_room: true,
+        room_display_name: "  卧室  ",
+      }),
+    ).toBe("卧室");
+
+    // has_room 明确为 false 时不信任残留/占位房间名，回退默认房间
+    expect(
+      resolveCloudDeviceRoomName({
+        ...baseDevice,
+        has_room: false,
+        room_display_name: "客厅",
+      }),
+    ).toBe("默认房间");
+
+    // has_room 为 true 但房间名为空/null 时回退默认房间
+    expect(
+      resolveCloudDeviceRoomName({
+        ...baseDevice,
+        has_room: true,
+        room_display_name: "   ",
+      }),
+    ).toBe("默认房间");
+    expect(
+      resolveCloudDeviceRoomName({
+        ...baseDevice,
+        has_room: true,
+        room_display_name: null,
+      }),
+    ).toBe("默认房间");
+
+    // 兼容未携带 has_room 或使用 room_name / roomName / room 对象字段的响应
+    expect(resolveCloudDeviceRoomName({ ...baseDevice, room_display_name: "书房" })).toBe("书房");
+    expect(resolveCloudDeviceRoomName({ ...baseDevice, room_name: "阳台" })).toBe("阳台");
+    expect(resolveCloudDeviceRoomName({ ...baseDevice, roomName: "次卧" })).toBe("次卧");
+    expect(resolveCloudDeviceRoomName({ ...baseDevice, room: "地下室" })).toBe("地下室");
+    expect(resolveCloudDeviceRoomName({ ...baseDevice, room: { display_name: "玄关" } })).toBe(
+      "玄关",
+    );
+    expect(resolveCloudDeviceRoomName(baseDevice)).toBe("默认房间");
+
+    // 家庭名默认「德业智能」，若云端提供则优先使用
+    expect(resolveCloudDeviceHomeName(baseDevice)).toBe("德业智能");
+    expect(resolveCloudDeviceHomeName({ ...baseDevice, home_name: "方寸别院" })).toBe("方寸别院");
+    expect(resolveCloudDeviceHomeName({ ...baseDevice, family_name: "  测试之家  " })).toBe(
+      "测试之家",
+    );
+
+    const mapped = mapCloudDeviceToDeviceInfo({
+      ...baseDevice,
+      has_room: true,
+      room_display_name: "客厅",
+    });
+    expect(mapped.room_name).toBe("客厅");
+    expect(mapped.home_name).toBe("德业智能");
+
+    // 端到端通过 DeyePlatformProvider.listDevices() 区分同名除湿机所在房间
+    const nowMs = 1_760_000_000_000;
+    const validJwt = makeFakeJwt({
+      enduserid: "deye-room-uid",
+      exp: Math.floor(nowMs / 1000) + 10 * 86400,
+    });
+
+    const apiDevices: DeyeCloudDeviceInfo[] = [
+      {
+        ...baseDevice,
+        device_id: "deye-dev-living-001",
+        mac: "AA:BB:CC:DD:EE:11",
+        has_room: true,
+        room_display_name: "客厅",
+      },
+      {
+        ...baseDevice,
+        device_id: "deye-dev-bedroom-002",
+        mac: "AA:BB:CC:DD:EE:12",
+        has_room: true,
+        room_display_name: "卧室",
+      },
+      {
+        ...baseDevice,
+        device_id: "unassigned-dev-003",
+        mac: "AA:BB:CC:DD:EE:13",
+        has_room: false,
+        room_display_name: "",
+      },
+    ];
+
+    const mockFetch = (async (input: string | URL | Request) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/deviceList/")) {
+        return makeJsonResponse({
+          meta: { code: 0, message: "device list by user." },
+          data: apiDevices,
+        });
+      }
+      return makeJsonResponse({ meta: { code: 0, message: "ok" }, data: {} });
+    }) as typeof fetch;
+
+    const provider = new DeyePlatformProvider({
+      persistConfig: false,
+      httpFetch: mockFetch,
+      nowMs: () => nowMs,
+    });
+
+    await provider.configure({ enabled: true, mode: "cloud", authToken: validJwt });
+    const listed = await provider.listDevices();
+    expect(listed.map((d) => ({ did: d.did, name: d.name, room_name: d.room_name }))).toEqual([
+      { did: "deye-dev-living-001", name: "除湿机", room_name: "客厅" },
+      { did: "deye-dev-bedroom-002", name: "除湿机", room_name: "卧室" },
+      { did: "unassigned-dev-003", name: "除湿机", room_name: "默认房间" },
+    ]);
   });
 });

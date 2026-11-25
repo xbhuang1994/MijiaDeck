@@ -53,6 +53,20 @@ export interface DeyeApiResponseEnvelope<T = unknown> {
   data: T;
 }
 
+export interface DeyeCloudDeviceRoomObject {
+  room_display_name?: string | null;
+  display_name?: string | null;
+  room_name?: string | null;
+  roomName?: string | null;
+  name?: string | null;
+}
+
+export interface DeyeCloudDeviceLocation {
+  address?: string;
+  latitude?: string | number;
+  longitude?: string | number;
+}
+
 export interface DeyeCloudDeviceInfo {
   producttype_id?: number;
   device_name: string;
@@ -74,6 +88,18 @@ export interface DeyeCloudDeviceInfo {
   picture_v3?: string;
   work_time?: number;
   user_count?: number;
+  has_room?: boolean;
+  room_display_name?: string | null;
+  room_name?: string | null;
+  roomName?: string | null;
+  room?: string | DeyeCloudDeviceRoomObject | null;
+  home_name?: string | null;
+  homeName?: string | null;
+  family_name?: string | null;
+  familyName?: string | null;
+  location?: DeyeCloudDeviceLocation | null;
+  attributes?: Record<string, unknown> | null;
+  history_data_enabled?: boolean;
 }
 
 export interface DeyeProductDefinition {
