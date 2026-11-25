@@ -61,6 +61,24 @@ export interface MideaLocalDeviceEntry {
   model?: string;
 }
 
+export interface MideaCloudSessionCache {
+  brand: "meiju" | "msmarthome" | "nethomeplus" | "midea_air";
+  account: string;
+  useChinaServer: boolean;
+  baseUrl?: string;
+  uid: string;
+  accessToken: string;
+  sessionId: string;
+  /** 已解密的 16 字节会话 AES 密钥（32 位十六进制），恢复时直接写入而不二次解密 */
+  aesKeyHex?: string;
+  /** 可选已解密的 16 字节会话 AES IV（32 位十六进制） */
+  aesIvHex?: string;
+  deviceId?: string;
+  loggedInAt: number;
+  /** 可选服务端返回的令牌过期时间戳（毫秒） */
+  expiresAt?: number;
+}
+
 export interface MideaPlatformConfig {
   enabled: boolean;
   mode: "cloud" | "local" | "hybrid";
@@ -69,6 +87,7 @@ export interface MideaPlatformConfig {
   password: string;
   useChinaServer: boolean;
   preferLocal: boolean;
+  cloudSession?: MideaCloudSessionCache | null;
   localDevices: MideaLocalDeviceEntry[];
 }
 
@@ -103,7 +122,7 @@ const VALID_PLATFORM_SET = new Set<string>(ALL_PLATFORM_IDS);
 const EXTERNAL_PLATFORM_RE = /^(tuya|midea|deye):(.+)$/;
 
 const SECRET_KEY_RE =
-  /(secret|password|passwd|token|localKey|accessKey|authToken|refreshToken|^key$)/i;
+  /(secret|password|passwd|token|localKey|accessKey|authToken|refreshToken|sessionId|aesKey|aesIv|^key$)/i;
 
 export function isPlatformId(value: unknown): value is PlatformId {
   return typeof value === "string" && VALID_PLATFORM_SET.has(value);
@@ -188,6 +207,7 @@ export function defaultMideaConfig(): MideaPlatformConfig {
     password: process.env.MIDEA_PASSWORD ?? "",
     useChinaServer: true,
     preferLocal: true,
+    cloudSession: null,
     localDevices: [],
   };
 }
@@ -300,6 +320,60 @@ function normalizeTuyaConfig(raw: unknown): TuyaPlatformConfig {
   };
 }
 
+function normalizeMideaCloudSession(raw: unknown): MideaCloudSessionCache | null {
+  if (!isPlainRecord(raw)) return null;
+  const brand = raw.brand;
+  if (
+    brand !== "meiju" &&
+    brand !== "msmarthome" &&
+    brand !== "nethomeplus" &&
+    brand !== "midea_air"
+  ) {
+    return null;
+  }
+  const accessToken = typeof raw.accessToken === "string" ? raw.accessToken.trim() : "";
+  const sessionId = typeof raw.sessionId === "string" ? raw.sessionId.trim() : "";
+  if (!accessToken && !sessionId) {
+    return null;
+  }
+  const account = typeof raw.account === "string" ? raw.account.trim() : "";
+  const uid = typeof raw.uid === "string" ? raw.uid.trim() : "";
+  const useChinaServer = typeof raw.useChinaServer === "boolean" ? raw.useChinaServer : true;
+  const loggedInAt =
+    typeof raw.loggedInAt === "number" && Number.isFinite(raw.loggedInAt) && raw.loggedInAt > 0
+      ? raw.loggedInAt
+      : 0;
+  const expiresAt =
+    typeof raw.expiresAt === "number" && Number.isFinite(raw.expiresAt) && raw.expiresAt > 0
+      ? raw.expiresAt
+      : undefined;
+  const baseUrl = typeof raw.baseUrl === "string" && raw.baseUrl.trim() ? raw.baseUrl.trim() : undefined;
+  const aesKeyHex =
+    typeof raw.aesKeyHex === "string" && /^[0-9a-f]{32}$/i.test(raw.aesKeyHex.trim())
+      ? raw.aesKeyHex.trim().toLowerCase()
+      : undefined;
+  const aesIvHex =
+    typeof raw.aesIvHex === "string" && /^[0-9a-f]{32}$/i.test(raw.aesIvHex.trim())
+      ? raw.aesIvHex.trim().toLowerCase()
+      : undefined;
+  const deviceId = typeof raw.deviceId === "string" && raw.deviceId.trim() ? raw.deviceId.trim() : undefined;
+
+  return {
+    brand,
+    account,
+    useChinaServer,
+    ...(baseUrl ? { baseUrl } : {}),
+    uid,
+    accessToken,
+    sessionId,
+    ...(aesKeyHex ? { aesKeyHex } : {}),
+    ...(aesIvHex ? { aesIvHex } : {}),
+    ...(deviceId ? { deviceId } : {}),
+    loggedInAt,
+    ...(expiresAt !== undefined ? { expiresAt } : {}),
+  };
+}
+
 function normalizeMideaConfig(raw: unknown): MideaPlatformConfig {
   const base = defaultMideaConfig();
   if (!isPlainRecord(raw)) return base;
@@ -338,6 +412,7 @@ function normalizeMideaConfig(raw: unknown): MideaPlatformConfig {
     useChinaServer:
       typeof raw.useChinaServer === "boolean" ? raw.useChinaServer : base.useChinaServer,
     preferLocal: typeof raw.preferLocal === "boolean" ? raw.preferLocal : base.preferLocal,
+    cloudSession: normalizeMideaCloudSession(raw.cloudSession),
     localDevices,
   };
 }
@@ -476,6 +551,7 @@ export function summarizeMideaConfig(cfg: MideaPlatformConfig): Record<string, u
     cloudBrand: cfg.cloudBrand,
     account: cfg.account,
     hasPassword: Boolean(cfg.password),
+    hasCloudSession: Boolean(cfg.cloudSession?.accessToken || cfg.cloudSession?.sessionId),
     useChinaServer: cfg.useChinaServer,
     preferLocal: cfg.preferLocal,
     localDevices: cfg.localDevices.map((d) => ({

@@ -138,6 +138,7 @@ export {
   type MideaCloudAppliance,
   type MideaCloudClientOptions,
   type MideaCloudHome,
+  type MideaCloudLoginOptions,
   type MideaCloudSession,
   type MideaLuaApplianceMeta,
   type MideaTokenKeyPair,

@@ -334,6 +334,36 @@ export class MideaCloudSecurity {
     this._aesIv = null;
   }
 
+  /**
+   * 导出已解密的 16 字节会话 AES 密钥与可选 IV（十六进制），用于跨重启持久化缓存。
+   */
+  exportAesKeys(): { keyHex: string; ivHex?: string } | null {
+    if (!this._aesKey) {
+      return null;
+    }
+    return {
+      keyHex: this._aesKey.toString("hex"),
+      ...(this._aesIv ? { ivHex: this._aesIv.toString("hex") } : {}),
+    };
+  }
+
+  /**
+   * 直接恢复先前导出的明文会话 AES 密钥与 IV，不经过固定密钥二次解密。
+   */
+  restoreAesKeys(keyHex: string, ivHex?: string): void {
+    const cleanKey = keyHex.trim();
+    if (!/^[0-9a-f]{32}$/i.test(cleanKey)) {
+      return;
+    }
+    this._aesKey = Buffer.from(cleanKey, "hex");
+    const cleanIv = ivHex?.trim();
+    if (cleanIv && /^[0-9a-f]{32}$/i.test(cleanIv)) {
+      this._aesIv = Buffer.from(cleanIv, "hex");
+    } else if (this.preset.fixedIv === undefined) {
+      this._aesIv = null;
+    }
+  }
+
   get hasSessionAesKey(): boolean {
     return this._aesKey !== null;
   }
