@@ -2302,6 +2302,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           preVadSegmented: true,
           stripCommittedPrefixHint:
             cvTracks.length === 1 ? segment.stripCommittedPrefixHint : undefined,
+          streamAcousticWake: cvTracks.length === 1 ? (segment.acousticWake ?? null) : null,
         },
         {
           lang,
@@ -2714,6 +2715,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       rawDurationMs: number;
       preVadSegmented: boolean;
       stripCommittedPrefixHint?: string;
+      /** 单轨模式下来自流式 openWakeWord 的声学唤醒命中（严禁跨多轨共享） */
+      streamAcousticWake?: WakeWordAcousticHit | null;
     },
     options: {
       lang: string;
@@ -2872,13 +2875,24 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         voiceprint = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
       }
 
-      // A3. 分轨独立 openWakeWord 声学唤醒打分
-      const acousticWake = owwEvaluated
+      // A3. 分轨独立 openWakeWord 声学唤醒打分（仅单轨时兼容保留流式已命中的声学唤醒，多轨严格隔离）
+      const perTrackWake = owwEvaluated
         ? this._localEngine.scoreWakeWordAudio(speechSamples, cfg.wakeWords, {
             threshold: cfg.owwThreshold,
             headOnlySec: 2.0,
           })
         : null;
+      const fallbackStreamWake = trackCount === 1 ? (meta.streamAcousticWake ?? null) : null;
+      const acousticWake =
+        perTrackWake && fallbackStreamWake
+          ? perTrackWake.matched && !fallbackStreamWake.matched
+            ? perTrackWake
+            : fallbackStreamWake.matched && !perTrackWake.matched
+              ? fallbackStreamWake
+              : perTrackWake.score >= fallbackStreamWake.score
+                ? perTrackWake
+                : fallbackStreamWake
+          : (perTrackWake ?? fallbackStreamWake);
       if (acousticWake?.matched) {
         this._lastWakeHit = { ...acousticWake, timestamp: now };
       }
