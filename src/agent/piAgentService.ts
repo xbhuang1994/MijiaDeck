@@ -25,12 +25,19 @@ import {
   type JsonValue,
   type Model,
   type TextContent,
+  type ThinkingContent,
   type ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { googleGenerativeAIApi } from "@earendil-works/pi-ai/api/google-generative-ai.lazy";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
+import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
+import { DEEPSEEK_MODELS } from "@earendil-works/pi-ai/providers/deepseek.models";
+import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
+import { MOONSHOTAI_CN_MODELS } from "@earendil-works/pi-ai/providers/moonshotai-cn.models";
+import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
+import { XIAOMI_MODELS } from "@earendil-works/pi-ai/providers/xiaomi.models";
 import {
   getProviderPreset,
   isLocalEndpointUrl,
@@ -39,6 +46,7 @@ import {
   resolveEffectiveApiKey,
   toPublicAgentVoiceConfig,
   type AgentProviderMode,
+  type AgentThinkingLevel,
   type AgentVoiceConfig,
   type ProviderPreset,
   type PublicAgentVoiceConfig,
@@ -166,6 +174,12 @@ export interface AgentTimelineEntry {
   role: "user" | "assistant";
   source: "text" | "voice";
   text: string;
+  /** 模型思考/推理过程（仅在对话框展示，绝不进行语音播报） */
+  thinking?: string;
+  /** 是否正在流式接收思考过程 */
+  thinkingActive?: boolean;
+  /** 本轮请求所用的思考等级 */
+  thinkingLevel?: AgentThinkingLevel;
   timestamp: number;
   status: "streaming" | "done" | "error" | "aborted";
   provider?: AgentProviderMode;
@@ -208,6 +222,8 @@ export interface PiAgentRunResult {
   entryId: string;
   ack: string;
   reply: string;
+  thinking?: string;
+  thinkingLevel?: AgentThinkingLevel;
   toolCalls: AgentToolCallRecord[];
   retriesUsed?: number;
   retryNotices?: AgentRetryNotice[];
@@ -261,97 +277,305 @@ function createErrorStream(model: Model<Api>, message: string): ReturnType<typeo
   return stream;
 }
 
-function buildModelForConfig(config: AgentVoiceConfig): Model<Api> {
+const BUILTIN_CATALOGS_BY_PROVIDER: Readonly<
+  Partial<Record<AgentProviderMode, Readonly<Record<string, Model<Api>>>>>
+> = {
+  openai: OPENAI_MODELS as unknown as Readonly<Record<string, Model<Api>>>,
+  anthropic: ANTHROPIC_MODELS as unknown as Readonly<Record<string, Model<Api>>>,
+  google: GOOGLE_MODELS as unknown as Readonly<Record<string, Model<Api>>>,
+  deepseek: DEEPSEEK_MODELS as unknown as Readonly<Record<string, Model<Api>>>,
+  moonshot: MOONSHOTAI_CN_MODELS as unknown as Readonly<Record<string, Model<Api>>>,
+  xiaomi: XIAOMI_MODELS as unknown as Readonly<Record<string, Model<Api>>>,
+};
+
+const ALL_BUILTIN_CATALOGS: ReadonlyArray<Readonly<Record<string, Model<Api>>>> = [
+  OPENAI_MODELS as unknown as Readonly<Record<string, Model<Api>>>,
+  ANTHROPIC_MODELS as unknown as Readonly<Record<string, Model<Api>>>,
+  GOOGLE_MODELS as unknown as Readonly<Record<string, Model<Api>>>,
+  DEEPSEEK_MODELS as unknown as Readonly<Record<string, Model<Api>>>,
+  MOONSHOTAI_CN_MODELS as unknown as Readonly<Record<string, Model<Api>>>,
+  XIAOMI_MODELS as unknown as Readonly<Record<string, Model<Api>>>,
+];
+
+function lookupCatalogModel(
+  catalog: Readonly<Record<string, Model<Api>>>,
+  modelId: string,
+  expectedApi?: Api,
+): Model<Api> | undefined {
+  const exact = catalog[modelId];
+  if (exact && (!expectedApi || exact.api === expectedApi)) {
+    return exact;
+  }
+  const lower = modelId.toLowerCase();
+  for (const [id, model] of Object.entries(catalog)) {
+    if (id.toLowerCase() === lower && (!expectedApi || model.api === expectedApi)) {
+      return model;
+    }
+  }
+  return undefined;
+}
+
+function findBuiltinCatalogModel(
+  provider: AgentProviderMode,
+  modelId: string,
+  expectedApi?: Api,
+): Model<Api> | undefined {
+  if (!modelId) return undefined;
+  const directCatalog = BUILTIN_CATALOGS_BY_PROVIDER[provider];
+  if (directCatalog) {
+    return lookupCatalogModel(directCatalog, modelId, expectedApi);
+  }
+  if (provider === "openai-compatible") {
+    for (const catalog of ALL_BUILTIN_CATALOGS) {
+      const found = lookupCatalogModel(catalog, modelId, expectedApi);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
+function sanitizeProxyCompat(
+  compat: Model<Api>["compat"],
+  isOfficialEndpoint: boolean,
+): Model<Api>["compat"] {
+  if (!compat) return undefined;
+  if (isOfficialEndpoint) return { ...compat };
+  const copy = { ...(compat as Record<string, unknown>) };
+  // 第三方代理/自建网关常不支持 Anthropic/OpenAI 实验性会话/中段努力度扩展字段，移除以免 400
+  delete copy.supportsMidConvoEffort;
+  delete copy.supportsMidConvoSystemMessages;
+  delete copy.supportsMidConvoToolChanges;
+  delete copy.supportsMessageThreads;
+  delete copy.supportsAdditionalTools;
+  delete copy.supportsToolSearch;
+  delete copy.supportsExplicitPromptCacheMode;
+  return copy as Model<Api>["compat"];
+}
+
+export function buildModelForConfig(config: AgentVoiceConfig): Model<Api> {
   const preset = getProviderPreset(config.provider);
   const modelId = config.modelId.trim() || preset.defaultModel;
   const baseUrl = config.baseUrl.trim() || preset.defaultBaseUrl;
+  const wantThinking = config.thinkingLevel !== "off";
+  const defaultMaxTokens = wantThinking ? 32_768 : 4096;
+
+  if (config.provider === "local") {
+    return {
+      id: modelId,
+      name: "MijiaDeck 内置本地智能规划引擎",
+      api: "openai-completions",
+      provider: "mijiadeck-local",
+      baseUrl: "http://127.0.0.1/local",
+      input: ["text"],
+      cost: ZERO_COST,
+      reasoning: false,
+      contextWindow: 32_768,
+      maxTokens: 2048,
+    };
+  }
+
+  let api: Api;
+  let providerId: string;
+  let fallbackBaseUrl: string;
+  let defaultContextWindow = 128_000;
 
   switch (config.provider) {
-    case "local":
-      return {
-        id: modelId,
-        name: "MijiaDeck 内置本地智能规划引擎",
-        api: "openai-completions",
-        provider: "mijiadeck-local",
-        baseUrl: "http://127.0.0.1/local",
-        input: ["text"],
-        cost: ZERO_COST,
-        reasoning: false,
-        contextWindow: 32_768,
-        maxTokens: 2048,
-      };
     case "anthropic":
-      return {
-        id: modelId,
-        name: modelId,
-        api: "anthropic-messages",
-        provider: "anthropic",
-        baseUrl: baseUrl || "https://api.anthropic.com",
-        input: ["text"],
-        cost: ZERO_COST,
-        reasoning: false,
-        contextWindow: 200_000,
-        maxTokens: 4096,
-      };
+      api = "anthropic-messages";
+      providerId = "anthropic";
+      fallbackBaseUrl = "https://api.anthropic.com";
+      defaultContextWindow = 200_000;
+      break;
     case "google":
-      return {
-        id: modelId,
-        name: modelId,
-        api: "google-generative-ai",
-        provider: "google",
-        baseUrl: baseUrl || "https://generativelanguage.googleapis.com/v1beta",
-        input: ["text"],
-        cost: ZERO_COST,
-        reasoning: false,
-        contextWindow: 1_000_000,
-        maxTokens: 4096,
-      };
+      api = "google-generative-ai";
+      providerId = "google";
+      fallbackBaseUrl = "https://generativelanguage.googleapis.com/v1beta";
+      defaultContextWindow = 1_000_000;
+      break;
     case "openai":
-      return {
-        id: modelId,
-        name: modelId,
-        api: baseUrl && baseUrl !== "https://api.openai.com/v1" ? "openai-completions" : "openai-responses",
-        provider: "openai",
-        baseUrl: baseUrl || "https://api.openai.com/v1",
-        input: ["text"],
-        cost: ZERO_COST,
-        reasoning: false,
-        contextWindow: 128_000,
-        maxTokens: 4096,
-      };
-    case "openai-compatible": {
-      const api = config.customApiType || "openai-completions";
-      return {
-        id: modelId,
-        name: modelId,
-        api,
-        provider: config.customProviderName || "openai-compatible",
-        baseUrl: baseUrl || "http://127.0.0.1:11434/v1",
-        input: ["text"],
-        cost: ZERO_COST,
-        reasoning: false,
-        contextWindow: 128_000,
-        maxTokens: 4096,
-      };
-    }
+      api = baseUrl && baseUrl !== "https://api.openai.com/v1" ? "openai-completions" : "openai-responses";
+      providerId = "openai";
+      fallbackBaseUrl = "https://api.openai.com/v1";
+      defaultContextWindow = 128_000;
+      break;
+    case "openai-compatible":
+      api = config.customApiType || "openai-completions";
+      providerId = config.customProviderName || "openai-compatible";
+      fallbackBaseUrl = "http://127.0.0.1:11434/v1";
+      defaultContextWindow = 128_000;
+      break;
     case "deepseek":
     case "moonshot":
     case "xiaomi":
     case "openrouter":
     default:
-      return {
-        id: modelId,
-        name: modelId,
-        api: "openai-completions",
-        provider: config.provider,
-        baseUrl: baseUrl || "http://127.0.0.1:11434/v1",
-        input: ["text"],
-        cost: ZERO_COST,
-        reasoning: false,
-        contextWindow: 128_000,
-        maxTokens: 4096,
-      };
+      api = "openai-completions";
+      providerId = config.provider;
+      fallbackBaseUrl = "http://127.0.0.1:11434/v1";
+      defaultContextWindow = 128_000;
+      break;
   }
+
+  const effectiveBaseUrl = baseUrl || fallbackBaseUrl;
+  const isOfficialEndpoint =
+    config.provider !== "openai-compatible" &&
+    (!config.baseUrl.trim() || config.baseUrl.trim() === preset.defaultBaseUrl);
+  const catalog = findBuiltinCatalogModel(config.provider, modelId, api);
+
+  if (catalog) {
+    // 已知非推理官方模型（如 gpt-4o-mini）保持 reasoning=false，避免官方接口因不支持 reasoning 参数返回 400
+    const reasoning =
+      isOfficialEndpoint && catalog.reasoning === false
+        ? false
+        : wantThinking
+          ? true
+          : Boolean(catalog.reasoning);
+    const compat = sanitizeProxyCompat(catalog.compat, isOfficialEndpoint);
+    return {
+      id: modelId,
+      name: modelId,
+      api,
+      provider: providerId,
+      baseUrl: effectiveBaseUrl,
+      input: ["text"],
+      cost: ZERO_COST,
+      reasoning,
+      ...(catalog.thinkingLevelMap ? { thinkingLevelMap: { ...catalog.thinkingLevelMap } } : {}),
+      ...(compat ? { compat } : {}),
+      contextWindow: catalog.contextWindow || defaultContextWindow,
+      maxTokens: Math.max(defaultMaxTokens, catalog.maxTokens || defaultMaxTokens),
+    };
+  }
+
+  return {
+    id: modelId,
+    name: modelId,
+    api,
+    provider: providerId,
+    baseUrl: effectiveBaseUrl,
+    input: ["text"],
+    cost: ZERO_COST,
+    reasoning: wantThinking,
+    contextWindow: defaultContextWindow,
+    maxTokens: defaultMaxTokens,
+  };
+}
+
+const THINK_OPEN_TAG = "<think>";
+const THINK_CLOSE_TAG = "</think>";
+
+function trailingPartialTagLen(buf: string, targetLower: string): number {
+  const lower = buf.toLowerCase();
+  const maxLen = Math.min(lower.length, targetLower.length - 1);
+  for (let len = maxLen; len >= 1; len -= 1) {
+    if (lower.endsWith(targetLower.slice(0, len))) {
+      return len;
+    }
+  }
+  return 0;
+}
+
+/**
+ * 流式 `<think>...</think>` 标签拆分器：
+ * 兼容把思考过程内联在普通文本流里的 OpenAI 兼容网关 / Ollama / DeepSeek-R1 / Qwen3，
+ * 将 `<think>...</think>` 内文本路由到思考展示区，绝不混入正文回复或语音播报。
+ */
+export class InlineThinkStreamSplitter {
+  private _inThink = false;
+  private _carry = "";
+  private _emittedThinking = false;
+
+  get inThink(): boolean {
+    return this._inThink;
+  }
+
+  reset(): void {
+    this._inThink = false;
+    this._carry = "";
+    this._emittedThinking = false;
+  }
+
+  push(delta: string): { thinking: string; text: string } {
+    if (!delta) return { thinking: "", text: "" };
+    let buf = this._carry + delta;
+    this._carry = "";
+    let thinking = "";
+    let text = "";
+
+    while (buf.length > 0) {
+      if (!this._inThink) {
+        const idx = buf.toLowerCase().indexOf(THINK_OPEN_TAG);
+        if (idx !== -1) {
+          text += buf.slice(0, idx);
+          buf = buf.slice(idx + THINK_OPEN_TAG.length);
+          this._inThink = true;
+          if (this._emittedThinking) {
+            thinking += "\n\n";
+          }
+          continue;
+        }
+        const partial = trailingPartialTagLen(buf, THINK_OPEN_TAG);
+        if (partial > 0) {
+          text += buf.slice(0, buf.length - partial);
+          this._carry = buf.slice(buf.length - partial);
+        } else {
+          text += buf;
+        }
+        break;
+      } else {
+        const idx = buf.toLowerCase().indexOf(THINK_CLOSE_TAG);
+        if (idx !== -1) {
+          const piece = buf.slice(0, idx);
+          if (piece) {
+            thinking += piece;
+            this._emittedThinking = true;
+          }
+          buf = buf.slice(idx + THINK_CLOSE_TAG.length);
+          this._inThink = false;
+          continue;
+        }
+        const partial = trailingPartialTagLen(buf, THINK_CLOSE_TAG);
+        if (partial > 0) {
+          const piece = buf.slice(0, buf.length - partial);
+          if (piece) {
+            thinking += piece;
+            this._emittedThinking = true;
+          }
+          this._carry = buf.slice(buf.length - partial);
+        } else {
+          thinking += buf;
+          this._emittedThinking = true;
+        }
+        break;
+      }
+    }
+
+    return { thinking, text };
+  }
+
+  flush(): { thinking: string; text: string } {
+    const leftover = this._carry;
+    this._carry = "";
+    if (!leftover) return { thinking: "", text: "" };
+    if (this._inThink) {
+      this._emittedThinking = true;
+      return { thinking: leftover, text: "" };
+    }
+    return { thinking: "", text: leftover };
+  }
+}
+
+export function splitInlineThinkBlocks(raw: string): { thinking: string; text: string } {
+  if (!raw || !raw.toLowerCase().includes(THINK_OPEN_TAG)) {
+    return { thinking: "", text: raw };
+  }
+  const splitter = new InlineThinkStreamSplitter();
+  const a = splitter.push(raw);
+  const b = splitter.flush();
+  return {
+    thinking: (a.thinking + b.thinking).trim(),
+    text: (a.text + b.text).trim(),
+  };
 }
 
 function redactSecretFromText(raw: string): string {
@@ -407,6 +631,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   private _activeVoiceMeta: VoicePromptMeta | null = null;
   private _speakCursor = 0;
   private _rawStreamText = "";
+  private _inlineThinkSplitter = new InlineThinkStreamSplitter();
+  private _thinkingStreamedInMessage = false;
+  private _needsThinkingSeparator = false;
   private _speakChunkState: CavemanSpeakChunkState = { emittedAny: false };
   private _suppressedSilent = false;
   private _emittedSpeakChunks = false;
@@ -710,13 +937,13 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       initialState: {
         systemPrompt: this._buildSystemPrompt(),
         model,
-        thinkingLevel: "off",
+        thinkingLevel: this._config.thinkingLevel,
         tools: this._tools,
       },
       streamFn: this._createStreamFn(),
       getApiKey: () => resolveEffectiveApiKey(this._config),
       toolExecution: "sequential",
-      prepareRequest: ({ context, model: reqModel, thinkingLevel }) => {
+      prepareRequest: ({ context, model: reqModel }) => {
         // 每次请求前刷新最新设备目录到首条 system message，同时按 maxHistoryTurns 裁剪过长历史
         const msgs = [...context.messages];
         const freshPrompt = this._buildSystemPrompt();
@@ -740,7 +967,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         return {
           context: { ...context, messages: trimmed },
           model: this._customModel ?? buildModelForConfig(this._config) ?? reqModel,
-          thinkingLevel,
+          thinkingLevel: this._config.thinkingLevel,
         };
       },
     });
@@ -751,35 +978,121 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     return agent;
   }
 
+  private _appendThinkingDelta(entry: AgentTimelineEntry, delta: string): void {
+    if (!delta) return;
+    if (this._needsThinkingSeparator && entry.thinking && entry.thinking.trim().length > 0) {
+      entry.thinking = `${entry.thinking.replace(/\s+$/, "")}\n\n${delta.replace(/^\s+/, "")}`;
+      this._needsThinkingSeparator = false;
+    } else {
+      entry.thinking = (entry.thinking ?? "") + delta;
+    }
+    entry.thinkingActive = true;
+    // 仅通过 streamEvent 推送到对话框渲染，绝不触发 speakChunk / 语音播报
+    this.emit("streamEvent", {
+      kind: "thinking_delta",
+      entryId: entry.id,
+      delta,
+      thinking: entry.thinking,
+      thinkingActive: true,
+      thinkingLevel: entry.thinkingLevel,
+    });
+  }
+
+  private _finishThinkingPhase(entry: AgentTimelineEntry): void {
+    if (!entry.thinkingActive) return;
+    entry.thinkingActive = false;
+    this.emit("streamEvent", {
+      kind: "thinking_end",
+      entryId: entry.id,
+      thinking: entry.thinking ?? "",
+      thinkingActive: false,
+      thinkingLevel: entry.thinkingLevel,
+    });
+  }
+
+  private _pushAnswerTextDelta(entry: AgentTimelineEntry, delta: string): void {
+    if (!delta) return;
+    let piece = delta;
+    if (!entry.text && !this._rawStreamText && !this._bufferedPostToolText) {
+      piece = piece.replace(/^\s+/, "");
+      if (!piece) return;
+    }
+    if (this._holdReplyUntilVerified || this._inCloudRecoveryTurn) {
+      this._bufferedPostToolText += piece;
+      return;
+    }
+    this._rawStreamText += piece;
+    entry.text += piece;
+    this.emit("streamEvent", {
+      kind: "text_delta",
+      entryId: entry.id,
+      delta: piece,
+      text: entry.text,
+    });
+    // 无设备变更的纯问答/闲聊可立即流式分句播报，降低首字播报延迟（TTFA）
+    if (this._activeSource === "voice" && this._config.autoSpeakReply) {
+      this._flushReadySpeakSentences(entry, false);
+    }
+  }
+
   private _handleAgentEvent(event: AgentEvent): void {
     const entry = this._activeAssistantEntry;
 
     switch (event.type) {
+      case "message_start": {
+        if (!entry) break;
+        if (event.message.role === "assistant") {
+          this._inlineThinkSplitter.reset();
+          this._thinkingStreamedInMessage = false;
+        }
+        break;
+      }
       case "message_update": {
         if (!entry) break;
         const ev = event.assistantMessageEvent;
-        if (ev.type === "text_delta" && ev.delta) {
-          if (this._holdReplyUntilVerified || this._inCloudRecoveryTurn) {
-            this._bufferedPostToolText += ev.delta;
-            break;
+        if (ev.type === "thinking_start") {
+          if (entry.thinking && entry.thinking.trim().length > 0) {
+            this._needsThinkingSeparator = true;
           }
-          this._rawStreamText += ev.delta;
-          entry.text += ev.delta;
+          entry.thinkingActive = true;
+          this._thinkingStreamedInMessage = true;
           this.emit("streamEvent", {
-            kind: "text_delta",
+            kind: "thinking_start",
             entryId: entry.id,
-            delta: ev.delta,
-            text: entry.text,
+            thinking: entry.thinking ?? "",
+            thinkingActive: true,
+            thinkingLevel: entry.thinkingLevel,
           });
-          // 无设备变更的纯问答/闲聊可立即流式分句播报，降低首字播报延迟（TTFA）
-          if (this._activeSource === "voice" && this._config.autoSpeakReply) {
-            this._flushReadySpeakSentences(entry, false);
+        } else if (ev.type === "thinking_delta" && ev.delta) {
+          if (!this._thinkingStreamedInMessage && entry.thinking && entry.thinking.trim().length > 0) {
+            this._needsThinkingSeparator = true;
+          }
+          this._thinkingStreamedInMessage = true;
+          this._appendThinkingDelta(entry, ev.delta);
+        } else if (ev.type === "thinking_end") {
+          if (ev.content && !entry.thinking) {
+            this._appendThinkingDelta(entry, ev.content);
+          }
+          this._finishThinkingPhase(entry);
+        } else if (ev.type === "text_delta" && ev.delta) {
+          const split = this._inlineThinkSplitter.push(ev.delta);
+          if (split.thinking) {
+            if (!this._thinkingStreamedInMessage && entry.thinking && entry.thinking.trim().length > 0) {
+              this._needsThinkingSeparator = true;
+            }
+            this._thinkingStreamedInMessage = true;
+            this._appendThinkingDelta(entry, split.thinking);
+          }
+          if (split.text) {
+            this._finishThinkingPhase(entry);
+            this._pushAnswerTextDelta(entry, split.text);
           }
         }
         break;
       }
       case "tool_execution_start": {
         if (!entry) break;
+        this._finishThinkingPhase(entry);
         const label = this._toolLabels.get(event.toolName) ?? event.toolName;
         const args =
           event.args && typeof event.args === "object" && !Array.isArray(event.args)
@@ -866,11 +1179,47 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         if (!entry) break;
         const msg = event.message;
         if (msg.role === "assistant") {
-          const textBlocks = msg.content
+          const tail = this._inlineThinkSplitter.flush();
+          if (tail.thinking) {
+            if (!this._thinkingStreamedInMessage && entry.thinking && entry.thinking.trim().length > 0) {
+              this._needsThinkingSeparator = true;
+            }
+            this._thinkingStreamedInMessage = true;
+            this._appendThinkingDelta(entry, tail.thinking);
+          }
+          if (tail.text) {
+            this._finishThinkingPhase(entry);
+            this._pushAnswerTextDelta(entry, tail.text);
+          }
+
+          // 若后端未走 thinking_delta 流式事件（例如一次性返回 ThinkingContent），此处补全思考过程
+          const structuredThinking = msg.content
+            .filter((b): b is ThinkingContent => b.type === "thinking")
+            .map((b) => (b.redacted && !b.thinking ? "（模型已思考，内容由服务商折叠保护）" : b.thinking))
+            .map((t) => t.trim())
+            .filter(Boolean)
+            .join("\n\n");
+          if (structuredThinking && !this._thinkingStreamedInMessage) {
+            if (entry.thinking && entry.thinking.trim().length > 0) {
+              this._needsThinkingSeparator = true;
+            }
+            this._appendThinkingDelta(entry, structuredThinking);
+          }
+
+          const rawTextBlocks = msg.content
             .filter((b): b is TextContent => b.type === "text")
             .map((b) => b.text)
-            .join("")
-            .trim();
+            .join("");
+          const splitFinal = splitInlineThinkBlocks(rawTextBlocks);
+          if (splitFinal.thinking && !this._thinkingStreamedInMessage) {
+            if (entry.thinking && entry.thinking.trim().length > 0) {
+              this._needsThinkingSeparator = true;
+            }
+            this._appendThinkingDelta(entry, splitFinal.thinking);
+          }
+          this._finishThinkingPhase(entry);
+
+          const textBlocks = splitFinal.text.trim();
           if (msg.stopReason === "error") {
             if (this._inCloudRecoveryTurn) {
               this._cloudRecoveryFailed = true;
@@ -1295,7 +1644,8 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     if (this._config.provider === "local" && !this._customStreamFn) {
       return null;
     }
-    const model = this._customModel ?? buildModelForConfig(this._config);
+    const model =
+      this._customModel ?? buildModelForConfig({ ...this._config, thinkingLevel: "off" });
     const apiKey = resolveEffectiveApiKey(this._config);
     const localUrl = isLocalEndpointUrl(model.baseUrl);
     const effectiveKey = apiKey || (localUrl ? "ollama" : undefined);
@@ -1362,13 +1712,17 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       nextConfig.customProviderName !== this._config.customProviderName ||
       nextConfig.customApiType !== this._config.customApiType ||
       nextConfig.modelId !== this._config.modelId ||
-      nextConfig.baseUrl !== this._config.baseUrl;
+      nextConfig.baseUrl !== this._config.baseUrl ||
+      nextConfig.thinkingLevel !== this._config.thinkingLevel;
     this._config = nextConfig;
     this._systemOne?.reset();
     this._systemOne = SystemOneClient.fromConfig(this._config, this._systemOneFetcher);
-    if (providerOrModelChanged && !this._running) {
-      // 保留现有 UI timeline，但更新底层 Agent 的 model 配置
-      this._agent.state.model = this._customModel ?? buildModelForConfig(this._config);
+    if (!this._running) {
+      this._agent.state.thinkingLevel = this._config.thinkingLevel;
+      if (providerOrModelChanged) {
+        // 保留现有 UI timeline，但更新底层 Agent 的 model 配置
+        this._agent.state.model = this._customModel ?? buildModelForConfig(this._config);
+      }
     }
     this.emit("stateChanged", this.snapshot());
   }
@@ -1401,6 +1755,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     this._activeVoiceMeta = options.voiceMeta ?? null;
     this._speakCursor = 0;
     this._rawStreamText = "";
+    this._inlineThinkSplitter.reset();
+    this._thinkingStreamedInMessage = false;
+    this._needsThinkingSeparator = false;
     this._speakChunkState = { emittedAny: false };
     this._suppressedSilent = false;
     this._emittedSpeakChunks = false;
@@ -1435,6 +1792,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       role: "assistant",
       source,
       text: "",
+      thinking: "",
+      thinkingActive: false,
+      thinkingLevel: this._config.thinkingLevel,
       timestamp: now,
       status: "streaming",
       provider: this._config.provider,
@@ -1824,10 +2184,13 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           }
         }
 
+        this._finishThinkingPhase(assistantEntry);
         this.emit("streamEvent", {
           kind: "final_reply",
           entryId: assistantEntry.id,
           text: assistantEntry.text,
+          ...(assistantEntry.thinking?.trim() ? { thinking: assistantEntry.thinking } : {}),
+          ...(assistantEntry.thinkingLevel ? { thinkingLevel: assistantEntry.thinkingLevel } : {}),
           verification: assistantEntry.verification,
           skillEvent: assistantEntry.skillEvent,
         });
@@ -1840,6 +2203,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       assistantEntry.text = assistantEntry.error;
       this._lastError = assistantEntry.error;
     } finally {
+      assistantEntry.thinkingActive = false;
       const streamedChunks = this._emittedSpeakChunks;
       this._running = false;
       this._turnUseLocalFastPath = false;
@@ -1847,6 +2211,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       this._inCloudRecoveryTurn = false;
       this._cloudRecoveryFailed = false;
       this._bufferedPostToolText = "";
+      this._inlineThinkSplitter.reset();
+      this._thinkingStreamedInMessage = false;
+      this._needsThinkingSeparator = false;
       this._roundToolTraces = [];
       this._roundToolArgs.clear();
       this._turnAbortController = null;
@@ -1863,11 +2230,14 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       this._emittedSpeakChunks = streamedChunks;
     }
 
+    const trimmedThinking = assistantEntry.thinking?.trim();
     return {
       ok: assistantEntry.status === "done",
       entryId: assistantEntry.id,
       ack: assistantEntry.ackText ?? TASK_ACK_TEXT,
       reply: assistantEntry.text,
+      ...(trimmedThinking ? { thinking: trimmedThinking } : {}),
+      ...(assistantEntry.thinkingLevel ? { thinkingLevel: assistantEntry.thinkingLevel } : {}),
       toolCalls: assistantEntry.toolCalls.map((t) => ({ ...t })),
       retriesUsed,
       ...(retryNotices.length > 0 ? { retryNotices } : {}),

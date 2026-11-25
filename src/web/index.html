@@ -277,6 +277,15 @@
         <button type="button" id="pi-voice-wake-toggle-btn" class="pi-wake-pill active" title="点击切换唤醒词模式或免唤醒直达模式">唤醒词：小派</button>
         <button type="button" id="pi-streaming-toggle-btn" class="pi-wake-pill active" title="点击快速开启或关闭 Qwen3-ASR 实时流式转写与智能断句">流式：开</button>
         <button type="button" id="pi-caveman-toggle-btn" class="pi-caveman-pill active" title="点击切换语音与文字回复风格">自然 · Lite</button>
+        <select id="pi-thinking-level-select" class="pi-thinking-select" aria-label="AI 思考等级" title="设置 AI 思考等级（思考过程显示在对话框，不语音播报）">
+          <option value="off">思考：关</option>
+          <option value="minimal">思考：极简</option>
+          <option value="low">思考：低</option>
+          <option value="medium">思考：中</option>
+          <option value="high">思考：高</option>
+          <option value="xhigh">思考：超高</option>
+          <option value="max">思考：最大</option>
+        </select>
       </div>
       <div id="pi-voice-telemetry" class="pi-voice-telemetry" hidden></div>
     </div>
@@ -698,6 +707,22 @@
                 <datalist id="set-agent-model-list"></datalist>
               </div>
             </div>
+          </div>
+
+          <div class="setting-card setting-card-wrap" id="setting-row-agent-thinking-level">
+            <div class="setting-info">
+              <div class="setting-label">AI 思考等级</div>
+              <div class="setting-desc" id="set-agent-thinking-level-desc">关闭思考以获得最快响应；开启后思考过程会实时显示在对话框中，且不会进行语音播报</div>
+            </div>
+            <select id="set-agent-thinking-level" class="md-select" aria-label="AI 思考等级">
+              <option value="off">关闭 Off（不思考 · 最快响应）</option>
+              <option value="minimal">极简 Minimal</option>
+              <option value="low">低 Low（轻度推理）</option>
+              <option value="medium">中 Medium（均衡推理）</option>
+              <option value="high">高 High（深度推理）</option>
+              <option value="xhigh">超高 XHigh（部分模型支持）</option>
+              <option value="max">最大 Max（部分模型支持）</option>
+            </select>
           </div>
 
           <div class="setting-card" id="setting-row-agent-local-fast-path">

@@ -2001,6 +2001,8 @@ export function createRequestHandler(
           entryId: result.entryId,
           ack: result.ack,
           reply: result.reply,
+          ...(result.thinking ? { thinking: result.thinking } : {}),
+          ...(result.thinkingLevel ? { thinkingLevel: result.thinkingLevel } : {}),
           toolCalls: result.toolCalls,
           retriesUsed: result.retriesUsed ?? 0,
           ...(result.retryNotices ? { retryNotices: result.retryNotices } : {}),

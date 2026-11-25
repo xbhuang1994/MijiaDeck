@@ -37,6 +37,7 @@ export type VoiceprintPolicyMode = "off" | "tag" | "strict";
 export type AttentionMode = "smart" | "strict" | "off";
 export type SystemOneMode = "auto" | "on" | "off";
 export type CavemanReplyMode = "ultra" | "full" | "lite" | "off";
+export type AgentThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type CustomApiType =
   | "openai-completions"
   | "openai-responses"
@@ -194,6 +195,33 @@ const CAVEMAN_MODE_ALIASES: Readonly<Record<string, CavemanReplyMode>> = {
 };
 export const DEFAULT_SYSTEMONE_MODEL = "karpo/karpo-decision-31b";
 export const DEFAULT_CAVEMAN_MODE: CavemanReplyMode = "lite";
+export const DEFAULT_THINKING_LEVEL: AgentThinkingLevel = "off";
+export const VALID_THINKING_LEVELS: ReadonlyArray<AgentThinkingLevel> = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+const VALID_THINKING_LEVEL_SET = new Set<string>(VALID_THINKING_LEVELS);
+const THINKING_LEVEL_ALIASES: Readonly<Record<string, AgentThinkingLevel>> = {
+  off: "off",
+  none: "off",
+  disabled: "off",
+  minimal: "minimal",
+  min: "minimal",
+  low: "low",
+  medium: "medium",
+  med: "medium",
+  high: "high",
+  xhigh: "xhigh",
+  "extra-high": "xhigh",
+  extra_high: "xhigh",
+  max: "max",
+  maximum: "max",
+};
 const VALID_CUSTOM_APIS = new Set<string>([
   "openai-completions",
   "openai-responses",
@@ -262,6 +290,8 @@ export interface AgentVoiceConfig {
   systemOneConfidenceThreshold: number;
   // Caveman 极简回复风格（参考 juliusbrussee/caveman）
   cavemanMode: CavemanReplyMode;
+  /** AI 思考/推理等级：off（关闭）/ minimal / low / medium / high / xhigh / max（思考过程仅展示在对话框，不语音播报） */
+  thinkingLevel: AgentThinkingLevel;
   // openWakeWord 独立本地声学唤醒词优化（支持用户自定义唤醒词）
   owwEnabled: boolean;
   owwThreshold: number;
@@ -330,6 +360,7 @@ export interface AgentConfigPatch {
   systemOneTimeoutMs?: unknown;
   systemOneConfidenceThreshold?: unknown;
   cavemanMode?: unknown;
+  thinkingLevel?: unknown;
   owwEnabled?: unknown;
   owwThreshold?: unknown;
   sttBaseUrl?: unknown;
@@ -384,6 +415,7 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     systemOneTimeoutMs: 2000,
     systemOneConfidenceThreshold: 0.65,
     cavemanMode: DEFAULT_CAVEMAN_MODE,
+    thinkingLevel: DEFAULT_THINKING_LEVEL,
     owwEnabled: true,
     owwThreshold: 0.6,
     sttBaseUrl: "",
@@ -481,6 +513,15 @@ export function normalizeCavemanMode(
   if (typeof value !== "string") return fallback;
   const key = value.trim().toLowerCase();
   return CAVEMAN_MODE_ALIASES[key] ?? fallback;
+}
+
+export function normalizeThinkingLevel(
+  value: unknown,
+  fallback: AgentThinkingLevel = DEFAULT_THINKING_LEVEL,
+): AgentThinkingLevel {
+  if (typeof value !== "string") return fallback;
+  const key = value.trim().toLowerCase();
+  return THINKING_LEVEL_ALIASES[key] ?? fallback;
 }
 
 function normalizeSystemOneBaseUrl(value: unknown): string {
@@ -587,6 +628,7 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     : defaults.systemOneMode;
 
   const cavemanMode = normalizeCavemanMode(raw.cavemanMode, defaults.cavemanMode);
+  const thinkingLevel = normalizeThinkingLevel(raw.thinkingLevel, defaults.thinkingLevel);
   const sysOneModelRaw =
     typeof raw.systemOneModel === "string" ? raw.systemOneModel.trim().slice(0, 128) : "";
 
@@ -685,6 +727,7 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
       ).toFixed(2),
     ),
     cavemanMode,
+    thinkingLevel,
     owwEnabled: typeof raw.owwEnabled === "boolean" ? raw.owwEnabled : defaults.owwEnabled,
     owwThreshold: Number(clampNumber(raw.owwThreshold, 0.25, 0.95, defaults.owwThreshold).toFixed(2)),
     sttBaseUrl: normalizeUrl(raw.sttBaseUrl),
@@ -1076,6 +1119,14 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
       throw new Error(`不支持的回复精简模式: ${cmRaw}`);
     }
     nextRaw.cavemanMode = mapped;
+  }
+  if (patch.thinkingLevel !== undefined) {
+    const tlRaw = String(patch.thinkingLevel).trim().toLowerCase();
+    const mapped = THINKING_LEVEL_ALIASES[tlRaw];
+    if (!mapped || !VALID_THINKING_LEVEL_SET.has(mapped)) {
+      throw new Error(`不支持的 AI 思考等级: ${tlRaw}`);
+    }
+    nextRaw.thinkingLevel = mapped;
   }
   if (patch.owwEnabled !== undefined) {
     nextRaw.owwEnabled = Boolean(patch.owwEnabled);
