@@ -1805,12 +1805,22 @@ export async function analyzeAndPlanRecovery(
   const dedupedPlanParts = [...new Set(planParts)];
   const plan = `${dedupedPlanParts.join("，并")}，完成后再次检查设备状态`;
   const noticeText = `第${attempt}次重试：检查发现${problem}。我准备${plan}。`;
+  const failedCallDescs = [
+    ...new Set(solvableIssues.map((i) => `${i.toolName}(${JSON.stringify(i.toolArgs)})`)),
+  ];
+  const recommendedCallDescs = steps.map((s) => `${s.toolName}(${JSON.stringify(s.args)})`);
 
   const llmGuidancePrompt = [
     `[状态校验未通过 · 第 ${attempt}/${maxAttempts} 轮自愈排错]`,
     `用户原始任务：${userTask}`,
     `状态检查发现的问题：${problem}`,
+    ...(failedCallDescs.length > 0
+      ? [`已失败/未生效的调用（严禁原样重复）：${failedCallDescs.join("、")}`]
+      : []),
     `建议修复思路：${plan}`,
+    ...(recommendedCallDescs.length > 0
+      ? [`建议优先执行的修复调用：${recommendedCallDescs.join(" -> ")}`]
+      : []),
     "请先思考该问题是否能够解决：",
     "- 如果判断确实无法解决，不要再调用控制工具，直接输出以 `[UNSOLVABLE]` 开头的简短中文原因说明；",
     "- 如果可以解决，请立即调用合适的工具执行修复步骤（可先查 get_device_detail 核对真实属性/动作名），完成后简要汇报结果。",

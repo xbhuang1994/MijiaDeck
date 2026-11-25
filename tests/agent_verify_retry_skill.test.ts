@@ -2,7 +2,7 @@
 // MijiaDeck: Pi Agent 先回复“好的” -> 执行 -> 状态检查 -> 思考排错3轮重试 -> 沉淀复用 Skill 闭环测试
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -11,9 +11,13 @@ import {
   fauxToolCall,
 } from "@earendil-works/pi-ai";
 import {
+  buildSkillsPromptSection,
+  computeSkillStepsSignature,
   loadAgentSkills,
   matchAgentSkill,
   normalizeSkillIntentKey,
+  resolveCanonicalSkillIntent,
+  saveAgentSkill,
 } from "../src/agent/agentSkillStore.ts";
 import { PiAgentService, TASK_ACK_TEXT } from "../src/agent/piAgentService.ts";
 import {
@@ -25,6 +29,7 @@ import {
 import { NetworkMonitor } from "../src/core/availability.ts";
 import { JobExecutor } from "../src/core/jobs.ts";
 import { setDataPathOverrides } from "../src/core/jsonStore.ts";
+import { createDeviceInfo } from "../src/core/models.ts";
 import * as settingsStore from "../src/core/settingsStore.ts";
 import { VirtualDemoService } from "../src/core/virtualLightService.ts";
 import { startMijiaDeckServer, type MijiaDeckServer } from "../src/server/server.ts";
@@ -786,6 +791,512 @@ describe("Pi Agent Closed-Loop: Immediate Ack -> Execute -> State Verify -> 3-Ro
       expect(abortedRes.ok).toBe(false);
     } finally {
       await hAbort.cleanup();
+    }
+  });
+
+  test("stop-playback Skill precipitated via self-heal is reused across natural phrasing & ASR punctuation variations with 0 retries and 0 duplicate skills", async () => {
+    const service = new VirtualDemoService();
+    let pauseCalls = 0;
+    let textDirectiveCalls = 0;
+    const origRunAction = service.runAction.bind(service);
+    service.runAction = async (did: string, name: string, params?: unknown) => {
+      if (did === "demo-speaker-xiaoai" && name === "pause") {
+        // Simulate real XiaoAI quirk: MIoT pause leaves playing-state=1 (does not stop stream)
+        pauseCalls += 1;
+        return;
+      }
+      if (did === "demo-speaker-xiaoai" && name === "execute-text-directive") {
+        textDirectiveCalls += 1;
+        // Text directive "停止播放" actually stops playback -> playing-state=2
+        await origRunAction(did, "pause");
+        return;
+      }
+      return origRunAction(did, name, params);
+    };
+
+    let llmCalls = 0;
+    const faux = fauxProvider({
+      models: [{ id: "faux-stop-music", name: "Faux Stop Music" }],
+    });
+    faux.setResponses([
+      // Task 1 Round 0: Cloud LLM calls control_speaker(stop) -> triggers playback_mismatch
+      fauxAssistantMessage(
+        [fauxToolCall("control_speaker", { target: "demo-speaker-xiaoai", playback: "stop" })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage("已停止播放。", { stopReason: "stop" }),
+      // Task 1 Round 1 recovery: Cloud LLM escalates to silent send_xiaoai_command("停止播放") -> passes!
+      fauxAssistantMessage(
+        [
+          fauxToolCall("send_xiaoai_command", {
+            speaker: "demo-speaker-xiaoai",
+            text: "停止播放",
+            silent: true,
+          }),
+        ],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage("已通过小爱指令停止播放。", { stopReason: "stop" }),
+    ]);
+
+    const h = createHarness({
+      service,
+      verificationOptions: {
+        settleDelaysMs: [],
+        speakerPlaybackSettleDelaysMs: [],
+        sleep: async () => {},
+      },
+      customModel: faux.getModel(),
+      customStreamFn: (m, ctx, opts) => {
+        llmCalls += 1;
+        return faux.provider.streamSimple(m, ctx, opts);
+      },
+    });
+
+    try {
+      await h.ready();
+      await origRunAction("demo-speaker-xiaoai", "play");
+      expect(await service.readProp("demo-speaker-xiaoai", "playing-state")).toBe(1);
+
+      // --- Task 1: "停止播放。" hits playback_mismatch, heals via silent send_xiaoai_command, precipitates Skill #1 ---
+      const r1 = await h.agent.prompt("停止播放。", { source: "voice" });
+      expect(r1.ok).toBe(true);
+      expect(r1.retriesUsed).toBe(1);
+      expect(r1.verification?.status).toBe("recovered");
+      expect(r1.skillEvent?.kind).toBe("created");
+      expect(textDirectiveCalls).toBe(1);
+      expect(pauseCalls).toBe(1);
+
+      const skillsAfterRun1 = loadAgentSkills();
+      expect(skillsAfterRun1.length).toBe(1);
+      const skill1 = skillsAfterRun1[0]!;
+      expect(skill1.canonicalIntentKey).toBe("speaker:stop_playback");
+      expect(skill1.targetDids).toEqual(["demo-speaker-xiaoai"]);
+      // send_xiaoai_command step MUST bind `speaker` cleanly (keeping `silent: true`) and NEVER inject bogus `target`!
+      expect(skill1.steps).toEqual([
+        {
+          toolName: "send_xiaoai_command",
+          args: { speaker: "demo-speaker-xiaoai", text: "停止播放", silent: true },
+        },
+      ]);
+
+      // --- Task 2: Slightly varied phrasing + ASR punctuation ("停止播放音乐。") MUST reuse Skill #1 with 0 retries & 0 LLM calls! ---
+      await origRunAction("demo-speaker-xiaoai", "play");
+      expect(await service.readProp("demo-speaker-xiaoai", "playing-state")).toBe(1);
+      const llmCallsBeforeRun2 = llmCalls;
+      pauseCalls = 0;
+      textDirectiveCalls = 0;
+
+      const r2 = await h.agent.prompt("停止播放音乐。", { source: "voice" });
+      expect(r2.ok).toBe(true);
+      expect(r2.retriesUsed).toBe(0);
+      expect(r2.retryNotices).toBeUndefined();
+      expect(r2.verification?.status).toBe("passed");
+      expect(r2.skillEvent?.kind).toBe("reused");
+      expect(r2.skillEvent?.skillId).toBe(skill1.id);
+      expect(llmCalls).toBe(llmCallsBeforeRun2); // ZERO cloud LLM round-trips!
+      expect(pauseCalls).toBe(0); // NEVER stepped into the broken pause pitfall again!
+      expect(textDirectiveCalls).toBe(1);
+      expect(await service.readProp("demo-speaker-xiaoai", "playing-state")).toBe(2);
+
+      // --- Tasks 3..5: Natural stop phrasings ("停止播放了。", "让小爱停止播放吧。", "别放了。") ALL reuse Skill #1 ---
+      for (const phrase of ["停止播放了。", "让小爱停止播放吧。", "别放了。"]) {
+        await origRunAction("demo-speaker-xiaoai", "play");
+        const rx = await h.agent.prompt(phrase, { source: "voice" });
+        expect(rx.ok).toBe(true);
+        expect(rx.retriesUsed).toBe(0);
+        expect(rx.skillEvent?.kind).toBe("reused");
+        expect(rx.skillEvent?.skillId).toBe(skill1.id);
+      }
+
+      expect(llmCalls).toBe(llmCallsBeforeRun2);
+      const finalSkills = loadAgentSkills();
+      expect(finalSkills.length).toBe(1); // STRICTLY NO DUPLICATE SKILLS!
+      expect(finalSkills[0]!.useCount).toBe(4);
+      expect(finalSkills[0]!.retriesAvoided).toBe(4);
+      expect(finalSkills[0]!.triggers).toContain("停止播放。");
+      expect(finalSkills[0]!.triggers).toContain("停止播放音乐。");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("escalates immediately when a reused pause Skill fails, upgrades the Skill in-place without creating duplicates, and reuses upgraded Skill next time", async () => {
+    const service = new VirtualDemoService();
+    let pauseShouldWork = true;
+    const origRunAction = service.runAction.bind(service);
+    const seenActions: string[] = [];
+
+    service.runAction = async (did: string, name: string, params?: unknown) => {
+      seenActions.push(`${name}:${JSON.stringify(params ?? null)}`);
+      if (did === "demo-speaker-xiaoai" && name === "pause") {
+        if (pauseShouldWork) {
+          return origRunAction(did, "pause");
+        }
+        // On Task 2, pause stops working -> playing-state remains 1!
+        return;
+      }
+      if (did === "demo-speaker-xiaoai" && name === "execute-text-directive") {
+        return origRunAction(did, "pause");
+      }
+      return origRunAction(did, name, params);
+    };
+
+    const h = createHarness({
+      service,
+      verificationOptions: {
+        settleDelaysMs: [],
+        speakerPlaybackSettleDelaysMs: [],
+        sleep: async () => {},
+      },
+    });
+    try {
+      await h.ready();
+      // Pre-seed a Skill that previously healed via control_speaker(pause)
+      const seeded = saveAgentSkill({
+        name: "停止播放（避坑流程）",
+        description: "旧沉淀：改用 pause 停止播放",
+        triggerText: "停止播放",
+        targetDids: ["demo-speaker-xiaoai"],
+        pitfall: "小爱音箱 Pro播放状态检查未生效：音箱仍在播放中",
+        resolutionSummary: "改用暂停指令停止小爱音箱 Pro播放",
+        steps: [{ toolName: "control_speaker", args: { target: "demo-speaker-xiaoai", playback: "pause" } }],
+        activeDevices: h.mainWindow.activeDevices(),
+      });
+      expect(seeded.created).toBe(true);
+      expect(loadAgentSkills().length).toBe(1);
+
+      // Now pause stops working! Task 2 matches seeded Skill, executes pause -> fails verification!
+      // Attempt 1 MUST NOT repeat pause; it escalates directly to silent send_xiaoai_command and upgrades Skill in-place!
+      pauseShouldWork = false;
+      await origRunAction("demo-speaker-xiaoai", "play");
+      seenActions.length = 0;
+
+      const r2 = await h.agent.prompt("停止播放音乐", { source: "voice" });
+      expect(r2.ok).toBe(true);
+      expect(r2.retriesUsed).toBe(1); // Escalated on Attempt 1 (did NOT waste Attempt 1 repeating pause!)
+      expect(r2.verification?.status).toBe("recovered");
+      expect(r2.skillEvent?.kind).toBe("updated");
+      expect(r2.skillEvent?.skillId).toBe(seeded.skill.id);
+      expect(r2.reply).toContain("已更新技能");
+      expect(r2.reply).not.toContain("沉淀为技能");
+      // First action was reused Skill's pause, second action was immediate escalation to silent execute-text-directive
+      expect(seenActions[0]).toBe("pause:null");
+      expect(seenActions[1]).toContain("execute-text-directive");
+
+      const afterUpgrade = loadAgentSkills();
+      expect(afterUpgrade.length).toBe(1); // STRICTLY 1 Skill (upgraded in-place, ZERO duplicates!)
+      expect(afterUpgrade[0]!.id).toBe(seeded.skill.id);
+      expect(afterUpgrade[0]!.steps[0]?.toolName).toBe("send_xiaoai_command");
+      expect(afterUpgrade[0]!.steps[0]?.args.speaker).toBe("demo-speaker-xiaoai");
+      expect(afterUpgrade[0]!.steps[0]?.args.silent).toBe(true);
+      expect(afterUpgrade[0]!.steps[0]?.args.target).toBeUndefined();
+
+      // Task 3 immediately reuses upgraded Skill with 0 retries!
+      await origRunAction("demo-speaker-xiaoai", "play");
+      seenActions.length = 0;
+      const r3 = await h.agent.prompt("停止播放", { source: "voice" });
+      expect(r3.ok).toBe(true);
+      expect(r3.retriesUsed).toBe(0);
+      expect(r3.skillEvent?.kind).toBe("reused");
+      expect(r3.skillEvent?.skillId).toBe(seeded.skill.id);
+      expect(seenActions.length).toBe(1);
+      expect(seenActions[0]).toContain("execute-text-directive");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("deduplicates skills across synonyms, identical (targetDids+steps), legacy polluted targetDids, and enforces strict device/room/numeric safety", () => {
+    const xiaoaiLiving = createDeviceInfo({
+      did: "504337266",
+      name: "小爱音箱Play",
+      model: "xiaomi.wifispeaker.l05b",
+      home_name: "方寸别院",
+      room_name: "客厅",
+      online: true,
+      spec_type: "urn:miot-spec-v2:device:speaker:0000A015:xiaomi-l05b:1",
+    });
+    const xiaoaiBedroom = createDeviceInfo({
+      did: "504337299",
+      name: "卧室小爱音箱",
+      model: "xiaomi.wifispeaker.l05b",
+      home_name: "方寸别院",
+      room_name: "卧室",
+      online: true,
+      spec_type: "urn:miot-spec-v2:device:speaker:0000A015:xiaomi-l05b:1",
+    });
+    const irAmp = createDeviceInfo({
+      did: "tuya:6cb2201c8dd09d11cdacgh",
+      name: "音响",
+      model: "tuya.infrared_amplifier.g4epfqle2vmfaxb8",
+      home_name: "我的家",
+      room_name: "客厅",
+      online: true,
+      spec_type: "urn:tuya:device:amplifier:1",
+    });
+    const livingLight = createDeviceInfo({
+      did: "demo-light-living",
+      name: "客厅吸顶灯",
+      model: "yeelink.light.ceiling1",
+      home_name: "方寸别院",
+      room_name: "客厅",
+      online: true,
+    });
+    const devices = [xiaoaiLiving, xiaoaiBedroom, irAmp, livingLight];
+
+    // 1. ASR trailing punctuation + polite particles normalization
+    expect(normalizeSkillIntentKey("停止播放。")).toBe("停止播放");
+    expect(normalizeSkillIntentKey("停止播放了。")).toBe("停止播放");
+    expect(normalizeSkillIntentKey("请帮我停止播放一下吧。")).toBe("停止播放");
+    expect(normalizeSkillIntentKey("嗨Neo，停止播放！")).toBe("停止播放");
+    expect(normalizeSkillIntentKey("把客厅吸顶灯亮度调到 85%。")).toBe("客厅吸顶灯亮度调到85%");
+    expect(normalizeSkillIntentKey("把客厅吸顶灯亮度调到 30%。")).toBe("客厅吸顶灯亮度调到30%");
+
+    // 2. Saving synonymous phrasings merges into a single Skill (never creates duplicates)
+    const s1 = saveAgentSkill({
+      name: "停止播放（避坑流程）",
+      description: "自动排错沉淀",
+      triggerText: "停止播放",
+      targetDids: ["504337266"],
+      pitfall: "音箱仍在播放中",
+      resolutionSummary: "改用小爱文本指令停止播放",
+      steps: [{ toolName: "send_xiaoai_command", args: { speaker: "504337266", text: "停止播放", silent: true } }],
+      activeDevices: devices,
+    });
+    expect(s1.created).toBe(true);
+
+    const s2 = saveAgentSkill({
+      name: "停止播放音乐（避坑流程）",
+      description: "自动排错沉淀",
+      triggerText: "停止播放音乐",
+      targetDids: ["504337266"],
+      pitfall: "音箱仍在播放中",
+      resolutionSummary: "改用小爱文本指令停止播放",
+      steps: [{ toolName: "send_xiaoai_command", args: { silent: true, text: "停止播放", speaker: "504337266" } }],
+      activeDevices: devices,
+    });
+    expect(s2.created).toBe(false);
+    expect(s2.stepsChanged).toBe(false);
+    expect(s2.triggerAdded).toBe(true);
+    expect(s2.skill.id).toBe(s1.skill.id);
+
+    // 3. Even an arbitrary phrasing producing identical (targetDids + steps) merges via stepsSignature!
+    const s3 = saveAgentSkill({
+      name: "把唱歌的停掉（避坑流程）",
+      description: "自动排错沉淀",
+      triggerText: "别再出声了",
+      targetDids: ["504337266"],
+      pitfall: "音箱仍在播放中",
+      resolutionSummary: "改用小爱文本指令停止播放",
+      steps: [{ toolName: "send_xiaoai_command", args: { speaker: "504337266", text: "停止播放", silent: true } }],
+      activeDevices: devices,
+    });
+    expect(s3.created).toBe(false);
+    expect(s3.skill.id).toBe(s1.skill.id);
+    expect(loadAgentSkills().length).toBe(1);
+    expect(
+      computeSkillStepsSignature([{ toolName: "control_speaker", args: { target: "504337266", playback: "pause" } }]),
+    ).toBe(
+      computeSkillStepsSignature([{ toolName: "control_speaker", args: { playback: "pause", target: "504337266" } }]),
+    );
+
+    // 4. Positive matches on XiaoAi stop skill
+    expect(matchAgentSkill("停止播放", devices)?.id).toBe(s1.skill.id);
+    expect(matchAgentSkill("停止播放音乐。", devices)?.id).toBe(s1.skill.id);
+    expect(matchAgentSkill("小爱音箱Play停止播放", devices)?.id).toBe(s1.skill.id);
+    expect(matchAgentSkill("小爱同学，别放了。", devices)?.id).toBe(s1.skill.id);
+    expect(matchAgentSkill("把客厅小爱音箱停掉播放", devices)?.id).toBe(s1.skill.id);
+
+    // 5. Strict negative safety guards: NEVER misroute across devices, rooms, polarity, compounds, or non-audio chores!
+    expect(matchAgentSkill("让音响停止播放", devices)).toBeNull();
+    expect(matchAgentSkill("让卧室小爱停止播放", devices)).toBeNull();
+    expect(matchAgentSkill("继续播放音乐", devices)).toBeNull();
+    expect(matchAgentSkill("取消暂停", devices)).toBeNull();
+    expect(matchAgentSkill("停止播放并关闭客厅吸顶灯", devices)).toBeNull();
+    expect(matchAgentSkill("停止洗衣机", devices)).toBeNull();
+    expect(matchAgentSkill("停止灌溉", devices)).toBeNull();
+    expect(matchAgentSkill("不要放猫粮", devices)).toBeNull();
+    expect(resolveCanonicalSkillIntent("不要放猫粮", devices)).toBeNull();
+
+    // 6. Distinct numeric targets NEVER merge or cross-match
+    const b85 = saveAgentSkill({
+      name: "客厅灯85%",
+      description: "85%",
+      triggerText: "把客厅吸顶灯亮度调到85%",
+      targetDids: ["demo-light-living"],
+      pitfall: "亮度未生效",
+      resolutionSummary: "先开灯再设85%",
+      steps: [{ toolName: "control_light", args: { target: "demo-light-living", on: true, brightness: 85 } }],
+      activeDevices: devices,
+    });
+    const b30 = saveAgentSkill({
+      name: "客厅灯30%",
+      description: "30%",
+      triggerText: "把客厅吸顶灯亮度调到30%",
+      targetDids: ["demo-light-living"],
+      pitfall: "亮度未生效",
+      resolutionSummary: "先开灯再设30%",
+      steps: [{ toolName: "control_light", args: { target: "demo-light-living", on: true, brightness: 30 } }],
+      activeDevices: devices,
+    });
+    expect(b85.skill.id).not.toBe(b30.skill.id);
+    expect(matchAgentSkill("客厅吸顶灯亮度调到 85%。", devices)?.id).toBe(b85.skill.id);
+    expect(matchAgentSkill("客厅吸顶灯亮度调到 30%。", devices)?.id).toBe(b30.skill.id);
+    expect(matchAgentSkill("客厅吸顶灯亮度调到 50%", devices)).toBeNull();
+
+    // 7. Legacy polluted targetDids (["504337266", "小爱"]) + legacy duplicate JSON entries are healed cleanly on load
+    writeFileSync(
+      path.join(tmpDir, "agent_skills.json"),
+      JSON.stringify({
+        version: 1,
+        skills: [
+          {
+            id: "skill_legacy_1",
+            name: "停止播放（避坑流程）",
+            description: "old1",
+            triggers: ["停止播放"],
+            normalizedIntentKey: "停止播放",
+            targetDids: ["504337266", "小爱"],
+            pitfall: "仍在播放",
+            resolutionSummary: "改用暂停",
+            steps: [{ toolName: "control_speaker", args: { target: "504337266", playback: "pause" } }],
+            verification: [],
+            createdFromRetry: true,
+            useCount: 1,
+            retriesAvoided: 1,
+            enabled: true,
+            createdAt: 1000,
+            updatedAt: 2000,
+            lastUsedAt: null,
+          },
+          {
+            id: "skill_legacy_2",
+            name: "停止播放音乐（避坑流程）",
+            description: "old2",
+            triggers: ["停止播放音乐"],
+            normalizedIntentKey: "停止播放音乐",
+            targetDids: ["504337266"],
+            pitfall: "仍在播放",
+            resolutionSummary: "改用暂停",
+            steps: [{ toolName: "control_speaker", args: { target: "504337266", playback: "pause" } }],
+            verification: [],
+            createdFromRetry: true,
+            useCount: 2,
+            retriesAvoided: 2,
+            enabled: true,
+            createdAt: 1500,
+            updatedAt: 3000,
+            lastUsedAt: null,
+          },
+        ],
+      }),
+      "utf-8",
+    );
+
+    const coalesced = loadAgentSkills();
+    expect(coalesced.length).toBe(1);
+    expect(coalesced[0]!.useCount).toBe(3);
+    expect(coalesced[0]!.triggers).toContain("停止播放");
+    expect(coalesced[0]!.triggers).toContain("停止播放音乐");
+    expect(matchAgentSkill("停止播放", devices)?.id).toBe(coalesced[0]!.id);
+    const promptSec = buildSkillsPromptSection(coalesced);
+    expect(promptSec).toContain("停止播放");
+    expect(promptSec).toContain("覆盖常规默认参数");
+  });
+
+  test("resolves did from set_device_power recovery without targetDids alias pollution and exposes saved Skill in Cloud LLM system prompt for compound commands", async () => {
+    const service = new VirtualDemoService();
+    const origRunAction = service.runAction.bind(service);
+    const origWriteProp = service.writeProp.bind(service);
+    let stopAttempts = 0;
+
+    service.runAction = async (did: string, name: string, params?: unknown) => {
+      if (did === "demo-speaker-xiaoai" && name === "pause") {
+        stopAttempts += 1;
+        if (stopAttempts === 1) {
+          // Round 0 fails to stop playback
+          return;
+        }
+      }
+      return origRunAction(did, name, params);
+    };
+
+    const seenSystems: string[] = [];
+    const faux = fauxProvider({
+      models: [{ id: "faux-power-skill", name: "Faux Power Skill" }],
+    });
+    faux.setResponses([
+      // Task 1 Round 0: control_speaker(stop) fails verification
+      fauxAssistantMessage(
+        [fauxToolCall("control_speaker", { target: "demo-speaker-xiaoai", playback: "stop" })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage("已停止播放。", { stopReason: "stop" }),
+      // Task 1 Round 1 recovery: Cloud LLM uses set_device_power with fuzzy alias "小爱" -> succeeds!
+      fauxAssistantMessage(
+        [fauxToolCall("set_device_power", { target: "小爱", state: "off" })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage("已将小爱静音暂停。", { stopReason: "stop" }),
+      // Task 3 (compound command): falls through to Cloud LLM -> receives saved Skill in messages[0]!
+      fauxAssistantMessage("已按避坑经验处理复合指令。", { stopReason: "stop" }),
+    ]);
+
+    const h = createHarness({
+      service,
+      verificationOptions: {
+        settleDelaysMs: [],
+        speakerPlaybackSettleDelaysMs: [],
+        sleep: async () => {},
+      },
+      customModel: faux.getModel(),
+      customStreamFn: (m, ctx, opts) => {
+        const sys = ctx.messages[0];
+        seenSystems.push(sys && typeof sys.content === "string" ? sys.content : "");
+        return faux.provider.streamSimple(m, ctx, opts);
+      },
+    });
+
+    try {
+      await h.ready();
+      await origRunAction("demo-speaker-xiaoai", "play");
+      await origWriteProp("demo-speaker-xiaoai", "mute", false);
+
+      // Task 1: recovers via set_device_power({ target: "小爱", state: "off" })
+      const r1 = await h.agent.prompt("停止播放", { source: "voice" });
+      expect(r1.ok).toBe(true);
+      expect(r1.retriesUsed).toBe(1);
+      expect(r1.skillEvent?.kind).toBe("created");
+
+      const saved = loadAgentSkills();
+      expect(saved.length).toBe(1);
+      // targetDids MUST contain ONLY real did (NO "小爱" alias pollution that previously broke matchAgentSkill!)
+      expect(saved[0]!.targetDids).toEqual(["demo-speaker-xiaoai"]);
+      expect(saved[0]!.steps).toEqual([
+        { toolName: "set_device_power", args: { target: "demo-speaker-xiaoai", state: "off" } },
+      ]);
+
+      // Task 2: immediately matches & reuses the skill (0 retries, 0 LLM calls)
+      await origRunAction("demo-speaker-xiaoai", "play");
+      await origWriteProp("demo-speaker-xiaoai", "mute", false);
+      const systemsBeforeTask2 = seenSystems.length;
+      const r2 = await h.agent.prompt("停止播放音乐", { source: "voice" });
+      expect(r2.ok).toBe(true);
+      expect(r2.retriesUsed).toBe(0);
+      expect(r2.skillEvent?.kind).toBe("reused");
+      expect(seenSystems.length).toBe(systemsBeforeTask2);
+
+      // Task 3: compound command falls through to Cloud LLM and system prompt includes the saved Skill!
+      const r3 = await h.agent.prompt("停止播放并关闭客厅吸顶灯", { source: "voice" });
+      expect(r3.ok).toBe(true);
+      const lastSys = seenSystems[seenSystems.length - 1] ?? "";
+      expect(lastSys).toContain("已沉淀技能（Skills");
+      expect(lastSys).toContain("停止播放（避坑流程）");
+      expect(lastSys).toContain("demo-speaker-xiaoai");
+      expect(loadAgentSkills().length).toBe(1);
+    } finally {
+      await h.cleanup();
     }
   });
 });

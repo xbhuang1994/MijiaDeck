@@ -60,10 +60,12 @@ import { SCENES_FEATURE_ENABLED } from "../core/featureFlags.ts";
 import type { FetchLike } from "../core/httpTimeout.ts";
 import {
   buildSkillsPromptSection,
+  computeSkillStepsSignature,
   deleteAgentSkill,
   loadAgentSkills,
   matchAgentSkill,
   recordSkillUse,
+  resolveCanonicalSkillIntent,
   saveAgentSkill,
   setAgentSkillEnabled,
   type AgentSkill,
@@ -1377,7 +1379,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       "## 五、宿主闭环、自愈协议与播报规范",
       "1. 去重与 TTS 规范：宿主收到指令已先回复简短应答词（如「好的」「稍等我看一下」「让我想想」等），正文严禁重复此类开场词或以「好的/好哒/没问题/收到/明白/Sure/OK」开头或加客服收尾；对于简单常规设备控制（如开关灯、调亮度/色温/音量、暂停/停止播放、调空调/窗帘等），宿主执行后会自动核验真实设备状态，状态正常将静默收尾不再二次回复（可简短确认或直接输出 `[SILENT]`），仅在存在异常/离线/部分失败/受限提醒，或需要向用户询问澄清/二次确认时才输出完整回复；服从下方回复风格块，语音下纯口语零 Markdown/emoji/列表符/英文属性枚举名，绝不丢失数字、单位与否定词；批量混合结果必须如实分列成功与失败/离线项。",
       "2. 语音静默 `[SILENT]`：仅语音模式（`<runtime_context>` 含 `Voice:`）下，遇家人闲聊、第三人称提及、电视/歌词碎片或助手自回声残片，**零工具调用**且严格仅输出 `[SILENT]`（禁加任何解释或标点）。",
-      "3. 技能复用：优先借鉴下方「已沉淀技能（Skills）」避坑路径，但必先核对设备在线且按当前新数值与安全红线动态适配，绝不照搬旧值。",
+      "3. 技能复用：遇到下方「已沉淀技能（Skills）」覆盖的设备与同类/同义任务时，必须优先采用已验证的避坑步骤（优先级高于通用默认参数，如音箱停播已沉淀 pause 或静默小爱文本指令则直接采用），同时核对设备在线并按当前新数值与安全红线动态适配，绝不照搬旧数值。",
       "4. 3 轮自愈协议（收到 `[状态校验未通过 · 第 X/3 轮自愈排错]` 严格二选一）：",
       "   - **不可解 → 立即止损**：离线、未登录、不存在/已屏蔽、硬件不支持（通断灯调光、红外音响绝对音量/点歌/播报、逆变器只读、水满/缺水/门未关、红外 2050）或**非幂等动作超时**（喂食器出粮/开水阀超时防重发）→ 不要调用任何变更工具，直接以 `[UNSOLVABLE]` 为首字符输出简短中文原因。",
       "   - **可解 → 递进换路定点修复**：禁重复同一失败调用、禁调破坏性重启/重置偏方、禁重跑已成功或离线设备、自愈轮禁传 `toggle`。属性/枚举/按键错先 `get_device_detail` 并在**同轮内完成变更修复**；关机灯拒写先开灯再写属性；音箱未停播按 `pause` → `send_xiaoai_command(\"停止播放\", silent=true)` → `pause+mute` 递进兜底。",
@@ -1658,10 +1660,8 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         };
       },
     });
-    // 若尚无历史消息且设备刚加载完成，同步静态台账；若已有历史则完整保留主 Agent 的冻结 messages[0]
-    if (seedMessages.length <= 1) {
-      this._syncStaticSystemPromptIfNeeded(agent, false);
-    }
+    // 仅当静态台账、技能或附加指令确有变更时才同步更新 messages[0]；未变更时零改写以完整复用主 Agent 缓存前缀
+    this._syncStaticSystemPromptIfNeeded(agent, false);
     const unsub = agent.subscribe((event) => {
       this._handleAgentEvent(event, ctx);
     });
@@ -2313,11 +2313,28 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     if (chosen.length === 0) {
       return fallbackSteps.map((s) => ({ ...s, args: { ...s.args } }));
     }
-    return chosen.map((t) => {
+
+    const normalized: AgentSkillStep[] = chosen.map((t) => {
       const d = t.details ?? {};
-      const resolvedDid = typeof d.did === "string" && d.did ? d.did : undefined;
+      let resolvedDid = typeof d.did === "string" && d.did ? d.did : undefined;
+      if (
+        !resolvedDid &&
+        Array.isArray(d.succeeded) &&
+        d.succeeded.length === 1 &&
+        d.succeeded[0] &&
+        typeof (d.succeeded[0] as { did?: unknown }).did === "string" &&
+        (d.succeeded[0] as { did: string }).did
+      ) {
+        resolvedDid = (d.succeeded[0] as { did: string }).did;
+      }
       const args = { ...t.args };
-      if (resolvedDid && (!args.target || typeof args.target === "string")) {
+      if (t.name === "send_xiaoai_command") {
+        // send_xiaoai_command 的目标参数为 speaker（非 target），绑定精确 did 并清除无效 target 字段
+        delete args.target;
+        if (resolvedDid) {
+          args.speaker = resolvedDid;
+        }
+      } else if (resolvedDid && (!args.target || typeof args.target === "string")) {
         args.target = resolvedDid;
       }
       return {
@@ -2325,6 +2342,29 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         args,
       };
     });
+
+    // 同一恢复轮内若对同一目标重复下发完全相同步骤，或针对同一音箱先后尝试了不同停播方式，仅保留最终生效步骤
+    const deduped: AgentSkillStep[] = [];
+    for (const step of normalized) {
+      const sig = computeSkillStepsSignature([step]);
+      if (deduped.length > 0 && computeSkillStepsSignature([deduped[deduped.length - 1]!]) === sig) {
+        continue;
+      }
+      if (step.toolName === "control_speaker" && typeof step.args.playback === "string") {
+        const prevIdx = deduped.findIndex(
+          (prev) =>
+            prev.toolName === "control_speaker" &&
+            prev.args.target === step.args.target &&
+            typeof prev.args.playback === "string",
+        );
+        if (prevIdx >= 0) {
+          deduped.splice(prevIdx, 1);
+        }
+      }
+      deduped.push(step);
+    }
+
+    return deduped.length > 0 ? deduped : normalized;
   }
 
   listSkills(): AgentSkill[] {
@@ -3670,6 +3710,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       let currentOutcome: TaskVerificationOutcome | null = null;
       let handledBySkill = false;
       let handledByMemoryGate = false;
+      let failedMatchedSkill: AgentSkill | null = null;
       let initialPitfall = "";
 
       // Step 0：待确认回复处理 + 隐式设备能力探测与强化记忆渐进确认闸门
@@ -3750,7 +3791,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
 
           if (skillVerify.passed) {
             handledBySkill = true;
-            recordSkillUse(matchedSkill.id, true);
+            recordSkillUse(matchedSkill.id, true, text);
             const skillEvent: AgentSkillEventRecord = {
               kind: "reused",
               skillId: matchedSkill.id,
@@ -3805,6 +3846,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
               assistantEntry.text = candidateReply;
             }
           } else {
+            failedMatchedSkill = matchedSkill;
             initialPitfall = skillVerify.issues.map((i) => i.summary).join("；");
           }
         }
@@ -4001,26 +4043,43 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           });
 
           if (currentOutcome.passed) {
-            // Step 4：排错成功 -> 将经校验有效的流程自动沉淀为 Skill，下次不再踩坑
+            // Step 4：排错成功 -> 将经校验有效的流程自动沉淀或原地升级 Skill，杜绝重复沉淀
+            const activeDevices = this._deps.mainWindow.activeDevices();
             const winningSteps = this._extractWinningSkillSteps(attemptTraces, plan.steps);
+            const traceDids: string[] = [];
+            for (const tr of attemptTraces) {
+              const td = tr.details;
+              if (!td) continue;
+              if (typeof td.did === "string" && td.did) traceDids.push(td.did);
+              if (Array.isArray(td.succeeded)) {
+                for (const item of td.succeeded) {
+                  if (
+                    item &&
+                    typeof item === "object" &&
+                    typeof (item as { did?: unknown }).did === "string" &&
+                    (item as { did: string }).did
+                  ) {
+                    traceDids.push((item as { did: string }).did);
+                  }
+                }
+              }
+            }
             const targetDids = [
-              ...new Set(
-                [
-                  ...currentOutcome.specs.map((s) => s.did ?? ""),
-                  ...attemptTraces.map((tr) =>
-                    tr.details && typeof tr.details.did === "string" ? tr.details.did : "",
-                  ),
-                ].filter(Boolean),
-              ),
+              ...new Set([...currentOutcome.specs.map((s) => s.did ?? ""), ...traceDids].filter(Boolean)),
             ];
             const pitfallText = initialPitfall || plan.problem;
             const skillName = buildSkillNameForRecovery(text, winningSteps);
             let savedSkill: AgentSkill | null = null;
             let skillCreated = false;
+            let skillStepsChanged = false;
+            let skillTriggerAdded = false;
+            const cleanedForConfirmCheck = text.trim().replace(/[。！!？?，,\s]+/g, "");
+            const hasCanonicalIntent = Boolean(resolveCanonicalSkillIntent(text, activeDevices));
             const looksLikeShortConfirmationReply =
-              text.trim().length < 4 ||
+              cleanedForConfirmCheck.length < 2 ||
+              (!hasCanonicalIntent && text.trim().length < 4) ||
               /^(?:嗯+|对|是的?|好的?|可以|行|确认|确定|取消|不用了?|算了|ok|yes|no)$/i.test(
-                text.trim().replace(/[。！!？?，,\s]+/g, ""),
+                cleanedForConfirmCheck,
               );
             try {
               if (!looksLikeShortConfirmationReply) {
@@ -4028,6 +4087,8 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
                   name: skillName,
                   description: `自动排错沉淀：解决「${pitfallText}」，第 ${attempt} 轮验证通过`,
                   triggerText: text,
+                  ...(failedMatchedSkill ? { replaceSkillId: failedMatchedSkill.id } : {}),
+                  activeDevices,
                   targetDids,
                   pitfall: pitfallText,
                   resolutionSummary: plan.plan,
@@ -4037,12 +4098,14 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
                 });
                 savedSkill = saved.skill;
                 skillCreated = saved.created;
+                skillStepsChanged = saved.stepsChanged;
+                skillTriggerAdded = saved.triggerAdded;
               }
             } catch {
               savedSkill = null;
             }
 
-            if (savedSkill) {
+            if (savedSkill && (skillCreated || skillStepsChanged)) {
               const skillEvent: AgentSkillEventRecord = {
                 kind: skillCreated ? "created" : "updated",
                 skillId: savedSkill.id,
@@ -4053,7 +4116,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
               assistantEntry.skillEvent = skillEvent;
               assistantEntry.taskUpdates?.push({
                 kind: "skill_saved",
-                text: `已将本次成功流程沉淀为技能「${savedSkill.name}」，下次将直接复用避免踩坑`,
+                text: skillCreated
+                  ? `已将本次成功流程沉淀为技能「${savedSkill.name}」，下次将直接复用避免踩坑`
+                  : `已升级技能「${savedSkill.name}」的避坑步骤，下次将按新流程执行`,
                 skillId: savedSkill.id,
                 skillName: savedSkill.name,
                 passed: true,
@@ -4067,6 +4132,15 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
                 created: skillCreated,
                 skillEvent,
               });
+            } else if (savedSkill && skillTriggerAdded) {
+              assistantEntry.taskUpdates?.push({
+                kind: "skill_reused",
+                text: `已将新表达合并至已有技能「${savedSkill.name}」（未重复沉淀）`,
+                skillId: savedSkill.id,
+                skillName: savedSkill.name,
+                passed: true,
+                timestamp: Date.now(),
+              });
             }
 
             const baseReply =
@@ -4077,9 +4151,12 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
               ) ||
               summarizeToolResults(attemptToolMsgs, text, this._config.cavemanMode);
 
-            assistantEntry.text = savedSkill
-              ? `${baseReply.replace(/[。！!]+$/, "")}，状态检查已通过，已将该流程沉淀为技能「${savedSkill.name}」，下次将避免踩坑。`
-              : `${baseReply.replace(/[。！!]+$/, "")}，状态检查已通过。`;
+            assistantEntry.text =
+              savedSkill && skillCreated
+                ? `${baseReply.replace(/[。！!]+$/, "")}，状态检查已通过，已将该流程沉淀为技能「${savedSkill.name}」，下次将避免踩坑。`
+                : savedSkill && skillStepsChanged
+                  ? `${baseReply.replace(/[。！!]+$/, "")}，状态检查已通过，已更新技能「${savedSkill.name}」的执行流程。`
+                  : `${baseReply.replace(/[。！!]+$/, "")}，状态检查已通过。`;
             break;
           }
 
