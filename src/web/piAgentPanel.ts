@@ -96,6 +96,9 @@ export interface UiAgentTimelineEntry {
   role: "user" | "assistant";
   source: "text" | "voice";
   text: string;
+  thinking?: string;
+  thinkingActive?: boolean;
+  thinkingLevel?: UiThinkingLevel;
   timestamp: number;
   status: "streaming" | "done" | "error" | "aborted";
   provider?: string;
@@ -120,6 +123,7 @@ export interface UiProviderPreset {
 
 export type UiSystemOneMode = "auto" | "on" | "off";
 export type UiCavemanMode = "ultra" | "full" | "lite" | "off";
+export type UiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface UiWakeWordPrototypeSummary {
   wakeWord: string;
@@ -175,6 +179,7 @@ export interface UiPublicAgentConfig extends ClientVoiceConfig {
   effectiveSystemOneBaseUrl?: string;
   effectiveSystemOneConfigured?: boolean;
   cavemanMode?: UiCavemanMode;
+  thinkingLevel?: UiThinkingLevel;
   preferLocalIntents?: boolean;
   owwEnabled?: boolean;
   owwThreshold?: number;
@@ -404,6 +409,38 @@ function normalizeUiCavemanMode(raw: unknown): UiCavemanMode {
   return raw === "ultra" || raw === "full" || raw === "lite" || raw === "off" ? raw : "lite";
 }
 
+const THINKING_LEVEL_LABELS: Readonly<Record<UiThinkingLevel, string>> = {
+  off: "关闭",
+  minimal: "极简",
+  low: "低",
+  medium: "中",
+  high: "高",
+  xhigh: "超高",
+  max: "最大",
+};
+
+const THINKING_LEVEL_BADGE_LABELS: Readonly<Record<UiThinkingLevel, string>> = {
+  off: "Off",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "XHigh",
+  max: "Max",
+};
+
+function normalizeUiThinkingLevel(raw: unknown): UiThinkingLevel {
+  return raw === "off" ||
+    raw === "minimal" ||
+    raw === "low" ||
+    raw === "medium" ||
+    raw === "high" ||
+    raw === "xhigh" ||
+    raw === "max"
+    ? raw
+    : "off";
+}
+
 function node<T extends HTMLElement = HTMLElement>(id: string): T {
   const el = document.getElementById(id);
   if (!el) throw new Error(`Missing DOM element: #${id}`);
@@ -437,6 +474,7 @@ export class PiAgentPanelController {
   private open = false;
   private skillsExpanded = false;
   private instructionsExpanded = false;
+  private thinkingCollapsed = new Map<string, boolean>();
   private agentState: UiPiAgentSnapshot | null = null;
   private voiceState: UiVoiceSnapshot | null = null;
   private localClientState: {
@@ -749,6 +787,14 @@ export class PiAgentPanelController {
       void this.cycleCavemanMode();
     });
 
+    const thinkingSelect = document.getElementById(
+      "pi-thinking-level-select",
+    ) as HTMLSelectElement | null;
+    thinkingSelect?.addEventListener("change", () => {
+      const next = normalizeUiThinkingLevel(thinkingSelect.value);
+      void this.setThinkingLevel(next);
+    });
+
     const skillsToggleBtn = document.getElementById("pi-skills-toggle-btn");
     skillsToggleBtn?.addEventListener("click", () => {
       this.skillsExpanded = !this.skillsExpanded;
@@ -903,6 +949,27 @@ export class PiAgentPanelController {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.deps.showToast(`切换回复风格失败：${msg}`, 3000);
+    }
+  }
+
+  async setThinkingLevel(next: UiThinkingLevel): Promise<void> {
+    try {
+      const res = await this.deps.apiPost<{
+        agent?: UiPiAgentSnapshot;
+        voice?: UiVoiceSnapshot;
+      }>("/api/agent/config", { thinkingLevel: next });
+      if (res.agent) this.applyAgentSnapshot(res.agent);
+      if (res.voice) this.applyVoiceSnapshot(res.voice);
+      this.deps.showToast(
+        next === "off"
+          ? "已关闭 AI 思考模式"
+          : `AI 思考等级已设为：${THINKING_LEVEL_LABELS[next]}（思考过程仅展示在对话框，不语音播报）`,
+        2400,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.deps.showToast(`设置 AI 思考等级失败：${msg}`, 3000);
+      this.renderVoiceStrip();
     }
   }
 
@@ -1109,10 +1176,45 @@ export class PiAgentPanelController {
       return;
     }
 
+    if (kind === "thinking_start" || kind === "thinking_delta" || kind === "thinking_end") {
+      const target = this.agentState.timeline.find((e) => e.id === entryId);
+      if (target) {
+        if (typeof ev.thinking === "string") {
+          target.thinking = ev.thinking;
+        } else if (kind === "thinking_delta" && typeof ev.delta === "string") {
+          target.thinking = (target.thinking ?? "") + ev.delta;
+        }
+        target.thinkingActive = kind !== "thinking_end";
+        if (typeof ev.thinkingLevel === "string") {
+          target.thinkingLevel = normalizeUiThinkingLevel(ev.thinkingLevel);
+        }
+
+        const thinkingBody = document.querySelector<HTMLElement>(
+          `[data-agent-msg-thinking="${CSS.escape(entryId)}"]`,
+        );
+        const thinkingCard = thinkingBody?.closest<HTMLElement>(".pi-thinking-card") ?? null;
+        if (thinkingBody && thinkingCard) {
+          thinkingBody.textContent = target.thinking ?? "";
+          thinkingBody.scrollTop = thinkingBody.scrollHeight;
+          thinkingCard.classList.toggle("is-streaming", Boolean(target.thinkingActive));
+          const titleEl = thinkingCard.querySelector<HTMLElement>(".pi-thinking-title");
+          if (titleEl) {
+            titleEl.textContent = target.thinkingActive ? "思考中…" : "思考过程";
+          }
+          this.scrollTimelineToBottom();
+          return;
+        }
+      }
+      this.renderTimeline();
+      return;
+    }
+
     if (kind === "final_reply" && typeof ev.text === "string") {
       const target = this.agentState.timeline.find((e) => e.id === entryId);
       if (target) {
         target.text = ev.text;
+        if (typeof ev.thinking === "string") target.thinking = ev.thinking;
+        target.thinkingActive = false;
         if (ev.verification) target.verification = ev.verification as UiAgentVerificationSummary;
         if (ev.skillEvent) target.skillEvent = ev.skillEvent as UiAgentSkillEvent;
         this.renderTimeline();
@@ -1199,6 +1301,10 @@ export class PiAgentPanelController {
   private currentCavemanMode(): UiCavemanMode {
     const raw = this.agentState?.config.cavemanMode ?? this.voiceState?.cavemanMode;
     return normalizeUiCavemanMode(raw);
+  }
+
+  private currentThinkingLevel(): UiThinkingLevel {
+    return normalizeUiThinkingLevel(this.agentState?.config.thinkingLevel);
   }
 
   private isWakeWordEnabled(): boolean {
@@ -1809,6 +1915,21 @@ export class PiAgentPanelController {
       cavemanBtn.title = `当前回复风格：${CAVEMAN_LABELS[cm]}（点击循环切换 自然 / 简短 / 极简 / 温暖）`;
     }
 
+    const thinkingSelect = document.getElementById(
+      "pi-thinking-level-select",
+    ) as HTMLSelectElement | null;
+    if (thinkingSelect) {
+      const tl = this.currentThinkingLevel();
+      if (thinkingSelect.value !== tl) {
+        thinkingSelect.value = tl;
+      }
+      thinkingSelect.classList.toggle("active", tl !== "off");
+      const isLocal = this.agentState?.provider === "local";
+      thinkingSelect.title = isLocal
+        ? `当前 AI 思考等级：${THINKING_LEVEL_LABELS[tl]}（内置本地引擎不启用云端推理；切换云端或自定义大模型后生效，思考过程仅展示在对话框，不播报）`
+        : `当前 AI 思考等级：${THINKING_LEVEL_LABELS[tl]}（思考过程显示在对话框中，不语音播报）`;
+    }
+
     const interim = this.localClientState.interimTranscript || this.voiceState?.interimTranscript || "";
     const err = this.localClientState.error || this.voiceState?.error || "";
 
@@ -2033,6 +2154,14 @@ export class PiAgentPanelController {
       });
     }
 
+    const thinkingLevel = this.currentThinkingLevel();
+    if (thinkingLevel !== "off") {
+      tags.push({
+        label: `思考 · ${THINKING_LEVEL_BADGE_LABELS[thinkingLevel]}`,
+        title: `AI 思考等级：${THINKING_LEVEL_LABELS[thinkingLevel]}（思考过程仅展示在对话框，不语音播报）`,
+      });
+    }
+
     const vpCount = vs?.voiceprints?.length ?? 0;
     if (vs?.voiceprintMode && vs.voiceprintMode !== "off" && vpCount > 0) {
       tags.push({ label: `声纹(${vpCount})` });
@@ -2128,6 +2257,7 @@ export class PiAgentPanelController {
     const entries = this.agentState?.timeline ?? [];
 
     if (entries.length === 0) {
+      this.thinkingCollapsed.clear();
       list.replaceChildren();
       emptyBox.hidden = false;
       return;
@@ -2135,6 +2265,13 @@ export class PiAgentPanelController {
 
     emptyBox.hidden = true;
     list.replaceChildren();
+
+    const activeIds = new Set(entries.map((e) => e.id));
+    for (const id of this.thinkingCollapsed.keys()) {
+      if (!activeIds.has(id)) {
+        this.thinkingCollapsed.delete(id);
+      }
+    }
 
     for (const entry of entries) {
       const item = document.createElement("div");
@@ -2166,6 +2303,58 @@ export class PiAgentPanelController {
         ackSpan.textContent = entry.ackText;
         ackPill.append(ackDot, ackSpan);
         item.appendChild(ackPill);
+      }
+
+      // AI Thinking / Reasoning process (display-only in dialog box, never spoken)
+      const thinkingText = typeof entry.thinking === "string" ? entry.thinking : "";
+      if (entry.role === "assistant" && (thinkingText.trim().length > 0 || entry.thinkingActive)) {
+        const card = document.createElement("details");
+        card.className = `pi-thinking-card${entry.thinkingActive ? " is-streaming" : ""}`;
+        card.open = this.thinkingCollapsed.get(entry.id) !== true;
+        card.addEventListener("toggle", () => {
+          this.thinkingCollapsed.set(entry.id, !card.open);
+        });
+
+        const head = document.createElement("summary");
+        head.className = "pi-thinking-head";
+
+        const dot = document.createElement("span");
+        dot.className = "pi-thinking-dot";
+        dot.setAttribute("aria-hidden", "true");
+
+        const title = document.createElement("span");
+        title.className = "pi-thinking-title";
+        title.textContent = entry.thinkingActive ? "思考中…" : "思考过程";
+
+        head.append(dot, title);
+
+        const level = entry.thinkingLevel ? normalizeUiThinkingLevel(entry.thinkingLevel) : "off";
+        if (level !== "off") {
+          const levelTag = document.createElement("span");
+          levelTag.className = "pi-thinking-level-tag";
+          levelTag.textContent = THINKING_LEVEL_BADGE_LABELS[level];
+          head.appendChild(levelTag);
+        }
+
+        const muteTag = document.createElement("span");
+        muteTag.className = "pi-thinking-mute-tag";
+        muteTag.textContent = "不播报";
+        muteTag.title = "思考过程仅在对话框展示，不会语音播报";
+        head.appendChild(muteTag);
+
+        const chevron = document.createElement("span");
+        chevron.className = "pi-thinking-chevron";
+        chevron.setAttribute("aria-hidden", "true");
+        chevron.textContent = "▾";
+        head.appendChild(chevron);
+
+        const body = document.createElement("div");
+        body.className = "pi-thinking-body";
+        body.dataset.agentMsgThinking = entry.id;
+        body.textContent = thinkingText || "正在思考…";
+
+        card.append(head, body);
+        item.appendChild(card);
       }
 
       // Tool calls list (for assistant messages)
@@ -2288,7 +2477,12 @@ export class PiAgentPanelController {
       bubble.className = "pi-msg-bubble";
       bubble.dataset.agentMsgText = entry.id;
       bubble.textContent =
-        entry.text || (entry.status === "streaming" ? "正在执行并核验设备状态…" : "");
+        entry.text ||
+        (entry.status === "streaming"
+          ? entry.thinkingActive
+            ? "正在思考中…"
+            : "正在执行并核验设备状态…"
+          : "");
       item.appendChild(bubble);
 
       list.appendChild(item);

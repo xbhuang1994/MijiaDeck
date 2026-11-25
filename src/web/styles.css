@@ -5671,6 +5671,44 @@ body.pi-drawer-open .voice-fab {
   color: var(--c-theme-dim);
 }
 
+.pi-thinking-select {
+  height: 27px;
+  padding: 0 22px 0 9px;
+  border-radius: 999px;
+  border: 1px solid var(--c-line);
+  background-color: var(--c-card);
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 12px) 11px, calc(100% - 8px) 11px;
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+  color: var(--c-text-secondary);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  flex-shrink: 0;
+  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.pi-thinking-select:hover {
+  background-color: var(--c-btn-hover);
+  color: var(--c-text-primary);
+}
+
+.pi-thinking-select.active {
+  border-color: var(--c-accent-border);
+  background-color: var(--c-accent-surface);
+  color: var(--c-theme-dim);
+}
+
+.pi-thinking-select option {
+  background: var(--c-surface);
+  color: var(--c-text-primary);
+}
+
 /* Conversation Scroll & Empty State */
 .pi-agent-scroll {
   flex: 1;
@@ -5901,6 +5939,117 @@ body.pi-drawer-open .voice-fab {
   border-radius: 50%;
   background: var(--c-online);
   flex-shrink: 0;
+}
+
+/* AI Thinking Process Card (display-only in dialog, never spoken) */
+.pi-thinking-card {
+  width: 96%;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--c-surface) 65%, var(--c-window-bg));
+  border: 1px solid var(--c-line);
+  border-left: 2.5px solid var(--c-accent-border);
+  overflow: hidden;
+  transition: border-color 0.16s ease;
+}
+
+.pi-thinking-card.is-streaming {
+  border-color: var(--c-accent-border);
+}
+
+.pi-thinking-head {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 11.2px;
+  color: var(--c-text-secondary);
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.pi-thinking-head::-webkit-details-marker {
+  display: none;
+}
+
+.pi-thinking-head:hover {
+  background: var(--c-btn-hover);
+  color: var(--c-text-primary);
+}
+
+.pi-thinking-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--c-text-muted);
+  flex-shrink: 0;
+}
+
+.pi-thinking-card.is-streaming .pi-thinking-dot {
+  background: var(--c-theme);
+  animation: piThinkingPulse 1.15s ease-in-out infinite;
+}
+
+@keyframes piThinkingPulse {
+  0%, 100% {
+    opacity: 0.4;
+    transform: scale(0.9);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.2);
+  }
+}
+
+.pi-thinking-title {
+  font-weight: 600;
+  color: var(--c-text-primary);
+}
+
+.pi-thinking-level-tag,
+.pi-thinking-mute-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10.2px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+.pi-thinking-level-tag {
+  background: var(--c-accent-surface);
+  border: 1px solid var(--c-accent-border);
+  color: var(--c-theme-dim);
+}
+
+.pi-thinking-mute-tag {
+  background: color-mix(in srgb, var(--c-text-muted) 14%, transparent);
+  color: var(--c-text-muted);
+}
+
+.pi-thinking-chevron {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--c-text-muted);
+  transition: transform 0.15s ease;
+}
+
+.pi-thinking-card:not([open]) .pi-thinking-chevron {
+  transform: rotate(-90deg);
+}
+
+.pi-thinking-body {
+  padding: 5px 9px 7px 9px;
+  border-top: 1px solid color-mix(in srgb, var(--c-line) 75%, transparent);
+  font-size: 11.4px;
+  line-height: 1.5;
+  color: var(--c-text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 92px;
+  overflow-y: auto;
 }
 
 .pi-retry-list {

@@ -53,6 +53,7 @@ const RE_AUTO_CLARITY_EN =
 const RE_FENCED_CODE = /```[\s\S]*?```/g;
 
 // TTS 语音清洗正则
+const RE_INLINE_THINK_BLOCK = /<think>[\s\S]*?(?:<\/think>|$)/gi;
 const RE_INTERNAL_ID_TAG = /\s*\[(?:did|id)=[^\]]*\]/gi;
 const RE_MD_FENCE_OPEN = /```[a-zA-Z0-9_-]*\r?\n?/g;
 const RE_MD_IMAGE = /!\[([^\]]*)\]\([^)]*\)/g;
@@ -230,6 +231,7 @@ export function sanitizeForVoiceTts(text: string): string {
   if (isSilentSentinel(text)) return SILENT_REPLY_SENTINEL;
 
   let out = text
+    .replace(RE_INLINE_THINK_BLOCK, "")
     .replace(RE_INTERNAL_ID_TAG, "")
     .replace(RE_MD_FENCE_OPEN, "")
     .replace(/```/g, "")

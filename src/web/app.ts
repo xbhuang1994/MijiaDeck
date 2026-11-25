@@ -13,6 +13,7 @@ import {
   type UiLocalVoiceStatus,
   type UiProviderPreset,
   type UiPublicAgentConfig,
+  type UiThinkingLevel,
   type UiVoiceprintProfile,
   type UiWakeWordHit,
   type UiWakeWordPrototypeSummary,
@@ -268,6 +269,16 @@ const CAVEMAN_PREVIEW_DESCS: Readonly<Record<UiCavemanMode, string>> = {
   full: "简短直给，去掉开场客套与收尾寒暄但保持自然句式 · 例：“客厅吸顶灯已打开，亮度调到85%。”",
   ultra: "电报体极致压缩，语音首字播报最快 · 例：“客厅吸顶灯已开，亮度 85%”",
   off: "温暖自然的完整对话回复，不做压缩 · 例：“好的，已经帮你打开客厅吸顶灯，亮度调到85%了。”",
+};
+
+const THINKING_LEVEL_PREVIEW_DESCS: Readonly<Record<UiThinkingLevel, string>> = {
+  off: "关闭思考以获得最快响应（默认）；若模型仍返回思考内容，仅在对话框展示，不会语音播报",
+  minimal: "极简思考：极少推理开销，适合快速判断；思考过程实时显示在对话框中，不语音播报",
+  low: "低思考：轻量推理，适合常见多设备组合控制；思考过程实时显示在对话框中，不语音播报",
+  medium: "中等思考（均衡推荐）：复杂模糊指令与排错更准确；思考过程实时显示在对话框中，不语音播报",
+  high: "深度思考：更充分的多步分析与自愈规划（响应稍慢）；思考过程实时显示在对话框中，不语音播报",
+  xhigh: "超高思考：仅部分前沿推理模型原生支持，其余模型自动兼容降档至高；思考过程仅展示不播报",
+  max: "最大思考：仅部分前沿推理模型原生支持，其余模型自动兼容降档至支持的最高档；思考过程仅展示不播报",
 };
 
 function safeUrlHost(rawUrl: string): string {
@@ -3765,6 +3776,8 @@ export class MijiaDeckWebApp {
     el("set-agent-clear-key-btn").hidden = !cfg?.hasApiKey;
     el<HTMLInputElement>("set-agent-prefer-local-intents").checked =
       cfg?.preferLocalIntents === true;
+    el<HTMLSelectElement>("set-agent-thinking-level").value = cfg?.thinkingLevel || "off";
+    this.syncThinkingLevelDesc();
     el<HTMLSelectElement>("set-agent-caveman-mode").value = cfg?.cavemanMode || "lite";
     this.syncCavemanDesc();
     el<HTMLTextAreaElement>("set-agent-system-prompt").value = cfg?.systemPromptExtra || "";
@@ -3934,6 +3947,29 @@ export class MijiaDeckWebApp {
     const mode: UiCavemanMode =
       raw === "ultra" || raw === "full" || raw === "lite" || raw === "off" ? raw : "lite";
     desc.textContent = CAVEMAN_PREVIEW_DESCS[mode];
+  }
+
+  private syncThinkingLevelDesc(): void {
+    const sel = document.getElementById("set-agent-thinking-level") as HTMLSelectElement | null;
+    const desc = document.getElementById("set-agent-thinking-level-desc");
+    if (!sel || !desc) return;
+    const raw = sel.value;
+    const level: UiThinkingLevel =
+      raw === "off" ||
+      raw === "minimal" ||
+      raw === "low" ||
+      raw === "medium" ||
+      raw === "high" ||
+      raw === "xhigh" ||
+      raw === "max"
+        ? raw
+        : "off";
+    const provId = (document.getElementById("set-agent-provider") as HTMLSelectElement | null)?.value;
+    const baseText = THINKING_LEVEL_PREVIEW_DESCS[level];
+    desc.textContent =
+      provId === "local"
+        ? `当前为「内置本地引擎」，思考等级将在切换云端或自定义大模型后生效 · ${baseText}`
+        : baseText;
   }
 
   private syncSystemOneStatusDesc(): void {
@@ -4730,6 +4766,7 @@ export class MijiaDeckWebApp {
         ? "当前为「内置本地引擎」，所有指令均由本地规划引擎执行；切换至云端或自定义大模型后，此开关控制常规指令是否优先走本地快路径（默认关闭）"
         : "开启后，常见确定性智能家居指令（如开关设备、调光、调音量、停播音乐）将优先走零延迟本地规划引擎；关闭则统一交由当前大模型理解与执行（默认关闭）";
     }
+    this.syncThinkingLevelDesc();
 
     if (preset) {
       el("set-agent-provider-desc").textContent = preset.description;
@@ -5009,6 +5046,7 @@ export class MijiaDeckWebApp {
       modelId: el<HTMLInputElement>("set-agent-model").value.trim(),
       baseUrl: el<HTMLInputElement>("set-agent-base-url").value.trim(),
       preferLocalIntents: el<HTMLInputElement>("set-agent-prefer-local-intents").checked,
+      thinkingLevel: el<HTMLSelectElement>("set-agent-thinking-level").value,
       cavemanMode: el<HTMLSelectElement>("set-agent-caveman-mode").value,
       systemPromptExtra: el<HTMLTextAreaElement>("set-agent-system-prompt").value.trim(),
       voiceEngine: el<HTMLSelectElement>("set-voice-engine").value,
@@ -6490,6 +6528,10 @@ export class MijiaDeckWebApp {
     });
     el<HTMLInputElement>("set-agent-api-key").addEventListener("change", () => {
       void this.fetchAgentModelsFromApi(false);
+    });
+
+    el<HTMLSelectElement>("set-agent-thinking-level").addEventListener("change", () => {
+      this.syncThinkingLevelDesc();
     });
 
     el<HTMLSelectElement>("set-agent-caveman-mode").addEventListener("change", () => {
