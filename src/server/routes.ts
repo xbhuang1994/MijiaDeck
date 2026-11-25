@@ -168,6 +168,8 @@ export interface AppRuntime {
       voicePipelineMode?: agentConfigStoreModule.VoicePipelineMode;
       vadSilenceMs?: number;
       vadSensitivity?: agentConfigStoreModule.VadSensitivityMode;
+      wakeWordEnabled?: boolean;
+      owwEnabled?: boolean;
     },
   ) => void;
   speakerAudioProps?: Map<string, { volName: string; muteName: string }>;
@@ -2536,6 +2538,8 @@ export function createRequestHandler(
           voicePipelineMode: updated.voicePipelineMode,
           vadSilenceMs: updated.vadSilenceMs,
           vadSensitivity: updated.vadSensitivity,
+          wakeWordEnabled: updated.wakeWordEnabled,
+          owwEnabled: updated.owwEnabled,
         });
         emitBroadcast(runtime);
         return jsonResponse({

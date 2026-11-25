@@ -174,6 +174,8 @@ function handleWsMessage(
         vadSensitivity: cfg.vadSensitivity,
         sampleRate,
         bypassWakeWord,
+        wakeWordEnabled: cfg.wakeWordEnabled,
+        wakeGatedAsr: true,
         isInConversation: () => vl.dialogState === "conversation",
         lang,
         engine: preferredEngine,
@@ -472,6 +474,12 @@ export async function startMijiaDeckServer(
     },
     reloadVoiceStreams: (wakeWords, threshold, streamOpts) => {
       for (const stream of activeVoiceStreams) {
+        if (typeof streamOpts?.wakeWordEnabled === "boolean") {
+          stream.setWakeWordEnabled(streamOpts.wakeWordEnabled);
+        }
+        if (typeof streamOpts?.owwEnabled === "boolean") {
+          stream.setOwwEnabled(streamOpts.owwEnabled);
+        }
         stream.reloadWakeWords(wakeWords, threshold);
         if (typeof streamOpts?.streamingAsrEnabled === "boolean") {
           stream.setStreamingAsrEnabled(streamOpts.streamingAsrEnabled);
@@ -547,6 +555,11 @@ export async function startMijiaDeckServer(
       });
     }),
     voiceListener.on("stateChanged", (voiceSnapshot) => {
+      const inConv = voiceSnapshot.dialogState === "conversation";
+      const transitionReason = voiceSnapshot.lastTransitionReason ?? undefined;
+      for (const stream of activeVoiceStreams) {
+        stream.syncDialogState(inConv, transitionReason);
+      }
       broadcaster.broadcast({
         type: "voice_state",
         data: voiceSnapshot,

@@ -993,6 +993,23 @@ export class OpenWakeWordStreamSession {
     return this._idleSkippedFrames;
   }
 
+  /**
+   * 当前流式唤醒会话是否已加载可用的声学唤醒词原型（允许运行期自动感知新注册/预热的原型）。
+   */
+  get hasActivePrototypes(): boolean {
+    if (!this._engine.isReady) {
+      return false;
+    }
+    if (this._context.prototypes.length > 0) {
+      return true;
+    }
+    const storeUpdatedAt = loadWakeWordStore().updatedAt;
+    if (storeUpdatedAt !== this._context.storeUpdatedAt) {
+      this._context = this._engine.compileScoringContext(this._wakeWords);
+    }
+    return this._context.prototypes.length > 0;
+  }
+
   reloadPrototypes(wakeWords?: readonly string[]): void {
     if (wakeWords) {
       this._wakeWords = [...wakeWords];

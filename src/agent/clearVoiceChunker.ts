@@ -314,6 +314,7 @@ export class ClearVoiceRealtimeChunker {
 
   private readonly _ring: Float32Array;
   private _totalSamples = 0;
+  private _minUtteranceStartSample = 0;
   private _pending = new Float32Array(0);
 
   // 当前话语与切片状态
@@ -519,8 +520,57 @@ export class ClearVoiceRealtimeChunker {
     return chunk;
   }
 
+  /**
+   * 仅向内部环形缓冲区预填充唤醒前历史上下文（默认用于给 MossFormer2 提供 0.3s 前文语境），
+   * 不触发 VAD、不改变话语起止状态，并锁定 `_minUtteranceStartSample` 防止新增切片倒灌进历史上下文。
+   */
+  seedContext(samples: Float32Array): void {
+    if (samples.length === 0) return;
+    const sr = this.config.sampleRate;
+    const normalized =
+      this._inputRate === sr ? samples : resampleLinear(samples, this._inputRate, sr);
+    const maxKeep = Math.min(normalized.length, this._ringCapacity);
+    const tail =
+      maxKeep < normalized.length ? normalized.subarray(normalized.length - maxKeep) : normalized;
+    this._writeRing(tail);
+    this._minUtteranceStartSample = this._totalSamples;
+  }
+
+  /**
+   * 当声学唤醒命中后回放循环录制缓冲区但唤醒词音量极轻未翻转 Silero VAD 时，
+   * 强制锚定当前话语起点覆盖缓冲区内的唤醒音频，保障唤醒词与后续音频不被吞掉。
+   */
+  ensureUtteranceActive(backSamples: number): void {
+    if (this._inUtterance) return;
+    const available = this._totalSamples - this._minUtteranceStartSample;
+    if (available <= 0) return;
+    const clampedBack = Math.max(
+      Math.min(this._frameSamples, available),
+      Math.min(backSamples, this._maxChunkSamples - this._frameSamples, available),
+    );
+    if (clampedBack <= 0) return;
+    this._inUtterance = true;
+    this._waitingUtteranceEnd = false;
+    this._utteranceSliceIndex = 0;
+    this._prevSliceForcedTimeout = false;
+    this._consecutiveSilenceMs = 0;
+    this._incompleteHint = false;
+    this._lastSliceEndSample = null;
+    this._sliceStartSample = Math.max(
+      this._minUtteranceStartSample,
+      this._totalSamples - clampedBack,
+    );
+    this._speechAccumSamples = Math.max(this._minSpeechSamples, clampedBack);
+    this._utteranceSpeechSamples = Math.max(this._minSpeechSamples, clampedBack);
+    if (!this._speaking) {
+      this._speaking = true;
+      this._onSpeechActivity?.(true);
+    }
+  }
+
   reset(): void {
     this._pending = new Float32Array(0);
+    this._minUtteranceStartSample = this._totalSamples;
     this._clearUtteranceState();
     if (this._vad) {
       try {
@@ -613,9 +663,9 @@ export class ClearVoiceRealtimeChunker {
         this._speechAccumSamples = 0;
         this._incompleteHint = false;
         this._lastSliceEndSample = null;
-        // 句首保留 preRollMs，绝不截断唤醒词或辅音起音
+        // 句首保留 preRollMs，绝不截断唤醒词或辅音起音（同时不越过预填充上下文边界）
         this._sliceStartSample = Math.max(
-          0,
+          this._minUtteranceStartSample,
           this._totalSamples - this._frameSamples - this._preRollSamples,
         );
       } else if (this._waitingUtteranceEnd) {
