@@ -223,12 +223,24 @@ export class TuyaSharingClient {
 
     const resp = await this._fetchJson(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
     });
 
     if (resp.success === false) {
+      const code = String(resp.code ?? "");
+      const rawMsg = String(resp.msg ?? "");
+      const lower = rawMsg.toLowerCase();
+      if (
+        code.toUpperCase() === "USERCODE_INCORRECT" ||
+        lower.includes("user code incorrect") ||
+        lower.includes("usercode")
+      ) {
+        throw new TuyaSharingApiError(
+          "涂鸦用户码不正确，请在「涂鸦智能 / Smart Life App → 我的 → 设置 → 账号与安全 → 用户码」中核对后重试",
+          resp.code as string | number | undefined,
+        );
+      }
       throw new TuyaSharingApiError(
-        String(resp.msg || "获取涂鸦扫码登录二维码失败"),
+        rawMsg || "获取涂鸦扫码登录二维码失败",
         resp.code as string | number | undefined,
       );
     }
@@ -279,36 +291,85 @@ export class TuyaSharingClient {
     }
 
     if (resp.success !== true) {
-      const msg = String(resp.msg ?? "");
-      const code = String(resp.code ?? "");
+      const msg = String(resp.msg ?? "").trim();
+      const code = String(resp.code ?? "").trim();
+      const upperCode = code.toUpperCase();
       const lower = msg.toLowerCase();
+
+      // 1. 明确的二维码过期状态
       if (
         lower.includes("expired") ||
         lower.includes("timeout") ||
-        code === "1107" ||
-        code === "EXPIRED"
+        upperCode === "1107" ||
+        upperCode === "E0020002" ||
+        upperCode === "EXPIRED" ||
+        upperCode === "QRCODE_EXPIRED" ||
+        upperCode === "QR_CODE_EXPIRED" ||
+        upperCode === "TOKEN_EXPIRED"
       ) {
         return {
           success: false,
           expired: true,
-          error: msg || "二维码已过期，请重新生成",
+          error: "二维码已过期，请重新获取",
+        };
+      }
+
+      // 2. 明确的用户码/参数错误或手机端主动拒绝授权
+      if (
+        upperCode === "USERCODE_INCORRECT" ||
+        upperCode === "INVALID_PARAM" ||
+        upperCode === "ILLEGAL_PARAM" ||
+        lower.includes("user code") ||
+        lower.includes("usercode") ||
+        lower.includes("incorrect") ||
+        lower.includes("invalid client")
+      ) {
+        return {
+          success: false,
+          error: "涂鸦用户码不正确，请核对后重试",
         };
       }
       if (
+        lower.includes("reject") ||
+        lower.includes("cancel") ||
+        lower.includes("denied") ||
+        lower.includes("refuse")
+      ) {
+        return {
+          success: false,
+          error: "手机端已取消授权，请重新获取二维码",
+        };
+      }
+
+      // 3. 涂鸦 Home Assistant Device Sharing 接口在用户尚未扫码确认前
+      // 会直接返回 { success: false, code: "E0020003", msg: "login failed" }，
+      // 必须归类为 pending 继续等待扫码，绝不能提前报错中断。
+      if (
         !msg ||
+        upperCode === "E0020003" ||
+        upperCode === "LOGIN_FAILED" ||
+        upperCode === "1106" ||
+        upperCode === "2001" ||
+        upperCode === "WAIT" ||
+        upperCode === "WAITING" ||
+        upperCode === "PENDING" ||
+        upperCode === "NOT_SCAN" ||
+        upperCode === "UNSCANNED" ||
+        lower.includes("login failed") ||
+        lower.includes("please scan") ||
         lower.includes("not scan") ||
+        lower.includes("unscanned") ||
         lower.includes("waiting") ||
         lower.includes("pending") ||
-        lower.includes("unscanned") ||
-        code === "1106" ||
-        code === "WAIT"
+        lower.includes("not confirm")
       ) {
         return {
           success: false,
           pending: true,
-          error: msg || "等待手机端扫码确认…",
+          error: "等待涂鸦智能 / Smart Life App 扫码并点击确认…",
         };
       }
+
       return {
         success: false,
         error: msg || `扫码登录失败（错误码 ${code || "unknown"}）`,

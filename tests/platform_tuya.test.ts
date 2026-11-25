@@ -705,6 +705,69 @@ describe("TuyaPlatformProvider — QR Auth, Encrypted Cloud Sync, Control, Hybri
     expect(provider.status().configSummary.username).toBe("tuya_demo_user");
   });
 
+  test("HA QR poll treats Tuya unscanned 'login failed' (E0020003) as pending and handles expiry/usercode errors", async () => {
+    const mem = makeMemoryConfigStore({
+      // Simulate prior regional endpoint stored in config — QR auth must still hit apigw.iotbing.com
+      endpoint: "https://apigw.tuyacn.com",
+    });
+    let pollStep = 0;
+
+    const mockFetch: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/v1.0/m/life/home-assistant/qrcode/tokens?") && init?.method === "POST") {
+        expect(url.startsWith("https://apigw.iotbing.com/")).toBe(true);
+        if (url.includes("usercode=BADCODE")) {
+          return jsonResponse({ success: false, code: "USERCODE_INCORRECT", msg: "User Code Incorrect" });
+        }
+        return jsonResponse({ success: true, result: { qrcode: "QR_UNSCANNED_TEST" } });
+      }
+      if (url.includes("/v1.0/m/life/home-assistant/qrcode/tokens/QR_UNSCANNED_TEST")) {
+        expect(url.startsWith("https://apigw.iotbing.com/")).toBe(true);
+        pollStep += 1;
+        if (pollStep === 1) {
+          return jsonResponse({ success: false, code: "E0020003", msg: "login failed" });
+        }
+        if (pollStep === 2) {
+          return jsonResponse({
+            success: false,
+            code: "LOGIN_FAILED",
+            msg: "Login failed, please scan and try again!",
+          });
+        }
+        if (pollStep === 3) {
+          return jsonResponse({ success: false, code: "E0020002", msg: "QR code expired" });
+        }
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    }) as typeof fetch;
+
+    const provider = new TuyaPlatformProvider({
+      httpFetch: mockFetch,
+      configStore: mem.store,
+      now: () => 1_730_000_000_000,
+    });
+
+    // Invalid user code returns clear Chinese hint
+    await expect(provider.beginQrAuth({ userCode: "BADCODE" })).rejects.toThrow("涂鸦用户码不正确");
+
+    // Valid user code starts session and clears prior lastError
+    const session = await provider.beginQrAuth({ userCode: "VALID01" });
+    expect(provider.status().lastError).toBeNull();
+
+    // Poll #1 & #2: Tuya returns "login failed" before user scans -> MUST stay "pending", never error!
+    const p1 = await provider.pollQrAuth(session.sessionId);
+    expect(p1.status).toBe("pending");
+    expect(provider.status().lastError).toBeNull();
+
+    const p2 = await provider.pollQrAuth(session.sessionId);
+    expect(p2.status).toBe("pending");
+    expect(provider.status().lastError).toBeNull();
+
+    // Poll #3: explicit expiry code E0020002 -> status "expired"
+    const p3 = await provider.pollQrAuth(session.sessionId);
+    expect(p3.status).toBe("expired");
+  });
+
   test("Full Sharing encrypted API round-trip: listDevices, deviceDetail, writeProp, togglePower, scenes & disconnect", async () => {
     const refreshToken = "refresh_tok_secret_98765";
     const accessToken = "access_tok_secret_12345";

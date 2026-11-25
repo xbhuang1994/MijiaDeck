@@ -274,7 +274,9 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
     return new TuyaSharingClient({
       clientId: this._config.clientId || TUYA_CLIENT_ID,
       schema: this._config.schema || TUYA_SCHEMA,
-      authEndpoint: this._config.endpoint || TUYA_SHARING_AUTH_ENDPOINT,
+      // 二维码认证固定走 Tuya HA 共享网关 apigw.iotbing.com；
+      // 登录后数据请求会自动使用 tokenSession.endpoint（如 apigw.tuyacn.com）
+      authEndpoint: TUYA_SHARING_AUTH_ENDPOINT,
       tokenSession: this._config.tokenSession ?? null,
       httpFetch: this._httpFetch,
       now: this._now,
@@ -661,6 +663,7 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
       this._lastError = msg;
       throw new ServiceError(`获取涂鸦登录二维码失败: ${msg}`);
     }
+    this._lastError = null;
 
     const sessionId = `tuya-qr-${this._now()}-${Math.random().toString(36).slice(2, 8)}`;
     const expiresAt = this._now() + 180_000;

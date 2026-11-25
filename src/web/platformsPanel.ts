@@ -2008,6 +2008,8 @@ export class PlatformsPanelController {
   private qrPollTimer: ReturnType<typeof setTimeout> | null = null;
   private qrCountdownTimer: ReturnType<typeof setInterval> | null = null;
   private qrCountdownEl: HTMLElement | null = null;
+  private qrPollInFlight = false;
+  private qrTransientErrors = 0;
 
   private disposed = false;
   private refreshBtn: HTMLButtonElement | null = null;
@@ -2017,7 +2019,7 @@ export class PlatformsPanelController {
   constructor(options: PlatformsPanelOptions) {
     this.options = options;
     this.container = options.container;
-    this.qrPollIntervalMs = Math.max(500, options.qrPollIntervalMs ?? 2000);
+    this.qrPollIntervalMs = Math.max(500, options.qrPollIntervalMs ?? 3000);
 
     for (const id of UI_PLATFORM_ORDER) {
       this.statuses.set(id, defaultPlatformStatus(id));
@@ -2655,6 +2657,16 @@ export class PlatformsPanelController {
 
         const qrBtns = document.createElement("div");
         qrBtns.className = "pf-inline-row";
+
+        const confirmQrBtn = document.createElement("button");
+        confirmQrBtn.type = "button";
+        confirmQrBtn.className = "primary-button btn-compact";
+        confirmQrBtn.textContent = "我已扫码，立即确认";
+        confirmQrBtn.disabled = this.qrPollInFlight || Date.now() >= qrState.session.expiresAt;
+        confirmQrBtn.addEventListener("click", () => {
+          void this.pollTuyaQrNow(this.qrSessionGen, qrState.session, true);
+        });
+
         const cancelQrBtn = document.createElement("button");
         cancelQrBtn.type = "button";
         cancelQrBtn.className = "secondary-button btn-compact";
@@ -2664,7 +2676,7 @@ export class PlatformsPanelController {
           this.activeTuyaQr = null;
           this.renderCardBody("tuya", true);
         });
-        qrBtns.appendChild(cancelQrBtn);
+        qrBtns.append(confirmQrBtn, cancelQrBtn);
         qrInfo.appendChild(qrBtns);
 
         qrPanel.append(qrBox, qrInfo);
@@ -3009,6 +3021,7 @@ export class PlatformsPanelController {
 
   private startTuyaQrPolling(gen: number, session: UiPlatformQrSession): void {
     this.clearQrTimersOnly();
+    this.qrTransientErrors = 0;
 
     this.qrCountdownTimer = setInterval(() => {
       if (this.disposed || gen !== this.qrSessionGen || !this.activeTuyaQr) {
@@ -3025,73 +3038,119 @@ export class PlatformsPanelController {
       }
     }, 1000);
 
-    const scheduleNext = (): void => {
-      if (this.disposed || gen !== this.qrSessionGen) return;
-      this.qrPollTimer = setTimeout(() => {
-        void pollOnce();
-      }, this.qrPollIntervalMs);
-    };
+    this.scheduleNextTuyaQrPoll(gen, session);
+  }
 
-    const pollOnce = async (): Promise<void> => {
-      if (this.disposed || gen !== this.qrSessionGen || !this.activeTuyaQr) return;
-      if (Date.now() >= session.expiresAt) {
-        this.activeTuyaQr.errorMessage = "二维码已过期，请重新获取";
-        this.clearQrTimersOnly();
-        this.renderCardBody("tuya", true);
+  private scheduleNextTuyaQrPoll(gen: number, session: UiPlatformQrSession): void {
+    if (this.disposed || gen !== this.qrSessionGen || !this.activeTuyaQr) return;
+    if (this.qrPollTimer !== null) {
+      clearTimeout(this.qrPollTimer);
+      this.qrPollTimer = null;
+    }
+    this.qrPollTimer = setTimeout(() => {
+      this.qrPollTimer = null;
+      void this.pollTuyaQrNow(gen, session, false);
+    }, this.qrPollIntervalMs);
+  }
+
+  private async pollTuyaQrNow(
+    gen: number,
+    session: UiPlatformQrSession,
+    manual: boolean,
+  ): Promise<void> {
+    if (this.disposed || gen !== this.qrSessionGen || !this.activeTuyaQr) return;
+    if (Date.now() >= session.expiresAt) {
+      this.activeTuyaQr.errorMessage = "二维码已过期，请重新获取";
+      this.clearQrTimersOnly();
+      this.renderCardBody("tuya", true);
+      return;
+    }
+    if (this.qrPollInFlight) return;
+    if (this.qrPollTimer !== null) {
+      clearTimeout(this.qrPollTimer);
+      this.qrPollTimer = null;
+    }
+
+    this.qrPollInFlight = true;
+    if (manual && this.activeTuyaQr) {
+      this.activeTuyaQr.statusMessage = "正在确认扫码结果…";
+      this.activeTuyaQr.errorMessage = null;
+      if (this.qrCountdownEl) {
+        this.qrCountdownEl.textContent = this.formatQrCountdown(this.activeTuyaQr);
+      }
+    }
+
+    try {
+      const res = await this.apiPost<PlatformQrPollResponse>("/api/platforms/tuya/qr/poll", {
+        sessionId: session.sessionId,
+      });
+      if (this.disposed || gen !== this.qrSessionGen) return;
+
+      this.qrTransientErrors = 0;
+      const result = res?.result;
+      if (!result || result.status === "pending") {
+        if (this.activeTuyaQr) {
+          this.activeTuyaQr.statusMessage = manual
+            ? "尚未检测到手机端确认，请先在 App 中点击「确认登录」"
+            : "等待手机扫码确认…";
+          this.activeTuyaQr.errorMessage = null;
+          if (this.qrCountdownEl) {
+            this.qrCountdownEl.textContent = this.formatQrCountdown(this.activeTuyaQr);
+          }
+        }
+        this.scheduleNextTuyaQrPoll(gen, session);
         return;
       }
 
-      try {
-        const res = await this.apiPost<PlatformQrPollResponse>("/api/platforms/tuya/qr/poll", {
-          sessionId: session.sessionId,
-        });
-        if (this.disposed || gen !== this.qrSessionGen) return;
-
-        const result = res?.result;
-        if (!result || result.status === "pending") {
-          scheduleNext();
-          return;
-        }
-
-        if (result.status === "success") {
-          this.stopQrPolling();
-          this.activeTuyaQr = null;
-          this.dirtyFlags.tuya = false;
-          if (Array.isArray(res.platforms) && res.platforms.length > 0) {
-            this.update(res.platforms);
-            this.options.onPlatformsChanged?.(this.getPlatforms());
-          } else if (result.platformStatus) {
-            this.statuses.set("tuya", result.platformStatus);
-            this.hydrateFormFromStatus("tuya", result.platformStatus);
-            this.syncAllHeadersAndOverview();
-            this.options.onPlatformsChanged?.(this.getPlatforms());
-          } else {
-            await this.refresh();
-          }
-          this.renderCardBody("tuya", true);
-          this.notifyToast(result.message || "涂鸦智能扫码授权成功", 3000);
-          return;
-        }
-
-        // expired or error
+      if (result.status === "success") {
         this.stopQrPolling();
-        if (this.activeTuyaQr) {
-          this.activeTuyaQr.errorMessage =
-            sanitizePlatformErrorMessage(result.message) ||
-            (result.status === "expired" ? "二维码已过期，请重新获取" : "扫码授权失败，请重试");
+        this.activeTuyaQr = null;
+        this.dirtyFlags.tuya = false;
+        if (Array.isArray(res.platforms) && res.platforms.length > 0) {
+          this.update(res.platforms);
+          this.options.onPlatformsChanged?.(this.getPlatforms());
+        } else if (result.platformStatus) {
+          this.statuses.set("tuya", result.platformStatus);
+          this.hydrateFormFromStatus("tuya", result.platformStatus);
+          this.syncAllHeadersAndOverview();
+          this.options.onPlatformsChanged?.(this.getPlatforms());
+        } else {
+          await this.refresh();
         }
         this.renderCardBody("tuya", true);
-      } catch (err) {
-        if (this.disposed || gen !== this.qrSessionGen) return;
-        this.stopQrPolling();
-        if (this.activeTuyaQr) {
-          this.activeTuyaQr.errorMessage = `轮询扫码状态失败：${sanitizePlatformErrorMessage(err)}`;
-        }
-        this.renderCardBody("tuya", true);
+        this.notifyToast(result.message || "涂鸦智能扫码授权成功", 3000);
+        return;
       }
-    };
 
-    scheduleNext();
+      // expired or genuine error (e.g. USERCODE_INCORRECT / rejected)
+      this.stopQrPolling();
+      if (this.activeTuyaQr) {
+        this.activeTuyaQr.errorMessage =
+          sanitizePlatformErrorMessage(result.message) ||
+          (result.status === "expired" ? "二维码已过期，请重新获取" : "扫码授权失败，请重试");
+      }
+      this.renderCardBody("tuya", true);
+    } catch (err) {
+      if (this.disposed || gen !== this.qrSessionGen) return;
+      this.qrTransientErrors += 1;
+      if (this.qrTransientErrors < 3) {
+        if (this.activeTuyaQr) {
+          this.activeTuyaQr.statusMessage = "网络波动，正在继续等待手机扫码确认…";
+          if (this.qrCountdownEl) {
+            this.qrCountdownEl.textContent = this.formatQrCountdown(this.activeTuyaQr);
+          }
+        }
+        this.scheduleNextTuyaQrPoll(gen, session);
+        return;
+      }
+      this.stopQrPolling();
+      if (this.activeTuyaQr) {
+        this.activeTuyaQr.errorMessage = `轮询扫码状态失败：${sanitizePlatformErrorMessage(err)}`;
+      }
+      this.renderCardBody("tuya", true);
+    } finally {
+      this.qrPollInFlight = false;
+    }
   }
 
   private clearQrTimersOnly(): void {

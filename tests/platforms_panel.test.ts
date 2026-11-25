@@ -880,4 +880,89 @@ describe("PlatformsPanelController lifecycle", () => {
       (globalThis as Record<string, unknown>).document = origDocument;
     }
   });
+
+  test("PlatformsPanelController supports manual confirm button and stays clean across pending QR polls", async () => {
+    const origDocument = (globalThis as Record<string, unknown>).document;
+    const head = new FakeElement("head");
+    const fakeDocument = {
+      head,
+      activeElement: null,
+      createElement: (tag: string) => new FakeElement(tag),
+      createElementNS: (_ns: string, tag: string) => new FakeElement(tag),
+      getElementById: (id: string) => head.findAll((el) => el.id === id)[0] ?? null,
+    };
+    (globalThis as Record<string, unknown>).document = fakeDocument;
+
+    try {
+      const container = new FakeElement("div");
+      let pollCount = 0;
+
+      const initialPlatforms: UiPlatformStatus[] = [
+        makeStatus({ id: "mijia", enabled: true, connected: true, state: "connected" }),
+        makeStatus({
+          id: "tuya",
+          enabled: true,
+          connected: false,
+          state: "configuring",
+          configSummary: { mode: "sharing", userCode: "USER_PENDING" },
+        }),
+        makeStatus({ id: "midea", enabled: false, connected: false, state: "disconnected" }),
+        makeStatus({ id: "deye", enabled: false, connected: false, state: "disconnected" }),
+      ];
+
+      const controller = new PlatformsPanelController({
+        container: container as unknown as HTMLElement,
+        qrPollIntervalMs: 5000,
+        apiGet: async <T>() => ({ ok: true, platforms: initialPlatforms }) as T,
+        apiPost: async <T>(url: string) => {
+          if (url === "/api/platforms/tuya/qr/begin") {
+            return {
+              ok: true,
+              session: {
+                platform: "tuya",
+                sessionId: "sess-pending-1",
+                qrContent: "tuyaSmart--qrLogin?token=tok_wait",
+                expiresAt: Date.now() + 180_000,
+                hint: "请扫码确认",
+              },
+            } as T;
+          }
+          if (url === "/api/platforms/tuya/qr/poll") {
+            pollCount += 1;
+            return {
+              ok: true,
+              result: {
+                platform: "tuya",
+                status: "pending",
+                message: "等待涂鸦智能 / Smart Life App 扫码并点击确认…",
+              },
+            } as T;
+          }
+          throw new Error(`Unexpected POST ${url}`);
+        },
+      });
+
+      await controller.refresh();
+      const qrBtn = container.findAll(
+        (el) => el.tagName === "BUTTON" && el.textContent === "获取授权二维码",
+      )[0];
+      qrBtn!.click();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      const confirmBtn = container.findAll(
+        (el) => el.tagName === "BUTTON" && el.textContent === "我已扫码，立即确认",
+      )[0];
+      expect(confirmBtn).toBeDefined();
+      confirmBtn!.click();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      expect(pollCount).toBe(1);
+      const errLines = container.findAll((el) => el.className === "pf-qr-status-err");
+      expect(errLines).toHaveLength(0);
+
+      controller.dispose();
+    } finally {
+      (globalThis as Record<string, unknown>).document = origDocument;
+    }
+  });
 });
