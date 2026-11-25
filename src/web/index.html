@@ -280,6 +280,18 @@
       <div id="pi-voice-telemetry" class="pi-voice-telemetry" hidden></div>
     </div>
 
+    <!-- Precipitated Agent Skills Bar (auto-shown once skills are learned) -->
+    <div id="pi-skills-bar" class="pi-skills-bar" hidden>
+      <button type="button" id="pi-skills-toggle-btn" class="pi-skills-toggle-btn" aria-expanded="false">
+        <span class="pi-skills-toggle-left">
+          <span class="pi-skills-icon" aria-hidden="true">⚡</span>
+          <span id="pi-skills-count-label">已沉淀 Skill (0)</span>
+        </span>
+        <span id="pi-skills-chevron" class="pi-skills-chevron" aria-hidden="true">▸</span>
+      </button>
+      <div id="pi-skills-list" class="pi-skills-list" hidden></div>
+    </div>
+
     <!-- Conversation & Tool Execution Timeline -->
     <div id="pi-agent-scroll" class="pi-agent-scroll">
       <div id="pi-agent-empty" class="pi-agent-empty">

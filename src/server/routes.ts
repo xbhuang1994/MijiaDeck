@@ -1934,9 +1934,64 @@ export function createRequestHandler(
         return jsonResponse({
           ok: result.ok,
           entryId: result.entryId,
+          ack: result.ack,
           reply: result.reply,
           toolCalls: result.toolCalls,
+          retriesUsed: result.retriesUsed ?? 0,
+          ...(result.retryNotices ? { retryNotices: result.retryNotices } : {}),
+          verification: result.verification ?? null,
+          ...(result.skillEvent ? { skillEvent: result.skillEvent } : {}),
           ...(result.error ? { error: result.error } : {}),
+          agent: runtime.piAgent.snapshot(),
+        });
+      }
+
+      if (method === "GET" && pathname === "/api/agent/skills") {
+        if (!runtime.piAgent) {
+          throw new HttpError(503, "Pi Agent 服务未初始化");
+        }
+        return jsonResponse({
+          ok: true,
+          skills: runtime.piAgent.listSkills(),
+          agent: runtime.piAgent.snapshot(),
+        });
+      }
+
+      const skillToggleMatch = /^\/api\/agent\/skills\/([^/]+)\/toggle$/.exec(pathname);
+      if (method === "POST" && skillToggleMatch) {
+        if (!runtime.piAgent) {
+          throw new HttpError(503, "Pi Agent 服务未初始化");
+        }
+        const id = decodeSegment(skillToggleMatch[1]!);
+        const body = await readJsonBody(req);
+        const enabled = body.enabled !== false;
+        const skill = runtime.piAgent.setSkillEnabled(id, enabled);
+        if (!skill) {
+          throw new HttpError(404, "未找到指定的 Agent 技能");
+        }
+        return jsonResponse({
+          ok: true,
+          skill,
+          skills: runtime.piAgent.listSkills(),
+          agent: runtime.piAgent.snapshot(),
+        });
+      }
+
+      const skillDeletePostMatch = /^\/api\/agent\/skills\/([^/]+)\/delete$/.exec(pathname);
+      const skillDeleteMatch = /^\/api\/agent\/skills\/([^/]+)$/.exec(pathname);
+      if ((method === "DELETE" && skillDeleteMatch) || (method === "POST" && skillDeletePostMatch)) {
+        if (!runtime.piAgent) {
+          throw new HttpError(503, "Pi Agent 服务未初始化");
+        }
+        const id = decodeSegment((skillDeletePostMatch ?? skillDeleteMatch)![1]!);
+        const deleted = runtime.piAgent.deleteSkill(id);
+        if (!deleted) {
+          throw new HttpError(404, "未找到指定的 Agent 技能");
+        }
+        return jsonResponse({
+          ok: true,
+          deleted: true,
+          skills: runtime.piAgent.listSkills(),
           agent: runtime.piAgent.snapshot(),
         });
       }

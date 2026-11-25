@@ -22,6 +22,53 @@ export interface UiAgentToolCall {
   durationMs?: number;
 }
 
+export interface UiAgentTaskUpdate {
+  kind: "ack" | "verification" | "retry" | "skill_saved" | "skill_reused";
+  text: string;
+  timestamp: number;
+  attempt?: number;
+  maxAttempts?: number;
+  problem?: string;
+  plan?: string;
+  passed?: boolean;
+  skillId?: string;
+  skillName?: string;
+}
+
+export interface UiAgentVerificationSummary {
+  status: "passed" | "recovered" | "failed" | "unsolvable" | "skipped";
+  passed: boolean;
+  checked: boolean;
+  solvable: boolean;
+  retriesUsed: number;
+  maxRetries: number;
+  analysis: string;
+  checks: Array<{ did?: string; deviceName?: string; toolName: string; passed: boolean; summary: string }>;
+  issues: Array<{ code: string; solvable: boolean; did?: string; deviceName?: string; summary: string }>;
+}
+
+export interface UiAgentSkillEvent {
+  kind: "created" | "updated" | "reused";
+  skillId: string;
+  skillName: string;
+  pitfall?: string;
+  stepsCount: number;
+}
+
+export interface UiAgentSkill {
+  id: string;
+  name: string;
+  description: string;
+  triggers: string[];
+  pitfall: string;
+  resolutionSummary: string;
+  steps: Array<{ toolName: string; args: Record<string, unknown>; note?: string }>;
+  useCount: number;
+  retriesAvoided: number;
+  enabled: boolean;
+  updatedAt: number;
+}
+
 export interface UiAgentTimelineEntry {
   id: string;
   role: "user" | "assistant";
@@ -32,6 +79,10 @@ export interface UiAgentTimelineEntry {
   provider?: string;
   modelId?: string;
   toolCalls: UiAgentToolCall[];
+  ackText?: string;
+  taskUpdates?: UiAgentTaskUpdate[];
+  verification?: UiAgentVerificationSummary | null;
+  skillEvent?: UiAgentSkillEvent | null;
   error?: string;
 }
 
@@ -114,6 +165,7 @@ export interface UiPiAgentSnapshot {
   providerLabel: string;
   modelId: string;
   tools: Array<{ name: string; label: string; description: string }>;
+  skills?: UiAgentSkill[];
   timeline: UiAgentTimelineEntry[];
   config: UiPublicAgentConfig;
   providers: UiProviderPreset[];
@@ -288,6 +340,7 @@ function formatArgsPreview(args: Record<string, unknown>): string {
 
 export class PiAgentPanelController {
   private open = false;
+  private skillsExpanded = false;
   private agentState: UiPiAgentSnapshot | null = null;
   private voiceState: UiVoiceSnapshot | null = null;
   private localClientState: {
@@ -556,6 +609,13 @@ export class PiAgentPanelController {
       void this.cycleCavemanMode();
     });
 
+    const skillsToggleBtn = document.getElementById("pi-skills-toggle-btn");
+    skillsToggleBtn?.addEventListener("click", () => {
+      this.skillsExpanded = !this.skillsExpanded;
+      this.renderSkillsBar();
+      this.scrollTimelineToBottom();
+    });
+
     const input = node<HTMLInputElement>("pi-agent-input");
     const submitInput = () => {
       const text = input.value.trim();
@@ -817,6 +877,70 @@ export class PiAgentPanelController {
     const entryId = String(ev.entryId ?? "");
     if (!entryId) return;
 
+    if (kind === "task_ack" && typeof ev.text === "string") {
+      const target = this.agentState.timeline.find((e) => e.id === entryId);
+      if (target) {
+        target.ackText = ev.text;
+        this.renderTimeline();
+      }
+      this.flashLivePill(`π ${ev.text}`, 1800);
+      return;
+    }
+
+    if (kind === "retry_notice" && typeof ev.text === "string") {
+      const target = this.agentState.timeline.find((e) => e.id === entryId);
+      if (target) {
+        if (!Array.isArray(target.taskUpdates)) target.taskUpdates = [];
+        const attempt = typeof ev.attempt === "number" ? ev.attempt : undefined;
+        const already =
+          attempt !== undefined &&
+          target.taskUpdates.some((u) => u.kind === "retry" && u.attempt === attempt);
+        if (!already) {
+          target.taskUpdates.push({
+            kind: "retry",
+            attempt,
+            maxAttempts: typeof ev.maxAttempts === "number" ? ev.maxAttempts : 3,
+            problem: typeof ev.problem === "string" ? ev.problem : undefined,
+            plan: typeof ev.plan === "string" ? ev.plan : undefined,
+            text: ev.text,
+            timestamp: Date.now(),
+          });
+        }
+        this.renderTimeline();
+      }
+      this.flashLivePill(`↻ ${ev.text}`, 3600);
+      return;
+    }
+
+    if (kind === "verification_result" && ev.verification) {
+      const target = this.agentState.timeline.find((e) => e.id === entryId);
+      if (target) {
+        target.verification = ev.verification as UiAgentVerificationSummary;
+        this.renderTimeline();
+      }
+      return;
+    }
+
+    if ((kind === "skill_saved" || kind === "skill_reused") && ev.skillEvent) {
+      const target = this.agentState.timeline.find((e) => e.id === entryId);
+      if (target) {
+        target.skillEvent = ev.skillEvent as UiAgentSkillEvent;
+        this.renderTimeline();
+      }
+      return;
+    }
+
+    if (kind === "final_reply" && typeof ev.text === "string") {
+      const target = this.agentState.timeline.find((e) => e.id === entryId);
+      if (target) {
+        target.text = ev.text;
+        if (ev.verification) target.verification = ev.verification as UiAgentVerificationSummary;
+        if (ev.skillEvent) target.skillEvent = ev.skillEvent as UiAgentSkillEvent;
+        this.renderTimeline();
+      }
+      return;
+    }
+
     if (kind === "text_delta" && typeof ev.text === "string") {
       const target = this.agentState.timeline.find((e) => e.id === entryId);
       if (target) {
@@ -1048,9 +1172,110 @@ export class PiAgentPanelController {
     this.renderTitleButtons();
     this.renderHeader();
     this.renderVoiceStrip();
+    this.renderSkillsBar();
     this.renderTimeline();
     this.renderComposer();
     this.renderLivePill();
+  }
+
+  private async toggleAgentSkill(skillId: string, enabled: boolean): Promise<void> {
+    try {
+      const res = await this.deps.apiPost<{ agent?: UiPiAgentSnapshot }>(
+        `/api/agent/skills/${encodeURIComponent(skillId)}/toggle`,
+        { enabled },
+      );
+      if (res.agent) this.applyAgentSnapshot(res.agent);
+      this.deps.showToast(enabled ? "已启用该 Skill" : "已暂停该 Skill", 1800);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.deps.showToast(`更新 Skill 状态失败：${msg}`, 3000);
+    }
+  }
+
+  private async deleteAgentSkill(skillId: string): Promise<void> {
+    try {
+      const res = await this.deps.apiPost<{ agent?: UiPiAgentSnapshot }>(
+        `/api/agent/skills/${encodeURIComponent(skillId)}/delete`,
+      );
+      if (res.agent) this.applyAgentSnapshot(res.agent);
+      this.deps.showToast("已删除该 Skill", 1800);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.deps.showToast(`删除 Skill 失败：${msg}`, 3000);
+    }
+  }
+
+  private renderSkillsBar(): void {
+    const bar = document.getElementById("pi-skills-bar");
+    const countLabel = document.getElementById("pi-skills-count-label");
+    const chevron = document.getElementById("pi-skills-chevron");
+    const toggleBtn = document.getElementById("pi-skills-toggle-btn");
+    const list = document.getElementById("pi-skills-list");
+    if (!bar || !countLabel || !chevron || !toggleBtn || !list) return;
+
+    const skills = this.agentState?.skills ?? [];
+    if (skills.length === 0) {
+      bar.hidden = true;
+      this.skillsExpanded = false;
+      list.replaceChildren();
+      return;
+    }
+
+    bar.hidden = false;
+    const enabledCount = skills.filter((s) => s.enabled).length;
+    countLabel.textContent = `已沉淀 Skill (${enabledCount}/${skills.length})`;
+    chevron.textContent = this.skillsExpanded ? "▾" : "▸";
+    toggleBtn.setAttribute("aria-expanded", String(this.skillsExpanded));
+    list.hidden = !this.skillsExpanded;
+    list.replaceChildren();
+
+    if (!this.skillsExpanded) return;
+
+    for (const skill of skills) {
+      const row = document.createElement("div");
+      row.className = `pi-skill-item${skill.enabled ? "" : " is-disabled"}`;
+
+      const main = document.createElement("div");
+      main.className = "pi-skill-item-main";
+
+      const title = document.createElement("div");
+      title.className = "pi-skill-item-name";
+      title.textContent = skill.name;
+      title.title = skill.description || skill.name;
+
+      const meta = document.createElement("div");
+      meta.className = "pi-skill-item-meta";
+      const metaParts: string[] = [];
+      if (skill.pitfall) metaParts.push(`避坑：${skill.pitfall}`);
+      metaParts.push(`${skill.steps.length} 步`);
+      if (skill.useCount > 0) metaParts.push(`已复用 ${skill.useCount} 次`);
+      meta.textContent = metaParts.join(" · ");
+
+      main.append(title, meta);
+
+      const actions = document.createElement("div");
+      actions.className = "pi-skill-item-actions";
+
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "pi-skill-mini-btn";
+      toggle.textContent = skill.enabled ? "停用" : "启用";
+      toggle.addEventListener("click", () => {
+        void this.toggleAgentSkill(skill.id, !skill.enabled);
+      });
+
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "pi-skill-mini-btn is-danger";
+      del.textContent = "删除";
+      del.addEventListener("click", () => {
+        void this.deleteAgentSkill(skill.id);
+      });
+
+      actions.append(toggle, del);
+      row.append(main, actions);
+      list.appendChild(row);
+    }
   }
 
   private renderTitleButtons(): void {
@@ -1400,6 +1625,19 @@ export class PiAgentPanelController {
       meta.append(roleSpan, timeSpan);
       item.appendChild(meta);
 
+      // Immediate task acknowledgement ("好的") rendered BEFORE execution & verification
+      if (entry.role === "assistant" && entry.ackText) {
+        const ackPill = document.createElement("div");
+        ackPill.className = "pi-ack-pill";
+        const ackDot = document.createElement("span");
+        ackDot.className = "pi-ack-dot";
+        ackDot.setAttribute("aria-hidden", "true");
+        const ackSpan = document.createElement("span");
+        ackSpan.textContent = entry.ackText;
+        ackPill.append(ackDot, ackSpan);
+        item.appendChild(ackPill);
+      }
+
       // Tool calls list (for assistant messages)
       if (entry.toolCalls.length > 0) {
         const toolsWrap = document.createElement("div");
@@ -1450,11 +1688,77 @@ export class PiAgentPanelController {
         item.appendChild(toolsWrap);
       }
 
+      // Self-healing retry notices ("出了什么问题 + 准备怎么做")
+      const retryUpdates = (entry.taskUpdates ?? []).filter((u) => u.kind === "retry");
+      if (entry.role === "assistant" && retryUpdates.length > 0) {
+        const retryWrap = document.createElement("div");
+        retryWrap.className = "pi-retry-list";
+        for (const ru of retryUpdates) {
+          const card = document.createElement("div");
+          card.className = "pi-retry-card";
+
+          const head = document.createElement("div");
+          head.className = "pi-retry-head";
+          head.textContent = `↻ 第 ${ru.attempt ?? 1}/${ru.maxAttempts ?? 3} 轮自愈重试`;
+
+          const body = document.createElement("div");
+          body.className = "pi-retry-body";
+          body.textContent =
+            ru.problem && ru.plan
+              ? `问题：${ru.problem}\n做法：${ru.plan}`
+              : ru.text;
+
+          card.append(head, body);
+          retryWrap.appendChild(card);
+        }
+        item.appendChild(retryWrap);
+      }
+
+      // State verification & Skill precipitation / reuse status pills
+      if (entry.role === "assistant" && (entry.verification || entry.skillEvent)) {
+        const pillsRow = document.createElement("div");
+        pillsRow.className = "pi-status-pills";
+
+        if (entry.verification && entry.verification.status !== "skipped") {
+          const v = entry.verification;
+          const vPill = document.createElement("span");
+          vPill.className = `pi-verify-pill is-${v.status}`;
+          if (v.status === "passed") {
+            vPill.textContent = "✓ 状态检查通过";
+          } else if (v.status === "recovered") {
+            vPill.textContent = `✓ 第 ${v.retriesUsed} 轮自愈后检查通过`;
+          } else if (v.status === "unsolvable") {
+            vPill.textContent = "⊘ 评估不可自动解决";
+          } else {
+            vPill.textContent = `✕ 重试 ${v.retriesUsed}/${v.maxRetries} 轮后仍未解决`;
+          }
+          if (v.analysis) vPill.title = v.analysis;
+          pillsRow.appendChild(vPill);
+        }
+
+        if (entry.skillEvent) {
+          const sPill = document.createElement("span");
+          sPill.className = "pi-skill-pill";
+          sPill.textContent =
+            entry.skillEvent.kind === "reused"
+              ? `⚡ 已复用 Skill：${entry.skillEvent.skillName}`
+              : `⚡ 已沉淀为 Skill：${entry.skillEvent.skillName}`;
+          if (entry.skillEvent.pitfall) {
+            sPill.title = `避坑记录：${entry.skillEvent.pitfall}`;
+          }
+          pillsRow.appendChild(sPill);
+        }
+
+        if (pillsRow.childElementCount > 0) {
+          item.appendChild(pillsRow);
+        }
+      }
+
       const bubble = document.createElement("div");
       bubble.className = "pi-msg-bubble";
       bubble.dataset.agentMsgText = entry.id;
       bubble.textContent =
-        entry.text || (entry.status === "streaming" ? "正在思考并操作设备…" : "");
+        entry.text || (entry.status === "streaming" ? "正在执行并核验设备状态…" : "");
       item.appendChild(bubble);
 
       list.appendChild(item);

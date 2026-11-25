@@ -22,8 +22,10 @@ import {
   normalizeContext,
   type Api,
   type AssistantMessage,
+  type JsonValue,
   type Model,
   type TextContent,
+  type ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { googleGenerativeAIApi } from "@earendil-works/pi-ai/api/google-generative-ai.lazy";
@@ -46,6 +48,18 @@ import { deviceCategoryLabel } from "../core/deviceDetailModel.ts";
 import { SCENES_FEATURE_ENABLED } from "../core/featureFlags.ts";
 import type { FetchLike } from "../core/httpTimeout.ts";
 import {
+  buildSkillsPromptSection,
+  deleteAgentSkill,
+  loadAgentSkills,
+  matchAgentSkill,
+  recordSkillUse,
+  saveAgentSkill,
+  setAgentSkillEnabled,
+  type AgentSkill,
+  type AgentSkillStep,
+  type SaveAgentSkillInput,
+} from "./agentSkillStore.ts";
+import {
   buildCavemanPromptBlock,
   compressCavemanReply,
   compressCavemanSpeakChunk,
@@ -56,6 +70,7 @@ import {
   createLocalSmartHomeStreamFn,
   findRecentDeviceFromMessages,
   planDeterministicLocalCalls,
+  summarizeToolResults,
 } from "./localPlannerStream.ts";
 import { BANNED_TAB } from "../ui/controllers/mainWindowController.ts";
 import { createSmartHomeTools, type SmartHomeToolDeps } from "./smartHomeTools.ts";
@@ -64,6 +79,21 @@ import {
   type CommandIntentChoice,
   type SystemOneHealthSnapshot,
 } from "./systemOneClient.ts";
+import {
+  analyzeAndPlanRecovery,
+  buildSkillNameForRecovery,
+  MAX_RECOVERY_ROUNDS,
+  MUTATING_TOOLS,
+  toVerificationSummary,
+  verifyExecutedToolCalls,
+  type ExecutedToolTrace,
+  type RecoveryPlan,
+  type TaskVerificationOutcome,
+  type TaskVerificationSummary,
+} from "./taskVerificationLoop.ts";
+
+export const TASK_ACK_TEXT = "好的";
+export { MAX_RECOVERY_ROUNDS, type AgentSkill, type SaveAgentSkillInput, type TaskVerificationSummary };
 
 export interface AgentToolCallRecord {
   id: string;
@@ -73,6 +103,35 @@ export interface AgentToolCallRecord {
   status: "running" | "done" | "error";
   summary: string;
   durationMs?: number;
+}
+
+export interface AgentTaskUpdate {
+  kind: "ack" | "verification" | "retry" | "skill_saved" | "skill_reused";
+  text: string;
+  timestamp: number;
+  attempt?: number;
+  maxAttempts?: number;
+  problem?: string;
+  plan?: string;
+  passed?: boolean;
+  skillId?: string;
+  skillName?: string;
+}
+
+export interface AgentSkillEventRecord {
+  kind: "created" | "updated" | "reused";
+  skillId: string;
+  skillName: string;
+  pitfall?: string;
+  stepsCount: number;
+}
+
+export interface AgentRetryNotice {
+  attempt: number;
+  maxAttempts: number;
+  problem: string;
+  plan: string;
+  text: string;
 }
 
 export interface AgentTimelineEntry {
@@ -85,6 +144,10 @@ export interface AgentTimelineEntry {
   provider?: AgentProviderMode;
   modelId?: string;
   toolCalls: AgentToolCallRecord[];
+  ackText?: string;
+  taskUpdates?: AgentTaskUpdate[];
+  verification?: TaskVerificationSummary | null;
+  skillEvent?: AgentSkillEventRecord | null;
   error?: string;
 }
 
@@ -94,6 +157,7 @@ export interface PiAgentSnapshot {
   providerLabel: string;
   modelId: string;
   tools: Array<{ name: string; label: string; description: string }>;
+  skills: AgentSkill[];
   timeline: AgentTimelineEntry[];
   config: PublicAgentVoiceConfig;
   providers: ReadonlyArray<ProviderPreset>;
@@ -113,8 +177,13 @@ export interface VoicePromptMeta {
 export interface PiAgentRunResult {
   ok: boolean;
   entryId: string;
+  ack: string;
   reply: string;
   toolCalls: AgentToolCallRecord[];
+  retriesUsed?: number;
+  retryNotices?: AgentRetryNotice[];
+  verification?: TaskVerificationSummary | null;
+  skillEvent?: AgentSkillEventRecord | null;
   streamedSpeakChunks?: boolean;
   error?: string;
 }
@@ -285,6 +354,15 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   private _speakChunkState: CavemanSpeakChunkState = { emittedAny: false };
   private _suppressedSilent = false;
   private _emittedSpeakChunks = false;
+  private _emittedAckSpeak = false;
+  private _emittedFinalSpeak = false;
+  private _holdReplyUntilVerified = false;
+  private _inCloudRecoveryTurn = false;
+  private _cloudRecoveryFailed = false;
+  private _bufferedPostToolText = "";
+  private _roundToolTraces: ExecutedToolTrace[] = [];
+  private _roundToolArgs = new Map<string, Record<string, unknown>>();
+  private _turnAbortController: AbortController | null = null;
   private _turnUseLocalFastPath = false;
   private _lastError: string | null = null;
   private _running = false;
@@ -383,6 +461,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       speakerRole: vm?.speakerRole,
     });
     const intentHint = vm?.intent ? `Intent hint: ${vm.intent}.` : "";
+    const skillsSection = buildSkillsPromptSection(loadAgentSkills());
     const roomTabs = mw.tabNames.filter(
       (name) => name !== BANNED_TAB && (SCENES_FEATURE_ENABLED || name !== "场景"),
     );
@@ -398,9 +477,11 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       "3. 支持一次响应中包含多个工具调用（例如同时调节客厅灯亮度并关闭餐厅主灯）。",
       "4. 完成工具调用后直接告知执行结果或读取到的数据，严格遵循下方回复风格约束，不要输出内部 did/id 或冗长客套。",
       "5. 若设备离线、未登录或找不到匹配设备，诚实告知原因。",
+      "6. 任务闭环规范：收到任务后系统会先简短回复「好的」再执行，执行后自动做真实状态检查；若检查异常需先思考能否解决并最多重试 3 轮，成功排错的流程将自动沉淀为 Skill 以便下次直接避坑。",
       "",
       cavemanBlock,
       ...(intentHint ? [intentHint] : []),
+      ...(skillsSection ? ["", skillsSection] : []),
       "",
       `当前家庭：${mw.currentHome || "全部"} | 房间列表：${roomTabs.join("、") || "全屋"}`,
       "当前设备清单：",
@@ -549,6 +630,10 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         if (!entry) break;
         const ev = event.assistantMessageEvent;
         if (ev.type === "text_delta" && ev.delta) {
+          if (this._holdReplyUntilVerified || this._inCloudRecoveryTurn) {
+            this._bufferedPostToolText += ev.delta;
+            break;
+          }
           this._rawStreamText += ev.delta;
           entry.text += ev.delta;
           this.emit("streamEvent", {
@@ -557,7 +642,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             delta: ev.delta,
             text: entry.text,
           });
-          // 流式分句语音播报：遇到句末标点立即派发，大幅降低首字播报延迟（TTFA）
+          // 无设备变更的纯问答/闲聊可立即流式分句播报，降低首字播报延迟（TTFA）
           if (this._activeSource === "voice" && this._config.autoSpeakReply) {
             this._flushReadySpeakSentences(entry, false);
           }
@@ -567,14 +652,20 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       case "tool_execution_start": {
         if (!entry) break;
         const label = this._toolLabels.get(event.toolName) ?? event.toolName;
+        const args =
+          event.args && typeof event.args === "object" && !Array.isArray(event.args)
+            ? (event.args as Record<string, unknown>)
+            : {};
+        this._roundToolArgs.set(event.toolCallId, { ...args });
+        if (MUTATING_TOOLS.has(event.toolName)) {
+          // 涉及设备状态变更的工具调用完成后必须先执行真实状态校验，校验通过后再回复用户
+          this._holdReplyUntilVerified = true;
+        }
         const tc: AgentToolCallRecord = {
           id: event.toolCallId,
           name: event.toolName,
           label,
-          args:
-            event.args && typeof event.args === "object" && !Array.isArray(event.args)
-              ? (event.args as Record<string, unknown>)
-              : {},
+          args,
           status: "running",
           summary: "正在执行…",
         };
@@ -590,10 +681,13 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       case "tool_execution_end": {
         if (!entry) break;
         const existing = entry.toolCalls.find((t) => t.id === event.toolCallId);
-        const detailsUiSummary =
-          event.result?.details && typeof event.result.details === "object"
-            ? (event.result.details as { uiSummary?: unknown }).uiSummary
-            : undefined;
+        const detailsObj =
+          event.result?.details &&
+          typeof event.result.details === "object" &&
+          !Array.isArray(event.result.details)
+            ? (event.result.details as Record<string, unknown>)
+            : null;
+        const detailsUiSummary = detailsObj ? detailsObj.uiSummary : undefined;
         const cleanUiSummary =
           typeof detailsUiSummary === "string" ? detailsUiSummary.trim() : "";
         const resultContent = Array.isArray(event.result?.content)
@@ -611,6 +705,20 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           : event.isError
             ? "执行失败"
             : "执行完成";
+
+        const recordedArgs = this._roundToolArgs.get(event.toolCallId) ?? existing?.args ?? {};
+        this._roundToolTraces.push({
+          toolCallId: event.toolCallId,
+          name: event.toolName,
+          args: { ...recordedArgs },
+          isError: Boolean(event.isError),
+          text: resultContent || rawSummary,
+          details: detailsObj,
+        });
+
+        if (event.isError) {
+          this._holdReplyUntilVerified = true;
+        }
 
         if (existing) {
           existing.status = event.isError ? "error" : "done";
@@ -634,13 +742,11 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             .map((b) => b.text)
             .join("")
             .trim();
-          if (textBlocks) {
-            if (!this._rawStreamText) {
-              this._rawStreamText = textBlocks;
-            }
-            entry.text = textBlocks;
-          }
           if (msg.stopReason === "error") {
+            if (this._inCloudRecoveryTurn) {
+              this._cloudRecoveryFailed = true;
+              break;
+            }
             entry.status = "error";
             entry.error = redactSecretFromText(msg.errorMessage || "Pi Agent 执行出错");
             if (!entry.text) {
@@ -652,16 +758,28 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             if (!entry.text) {
               entry.text = "已中断当前操作。";
             }
-          } else if (entry.text) {
-            if (isSilentSentinel(entry.text)) {
-              entry.text = "";
-              this._suppressedSilent = true;
-            } else {
-              entry.text = compressCavemanReply(
-                entry.text,
-                this._config.cavemanMode,
-                this._activeSource === "voice",
-              );
+          } else if (this._holdReplyUntilVerified || this._inCloudRecoveryTurn) {
+            if (textBlocks) {
+              this._bufferedPostToolText = textBlocks;
+            }
+          } else {
+            if (textBlocks) {
+              if (!this._rawStreamText) {
+                this._rawStreamText = textBlocks;
+              }
+              entry.text = textBlocks;
+            }
+            if (entry.text) {
+              if (isSilentSentinel(entry.text)) {
+                entry.text = "";
+                this._suppressedSilent = true;
+              } else {
+                entry.text = compressCavemanReply(
+                  entry.text,
+                  this._config.cavemanMode,
+                  this._activeSource === "voice",
+                );
+              }
             }
           }
         }
@@ -687,6 +805,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         );
         if (filtered.length >= 2) {
           this._emittedSpeakChunks = true;
+          this._emittedFinalSpeak = true;
           this.emit("speakChunk", { entryId: entry.id, text: filtered, final: false });
         }
       }
@@ -703,8 +822,269 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     );
     if (filtered) {
       this._emittedSpeakChunks = true;
+      this._emittedFinalSpeak = true;
       this.emit("speakChunk", { entryId: entry.id, text: filtered, final: true });
     }
+  }
+
+  private _formatVerifiedReplyText(raw: string): string {
+    const trimmed = raw.trim();
+    if (!trimmed) return "";
+    if (isSilentSentinel(trimmed)) {
+      this._suppressedSilent = true;
+      return "";
+    }
+    return compressCavemanReply(
+      trimmed,
+      this._config.cavemanMode,
+      this._activeSource === "voice",
+    );
+  }
+
+  private _emitVerifiedFinalVoiceChunk(entry: AgentTimelineEntry): void {
+    if (this._activeSource !== "voice" || !this._config.autoSpeakReply || this._suppressedSilent) {
+      return;
+    }
+    const finalText = entry.text.trim();
+    if (!finalText) return;
+
+    if (this._emittedFinalSpeak) {
+      this._flushReadySpeakSentences(entry, true);
+      return;
+    }
+
+    // 任务开始时已先播报“好的”，若最终口语回复也以“好的，”开头且后面有实质内容，仅对语音播报去重避免连续念两次“好的”
+    let spokenText = finalText;
+    if (this._emittedAckSpeak) {
+      const stripped = spokenText.replace(/^好的[，,！!。\s]+/, "").trim();
+      if (stripped.length >= 2) {
+        spokenText = stripped;
+      }
+    }
+    if (spokenText) {
+      this._emittedSpeakChunks = true;
+      this._emittedFinalSpeak = true;
+      this.emit("speakChunk", { entryId: entry.id, text: spokenText, final: true });
+    }
+  }
+
+  private async _executeDirectToolSteps(
+    steps: readonly AgentSkillStep[],
+    entry: AgentTimelineEntry,
+    signal?: AbortSignal,
+  ): Promise<{ traces: ExecutedToolTrace[]; toolResultMessages: ToolResultMessage[] }> {
+    const traces: ExecutedToolTrace[] = [];
+    const toolResultMessages: ToolResultMessage[] = [];
+
+    for (const step of steps) {
+      if (signal?.aborted) break;
+      const tool = this._tools.find((t) => t.name === step.toolName);
+      const toolCallId = `step_${Date.now()}_${++this._entrySeq}`;
+      const label = tool?.label || this._toolLabels.get(step.toolName) || step.toolName;
+      const args = { ...(step.args ?? {}) };
+
+      const tc: AgentToolCallRecord = {
+        id: toolCallId,
+        name: step.toolName,
+        label,
+        args,
+        status: "running",
+        summary: step.note ? `正在执行：${step.note}` : "正在执行…",
+      };
+      entry.toolCalls.push(tc);
+      this.emit("streamEvent", {
+        kind: "tool_start",
+        entryId: entry.id,
+        toolCall: { ...tc },
+      });
+      this.emit("stateChanged", this.snapshot());
+
+      const t0 = performance.now();
+      let isError = false;
+      let resultText = "";
+      let detailsObj: Record<string, unknown> | null = null;
+      let contentBlocks: TextContent[] = [];
+
+      if (!tool) {
+        isError = true;
+        resultText = `未注册工具：${step.toolName}`;
+        contentBlocks = [{ type: "text", text: resultText }];
+        detailsObj = { ok: false, error: resultText };
+      } else {
+        try {
+          const res = await tool.execute(toolCallId, args, signal);
+          isError = Boolean(res?.isError);
+          contentBlocks = Array.isArray(res?.content)
+            ? (res.content.filter((c): c is TextContent => c.type === "text" && typeof c.text === "string"))
+            : [];
+          resultText = contentBlocks.map((c) => c.text).join(" ").trim();
+          detailsObj =
+            res?.details && typeof res.details === "object" && !Array.isArray(res.details)
+              ? (res.details as Record<string, unknown>)
+              : null;
+        } catch (err) {
+          isError = true;
+          resultText = redactSecretFromText(err instanceof Error ? err.message : String(err)) || "工具执行异常";
+          contentBlocks = [{ type: "text", text: resultText }];
+          detailsObj = { ok: false, error: resultText };
+        }
+      }
+
+      const durationMs = Math.max(1, Math.round(performance.now() - t0));
+      const uiSum =
+        detailsObj && typeof detailsObj.uiSummary === "string" && detailsObj.uiSummary.trim()
+          ? detailsObj.uiSummary.trim()
+          : resultText;
+      tc.status = isError ? "error" : "done";
+      tc.summary = uiSum
+        ? uiSum.length > 180
+          ? `${uiSum.slice(0, 180)}…`
+          : uiSum
+        : isError
+          ? "执行失败"
+          : "执行完成";
+      tc.durationMs = durationMs;
+
+      this.emit("streamEvent", {
+        kind: "tool_end",
+        entryId: entry.id,
+        toolCall: { ...tc },
+      });
+      this.emit("stateChanged", this.snapshot());
+
+      traces.push({
+        toolCallId,
+        name: step.toolName,
+        args,
+        isError,
+        text: resultText || tc.summary,
+        details: detailsObj,
+      });
+      toolResultMessages.push({
+        role: "toolResult",
+        toolCallId,
+        toolName: step.toolName,
+        content: contentBlocks.length > 0 ? contentBlocks : [{ type: "text", text: resultText || tc.summary }],
+        details: (detailsObj ?? undefined) as JsonValue | undefined,
+        isError,
+        timestamp: Date.now(),
+      });
+    }
+
+    return { traces, toolResultMessages };
+  }
+
+  private async _runCloudLlmRecovery(
+    plan: RecoveryPlan,
+    entry: AgentTimelineEntry,
+    signal?: AbortSignal,
+  ): Promise<{
+    traces: ExecutedToolTrace[];
+    toolResultMessages: ToolResultMessage[];
+    llmText: string;
+    llmMarkedUnsolvable: boolean;
+  }> {
+    this._roundToolTraces = [];
+    this._roundToolArgs.clear();
+    this._bufferedPostToolText = "";
+    this._inCloudRecoveryTurn = true;
+    this._cloudRecoveryFailed = false;
+
+    try {
+      await this._agent.prompt(plan.llmGuidancePrompt);
+      await this._agent.waitForIdle();
+    } catch {
+      this._cloudRecoveryFailed = true;
+    } finally {
+      this._inCloudRecoveryTurn = false;
+    }
+
+    const llmText = this._bufferedPostToolText.trim();
+    if (!this._cloudRecoveryFailed && this._roundToolTraces.length === 0 && /^\[UNSOLVABLE\]/i.test(llmText)) {
+      return {
+        traces: [],
+        toolResultMessages: [],
+        llmText: llmText.replace(/^\[UNSOLVABLE\]\s*/i, "").trim() || plan.problem,
+        llmMarkedUnsolvable: true,
+      };
+    }
+
+    if (!this._cloudRecoveryFailed && this._roundToolTraces.length > 0) {
+      const toolResultMessages: ToolResultMessage[] = this._roundToolTraces.map((tr) => ({
+        role: "toolResult",
+        toolCallId: tr.toolCallId,
+        toolName: tr.name,
+        content: [{ type: "text", text: tr.text }],
+        details: (tr.details ?? undefined) as JsonValue | undefined,
+        isError: tr.isError,
+        timestamp: Date.now(),
+      }));
+      return {
+        traces: [...this._roundToolTraces],
+        toolResultMessages,
+        llmText,
+        llmMarkedUnsolvable: false,
+      };
+    }
+
+    // 云端模型未产出有效修复调用或出现流异常时，平滑回退到确定性修复步骤
+    const fallback = await this._executeDirectToolSteps(plan.steps, entry, signal);
+    return {
+      traces: fallback.traces,
+      toolResultMessages: fallback.toolResultMessages,
+      llmText: "",
+      llmMarkedUnsolvable: false,
+    };
+  }
+
+  private _extractWinningSkillSteps(
+    traces: readonly ExecutedToolTrace[],
+    fallbackSteps: readonly AgentSkillStep[],
+  ): AgentSkillStep[] {
+    const succeeded = traces.filter((t) => !t.isError);
+    const controlSteps = succeeded.filter((t) => MUTATING_TOOLS.has(t.name));
+    const chosen = controlSteps.length > 0 ? controlSteps : succeeded;
+    if (chosen.length === 0) {
+      return fallbackSteps.map((s) => ({ ...s, args: { ...s.args } }));
+    }
+    return chosen.map((t) => {
+      const d = t.details ?? {};
+      const resolvedDid = typeof d.did === "string" && d.did ? d.did : undefined;
+      const args = { ...t.args };
+      if (resolvedDid && (!args.target || typeof args.target === "string")) {
+        args.target = resolvedDid;
+      }
+      return {
+        toolName: t.name,
+        args,
+      };
+    });
+  }
+
+  listSkills(): AgentSkill[] {
+    return loadAgentSkills();
+  }
+
+  saveSkill(input: SaveAgentSkillInput): { skill: AgentSkill; created: boolean } {
+    const res = saveAgentSkill(input);
+    this.emit("stateChanged", this.snapshot());
+    return res;
+  }
+
+  setSkillEnabled(skillId: string, enabled: boolean): AgentSkill | null {
+    const updated = setAgentSkillEnabled(skillId, enabled);
+    if (updated) {
+      this.emit("stateChanged", this.snapshot());
+    }
+    return updated;
+  }
+
+  deleteSkill(skillId: string): boolean {
+    const deleted = deleteAgentSkill(skillId);
+    if (deleted) {
+      this.emit("stateChanged", this.snapshot());
+    }
+    return deleted;
   }
 
   /**
@@ -812,10 +1192,18 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   ): Promise<PiAgentRunResult> {
     const text = rawText.trim();
     if (!text) {
-      return { ok: false, entryId: "", reply: "", toolCalls: [], error: "指令内容不能为空" };
+      return {
+        ok: false,
+        entryId: "",
+        ack: "",
+        reply: "",
+        toolCalls: [],
+        error: "指令内容不能为空",
+      };
     }
     if (this._running) {
       // 等待上一轮尽快收敛，或中止后立即响应最新语音指令
+      this._turnAbortController?.abort();
       this._agent.abort();
       await this._agent.waitForIdle();
     }
@@ -828,29 +1216,49 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     this._speakChunkState = { emittedAny: false };
     this._suppressedSilent = false;
     this._emittedSpeakChunks = false;
+    this._emittedAckSpeak = false;
+    this._emittedFinalSpeak = false;
+    this._holdReplyUntilVerified = false;
+    this._inCloudRecoveryTurn = false;
+    this._cloudRecoveryFailed = false;
+    this._bufferedPostToolText = "";
+    this._roundToolTraces = [];
+    this._roundToolArgs.clear();
+    this._turnAbortController = new AbortController();
     this._turnUseLocalFastPath = false;
     this._running = true;
     this._lastError = null;
 
+    const retryNotices: AgentRetryNotice[] = [];
+    let retriesUsed = 0;
+    const now = Date.now();
+
     const userEntry: AgentTimelineEntry = {
-      id: `msg_${Date.now()}_${++this._entrySeq}`,
+      id: `msg_${now}_${++this._entrySeq}`,
       role: "user",
       source,
       text,
-      timestamp: Date.now(),
+      timestamp: now,
       status: "done",
       toolCalls: [],
     };
     const assistantEntry: AgentTimelineEntry = {
-      id: `msg_${Date.now()}_${++this._entrySeq}`,
+      id: `msg_${now}_${++this._entrySeq}`,
       role: "assistant",
       source,
       text: "",
-      timestamp: Date.now(),
+      timestamp: now,
       status: "streaming",
       provider: this._config.provider,
-      modelId: this._customModel?.id ?? (this._config.modelId || getProviderPreset(this._config.provider).defaultModel),
+      modelId:
+        this._customModel?.id ??
+        (this._config.modelId || getProviderPreset(this._config.provider).defaultModel),
       toolCalls: [],
+      // Step 0：收到新任务时先什么都不要做，第一时间简短回复“好的”
+      ackText: TASK_ACK_TEXT,
+      taskUpdates: [{ kind: "ack", text: TASK_ACK_TEXT, timestamp: now }],
+      verification: null,
+      skillEvent: null,
     };
 
     this._timeline.push(userEntry, assistantEntry);
@@ -858,19 +1266,355 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       this._timeline = this._timeline.slice(-60);
     }
     this._activeAssistantEntry = assistantEntry;
+
+    // 立即对外派发简短确认“好的”，再进入后续任何匹配/执行步骤
+    this.emit("streamEvent", {
+      kind: "task_ack",
+      entryId: assistantEntry.id,
+      text: TASK_ACK_TEXT,
+    });
     this.emit("stateChanged", this.snapshot());
+    if (source === "voice" && this._config.autoSpeakReply) {
+      this._emittedAckSpeak = true;
+      this._emittedSpeakChunks = true;
+      this.emit("speakChunk", { entryId: assistantEntry.id, text: TASK_ACK_TEXT, final: false });
+    }
+
+    const signal = this._turnAbortController.signal;
+    const isCloudLlm =
+      (this._config.provider !== "local" || Boolean(this._customStreamFn)) && !this._turnUseLocalFastPath;
 
     try {
-      await this._agent.prompt(text);
-      await this._agent.waitForIdle();
+      let currentOutcome: TaskVerificationOutcome | null = null;
+      let handledBySkill = false;
+      let initialPitfall = "";
+
+      // Step 1：检查是否存在已沉淀的可复用 Skill，命中则直接按避坑流程执行并核验
+      const matchedSkill = matchAgentSkill(text, this._deps.mainWindow.activeDevices());
+      if (matchedSkill && !signal.aborted) {
+        this._holdReplyUntilVerified = true;
+        this.emit("streamEvent", {
+          kind: "skill_matched",
+          entryId: assistantEntry.id,
+          skill: {
+            id: matchedSkill.id,
+            name: matchedSkill.name,
+            stepsCount: matchedSkill.steps.length,
+          },
+        });
+
+        const skillExec = await this._executeDirectToolSteps(matchedSkill.steps, assistantEntry, signal);
+        if (!signal.aborted) {
+          const skillVerify = await verifyExecutedToolCalls(skillExec.traces, this._deps, {
+            isCloudLlm: false,
+          });
+          currentOutcome = skillVerify;
+          assistantEntry.verification = toVerificationSummary(skillVerify, 0);
+          this.emit("streamEvent", {
+            kind: "verification_result",
+            entryId: assistantEntry.id,
+            round: 0,
+            verification: assistantEntry.verification,
+          });
+
+          if (skillVerify.passed) {
+            handledBySkill = true;
+            recordSkillUse(matchedSkill.id, true);
+            const skillEvent: AgentSkillEventRecord = {
+              kind: "reused",
+              skillId: matchedSkill.id,
+              skillName: matchedSkill.name,
+              pitfall: matchedSkill.pitfall,
+              stepsCount: matchedSkill.steps.length,
+            };
+            assistantEntry.skillEvent = skillEvent;
+            assistantEntry.taskUpdates?.push({
+              kind: "skill_reused",
+              text: `已复用技能「${matchedSkill.name}」执行并通过状态检查`,
+              skillId: matchedSkill.id,
+              skillName: matchedSkill.name,
+              passed: true,
+              timestamp: Date.now(),
+            });
+            this.emit("streamEvent", {
+              kind: "skill_reused",
+              entryId: assistantEntry.id,
+              skill: matchedSkill,
+              skillEvent,
+            });
+            const summaryText = summarizeToolResults(
+              skillExec.toolResultMessages,
+              text,
+              this._config.cavemanMode,
+            );
+            assistantEntry.text = this._formatVerifiedReplyText(summaryText) || summaryText;
+          } else {
+            initialPitfall = skillVerify.issues.map((i) => i.summary).join("；");
+          }
+        }
+      }
+
+      // Step 2：常规执行（未命中技能时交由 Pi Agent 执行）
+      if (!handledBySkill && !currentOutcome && !signal.aborted) {
+        await this._agent.prompt(text);
+        await this._agent.waitForIdle();
+
+        const effectiveCloudLlm =
+          (this._config.provider !== "local" || Boolean(this._customStreamFn)) && !this._turnUseLocalFastPath;
+
+        const isFatalAgentState =
+          assistantEntry.status === "error" || assistantEntry.status === "aborted";
+
+        if (!isFatalAgentState && !signal.aborted) {
+          // Step 3：执行完成后执行真实设备状态检查
+          currentOutcome = await verifyExecutedToolCalls(this._roundToolTraces, this._deps, {
+            isCloudLlm: effectiveCloudLlm,
+          });
+          assistantEntry.verification = toVerificationSummary(currentOutcome, 0);
+          this.emit("streamEvent", {
+            kind: "verification_result",
+            entryId: assistantEntry.id,
+            round: 0,
+            verification: assistantEntry.verification,
+          });
+
+          if (currentOutcome.passed) {
+            if (this._holdReplyUntilVerified && this._bufferedPostToolText.trim()) {
+              assistantEntry.text = this._formatVerifiedReplyText(this._bufferedPostToolText);
+            }
+          } else if (!currentOutcome.solvable) {
+            // 思考判断不可自动解决：不盲目空转重试，如实向用户说明原因
+            const buffered = this._bufferedPostToolText.trim()
+              ? this._formatVerifiedReplyText(this._bufferedPostToolText)
+              : "";
+            assistantEntry.text =
+              buffered ||
+              assistantEntry.text.trim() ||
+              currentOutcome.issues.map((i) => i.summary).join("；");
+          } else {
+            initialPitfall = currentOutcome.issues.map((i) => i.summary).join("；");
+          }
+        }
+      }
+
+      // Step 3B：检查有问题且思考后可尝试解决 -> 最多 3 轮「告知问题与做法 -> 尝试解决 -> 再次状态检查」
+      if (
+        !handledBySkill &&
+        currentOutcome &&
+        !currentOutcome.passed &&
+        currentOutcome.solvable &&
+        assistantEntry.status !== "error" &&
+        assistantEntry.status !== "aborted" &&
+        !signal.aborted
+      ) {
+        const effectiveCloudLlm =
+          (this._config.provider !== "local" || Boolean(this._customStreamFn)) && !this._turnUseLocalFastPath;
+
+        for (let attempt = 1; attempt <= MAX_RECOVERY_ROUNDS; attempt += 1) {
+          if (signal.aborted) {
+            assistantEntry.status = "aborted";
+            break;
+          }
+
+          const plan = await analyzeAndPlanRecovery(
+            currentOutcome,
+            attempt,
+            text,
+            this._deps,
+            MAX_RECOVERY_ROUNDS,
+          );
+          if (!plan.canSolve) {
+            currentOutcome = {
+              ...currentOutcome,
+              solvable: false,
+              analysis: `思考评估后判断该问题无法通过重试自动解决：${plan.problem}`,
+            };
+            assistantEntry.verification = toVerificationSummary(currentOutcome, retriesUsed);
+            assistantEntry.text = plan.problem;
+            break;
+          }
+
+          // 每次重新尝试前，主动告诉用户出了什么问题、准备怎么做
+          const retryRecord: AgentRetryNotice = {
+            attempt,
+            maxAttempts: MAX_RECOVERY_ROUNDS,
+            problem: plan.problem,
+            plan: plan.plan,
+            text: plan.noticeText,
+          };
+          retryNotices.push(retryRecord);
+          assistantEntry.taskUpdates?.push({
+            kind: "retry",
+            attempt,
+            maxAttempts: MAX_RECOVERY_ROUNDS,
+            problem: plan.problem,
+            plan: plan.plan,
+            text: plan.noticeText,
+            timestamp: Date.now(),
+          });
+          this.emit("streamEvent", {
+            kind: "retry_notice",
+            entryId: assistantEntry.id,
+            ...retryRecord,
+          });
+          this.emit("stateChanged", this.snapshot());
+          if (source === "voice" && this._config.autoSpeakReply) {
+            this._emittedSpeakChunks = true;
+            this.emit("speakChunk", {
+              entryId: assistantEntry.id,
+              text: plan.noticeText,
+              final: false,
+            });
+          }
+
+          // 执行本轮排错修复
+          let attemptTraces: ExecutedToolTrace[];
+          let attemptToolMsgs: ToolResultMessage[];
+          let llmRecoveryText = "";
+
+          if (effectiveCloudLlm) {
+            const cloudAttempt = await this._runCloudLlmRecovery(plan, assistantEntry, signal);
+            if (cloudAttempt.llmMarkedUnsolvable) {
+              currentOutcome = {
+                ...currentOutcome,
+                solvable: false,
+                analysis: cloudAttempt.llmText,
+              };
+              assistantEntry.verification = toVerificationSummary(currentOutcome, retriesUsed);
+              assistantEntry.text = cloudAttempt.llmText;
+              break;
+            }
+            attemptTraces = cloudAttempt.traces;
+            attemptToolMsgs = cloudAttempt.toolResultMessages;
+            llmRecoveryText = cloudAttempt.llmText;
+          } else {
+            const directAttempt = await this._executeDirectToolSteps(plan.steps, assistantEntry, signal);
+            attemptTraces = directAttempt.traces;
+            attemptToolMsgs = directAttempt.toolResultMessages;
+          }
+
+          retriesUsed = attempt;
+          if (signal.aborted) {
+            assistantEntry.status = "aborted";
+            break;
+          }
+
+          // 修复完成后再次执行状态检查
+          currentOutcome = await verifyExecutedToolCalls(attemptTraces, this._deps, {
+            isCloudLlm: effectiveCloudLlm,
+          });
+          assistantEntry.verification = toVerificationSummary(currentOutcome, retriesUsed);
+          this.emit("streamEvent", {
+            kind: "verification_result",
+            entryId: assistantEntry.id,
+            round: attempt,
+            verification: assistantEntry.verification,
+          });
+
+          if (currentOutcome.passed) {
+            // Step 4：排错成功 -> 将经校验有效的流程自动沉淀为 Skill，下次不再踩坑
+            const winningSteps = this._extractWinningSkillSteps(attemptTraces, plan.steps);
+            const targetDids = [
+              ...new Set(
+                [
+                  ...currentOutcome.specs.map((s) => s.did ?? ""),
+                  ...attemptTraces.map((tr) =>
+                    tr.details && typeof tr.details.did === "string" ? tr.details.did : "",
+                  ),
+                ].filter(Boolean),
+              ),
+            ];
+            const pitfallText = initialPitfall || plan.problem;
+            const skillName = buildSkillNameForRecovery(text, winningSteps);
+            let savedSkill: AgentSkill | null = null;
+            let skillCreated = false;
+            try {
+              const saved = saveAgentSkill({
+                name: skillName,
+                description: `自动排错沉淀：解决「${pitfallText}」，第 ${attempt} 轮验证通过`,
+                triggerText: text,
+                targetDids,
+                pitfall: pitfallText,
+                resolutionSummary: plan.plan,
+                steps: winningSteps,
+                verification: currentOutcome.specs,
+                createdFromRetry: true,
+              });
+              savedSkill = saved.skill;
+              skillCreated = saved.created;
+            } catch {
+              savedSkill = null;
+            }
+
+            if (savedSkill) {
+              const skillEvent: AgentSkillEventRecord = {
+                kind: skillCreated ? "created" : "updated",
+                skillId: savedSkill.id,
+                skillName: savedSkill.name,
+                pitfall: savedSkill.pitfall,
+                stepsCount: savedSkill.steps.length,
+              };
+              assistantEntry.skillEvent = skillEvent;
+              assistantEntry.taskUpdates?.push({
+                kind: "skill_saved",
+                text: `已将本次成功流程沉淀为技能「${savedSkill.name}」，下次将直接复用避免踩坑`,
+                skillId: savedSkill.id,
+                skillName: savedSkill.name,
+                passed: true,
+                timestamp: Date.now(),
+              });
+              this.emit("streamEvent", {
+                kind: "skill_saved",
+                entryId: assistantEntry.id,
+                skill: savedSkill,
+                created: skillCreated,
+                skillEvent,
+              });
+            }
+
+            const baseReply =
+              (llmRecoveryText ? this._formatVerifiedReplyText(llmRecoveryText) : "") ||
+              this._formatVerifiedReplyText(
+                summarizeToolResults(attemptToolMsgs, text, this._config.cavemanMode),
+              ) ||
+              summarizeToolResults(attemptToolMsgs, text, this._config.cavemanMode);
+
+            assistantEntry.text = savedSkill
+              ? `${baseReply.replace(/[。！!]+$/, "")}，状态检查已通过，已将该流程沉淀为技能「${savedSkill.name}」，下次将避免踩坑。`
+              : `${baseReply.replace(/[。！!]+$/, "")}，状态检查已通过。`;
+            break;
+          }
+
+          if (!currentOutcome.solvable) {
+            assistantEntry.text = `已中止重试，原因无法自动解决：${currentOutcome.issues.map((i) => i.summary).join("；")}。`;
+            break;
+          }
+        }
+
+        // 3 轮重试后仍未能解决：如实告诉用户具体问题
+        if (
+          assistantEntry.status !== "aborted" &&
+          currentOutcome &&
+          !currentOutcome.passed &&
+          currentOutcome.solvable
+        ) {
+          const unresolvedText =
+            currentOutcome.issues.map((i) => i.summary).join("；") || "设备状态仍未达到预期";
+          assistantEntry.verification = toVerificationSummary(currentOutcome, retriesUsed);
+          assistantEntry.text = `已尝试 ${retriesUsed} 轮处理但仍未能解决：${unresolvedText}。请检查设备供电、网络连接或稍后再试。`;
+        }
+      }
 
       if (assistantEntry.status === "streaming") {
         assistantEntry.status = "done";
       }
+
       if (!this._suppressedSilent) {
         if (!assistantEntry.text.trim()) {
           if (assistantEntry.error) {
             assistantEntry.text = assistantEntry.error;
+          } else if (this._bufferedPostToolText.trim()) {
+            assistantEntry.text = this._formatVerifiedReplyText(this._bufferedPostToolText);
           } else if (assistantEntry.toolCalls.length > 0) {
             assistantEntry.text = assistantEntry.toolCalls
               .map((t) => t.summary)
@@ -880,9 +1624,15 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             assistantEntry.text = "已完成处理。";
           }
         }
-        if (this._activeSource === "voice" && this._config.autoSpeakReply && this._emittedSpeakChunks) {
-          this._flushReadySpeakSentences(assistantEntry, true);
-        }
+
+        this.emit("streamEvent", {
+          kind: "final_reply",
+          entryId: assistantEntry.id,
+          text: assistantEntry.text,
+          verification: assistantEntry.verification,
+          skillEvent: assistantEntry.skillEvent,
+        });
+        this._emitVerifiedFinalVoiceChunk(assistantEntry);
       }
     } catch (err) {
       const cleaned = redactSecretFromText(err instanceof Error ? err.message : String(err));
@@ -894,6 +1644,13 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       const streamedChunks = this._emittedSpeakChunks;
       this._running = false;
       this._turnUseLocalFastPath = false;
+      this._holdReplyUntilVerified = false;
+      this._inCloudRecoveryTurn = false;
+      this._cloudRecoveryFailed = false;
+      this._bufferedPostToolText = "";
+      this._roundToolTraces = [];
+      this._roundToolArgs.clear();
+      this._turnAbortController = null;
       this._activeAssistantEntry = null;
       this._activeVoiceMeta = null;
       this.emit("stateChanged", this.snapshot());
@@ -909,8 +1666,13 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     return {
       ok: assistantEntry.status === "done",
       entryId: assistantEntry.id,
+      ack: assistantEntry.ackText ?? TASK_ACK_TEXT,
       reply: assistantEntry.text,
       toolCalls: assistantEntry.toolCalls.map((t) => ({ ...t })),
+      retriesUsed,
+      ...(retryNotices.length > 0 ? { retryNotices } : {}),
+      verification: assistantEntry.verification ?? null,
+      ...(assistantEntry.skillEvent ? { skillEvent: { ...assistantEntry.skillEvent } } : {}),
       streamedSpeakChunks: this._emittedSpeakChunks,
       ...(assistantEntry.error ? { error: assistantEntry.error } : {}),
     };
@@ -920,12 +1682,14 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     if (!this._running) {
       return false;
     }
+    this._turnAbortController?.abort();
     this._agent.abort();
     return true;
   }
 
   reset(): void {
     if (this._running) {
+      this._turnAbortController?.abort();
       this._agent.abort();
     }
     this._agent.reset();
@@ -951,9 +1715,21 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         label: t.label,
         description: t.description,
       })),
+      skills: loadAgentSkills(),
       timeline: this._timeline.map((e) => ({
         ...e,
         toolCalls: e.toolCalls.map((tc) => ({ ...tc, args: { ...tc.args } })),
+        ...(e.taskUpdates ? { taskUpdates: e.taskUpdates.map((u) => ({ ...u })) } : {}),
+        ...(e.verification
+          ? {
+              verification: {
+                ...e.verification,
+                checks: e.verification.checks.map((c) => ({ ...c })),
+                issues: e.verification.issues.map((i) => ({ ...i })),
+              },
+            }
+          : {}),
+        ...(e.skillEvent ? { skillEvent: { ...e.skillEvent } } : {}),
       })),
       config: toPublicAgentVoiceConfig(this._config),
       providers: PROVIDER_PRESETS,
@@ -964,6 +1740,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
 
   dispose(): void {
     if (this._running) {
+      this._turnAbortController?.abort();
       this._agent.abort();
     }
     this._unsubAgent?.();

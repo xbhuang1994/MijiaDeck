@@ -690,14 +690,14 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   }
 
   /**
-   * 后台预热本地温柔女声神经 TTS 并缓存当前唤醒词回复短语（让“嗯?”几乎零延迟播放）。
+   * 后台预热本地温柔女声神经 TTS 并缓存唤醒词回复短语与任务即时确认“好的”（实现近零延迟播报）。
    */
   async prewarmLocalTts(): Promise<void> {
     const cfg = this.config;
     if (cfg.ttsEngine === "browser" || !cfg.autoSpeakReply) return;
     const ack = resolveWakeAckReply(cfg.wakeAckPhrase);
     const exitAck = formatExitConversationAck(cfg.cavemanMode);
-    const prewarmTexts = ack ? [ack, exitAck] : [exitAck];
+    const prewarmTexts = [...new Set(["好的", ...(ack ? [ack] : []), exitAck])];
     await this._localEngine.tts.warmup({
       voice: cfg.ttsVoice,
       speed: cfg.ttsSpeed,

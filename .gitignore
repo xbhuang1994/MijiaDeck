@@ -32,6 +32,8 @@ banned_devices.json
 workbench.json
 settings.json
 pi_agent.json
+agent_skills.json
+agent_skills/
 platforms.json
 voiceprints.json
 voiceprint_ref_*.wav

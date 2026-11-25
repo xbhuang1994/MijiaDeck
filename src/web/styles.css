@@ -5252,6 +5252,216 @@ body.pi-drawer-open .voice-fab {
   word-break: break-word;
 }
 
+/* Task Ack, Verification, Self-Healing Retry Notices & Precipitated Skills */
+.pi-ack-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--c-accent-surface);
+  border: 1px solid var(--c-accent-border);
+  color: var(--c-theme-dim);
+  font-size: 11.8px;
+  font-weight: 600;
+}
+
+.pi-ack-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--c-online);
+  flex-shrink: 0;
+}
+
+.pi-retry-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 96%;
+}
+
+.pi-retry-card {
+  padding: 7px 10px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--c-warn-text) 9%, var(--c-window-bg));
+  border: 1px solid color-mix(in srgb, var(--c-warn-text) 38%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.pi-retry-head {
+  font-size: 11.2px;
+  font-weight: 600;
+  color: var(--c-warn-text);
+}
+
+.pi-retry-body {
+  font-size: 11.4px;
+  line-height: 1.45;
+  color: var(--c-text-secondary);
+  word-break: break-word;
+}
+
+.pi-status-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  max-width: 96%;
+}
+
+.pi-verify-pill,
+.pi-skill-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.35;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.pi-verify-pill.is-passed,
+.pi-verify-pill.is-recovered {
+  background: color-mix(in srgb, var(--c-online) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--c-online) 38%, transparent);
+  color: var(--c-online);
+}
+
+.pi-verify-pill.is-unsolvable {
+  background: color-mix(in srgb, var(--c-warn-text) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--c-warn-text) 38%, transparent);
+  color: var(--c-warn-text);
+}
+
+.pi-verify-pill.is-failed {
+  background: color-mix(in srgb, var(--c-error-text) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--c-error-text) 40%, transparent);
+  color: var(--c-error-text);
+}
+
+.pi-skill-pill {
+  background: var(--c-accent-surface);
+  border: 1px solid var(--c-accent-border);
+  color: var(--c-theme-dim);
+}
+
+.pi-skills-bar {
+  margin: 0 14px 4px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--c-accent-border);
+  background: color-mix(in srgb, var(--c-accent-surface) 70%, var(--c-surface));
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.pi-skills-toggle-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 10px;
+  background: transparent;
+  border: none;
+  color: var(--c-text-primary);
+  font-size: 11.8px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.pi-skills-toggle-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pi-skills-icon {
+  color: var(--c-theme-dim);
+}
+
+.pi-skills-chevron {
+  color: var(--c-text-muted);
+  font-size: 11px;
+}
+
+.pi-skills-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 10px 9px 10px;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.pi-skill-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--c-window-bg);
+  border: 1px solid var(--c-line);
+}
+
+.pi-skill-item.is-disabled {
+  opacity: 0.58;
+}
+
+.pi-skill-item-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.pi-skill-item-name {
+  font-size: 11.6px;
+  font-weight: 600;
+  color: var(--c-text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pi-skill-item-meta {
+  font-size: 10.6px;
+  color: var(--c-text-muted);
+  margin-top: 2px;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.pi-skill-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.pi-skill-mini-btn {
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--c-line);
+  background: var(--c-surface);
+  color: var(--c-text-secondary);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+
+.pi-skill-mini-btn:hover {
+  border-color: var(--c-accent-border);
+  color: var(--c-text-primary);
+}
+
+.pi-skill-mini-btn.is-danger:hover {
+  border-color: var(--c-error-text);
+  color: var(--c-error-text);
+}
+
 /* Composer */
 .pi-composer {
   display: flex;
