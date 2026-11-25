@@ -21,6 +21,7 @@ import {
 import { VoiceStreamSession, type VoiceStreamSegmentPayload } from "../src/agent/voiceStreamSession.ts";
 import { VoiceListenerController } from "../src/agent/voiceListenerController.ts";
 import {
+  AGENT_CONFIG_VERSION,
   defaultAgentVoiceConfig,
   loadAgentVoiceConfig,
   normalizeAgentVoiceConfig,
@@ -31,6 +32,7 @@ import { JobExecutor } from "../src/core/jobs.ts";
 import { setDataPathOverrides } from "../src/core/jsonStore.ts";
 import * as settingsStore from "../src/core/settingsStore.ts";
 import { VirtualDemoService } from "../src/core/virtualLightService.ts";
+import { startMijiaDeckServer } from "../src/server/server.ts";
 import { MainWindowController } from "../src/ui/controllers/mainWindowController.ts";
 import { ThemeController, applyTheme } from "../src/ui/theme.ts";
 
@@ -182,28 +184,187 @@ describe("Home Assistant-inspired Voice Command Segmenter, AGC & Cooldown", () =
 });
 
 describe("Config Store (vadSensitivity & preferLocalIntents)", () => {
-  test("defaults and persists vadSensitivity & preferLocalIntents safely", () => {
+  test("defaults preferLocalIntents to false, migrates v1 configs, and persists toggles safely", () => {
     useTempDataDir();
     const def = defaultAgentVoiceConfig();
+    expect(def.version).toBe(AGENT_CONFIG_VERSION);
     expect(def.vadSensitivity).toBe("default");
-    expect(def.preferLocalIntents).toBe(true);
+    expect(def.preferLocalIntents).toBe(false);
     expect(def.vadSilenceMs).toBe(600);
 
-    const updated = updateAgentVoiceConfig({
+    const enabled = updateAgentVoiceConfig({
       vadSensitivity: "aggressive",
+      preferLocalIntents: true,
+    });
+    expect(enabled.vadSensitivity).toBe("aggressive");
+    expect(enabled.preferLocalIntents).toBe(true);
+    expect(loadAgentVoiceConfig().vadSensitivity).toBe("aggressive");
+    expect(loadAgentVoiceConfig().preferLocalIntents).toBe(true);
+
+    const disabled = updateAgentVoiceConfig({
       preferLocalIntents: false,
     });
-    expect(updated.vadSensitivity).toBe("aggressive");
-    expect(updated.preferLocalIntents).toBe(false);
-    expect(loadAgentVoiceConfig().vadSensitivity).toBe("aggressive");
+    expect(disabled.preferLocalIntents).toBe(false);
     expect(loadAgentVoiceConfig().preferLocalIntents).toBe(false);
 
     expect(() => updateAgentVoiceConfig({ vadSensitivity: "invalid" })).toThrow();
-    expect(normalizeAgentVoiceConfig({}).preferLocalIntents).toBe(true);
+    expect(normalizeAgentVoiceConfig({}).preferLocalIntents).toBe(false);
+    expect(normalizeAgentVoiceConfig({ preferLocalIntents: true }).preferLocalIntents).toBe(true);
+    // Pre-toggle v1 configs auto-persisted preferLocalIntents: true; migrate to default-off on v2
+    const migrated = normalizeAgentVoiceConfig({ version: 1, preferLocalIntents: true });
+    expect(migrated.version).toBe(AGENT_CONFIG_VERSION);
+    expect(migrated.preferLocalIntents).toBe(false);
+    // Explicit v2 opt-in is preserved
+    expect(normalizeAgentVoiceConfig({ version: 2, preferLocalIntents: true }).preferLocalIntents).toBe(
+      true,
+    );
   });
 });
 
 describe("Home Assistant prefer_local_intents Fast-Path in PiAgentService", () => {
+  test("routes deterministic commands to cloud LLM by default and toggles local fast-path dynamically", async () => {
+    useTempDataDir();
+    const demo = new VirtualDemoService();
+    const jobs = new JobExecutor();
+    applyTheme("dark", "green");
+    const themeCtrl = new ThemeController("dark");
+    const networkMonitor = new NetworkMonitor({ initialReachability: "online", autoStart: false });
+    const mw = new MainWindowController({
+      service: demo,
+      jobs,
+      themeCtrl,
+      networkMonitor,
+      autoStartTimers: false,
+      cacheLoader: () => null,
+      cacheSaver: () => {},
+    });
+    mw.start();
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {
+      if (!mw.loadActive && !mw.loadingDevices && mw.allDevices.length > 0) {
+        break;
+      }
+      await Bun.sleep(15);
+    }
+
+    let cloudCalls = 0;
+    const mockCloud = Bun.serve({
+      port: 0,
+      async fetch() {
+        cloudCalls += 1;
+        const sse = [
+          `data: ${JSON.stringify({
+            id: `chatcmpl-${cloudCalls}`,
+            object: "chat.completion.chunk",
+            created: 1700000000,
+            model: "mock-cloud-model",
+            choices: [{ index: 0, delta: { role: "assistant", content: "云端已收到指令" }, finish_reason: null }],
+          })}`,
+          `data: ${JSON.stringify({
+            id: `chatcmpl-${cloudCalls}`,
+            object: "chat.completion.chunk",
+            created: 1700000000,
+            model: "mock-cloud-model",
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          })}`,
+          "data: [DONE]",
+          "",
+        ].join("\n\n");
+        return new Response(sse, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      },
+    });
+
+    const baseCloudConfig = normalizeAgentVoiceConfig({
+      ...defaultAgentVoiceConfig(),
+      provider: "openai-compatible",
+      baseUrl: `http://127.0.0.1:${mockCloud.port}/v1`,
+      apiKey: "sk-local-fastpath-toggle-key",
+      modelId: "mock-cloud-model",
+    });
+    expect(baseCloudConfig.preferLocalIntents).toBe(false);
+
+    const agent = new PiAgentService({
+      deps: { mainWindow: mw, service: demo, jobs, settingsStore, broadcastState: () => {} },
+      initialConfig: baseCloudConfig,
+    });
+
+    try {
+      // 1. Default OFF: deterministic command goes to cloud LLM, NOT local fast-path
+      const r1 = await agent.prompt("关闭客厅吸顶灯", { source: "voice" });
+      expect(r1.ok).toBe(true);
+      expect(cloudCalls).toBe(1);
+      expect(r1.reply).toContain("云端已收到指令");
+      expect(await demo.powerState("demo-light-living")).toBe(true);
+
+      // 2. Toggle ON at runtime: deterministic command executes locally with 0 additional cloud calls
+      agent.reconfigure({ ...baseCloudConfig, preferLocalIntents: true });
+      const r2 = await agent.prompt("关闭客厅吸顶灯", { source: "voice" });
+      expect(r2.ok).toBe(true);
+      expect(cloudCalls).toBe(1);
+      expect(r2.toolCalls.length).toBeGreaterThan(0);
+      expect(await demo.powerState("demo-light-living")).toBe(false);
+
+      // 3. Toggle OFF at runtime: subsequent deterministic command returns to cloud LLM
+      agent.reconfigure({ ...baseCloudConfig, preferLocalIntents: false });
+      const r3 = await agent.prompt("打开客厅吸顶灯", { source: "voice" });
+      expect(r3.ok).toBe(true);
+      expect(cloudCalls).toBe(2);
+      expect(r3.reply).toContain("云端已收到指令");
+      expect(await demo.powerState("demo-light-living")).toBe(false);
+    } finally {
+      mockCloud.stop(true);
+      agent.dispose();
+      networkMonitor.stop();
+      mw.dispose();
+      await jobs.shutdown();
+    }
+  });
+
+  test("exposes preferLocalIntents toggle via /api/agent/config and settings HTML (default off)", async () => {
+    useTempDataDir();
+    const server = await startMijiaDeckServer({
+      port: 0,
+      mode: "demo",
+      autoStartTimers: false,
+    });
+    try {
+      const get1 = await fetch(`${server.url}/api/agent/config`);
+      expect(get1.status).toBe(200);
+      const data1 = (await get1.json()) as { config: { preferLocalIntents: boolean } };
+      expect(data1.config.preferLocalIntents).toBe(false);
+
+      const postOn = await fetch(`${server.url}/api/agent/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ preferLocalIntents: true }),
+      });
+      expect(postOn.status).toBe(200);
+      const dataOn = (await postOn.json()) as { config: { preferLocalIntents: boolean } };
+      expect(dataOn.config.preferLocalIntents).toBe(true);
+      expect(server.runtime.piAgent?.config.preferLocalIntents).toBe(true);
+
+      const postOff = await fetch(`${server.url}/api/agent/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ preferLocalIntents: false }),
+      });
+      expect(postOff.status).toBe(200);
+      const dataOff = (await postOff.json()) as { config: { preferLocalIntents: boolean } };
+      expect(dataOff.config.preferLocalIntents).toBe(false);
+      expect(server.runtime.piAgent?.config.preferLocalIntents).toBe(false);
+
+      const htmlRes = await fetch(`${server.url}/`);
+      const html = await htmlRes.text();
+      expect(html).toContain('id="setting-row-agent-local-fast-path"');
+      expect(html).toContain('id="set-agent-prefer-local-intents"');
+    } finally {
+      await server.stop();
+    }
+  });
+
   test("executes deterministic smart-home commands locally in <50ms even when a cloud LLM is configured", async () => {
     useTempDataDir();
     const demo = new VirtualDemoService();

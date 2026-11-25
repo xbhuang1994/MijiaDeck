@@ -102,6 +102,7 @@ export interface UiPublicAgentConfig extends ClientVoiceConfig {
   effectiveSystemOneBaseUrl?: string;
   effectiveSystemOneConfigured?: boolean;
   cavemanMode?: UiCavemanMode;
+  preferLocalIntents?: boolean;
   owwEnabled?: boolean;
   owwThreshold?: number;
   maxConsecutiveSidetalk?: number;

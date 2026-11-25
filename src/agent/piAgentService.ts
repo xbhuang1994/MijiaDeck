@@ -427,11 +427,11 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         );
       }
 
-      // 借鉴 Home Assistant assist_pipeline `prefer_local_intents` 架构：
-      // 即使配置了云端大模型，常规确定性智能家居指令（如“打开客厅灯”“停止播放音乐”“音量调到30”）
+      // 借鉴 Home Assistant assist_pipeline `prefer_local_intents` 架构（默认关闭，可在设置中手动开启）：
+      // 开启后即使配置了云端大模型，常规确定性智能家居指令（如“打开客厅灯”“停止播放音乐”“音量调到30”）
       // 也由本地规划器 + 工具循环零延迟执行（省去两次云端 LLM 往返 ~1.5~4s），
       // 复杂推理、口语隐式意图或开放问答无缝交由云端大模型处理。
-      if (this._config.preferLocalIntents !== false) {
+      if (this._config.preferLocalIntents === true) {
         const msgs = context.messages;
         const lastMsg = msgs[msgs.length - 1];
         if (lastMsg && lastMsg.role === "toolResult" && this._turnUseLocalFastPath) {

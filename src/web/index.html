@@ -659,6 +659,17 @@
             </div>
           </div>
 
+          <div class="setting-card" id="setting-row-agent-local-fast-path">
+            <div class="setting-info">
+              <div class="setting-label">本地快路径（常规指令本地优先）</div>
+              <div class="setting-desc" id="set-agent-local-fast-path-desc">配置云端或自定义大模型时，开启后常见确定性智能家居指令（如开关设备、调光、调音量、停播音乐）将优先走零延迟本地规划引擎；关闭则统一交由当前大模型理解与执行（默认关闭）</div>
+            </div>
+            <label class="md-switch">
+              <input type="checkbox" id="set-agent-prefer-local-intents" aria-label="本地快路径开关">
+              <span class="md-switch-track"></span>
+            </label>
+          </div>
+
           <div class="setting-card setting-card-wrap">
             <div class="setting-info">
               <div class="setting-label">语音与文字回复风格</div>

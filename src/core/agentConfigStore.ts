@@ -9,7 +9,7 @@
 
 import { dataFile, readJson, writeJson } from "./jsonStore.ts";
 
-export const AGENT_CONFIG_VERSION = 1;
+export const AGENT_CONFIG_VERSION = 2;
 const FILENAME = "pi_agent.json";
 
 export type AgentProviderMode =
@@ -209,7 +209,7 @@ export interface AgentVoiceConfig {
   noiseSuppressionMode: NoiseSuppressionMode;
   sourceSeparationMode: SourceSeparationMode;
   vadMode: VadEngineMode;
-  // 借鉴 Home Assistant prefer_local_intents：常规智能家居控制指令优先走零延迟本地规划引擎，免去云端大模型往返
+  // 借鉴 Home Assistant prefer_local_intents：常规智能家居控制指令优先走零延迟本地规划引擎，免去云端大模型往返（默认关闭，可在设置中手动开启）
   preferLocalIntents: boolean;
   voiceprintMode: VoiceprintPolicyMode;
   voiceprintThreshold: number;
@@ -328,7 +328,7 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     noiseSuppressionMode: "auto",
     sourceSeparationMode: "auto",
     vadMode: "silero",
-    preferLocalIntents: true,
+    preferLocalIntents: false,
     voiceprintMode: "tag",
     voiceprintThreshold: 0.42,
     attentionMode: "smart",
@@ -539,6 +539,16 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
 
   const ttsSpeed = Number(clampNumber(raw.ttsSpeed, 0.7, 1.4, defaults.ttsSpeed).toFixed(2));
 
+  // v1 配置生成于本地快路径 UI 开关加入之前，当时 preferLocalIntents 默认自动写入为 true；
+  // 升级到 v2 后统一默认关闭，用户可在设置中按需手动开启。
+  const rawVersion = typeof raw.version === "number" ? raw.version : null;
+  const preferLocalIntents =
+    rawVersion !== null && rawVersion < 2
+      ? false
+      : typeof raw.preferLocalIntents === "boolean"
+        ? raw.preferLocalIntents
+        : defaults.preferLocalIntents;
+
   return {
     version: AGENT_CONFIG_VERSION,
     provider,
@@ -572,10 +582,7 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     noiseSuppressionMode,
     sourceSeparationMode,
     vadMode,
-    preferLocalIntents:
-      typeof raw.preferLocalIntents === "boolean"
-        ? raw.preferLocalIntents
-        : defaults.preferLocalIntents,
+    preferLocalIntents,
     voiceprintMode,
     voiceprintThreshold: Number(
       clampNumber(raw.voiceprintThreshold, 0.2, 0.85, defaults.voiceprintThreshold).toFixed(2),

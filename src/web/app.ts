@@ -3476,6 +3476,8 @@ export class MijiaDeckWebApp {
         ? "已检测到环境变量密钥，也可在此覆盖"
         : "输入新的 API Key（留空保持不变）";
     el("set-agent-clear-key-btn").hidden = !cfg?.hasApiKey;
+    el<HTMLInputElement>("set-agent-prefer-local-intents").checked =
+      cfg?.preferLocalIntents === true;
     el<HTMLSelectElement>("set-agent-caveman-mode").value = cfg?.cavemanMode || "lite";
     this.syncCavemanDesc();
     el<HTMLTextAreaElement>("set-agent-system-prompt").value = cfg?.systemPromptExtra || "";
@@ -4096,6 +4098,13 @@ export class MijiaDeckWebApp {
     el("setting-row-agent-baseurl").hidden = isLocal;
     el("setting-row-agent-apikey").hidden = isLocal;
 
+    const localFastPathDesc = document.getElementById("set-agent-local-fast-path-desc");
+    if (localFastPathDesc) {
+      localFastPathDesc.textContent = isLocal
+        ? "当前为「内置本地引擎」，所有指令均由本地规划引擎执行；切换至云端或自定义大模型后，此开关控制常规指令是否优先走本地快路径（默认关闭）"
+        : "开启后，常见确定性智能家居指令（如开关设备、调光、调音量、停播音乐）将优先走零延迟本地规划引擎；关闭则统一交由当前大模型理解与执行（默认关闭）";
+    }
+
     if (preset) {
       el("set-agent-provider-desc").textContent = preset.description;
       if (resetDefaultsOnSwitch) {
@@ -4372,6 +4381,7 @@ export class MijiaDeckWebApp {
       customApiType: el<HTMLSelectElement>("set-agent-api-type").value,
       modelId: el<HTMLInputElement>("set-agent-model").value.trim(),
       baseUrl: el<HTMLInputElement>("set-agent-base-url").value.trim(),
+      preferLocalIntents: el<HTMLInputElement>("set-agent-prefer-local-intents").checked,
       cavemanMode: el<HTMLSelectElement>("set-agent-caveman-mode").value,
       systemPromptExtra: el<HTMLTextAreaElement>("set-agent-system-prompt").value.trim(),
       voiceEngine: el<HTMLSelectElement>("set-voice-engine").value,
