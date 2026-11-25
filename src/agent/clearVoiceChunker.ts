@@ -31,8 +31,16 @@ export interface ClearVoiceChunkerConfig {
   sampleRate: number;
   /** 帧大小（ms，默认 32ms = 512 样本 @ 16kHz，对齐 Silero VAD 窗口） */
   frameSizeMs: number;
-  /** 静音触发阈值（ms，250–300ms，默认 280ms） */
+  /** 降噪切片静音触发阈值（ms，250–300ms，默认 280ms：仅触发增量 GPU 降噪切片，不等同于整句结束） */
   silenceTriggerMs: number;
+  /** 整句结束静音判停阈值（ms，默认与 silenceTriggerMs 相同保持单测兼容；流会话按 vadSilenceMs 设为 ~1000–1200ms） */
+  utteranceSilenceMs: number;
+  /** 长语音耐心加成触发阈值（ms，累计有效人声达到该时长后自动放宽句中停顿容忍，默认 3000ms） */
+  longUtteranceThresholdMs: number;
+  /** 长语音额外句中停顿容忍时长（ms，仅在 utteranceSilenceMs > silenceTriggerMs 时生效，默认 350ms） */
+  longUtteranceExtraSilenceMs: number;
+  /** 语义未闭合提示额外等待时长（ms，如停在“然后/把客厅灯”等未说完处，默认 700ms） */
+  incompleteGraceMs: number;
   /** 超时强制切分上限（ms，默认 2000ms = 2.0s） */
   maxChunkMs: number;
   /** 历史上下文缓冲时长（ms，默认 300ms = 0.3s） */
@@ -51,6 +59,10 @@ export const DEFAULT_CLEARVOICE_CHUNKER_CONFIG: Readonly<ClearVoiceChunkerConfig
   sampleRate: 16000,
   frameSizeMs: 32,
   silenceTriggerMs: 280,
+  utteranceSilenceMs: 280,
+  longUtteranceThresholdMs: 3000,
+  longUtteranceExtraSilenceMs: 0,
+  incompleteGraceMs: 0,
   maxChunkMs: 2000,
   lookbackMs: 300,
   crossfadeMs: 20,
@@ -307,11 +319,15 @@ export class ClearVoiceRealtimeChunker {
   // 当前话语与切片状态
   private _speaking = false;
   private _inUtterance = false;
+  private _waitingUtteranceEnd = false;
   private _utteranceSliceIndex = 0;
+  private _utteranceSpeechSamples = 0;
   private _prevSliceForcedTimeout = false;
   private _sliceStartSample: number | null = null;
+  private _lastSliceEndSample: number | null = null;
   private _speechAccumSamples = 0;
   private _consecutiveSilenceMs = 0;
+  private _incompleteHint = false;
   private _adaptiveNoiseFloor = 0.006;
 
   constructor(options: ClearVoiceRealtimeChunkerOptions = {}) {
@@ -321,6 +337,27 @@ export class ClearVoiceRealtimeChunker {
       180,
       Math.min(800, options.silenceTriggerMs ?? DEFAULT_CLEARVOICE_CHUNKER_CONFIG.silenceTriggerMs),
     );
+    const utteranceSilenceMs =
+      options.utteranceSilenceMs !== undefined
+        ? Math.max(silenceTriggerMs, Math.min(5000, options.utteranceSilenceMs))
+        : silenceTriggerMs;
+    const decoupledUtteranceEnd = utteranceSilenceMs > silenceTriggerMs;
+    const longUtteranceThresholdMs = Math.max(
+      800,
+      options.longUtteranceThresholdMs ?? DEFAULT_CLEARVOICE_CHUNKER_CONFIG.longUtteranceThresholdMs,
+    );
+    const longUtteranceExtraSilenceMs =
+      options.longUtteranceExtraSilenceMs !== undefined
+        ? Math.max(0, Math.min(1500, options.longUtteranceExtraSilenceMs))
+        : decoupledUtteranceEnd
+          ? 350
+          : 0;
+    const incompleteGraceMs =
+      options.incompleteGraceMs !== undefined
+        ? Math.max(0, Math.min(1800, options.incompleteGraceMs))
+        : decoupledUtteranceEnd
+          ? 700
+          : 0;
     const maxChunkMs = Math.max(
       600,
       Math.min(5000, options.maxChunkMs ?? DEFAULT_CLEARVOICE_CHUNKER_CONFIG.maxChunkMs),
@@ -342,7 +379,7 @@ export class ClearVoiceRealtimeChunker {
       Math.min(500, options.minSpeechMs ?? DEFAULT_CLEARVOICE_CHUNKER_CONFIG.minSpeechMs),
     );
     const ringCapacityMs = Math.max(
-      maxChunkMs + lookbackMs + 2000,
+      maxChunkMs + lookbackMs + utteranceSilenceMs + 2000,
       options.ringCapacityMs ?? DEFAULT_CLEARVOICE_CHUNKER_CONFIG.ringCapacityMs,
     );
 
@@ -350,6 +387,10 @@ export class ClearVoiceRealtimeChunker {
       sampleRate,
       frameSizeMs,
       silenceTriggerMs,
+      utteranceSilenceMs,
+      longUtteranceThresholdMs,
+      longUtteranceExtraSilenceMs,
+      incompleteGraceMs,
       maxChunkMs,
       lookbackMs,
       crossfadeMs,
@@ -382,6 +423,43 @@ export class ClearVoiceRealtimeChunker {
 
   get inUtterance(): boolean {
     return this._inUtterance;
+  }
+
+  get waitingUtteranceEnd(): boolean {
+    return this._waitingUtteranceEnd;
+  }
+
+  /**
+   * 实时注入语义未闭合提示（如句中停在“然后/把客厅灯”等未说完处时自动延长尾静音宽限，防慢语速提前断句）。
+   */
+  setIncompleteUtteranceHint(incomplete: boolean): void {
+    this._incompleteHint = Boolean(incomplete);
+  }
+
+  /**
+   * 运行期热更新整句尾静音判停时长（用户在设置中调整 vadSilenceMs 后立即生效，无需重连 WebSocket）。
+   */
+  setUtteranceSilenceMs(utteranceSilenceMs: number): void {
+    if (!Number.isFinite(utteranceSilenceMs)) return;
+    this.config.utteranceSilenceMs = Math.max(
+      this.config.silenceTriggerMs,
+      Math.min(5000, Math.round(utteranceSilenceMs)),
+    );
+  }
+
+  private _effectiveUtteranceSilenceMs(): number {
+    let target = this.config.utteranceSilenceMs;
+    if (target <= this.config.silenceTriggerMs) {
+      return target;
+    }
+    const utteranceSpeechMs = (this._utteranceSpeechSamples / this.config.sampleRate) * 1000;
+    if (utteranceSpeechMs >= this.config.longUtteranceThresholdMs) {
+      target += this.config.longUtteranceExtraSilenceMs;
+    }
+    if (this._incompleteHint) {
+      target += this.config.incompleteGraceMs;
+    }
+    return Math.min(5000, target);
   }
 
   /**
@@ -422,7 +500,12 @@ export class ClearVoiceRealtimeChunker {
       this._writeRing(this._pending);
       this._pending = new Float32Array(0);
     }
-    if (this._sliceStartSample === null || !this._inUtterance) {
+    if (!this._inUtterance) {
+      this._clearUtteranceState();
+      return null;
+    }
+    // 已在 280ms 静音处送出尾部切片、正处于整句静默等待期时，无需重复送空白切片，清理状态由装配器直接提交
+    if (this._waitingUtteranceEnd || this._sliceStartSample === null) {
       this._clearUtteranceState();
       return null;
     }
@@ -454,11 +537,15 @@ export class ClearVoiceRealtimeChunker {
     const wasSpeaking = this._speaking;
     this._speaking = false;
     this._inUtterance = false;
+    this._waitingUtteranceEnd = false;
     this._utteranceSliceIndex = 0;
+    this._utteranceSpeechSamples = 0;
     this._prevSliceForcedTimeout = false;
     this._sliceStartSample = null;
+    this._lastSliceEndSample = null;
     this._speechAccumSamples = 0;
     this._consecutiveSilenceMs = 0;
+    this._incompleteHint = false;
     if (wasSpeaking) {
       this._onSpeechActivity?.(false);
     }
@@ -519,18 +606,41 @@ export class ClearVoiceRealtimeChunker {
       this._consecutiveSilenceMs = 0;
       if (!this._inUtterance) {
         this._inUtterance = true;
+        this._waitingUtteranceEnd = false;
         this._utteranceSliceIndex = 0;
+        this._utteranceSpeechSamples = 0;
         this._prevSliceForcedTimeout = false;
         this._speechAccumSamples = 0;
+        this._incompleteHint = false;
+        this._lastSliceEndSample = null;
         // 句首保留 preRollMs，绝不截断唤醒词或辅音起音
         this._sliceStartSample = Math.max(
           0,
           this._totalSamples - this._frameSamples - this._preRollSamples,
         );
+      } else if (this._waitingUtteranceEnd) {
+        // 慢语速短停顿后用户继续说话：无缝续接同一条话语，严禁强拆为多条句子！
+        this._waitingUtteranceEnd = false;
+        this._speechAccumSamples = 0;
+        const anchor =
+          this._lastSliceEndSample ??
+          Math.max(0, this._totalSamples - this._frameSamples - this._preRollSamples);
+        const gapSamples = this._totalSamples - anchor;
+        if (gapSamples > this._maxChunkSamples - this._frameSamples * 8) {
+          // 停顿较长时跳过中段纯静音，保留续说前导 preRoll，保证单片不超过 maxChunkMs
+          this._sliceStartSample = Math.max(
+            anchor,
+            this._totalSamples - this._frameSamples - this._preRollSamples,
+          );
+        } else {
+          // 保持与上一段完全连续的时间轴，使 0.3s 历史窗与 20ms Overlap-Add 精确对齐
+          this._sliceStartSample = anchor;
+        }
       } else if (this._sliceStartSample === null) {
         this._sliceStartSample = Math.max(0, this._totalSamples - this._frameSamples);
       }
       this._speechAccumSamples += this._frameSamples;
+      this._utteranceSpeechSamples += this._frameSamples;
       if (!this._speaking) {
         this._speaking = true;
         this._onSpeechActivity?.(true);
@@ -539,29 +649,74 @@ export class ClearVoiceRealtimeChunker {
       this._consecutiveSilenceMs += this.config.frameSizeMs;
     }
 
-    if (!this._inUtterance || this._sliceStartSample === null) {
+    if (!this._inUtterance) {
+      return null;
+    }
+
+    // 正处于“已送完增量降噪切片、等待整句真正说完”的静音观察期：
+    // 只有连续静默达到完整整句判停阈值（含长语音与未闭合宽限）才结束整句并提交 ASR -> Pi Agent
+    if (this._waitingUtteranceEnd) {
+      if (!isVoice && this._consecutiveSilenceMs >= this._effectiveUtteranceSilenceMs()) {
+        const endPos = this._totalSamples;
+        const marker: ClearVoiceChunkDescriptor = {
+          sliceIndex: this._utteranceSliceIndex,
+          triggerReason: "silence",
+          utteranceEnded: true,
+          rawNewSamples: new Float32Array(0),
+          rawWithContext: new Float32Array(0),
+          lookbackSamples: 0,
+          needsCrossfade: false,
+          startSample: endPos,
+          endSample: endPos,
+          durationMs: 0,
+        };
+        this._clearUtteranceState();
+        return marker;
+      }
+      return null;
+    }
+
+    if (this._sliceStartSample === null) {
       return null;
     }
 
     const sliceLen = this._totalSamples - this._sliceStartSample;
 
     // 触发规则 1（优先）：静音触发（检测到人声后的静音停顿 >= 250ms–300ms）
+    // - 若整句判停阈值 > 切片静音阈值：先增量送 GPU ClearVoice 降噪（utteranceEnded=false），进入整句静默观察期；
+    // - 若两者相等（单测直调模式）：直接收尾整句（utteranceEnded=true）。
     if (!isVoice && this._consecutiveSilenceMs >= this.config.silenceTriggerMs) {
       if (this._speechAccumSamples < this._minSpeechSamples && this._utteranceSliceIndex === 0) {
         // 极短瞬态杂音（< minSpeechMs），直接丢弃
         this._clearUtteranceState();
         return null;
       }
-      const chunk = this._buildChunk(this._sliceStartSample, this._totalSamples, "silence", true);
-      this._clearUtteranceState();
+      const shouldEndNow = this._consecutiveSilenceMs >= this._effectiveUtteranceSilenceMs();
+      const chunk = this._buildChunk(
+        this._sliceStartSample,
+        this._totalSamples,
+        "silence",
+        shouldEndNow,
+      );
+      if (shouldEndNow) {
+        this._clearUtteranceState();
+      } else {
+        this._utteranceSliceIndex += 1;
+        this._prevSliceForcedTimeout = false;
+        this._lastSliceEndSample = this._totalSamples;
+        this._sliceStartSample = null;
+        this._speechAccumSamples = 0;
+        this._waitingUtteranceEnd = true;
+      }
       return chunk;
     }
 
-    // 触发规则 2（兜底）：超时强制触发（连续讲话不停顿达到上限 2.0s 时强制切分）
+    // 触发规则 2（兜底）：超时强制触发（连续讲话不停顿达到上限 2.0s 时强制切分给 GPU 增量降噪，绝不提前中断整句）
     if (sliceLen >= this._maxChunkSamples) {
       const chunk = this._buildChunk(this._sliceStartSample, this._totalSamples, "timeout", false);
       this._utteranceSliceIndex += 1;
       this._prevSliceForcedTimeout = true;
+      this._lastSliceEndSample = this._totalSamples;
       this._sliceStartSample = this._totalSamples;
       this._speechAccumSamples = 0;
       this._consecutiveSilenceMs = 0;

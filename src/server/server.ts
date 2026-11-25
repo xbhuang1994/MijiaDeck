@@ -482,6 +482,15 @@ export async function startMijiaDeckServer(
         ) {
           stream.setVoicePipelineMode(streamOpts.voicePipelineMode);
         }
+        if (
+          typeof streamOpts?.vadSilenceMs === "number" ||
+          streamOpts?.vadSensitivity !== undefined
+        ) {
+          stream.updateVadTiming({
+            vadSilenceMs: streamOpts?.vadSilenceMs,
+            vadSensitivity: streamOpts?.vadSensitivity,
+          });
+        }
       }
     },
   };

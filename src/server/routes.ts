@@ -159,6 +159,8 @@ export interface AppRuntime {
     options?: {
       streamingAsrEnabled?: boolean;
       voicePipelineMode?: agentConfigStoreModule.VoicePipelineMode;
+      vadSilenceMs?: number;
+      vadSensitivity?: agentConfigStoreModule.VadSensitivityMode;
     },
   ) => void;
   speakerAudioProps?: Map<string, { volName: string; muteName: string }>;
@@ -2396,6 +2398,8 @@ export function createRequestHandler(
         runtime.reloadVoiceStreams?.(updated.wakeWords, updated.owwThreshold, {
           streamingAsrEnabled: updated.qwen3StreamingEnabled,
           voicePipelineMode: updated.voicePipelineMode,
+          vadSilenceMs: updated.vadSilenceMs,
+          vadSensitivity: updated.vadSensitivity,
         });
         emitBroadcast(runtime);
         return jsonResponse({

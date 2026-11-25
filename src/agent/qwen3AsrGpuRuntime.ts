@@ -238,7 +238,7 @@ export function buildQwen3GpuChatPayload(
     temperature: 0,
     top_p: 0.8,
     seed: 42,
-    max_tokens: Math.max(16, Math.min(256, Math.round(options.maxTokens ?? 128))),
+    max_tokens: Math.max(16, Math.min(512, Math.round(options.maxTokens ?? 128))),
     stream: Boolean(options.stream),
   };
 }
@@ -601,15 +601,19 @@ export class Qwen3AsrGpuRuntime {
       "base64",
     );
     const wantStream = typeof options.onPartial === "function";
+    const audioSec = pcm16k.length / 16000;
+    const autoMaxTokens =
+      options.maxTokens ?? Math.max(128, Math.min(512, Math.ceil(audioSec * 16) + 32));
     const payload = buildQwen3GpuChatPayload(wavBase64, {
       voiceLang: options.voiceLang,
       hotwords: options.hotwords,
-      maxTokens: options.maxTokens,
+      maxTokens: autoMaxTokens,
       stream: wantStream,
     });
 
-    // 首次推理需编译 Vulkan 着色器（约 5~14s），预热后单句仅 ~150~220ms
-    const timeoutMs = options.timeoutMs ?? (this._warmedUp ? 12_000 : 30_000);
+    // 首次推理需编译 Vulkan 着色器（约 5~14s），预热后单句仅 ~150~220ms；长语音按时长适当放宽超时
+    const warmedTimeoutMs = Math.max(12_000, Math.min(30_000, Math.round(audioSec * 800) + 6000));
+    const timeoutMs = options.timeoutMs ?? (this._warmedUp ? warmedTimeoutMs : 30_000);
     const timeoutController = new AbortController();
     const timer = setTimeout(() => timeoutController.abort(), timeoutMs);
     const combinedSignal = options.signal

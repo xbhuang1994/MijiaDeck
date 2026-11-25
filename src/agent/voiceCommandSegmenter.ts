@@ -24,27 +24,26 @@ import { computeRms } from "./audioPcm.ts";
 export type VadSensitivityMode = "aggressive" | "default" | "relaxed";
 
 /**
- * 将 Home Assistant 风格 VAD 灵敏度档位映射为句末静音判定时长（秒）。
+ * 将 Home Assistant 风格 VAD 灵敏度档位与用户配置的尾静音时长映射为句末静音判定时长（秒）。
  * - aggressive: 0.30s（极速抢答，适合短设备指令）
- * - default:    0.55s（响应速度与自然停顿平衡）
- * - relaxed:    1.05s（允许较长句中思考停顿）
+ * - default:    严格尊重用户设置的 `fallbackSilenceMs`（允许 0.40s ~ 3.50s，默认 0.95s 兼顾慢语速自然停顿）
+ * - relaxed:    >= 1.05s（允许较长句中思考停顿，同样尊重更高的用户配置）
  */
 export function vadSensitivityToSeconds(
   sensitivity: VadSensitivityMode | string | undefined,
   fallbackSilenceMs?: number,
 ): number {
   if (sensitivity === "aggressive") return 0.30;
-  if (sensitivity === "relaxed") return 1.05;
-  if (sensitivity === "default") {
+  if (sensitivity === "relaxed") {
     if (typeof fallbackSilenceMs === "number" && Number.isFinite(fallbackSilenceMs)) {
-      return Math.max(0.35, Math.min(0.68, fallbackSilenceMs / 1000));
+      return Math.max(1.05, Math.min(3.5, fallbackSilenceMs / 1000));
     }
-    return 0.55;
+    return 1.05;
   }
   if (typeof fallbackSilenceMs === "number" && Number.isFinite(fallbackSilenceMs)) {
-    return Math.max(0.30, Math.min(0.75, fallbackSilenceMs / 1000));
+    return Math.max(0.4, Math.min(3.5, fallbackSilenceMs / 1000));
   }
-  return 0.55;
+  return 0.95;
 }
 
 export interface VoiceCommandSegmenterOptions {
@@ -81,7 +80,7 @@ export interface VoiceCommandSegmenterStepResult {
 export class VoiceCommandSegmenter {
   readonly speechSeconds: number;
   readonly commandSeconds: number;
-  readonly silenceSeconds: number;
+  private _silenceSeconds: number;
   readonly timeoutSeconds: number;
   readonly resetSeconds: number;
   readonly beforeCommandSpeechThreshold: number;
@@ -104,12 +103,24 @@ export class VoiceCommandSegmenter {
   constructor(options: VoiceCommandSegmenterOptions = {}) {
     this.speechSeconds = Math.max(0.06, options.speechSeconds ?? 0.20);
     this.commandSeconds = Math.max(this.speechSeconds, options.commandSeconds ?? 0.65);
-    this.silenceSeconds = Math.max(0.20, options.silenceSeconds ?? 0.55);
-    this.timeoutSeconds = Math.max(1.5, options.timeoutSeconds ?? 5.5);
+    this._silenceSeconds = Math.max(0.20, options.silenceSeconds ?? 0.95);
+    this.timeoutSeconds = Math.max(1.5, options.timeoutSeconds ?? 30.0);
     this.resetSeconds = Math.max(0.08, options.resetSeconds ?? 0.24);
     this.beforeCommandSpeechThreshold = options.beforeCommandSpeechThreshold ?? 0.25;
     this.inCommandSpeechThreshold = options.inCommandSpeechThreshold ?? 0.48;
     this.reset();
+  }
+
+  get silenceSeconds(): number {
+    return this._silenceSeconds;
+  }
+
+  setSilenceSeconds(seconds: number): void {
+    if (!Number.isFinite(seconds)) return;
+    this._silenceSeconds = Math.max(0.20, Math.min(5.0, seconds));
+    if (!this.inCommand) {
+      this._silenceSecondsLeft = this._silenceSeconds;
+    }
   }
 
   get ambientRmsFloor(): number {
@@ -119,7 +130,7 @@ export class VoiceCommandSegmenter {
   reset(): void {
     this._speechSecondsLeft = this.speechSeconds;
     this._commandSecondsLeft = Math.max(0, this.commandSeconds - this.speechSeconds);
-    this._silenceSecondsLeft = this.silenceSeconds;
+    this._silenceSecondsLeft = this._silenceSeconds;
     this._timeoutSecondsLeft = this.timeoutSeconds;
     this._resetSecondsLeft = this.resetSeconds;
     this.inCommand = false;
@@ -129,14 +140,14 @@ export class VoiceCommandSegmenter {
 
   /**
    * 由声学唤醒词（openWakeWord）强制进入指令捕获态（借鉴 Home Assistant WAKE_WORD -> STT 切换）：
-   * 立即跳过前置语音累积，保证唤醒词后紧跟的短指令完整捕获且在停顿后极速截断。
+   * 立即跳过前置语音累积，保证唤醒词后紧跟的短指令或慢语速长指令完整捕获，绝不在 4s 处强行截断。
    */
   forceStartCommand(initialPeakRms = 0.05): void {
     this.inCommand = true;
     this.timedOut = false;
     this._commandSecondsLeft = Math.max(0.45, this.commandSeconds - this.speechSeconds);
-    this._silenceSecondsLeft = this.silenceSeconds;
-    this._timeoutSecondsLeft = Math.min(this.timeoutSeconds, 4.0);
+    this._silenceSecondsLeft = this._silenceSeconds;
+    this._timeoutSecondsLeft = this.timeoutSeconds;
     this._resetSecondsLeft = this.resetSeconds;
     this._commandPeakRms = Math.max(initialPeakRms, this._ambientRmsFloor * 1.4);
     this._idleRmsWindow.length = 0;

@@ -36,10 +36,7 @@ import type {
   PiAgentRunResult,
   PiAgentService,
 } from "./piAgentService.ts";
-import {
-  splitStreamingSentences,
-  stripCommittedPrefix,
-} from "./qwen3StreamingTranscriber.ts";
+import { stripCommittedPrefix } from "./qwen3StreamingTranscriber.ts";
 import type { CommandIntentChoice, SystemOneHealthSnapshot } from "./systemOneClient.ts";
 import { TASK_ACK_PREWARM_PHRASES_ZH } from "./taskAckPolicy.ts";
 import type { VoiceStreamSegmentPayload } from "./voiceStreamSession.ts";
@@ -989,7 +986,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     }
 
     const cfg = this.config;
-    const speechStartedAt = Math.max(0, now - Math.min(8000, options.segmentDurationMs ?? 0));
+    const speechStartedAt = Math.max(0, now - Math.min(30_000, options.segmentDurationMs ?? 0));
     const awakeActive =
       this._awakeUntil !== null && (now < this._awakeUntil || speechStartedAt < this._awakeUntil);
     if (!awakeActive && this._awakeUntil !== null) {
@@ -1726,7 +1723,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       const now = Date.now();
       const preSepEpoch = this._dialogEpoch;
       const segDurMs = Math.round((pcm16k.length / 16000) * 1000);
-      const speechStartedAt = Math.max(0, now - Math.min(8000, segDurMs));
+      const speechStartedAt = Math.max(0, now - Math.min(30_000, segDurMs));
       const awakeActive =
         this._awakeUntil !== null && (now < this._awakeUntil || speechStartedAt < this._awakeUntil);
       const convWindowActive =
@@ -2238,7 +2235,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         const now = Date.now();
         const preSepEpoch = this._dialogEpoch;
         const segDurMs = Math.round(segment.durationSec * 1000);
-        const speechStartedAt = Math.max(0, now - Math.min(8000, segDurMs));
+        const speechStartedAt = Math.max(0, now - Math.min(30_000, segDurMs));
         const awakeActive =
           this._awakeUntil !== null && (now < this._awakeUntil || speechStartedAt < this._awakeUntil);
         const convWindowActive =
@@ -2493,14 +2490,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       };
     }
 
-    // 流式模式开启且非预分句结果时，若单次长语音内包含多句强标点连说，自动按双语断句逐句下发
-    const sentencesToDispatch =
-      cfg.qwen3StreamingEnabled && !canReuseStreamingPrecomputed
-        ? splitStreamingSentences(transcript, { wakeWords: cfg.wakeWords, forceFlush: true }).completed
-        : [transcript];
-    const effectiveSentences = sentencesToDispatch.length > 0 ? sentencesToDispatch : [transcript];
-
-    let dispatched = await this.handleTranscript(effectiveSentences[0]!, {
+    // 等用户整段话说完后作为一整条完整指令统一发送给 Pi Agent，绝不按句中标点强拆成多条独立请求！
+    const dispatched = await this.handleTranscript(transcript, {
       isFinal: true,
       bypassWakeWord: options.bypassWakeWord,
       engine: runtimeEngine,
@@ -2520,23 +2511,6 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       asyncDispatch: options.asyncDispatch,
       duringTtsPlayback: options.duringTtsPlayback ?? segment.duringTtsPlayback,
     });
-    for (let i = 1; i < effectiveSentences.length; i += 1) {
-      const follow = await this.handleTranscript(effectiveSentences[i]!, {
-        isFinal: true,
-        bypassWakeWord: options.bypassWakeWord,
-        engine: runtimeEngine,
-        segmentDurationMs: Math.round(segment.durationSec * 1000),
-        acousticEvent,
-        voiceprint: voiceprintResult,
-        snrGainDb: segment.snrGainDb,
-        llmAttentionOverride: options.llmAttentionOverride,
-        asyncDispatch: options.asyncDispatch,
-        duringTtsPlayback: options.duringTtsPlayback ?? segment.duringTtsPlayback,
-      });
-      if (follow.matched) {
-        dispatched = follow;
-      }
-    }
 
     return {
       ...dispatched,
