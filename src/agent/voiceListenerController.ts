@@ -125,6 +125,8 @@ export interface VoiceListenerSnapshot {
   consecutiveSidetalkCount: number;
   lastTransitionReason: string | null;
   engine: VoiceRuntimeEngine;
+  voicePipelineMode: AgentVoiceConfig["voicePipelineMode"];
+  clearVoiceServiceUrl: string;
   localAsrEngine: AgentVoiceConfig["localAsrEngine"];
   qwen3ComputeDevice: AgentVoiceConfig["qwen3ComputeDevice"];
   qwen3StreamingEnabled: boolean;
@@ -323,6 +325,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._localEngine = options.localEngine ?? new LocalVoiceEngine();
     this._localEngine.setPreferredAsrEngine?.(this.config.localAsrEngine);
     this._localEngine.setQwen3ComputeDevice?.(this.config.qwen3ComputeDevice);
+    this._localEngine.setClearVoiceServiceUrl?.(this.config.clearVoiceServiceUrl);
     this._engine = this._localEngine.getStatus().readyForLocalAsr ? "local" : "browser";
 
     // 转发 Pi Agent 流式分句语音播报事件，并记录用于自回声抑制
@@ -723,6 +726,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   }): VoiceListenerSnapshot {
     this._localEngine.setPreferredAsrEngine?.(this.config.localAsrEngine);
     this._localEngine.setQwen3ComputeDevice?.(this.config.qwen3ComputeDevice);
+    this._localEngine.setClearVoiceServiceUrl?.(this.config.clearVoiceServiceUrl);
     if (patch.active !== undefined) {
       this._active = Boolean(patch.active);
       if (!this._active) {
@@ -757,6 +761,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           preloadEnglish: hasAsciiWake,
           localAsrEngine: this.config.localAsrEngine,
           qwen3ComputeDevice: this.config.qwen3ComputeDevice,
+          voicePipelineMode: this.config.voicePipelineMode,
         });
         if (this.config.sourceSeparationMode !== "off") {
           void this._localEngine.sourceSeparator.warmupAsync().catch(() => {});
@@ -1269,6 +1274,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     // ---- Stage 1.5: 本地自适应多级声源分离与说话人隔离主通道（S_Fused 最终方案） ----
     this._localEngine.setPreferredAsrEngine?.(cfg.localAsrEngine);
     this._localEngine.setQwen3ComputeDevice?.(cfg.qwen3ComputeDevice);
+    this._localEngine.setClearVoiceServiceUrl?.(cfg.clearVoiceServiceUrl);
     const sttAuthPre = resolveEffectiveSttAuth(cfg);
     const hasCloudSttPre = Boolean(
       sttAuthPre.baseUrl && (sttAuthPre.apiKey || isLocalEndpointUrl(sttAuthPre.baseUrl)),
@@ -1279,6 +1285,184 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       prefPre === "local" ||
       (prefPre === "auto" && engineStatusPre.readyForLocalAsr) ||
       (prefPre === "whisper" && !hasCloudSttPre && engineStatusPre.readyForLocalAsr);
+
+    // ---- Stage 1.2 (新方案): ClearVoice GPU 准实时滑窗降噪（2.0s 切片 + 0.3s 历史上下文 + 20ms 交叉淡入淡出）-> Qwen3-ASR ----
+    if (
+      useLocalPre &&
+      cfg.voicePipelineMode === "clearvoice" &&
+      engineStatusPre.readyForClearVoiceGpu &&
+      !this._localEngine.clearVoiceGpu.isInFailureCooldown()
+    ) {
+      try {
+        const cvRes = await this._localEngine.clearVoiceGpu.enhanceOfflineWithChunking(pcm16k, 16000);
+        const vad = this._localEngine.detectSpeechSegments(cvRes.samples, 16000, {
+          mode: cfg.vadMode,
+        });
+        const speechSamples =
+          vad.hasSpeech && vad.speechSamples.length >= 1600 ? vad.speechSamples : cvRes.samples;
+
+        if (!vad.hasSpeech && cvRes.samples.length >= 3200) {
+          if (autoDispatch) {
+            this._noteNonConversationSegment("ambient_noise");
+          }
+          const timings: VoicePipelineTimings = {
+            denoiseMs: cvRes.durationMs,
+            vadMs: vad.durationMs,
+            totalMs: Math.round(performance.now() - totalStart),
+          };
+          this._lastMetrics = {
+            denoiseEngine: cvRes.engine,
+            snrGainDb: cvRes.snrGainDb,
+            vadEngine: `clearvoice-${vad.engine}`,
+            speechRatio: vad.speechRatio,
+            asrEngine: "skipped-no-speech",
+            timings,
+            updatedAt: Date.now(),
+          };
+          return {
+            ok: true,
+            text: "",
+            speechDetected: false,
+            denoiseEngine: cvRes.engine,
+            vadEngine: `clearvoice-${vad.engine}`,
+            asrEngine: "skipped-no-speech",
+            inputSnrDb: cvRes.inputSnrDb,
+            outputSnrDb: cvRes.outputSnrDb,
+            snrGainDb: cvRes.snrGainDb,
+            speechRatio: vad.speechRatio,
+            matched: false,
+            wokeOnly: false,
+            command: "",
+            timings,
+            voiceState: this.snapshot(),
+          };
+        }
+
+        let voiceprintResult: VoiceprintIdentifyResult | null = null;
+        let voiceprintMs = 0;
+        const profiles = listPublicVoiceprints();
+        if (cfg.voiceprintMode !== "off" && profiles.length > 0 && speechSamples.length >= 4000) {
+          const emb = this._localEngine.extractSpeakerEmbedding(speechSamples, 16000);
+          voiceprintMs = emb.durationMs;
+          voiceprintResult = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
+        }
+
+        const owwEvaluated = Boolean(cfg.owwEnabled && this._localEngine.openWakeWord.isReady);
+        const acousticWake = owwEvaluated
+          ? this._localEngine.scoreWakeWordAudio(speechSamples, cfg.wakeWords, {
+              threshold: cfg.owwThreshold,
+              headOnlySec: 2.0,
+            })
+          : null;
+        if (acousticWake?.matched) {
+          this._lastWakeHit = { ...acousticWake, timestamp: Date.now() };
+        }
+
+        const qwenRes = await this._localEngine.transcribeLocal(speechSamples, 16000, lang, {
+          engine: cfg.localAsrEngine === "sensevoice" ? "sensevoice" : "auto",
+          hotwords: cfg.wakeWords.length > 0 ? cfg.wakeWords : undefined,
+        });
+
+        const timingsBase: Partial<VoicePipelineTimings> = {
+          denoiseMs: cvRes.durationMs,
+          vadMs: vad.durationMs,
+          voiceprintMs,
+          asrMs: qwenRes.durationMs,
+        };
+        const vadLabel = `clearvoice-${vad.engine}`;
+        this._lastMetrics = {
+          denoiseEngine: cvRes.engine,
+          snrGainDb: cvRes.snrGainDb,
+          vadEngine: vadLabel,
+          speechRatio: vad.speechRatio,
+          asrEngine: qwenRes.engine,
+          voiceprint: voiceprintResult,
+          acousticWake,
+          timings: { ...timingsBase, totalMs: Math.round(performance.now() - totalStart) },
+          updatedAt: Date.now(),
+        };
+
+        if (!qwenRes.text.trim()) {
+          if (autoDispatch) {
+            this._noteNonConversationSegment("ambient_noise");
+          }
+          return {
+            ok: true,
+            text: "",
+            speechDetected: false,
+            denoiseEngine: cvRes.engine,
+            vadEngine: vadLabel,
+            asrEngine: qwenRes.engine,
+            inputSnrDb: cvRes.inputSnrDb,
+            outputSnrDb: cvRes.outputSnrDb,
+            snrGainDb: cvRes.snrGainDb,
+            speechRatio: vad.speechRatio,
+            acousticEvent: qwenRes.event,
+            voiceprint: voiceprintResult,
+            acousticWake,
+            matched: false,
+            wokeOnly: false,
+            command: "",
+            timings: { ...timingsBase, totalMs: Math.round(performance.now() - totalStart) },
+            voiceState: this.snapshot(),
+          };
+        }
+
+        if (!autoDispatch) {
+          return {
+            ok: true,
+            text: qwenRes.text,
+            speechDetected: true,
+            denoiseEngine: cvRes.engine,
+            vadEngine: vadLabel,
+            asrEngine: qwenRes.engine,
+            inputSnrDb: cvRes.inputSnrDb,
+            outputSnrDb: cvRes.outputSnrDb,
+            snrGainDb: cvRes.snrGainDb,
+            speechRatio: vad.speechRatio,
+            acousticEvent: qwenRes.event,
+            voiceprint: voiceprintResult,
+            acousticWake,
+            matched: false,
+            wokeOnly: false,
+            command: "",
+            timings: { ...timingsBase, totalMs: Math.round(performance.now() - totalStart) },
+            voiceState: this.snapshot(),
+          };
+        }
+
+        const dispatched = await this.handleTranscript(qwenRes.text, {
+          isFinal: true,
+          bypassWakeWord: options.bypassWakeWord,
+          engine: "local",
+          segmentDurationMs: Math.round((pcm16k.length / 16000) * 1000),
+          acousticEvent: qwenRes.event,
+          acousticWake,
+          owwEvaluated,
+          voiceprint: voiceprintResult,
+          snrGainDb: cvRes.snrGainDb,
+          timingsBase,
+          llmAttentionOverride: options.llmAttentionOverride,
+        });
+
+        return {
+          ...dispatched,
+          text: qwenRes.text,
+          speechDetected: true,
+          denoiseEngine: cvRes.engine,
+          vadEngine: vadLabel,
+          asrEngine: qwenRes.engine,
+          inputSnrDb: cvRes.inputSnrDb,
+          outputSnrDb: cvRes.outputSnrDb,
+          snrGainDb: cvRes.snrGainDb,
+          speechRatio: vad.speechRatio,
+          acousticEvent: qwenRes.event,
+          acousticWake,
+        };
+      } catch {
+        // ClearVoice GPU 不可用或单次失败时自动平滑回落原方案，保障语音交互不中断
+      }
+    }
 
     if (
       useLocalPre &&
@@ -1699,6 +1883,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
 
     this._localEngine.setPreferredAsrEngine?.(cfg.localAsrEngine);
     this._localEngine.setQwen3ComputeDevice?.(cfg.qwen3ComputeDevice);
+    this._localEngine.setClearVoiceServiceUrl?.(cfg.clearVoiceServiceUrl);
     const sttAuth = resolveEffectiveSttAuth(cfg);
     const hasCloudStt = Boolean(
       sttAuth.baseUrl && (sttAuth.apiKey || isLocalEndpointUrl(sttAuth.baseUrl)),
@@ -1710,15 +1895,22 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       (pref === "auto" && localReady) ||
       (pref === "whisper" && !hasCloudStt && localReady);
 
+    // 新方案直通：音频已经由 ClearVoice GPU 准实时切片（Silero VAD 双触发 + 0.3s 历史上下文 + 20ms 交叉淡入淡出）降噪，
+    // 直接送交 Qwen3-ASR 做语音转文字，跳过旧版 GTCRN / Spleeter 声源分离链路。
+    const isClearVoiceSegment =
+      segment.pipelineMode === "clearvoice" || segment.denoiseEngine.startsWith("clearvoice");
+
     const precomputedText = (segment.precomputedTranscript ?? "").trim();
     const canReuseStreamingPrecomputed =
       useLocal &&
+      !isClearVoiceSegment &&
       precomputedText.length > 0 &&
       (segment.commitReason === "punctuation_split" ||
         (!segment.forcedRoll && segment.inputSnrDb >= 14));
 
     const sepReady =
       useLocal &&
+      !isClearVoiceSegment &&
       !canReuseStreamingPrecomputed &&
       cfg.sourceSeparationMode !== "off" &&
       this._localEngine.getStatus().readyForSourceSeparation &&
@@ -1935,27 +2127,44 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         };
       }
 
-      const sv = await this._localEngine.transcribeDualTrack(
-        segment.rawSamples,
-        segment.denoisedSamples,
-        {
-          voiceLang: lang,
-          wakeWords: cfg.wakeWords,
-          inputSnrDb: segment.inputSnrDb,
-          forceDual: segment.forcedRoll || segment.inputSnrDb < 20,
-          systemOneClient: this._agent.systemOneClient,
-          acousticWake,
-          localAsrEngine: cfg.localAsrEngine,
-        },
-      );
-      transcript = segment.stripCommittedPrefixHint
-        ? stripCommittedPrefix(sv.text, segment.stripCommittedPrefixHint)
-        : sv.text;
-      altText = sv.altText;
-      acousticEvent = sv.event;
-      asrEngine = sv.engine;
-      asrMs = sv.durationMs;
-      runtimeEngine = "local";
+      if (isClearVoiceSegment) {
+        // 新方案：将 ClearVoice GPU（MossFormer2_SE_48K）切片降噪并平滑拼接后的音频直接送交 Qwen3-ASR 转写
+        const cvAudio =
+          segment.denoisedSamples.length >= 1600 ? segment.denoisedSamples : segment.rawSamples;
+        const qwenRes = await this._localEngine.transcribeLocal(cvAudio, 16000, lang, {
+          engine: cfg.localAsrEngine === "sensevoice" ? "sensevoice" : "auto",
+          hotwords: cfg.wakeWords.length > 0 ? cfg.wakeWords : undefined,
+        });
+        transcript = segment.stripCommittedPrefixHint
+          ? stripCommittedPrefix(qwenRes.text, segment.stripCommittedPrefixHint)
+          : qwenRes.text;
+        acousticEvent = qwenRes.event;
+        asrEngine = qwenRes.engine;
+        asrMs = qwenRes.durationMs;
+        runtimeEngine = "local";
+      } else {
+        const sv = await this._localEngine.transcribeDualTrack(
+          segment.rawSamples,
+          segment.denoisedSamples,
+          {
+            voiceLang: lang,
+            wakeWords: cfg.wakeWords,
+            inputSnrDb: segment.inputSnrDb,
+            forceDual: segment.forcedRoll || segment.inputSnrDb < 20,
+            systemOneClient: this._agent.systemOneClient,
+            acousticWake,
+            localAsrEngine: cfg.localAsrEngine,
+          },
+        );
+        transcript = segment.stripCommittedPrefixHint
+          ? stripCommittedPrefix(sv.text, segment.stripCommittedPrefixHint)
+          : sv.text;
+        altText = sv.altText;
+        acousticEvent = sv.event;
+        asrEngine = sv.engine;
+        asrMs = sv.durationMs;
+        runtimeEngine = "local";
+      }
     } else {
       const wavBytes = encodeWavPcm16(vpAudio, 16000);
       const blob = new Blob([wavBytes as unknown as BlobPart], { type: "audio/wav" });
@@ -1966,9 +2175,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       runtimeEngine = "whisper";
     }
 
-    const vadEngineLabel = segment.commitReason
-      ? `silero-stream:${segment.commitReason}`
-      : "silero-stream";
+    const vadEngineLabel = isClearVoiceSegment
+      ? `clearvoice-silero:${segment.clearVoiceMeta?.triggerReason ?? segment.commitReason ?? "silence"}`
+      : segment.commitReason
+        ? `silero-stream:${segment.commitReason}`
+        : "silero-stream";
+    const cvDenoiseMs = segment.clearVoiceMeta?.denoiseMs;
     this._lastMetrics = {
       denoiseEngine: segment.denoiseEngine,
       snrGainDb: segment.snrGainDb,
@@ -1998,7 +2210,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         matched: false,
         wokeOnly: false,
         command: "",
-        timings: { voiceprintMs, asrMs, totalMs: Math.round(performance.now() - totalStart) },
+        timings: {
+          ...(cvDenoiseMs !== undefined ? { denoiseMs: cvDenoiseMs } : {}),
+          voiceprintMs,
+          asrMs,
+          totalMs: Math.round(performance.now() - totalStart),
+        },
         voiceState: this.snapshot(),
       };
     }
@@ -2021,7 +2238,11 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       owwEvaluated,
       voiceprint: voiceprintResult,
       snrGainDb: segment.snrGainDb,
-      timingsBase: { voiceprintMs, asrMs },
+      timingsBase: {
+        ...(cvDenoiseMs !== undefined ? { denoiseMs: cvDenoiseMs } : {}),
+        voiceprintMs,
+        asrMs,
+      },
       llmAttentionOverride: options.llmAttentionOverride,
     });
     for (let i = 1; i < effectiveSentences.length; i += 1) {
@@ -2343,6 +2564,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const cfg = this.config;
     this._localEngine.setPreferredAsrEngine?.(cfg.localAsrEngine);
     this._localEngine.setQwen3ComputeDevice?.(cfg.qwen3ComputeDevice);
+    this._localEngine.setClearVoiceServiceUrl?.(cfg.clearVoiceServiceUrl);
     const now = Date.now();
     const conversationRemainingMs =
       this._dialogState === "conversation"
@@ -2370,6 +2592,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       consecutiveSidetalkCount: this._consecutiveSidetalkCount,
       lastTransitionReason: this._lastTransitionReason,
       engine: this._engine,
+      voicePipelineMode: cfg.voicePipelineMode,
+      clearVoiceServiceUrl: cfg.clearVoiceServiceUrl,
       localAsrEngine: cfg.localAsrEngine,
       qwen3ComputeDevice: cfg.qwen3ComputeDevice,
       qwen3StreamingEnabled: cfg.qwen3StreamingEnabled,

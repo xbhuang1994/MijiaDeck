@@ -3715,6 +3715,8 @@ export class MijiaDeckWebApp {
     el<HTMLSelectElement>("set-voice-local-asr-engine").value = cfg?.localAsrEngine || "auto";
     el<HTMLSelectElement>("set-voice-qwen3-device").value = cfg?.qwen3ComputeDevice || "auto";
     el<HTMLInputElement>("set-voice-qwen3-streaming").checked = cfg?.qwen3StreamingEnabled !== false;
+    el<HTMLInputElement>("set-voice-clearvoice-enabled").checked =
+      cfg?.voicePipelineMode === "clearvoice";
     el<HTMLSelectElement>("set-voice-lang").value = cfg?.voiceLang || "zh-CN";
     el<HTMLSelectElement>("set-voice-noise-mode").value = cfg?.noiseSuppressionMode || "auto";
     el<HTMLSelectElement>("set-voice-vad-mode").value = cfg?.vadMode || "silero";
@@ -3785,6 +3787,8 @@ export class MijiaDeckWebApp {
     const gpuInfo = status?.gpu ?? null;
     const gpuDetected = Boolean(gpuInfo?.detected);
     const gpuOk = Boolean(status?.readyForQwen3Gpu ?? gpuInfo?.ready);
+    const cvInfo = status?.clearVoice ?? null;
+    const cvOk = Boolean(status?.readyForClearVoiceGpu ?? cvInfo?.ready);
     const activeDev = status?.activeQwen3Device ?? null;
     const senseVoiceOk = Boolean(status?.readyForSenseVoice ?? status?.models?.senseVoice);
     const asrOk = Boolean(status?.readyForLocalAsr);
@@ -3804,6 +3808,30 @@ export class MijiaDeckWebApp {
         ? "GPU 待下载组件"
         : "无 GPU (CPU)";
     setBadge("badge-model-qwen3-gpu", gpuBadgeLabel, gpuOk);
+    const cvBadgeLabel = cvOk
+      ? cvInfo?.provider === "cuda"
+        ? "ClearVoice GPU (CUDA)"
+        : cvInfo?.provider === "remote"
+          ? "ClearVoice GPU (远程)"
+          : "ClearVoice (MossFormer2)"
+      : "ClearVoice 待就绪";
+    setBadge("badge-model-clearvoice", cvBadgeLabel, cvOk);
+    const cvBadgeEl = document.getElementById("badge-model-clearvoice");
+    if (cvBadgeEl) {
+      cvBadgeEl.title = cvOk
+        ? `MossFormer2_SE_48K 已就绪${cvInfo?.gpuName ? ` · ${cvInfo.gpuName}` : ""}${typeof cvInfo?.lastInferMs === "number" ? ` · 最近推理 ${cvInfo.lastInferMs}ms` : ""}`
+        : "ClearVoice MossFormer2_SE_48K GPU 服务尚未就绪";
+    }
+    const cvDescEl = document.getElementById("set-voice-clearvoice-desc");
+    if (cvDescEl) {
+      if (cvOk) {
+        const gpuLabel = cvInfo?.gpuName ? `${cvInfo.gpuName} (${(cvInfo.provider || "cuda").toUpperCase()})` : (cvInfo?.provider || "GPU").toUpperCase();
+        cvDescEl.textContent = `ClearVoice 服务已就绪（MossFormer2_SE_48K · ${gpuLabel}）。开启后启用新方案：32ms 采集 → Silero VAD 双触发切片（280ms 静音优先 / 2.0s 超时）→ 0.3s 历史上下文 GPU 降噪 → 20ms 交叉淡入淡出 → Qwen3-ASR 转文字；关闭则使用原方案`;
+      } else {
+        cvDescEl.textContent =
+          "开启后切换为 ClearVoice 准实时切片 → Qwen3-ASR 新方案（当前 ClearVoice GPU 运行时或 MossFormer2 模型未就绪，将自动平滑降级本地降噪）；关闭则使用原方案";
+      }
+    }
     const gpuBadgeEl = document.getElementById("badge-model-qwen3-gpu");
     if (gpuBadgeEl && gpuInfo?.deviceName) {
       const vramGb =
@@ -4673,6 +4701,9 @@ export class MijiaDeckWebApp {
       localAsrEngine: el<HTMLSelectElement>("set-voice-local-asr-engine").value,
       qwen3ComputeDevice: el<HTMLSelectElement>("set-voice-qwen3-device").value,
       qwen3StreamingEnabled: el<HTMLInputElement>("set-voice-qwen3-streaming").checked,
+      voicePipelineMode: el<HTMLInputElement>("set-voice-clearvoice-enabled").checked
+        ? "clearvoice"
+        : "legacy",
       voiceLang: el<HTMLSelectElement>("set-voice-lang").value,
       noiseSuppressionMode: el<HTMLSelectElement>("set-voice-noise-mode").value,
       vadMode: el<HTMLSelectElement>("set-voice-vad-mode").value,

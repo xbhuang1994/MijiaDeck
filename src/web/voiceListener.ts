@@ -17,6 +17,8 @@ export type ClientVoiceMode = "idle" | "listening" | "awake" | "processing" | "s
 export interface ClientVoiceConfig {
   voiceEnabled: boolean;
   voiceEngine: "auto" | "local" | "browser" | "whisper";
+  voicePipelineMode?: "legacy" | "clearvoice";
+  clearVoiceServiceUrl?: string;
   localAsrEngine?: "auto" | "qwen3-asr" | "sensevoice";
   qwen3ComputeDevice?: "auto" | "gpu" | "cpu";
   qwen3StreamingEnabled?: boolean;

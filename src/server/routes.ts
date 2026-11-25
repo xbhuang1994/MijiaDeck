@@ -145,7 +145,10 @@ export interface AppRuntime {
   reloadVoiceStreams?: (
     wakeWords: readonly string[],
     threshold?: number,
-    options?: { streamingAsrEnabled?: boolean },
+    options?: {
+      streamingAsrEnabled?: boolean;
+      voicePipelineMode?: agentConfigStoreModule.VoicePipelineMode;
+    },
   ) => void;
   speakerAudioProps?: Map<string, { volName: string; muteName: string }>;
 }
@@ -2157,9 +2160,16 @@ export function createRequestHandler(
           if (updated.ttsEngine !== "browser" && updated.autoSpeakReply) {
             void runtime.voiceListener.prewarmLocalTts().catch(() => {});
           }
+          if (
+            updated.voicePipelineMode === "clearvoice" &&
+            runtime.voiceListener.localEngine.clearVoiceGpu.getStatus().ready
+          ) {
+            void runtime.voiceListener.localEngine.clearVoiceGpu.warmup().catch(() => {});
+          }
         }
         runtime.reloadVoiceStreams?.(updated.wakeWords, updated.owwThreshold, {
           streamingAsrEnabled: updated.qwen3StreamingEnabled,
+          voicePipelineMode: updated.voicePipelineMode,
         });
         emitBroadcast(runtime);
         return jsonResponse({
