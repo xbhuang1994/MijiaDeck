@@ -737,11 +737,11 @@ async function executeSpeakerPlayback(
   did: string,
   actions: readonly ActionInfo[],
   pb: "play" | "pause" | "stop" | "next" | "previous",
-): Promise<void> {
+): Promise<string> {
   // 兼容极简 mock（detail.actions 为空时直接透传动作名）
   if (actions.length === 0) {
     await runJob(deps.jobs, () => deps.service.runAction(did, pb), 1);
-    return;
+    return pb;
   }
 
   const primary = findSpeakerPlaybackAction(actions, pb);
@@ -755,11 +755,11 @@ async function executeSpeakerPlayback(
   if (primary) {
     try {
       await runJob(deps.jobs, () => deps.service.runAction(did, primary.name), 1);
-      return;
+      return primary.name;
     } catch (err) {
       if (fallbackAction && fallbackAction.name !== primary.name) {
         await runJob(deps.jobs, () => deps.service.runAction(did, fallbackAction.name), 1);
-        return;
+        return fallbackAction.name;
       }
       throw err;
     }
@@ -767,7 +767,7 @@ async function executeSpeakerPlayback(
 
   if (fallbackAction) {
     await runJob(deps.jobs, () => deps.service.runAction(did, fallbackAction.name), 1);
-    return;
+    return fallbackAction.name;
   }
 
   // 部分音箱型号规格未暴露 stop/pause 时，通过静默文本指令兜底
@@ -781,10 +781,11 @@ async function executeSpeakerPlayback(
       () => deps.service.runAction(did, "execute-text-directive", [directive, 1]),
       1,
     );
-    return;
+    return "execute-text-directive";
   }
 
   await runJob(deps.jobs, () => deps.service.runAction(did, pb), 1);
+  return pb;
 }
 
 async function applySpeakerPower(
@@ -2031,6 +2032,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
     parameters: obj({
       text: str({ description: "发送给小爱同学的指令文本" }),
       speaker: opt(str({ description: "可选指定小爱音箱名称或 did；留空使用默认在线音箱" })),
+      silent: opt(bool({ description: "是否静默执行（不让小爱音箱语音回复），默认 false；适用于后台自愈停播等场景" })),
     }),
     execute: async (_toolCallId, params) => {
       const blocked = ensureAccessReady(deps);
@@ -2104,9 +2106,10 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         return textResult(speakerHint(devices) || "当前没有可用的在线小爱音箱。", { ok: false }, true);
       }
 
+      const directiveArgs = params.silent === true ? [directive, 1] : [directive];
       await runJob(
         deps.jobs,
-        () => deps.service.runAction(targetSpeaker!.did, "execute-text-directive", [directive]),
+        () => deps.service.runAction(targetSpeaker!.did, "execute-text-directive", directiveArgs),
         1,
       );
       if (deps.mainWindow.tray) {
@@ -2120,6 +2123,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         did: targetSpeaker.did,
         speaker: targetSpeaker.name,
         text: directive,
+        ...(params.silent === true ? { silent: true } : {}),
         uiSummary: msg,
       });
     },
@@ -2330,6 +2334,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       let powerNote: string | undefined;
       let appliedVolume: number | undefined;
       let appliedSong: string | undefined;
+      let executedPlaybackAction: string | undefined;
 
       if (params.power) {
         const pwRes = await applySpeakerPower(deps, speaker, params.power);
@@ -2414,7 +2419,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
           next: "下一首",
           previous: "上一首",
         };
-        await executeSpeakerPlayback(deps, speaker.did, detail.actions, pb);
+        executedPlaybackAction = await executeSpeakerPlayback(deps, speaker.did, detail.actions, pb);
         changes.push(labelMap[pb] ?? pb);
       }
 
@@ -2459,6 +2464,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         ...(appliedVolume !== undefined ? { volume: appliedVolume } : {}),
         ...(appliedSong ? { playMusic: appliedSong } : {}),
         ...(params.playback ? { playback: params.playback } : {}),
+        ...(executedPlaybackAction ? { executedPlaybackAction } : {}),
         ...(params.speak_text?.trim() ? { speak_text: params.speak_text.trim() } : {}),
         uiSummary: summary,
       });

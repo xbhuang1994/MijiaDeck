@@ -217,6 +217,8 @@ export class MijiaService implements IMijiaService {
   private readonly _httpFetch: typeof fetch;
 
   private _deviceCache = new Map<string, MijiaDevice>();
+  /** 已知 `stop` 动作返回固件不支持、需直接走同服务 `pause` 兜底的音箱 did 集合，避免每次停播白耗一次失败 RPC。 */
+  private _stopToPauseDids = new Set<string>();
   /** did -> [model, spec_type, name] 索引，自有与共享设备都在其中。 */
   private _deviceIndex = new Map<string, [string, string, string]>();
   private _panelParents: Set<string> | null = null;
@@ -356,6 +358,7 @@ export class MijiaService implements IMijiaService {
     }
     this._api = this._apiFactory({ authDataPath: authPath });
     this._deviceCache.clear();
+    this._stopToPauseDids.clear();
     this._deviceIndex.clear();
     this._cameraObservations.clear();
     this._panelParents = null;
@@ -983,6 +986,31 @@ export class MijiaService implements IMijiaService {
     if (this._isSplitParent(did)) {
       throw new ServiceError("面板本体仅展示信息，请操作对应灯路");
     }
+    const normalized = name.replaceAll("_", "-");
+    const baseName = normalized.replace(/-\d+$/, "");
+    const hasNoParams =
+      params === undefined || params === null || (Array.isArray(params) && params.length === 0);
+    if (hasNoParams && baseName === "stop" && this._stopToPauseDids.has(did)) {
+      const stopAction = dev.actionList[name] ?? dev.actionList[normalized];
+      const pauseFallback = stopAction
+        ? Object.values(dev.actionList).find(
+            (a) =>
+              a.method.siid === stopAction.method.siid &&
+              a.name.replace(/-\d+$/, "") === "pause",
+          )
+        : undefined;
+      if (pauseFallback) {
+        try {
+          await dev.runAction(pauseFallback.name);
+          return;
+        } catch (fallbackErr) {
+          if (fallbackErr instanceof ServiceError) {
+            throw fallbackErr;
+          }
+          throw wrapError(fallbackErr, `执行动作 ${pauseFallback.name} 失败`);
+        }
+      }
+    }
     try {
       if (params !== undefined && params !== null && (!Array.isArray(params) || params.length > 0)) {
         if (TEXT_DIRECTIVE_ACTIONS.has(name)) {
@@ -1012,8 +1040,6 @@ export class MijiaService implements IMijiaService {
       }
       // Many XiaoAI speaker firmwares (e.g. xiaomi.wifispeaker.l05b) declare `stop` in
       // MIoT-Spec `play-control` but return -704220008 (-4003) on invoke while supporting `pause`.
-      const normalized = name.replaceAll("_", "-");
-      const baseName = normalized.replace(/-\d+$/, "");
       if (
         baseName === "stop" &&
         err instanceof DeviceActionError &&
@@ -1030,6 +1056,7 @@ export class MijiaService implements IMijiaService {
         if (pauseFallback) {
           try {
             await dev.runAction(pauseFallback.name);
+            this._stopToPauseDids.add(did);
             return;
           } catch (fallbackErr) {
             if (fallbackErr instanceof ServiceError) {

@@ -735,7 +735,7 @@ describe("PiAgentService & VoiceListenerController — End-to-End Silent Simple 
       expect(r3.reply).toContain("智洗烘");
       expect(spoken.length).toBe(2);
 
-      // Case 4 -> LLM returned [SILENT], but state check caught mismatch -> retries & replies!
+      // Case 4 -> LLM returned [SILENT], but state check caught mismatch -> retries SILENTLY & reports final verified result!
       spoken.length = 0;
       await origSetPower("demo-light-living", true);
       dropLivingPowerOnce = true;
@@ -746,7 +746,8 @@ describe("PiAgentService & VoiceListenerController — End-to-End Silent Simple 
       expect(r4.verification?.status).toBe("recovered");
       expect(r4.reply).toContain("状态检查已通过");
       expect(spoken[0]).toBe("好的");
-      expect(spoken.some((s) => s.includes("第1次重试"))).toBe(true);
+      expect(spoken.some((s) => s.includes("第1次重试"))).toBe(false);
+      expect(spoken.length).toBe(2);
       expect(spoken[spoken.length - 1]).toContain("状态检查已通过");
     } finally {
       await h.cleanup();

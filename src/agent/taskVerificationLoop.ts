@@ -4,9 +4,9 @@
 
 /**
  * Pi Agent 任务闭环核心引擎：
- * 1. 执行后真实设备状态核验（回读 powerState / readProps / readProp，绝不盲信写入返回）
+ * 1. 执行后真实设备状态核验（回读 powerState / readProps / readProp，绝不盲信写入返回；支持设备/云端异步状态延迟确认轮询）
  * 2. 问题可解性思考与分类（区分离线/未找到/硬件不支持等不可解问题与状态不一致/超时等可解问题）
- * 3. 最多 3 轮递进式排错恢复计划生成（每轮重试前明确告知用户“出了什么问题 + 准备怎么做”）
+ * 3. 最多 3 轮递进式排错恢复计划生成（静默自愈重试，仅在时间线记录排错详情，不打扰用户播报）
  * 4. 成功后提炼沉淀为可复用 Skill 所需的结构化步骤与校验规则
  */
 
@@ -22,6 +22,23 @@ import type {
 import { parseColorToRgbInt, type SmartHomeToolDeps } from "./smartHomeTools.ts";
 
 export const MAX_RECOVERY_ROUNDS = 3;
+
+/** 通用设备状态回读出现不一致/瞬时回读异常时的延迟确认轮询间隔（ms）；首次回读已一致时零等待。 */
+export const DEFAULT_VERIFY_SETTLE_DELAYS_MS: readonly number[] = [300, 600];
+
+/** 智能音箱播放状态（playing-state）延迟确认轮询间隔（ms）：覆盖音箱停播/暂停缓冲与云端异步状态同步窗口（约 1~4s）。 */
+export const DEFAULT_SPEAKER_PLAYBACK_SETTLE_DELAYS_MS: readonly number[] = [700, 1000, 1300];
+
+export interface VerifyExecutedToolCallsOptions {
+  isCloudLlm?: boolean;
+  signal?: AbortSignal;
+  /** 通用属性/开关回读不一致时的延迟确认轮询间隔列表（ms） */
+  settleDelaysMs?: readonly number[];
+  /** 音箱播放状态回读不一致时的延迟确认轮询间隔列表（ms） */
+  speakerPlaybackSettleDelaysMs?: readonly number[];
+  /** 可选自定义 sleep（用于确定性单元测试） */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+}
 
 export const MUTATING_TOOLS = new Set<string>([
   "set_device_power",
@@ -67,6 +84,7 @@ export interface VerificationIssue {
   actual?: string;
   property?: string;
   expectedValue?: unknown;
+  executedAction?: string;
   rawError?: string;
 }
 
@@ -165,6 +183,106 @@ function findSpeakerProps(props: readonly PropInfo[]): {
     props.find((p) => p.name === "playing-state" && p.readable) ?? null;
 
   return { volumeProp, speakerMuteProp, micMuteProp, playingStateProp };
+}
+
+/**
+ * 从 MIoT 规格 `playing-state` 的 `value_list` 动态解析代表“正在播放”的枚举值（默认 1）。
+ * 兼容不同音箱型号（如 xiaomi.wifispeaker.l05b 为 1=Playing，部分机型枚举可能不同）。
+ */
+export function resolveSpeakerPlayingValue(prop: PropInfo): number {
+  if (Array.isArray(prop.value_list) && prop.value_list.length > 0) {
+    const hit = prop.value_list.find((opt) => {
+      const desc = `${opt.description ?? ""} ${opt.desc_zh_cn ?? ""}`.trim();
+      return /\bplaying\b|播放中|正在播放/i.test(desc);
+    });
+    if (hit && typeof hit.value === "number" && Number.isFinite(hit.value)) {
+      return hit.value;
+    }
+  }
+  return 1;
+}
+
+function isStopOrPauseXiaoAiDirective(text: string): "stop" | "pause" | null {
+  const clean = text.trim();
+  if (!clean) return null;
+  if (/(?:暂停播放|暂停音乐|暂停一下|暂停)/i.test(clean)) return "pause";
+  if (/(?:停止播放|停止音乐|别放了|不要放了|不要播放|关掉音乐|关闭音乐|停播)/i.test(clean)) {
+    return "stop";
+  }
+  return null;
+}
+
+function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal?.aborted) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    (timer as { unref?: () => void }).unref?.();
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+interface SettlePollAttemptResult<T> {
+  passed: boolean;
+  value: T;
+  fatal?: boolean;
+}
+
+/**
+ * 延迟确认轮询：
+ * - 首次回读若已符合预期，零延迟立即放行；
+ * - 若因设备执行缓冲或云端影子状态上报延迟导致首次回读不一致/瞬时超时，按递进间隔重读确认，
+ *   一旦同步到位即刻通过，避免误判失败并触发不必要的自愈重试与虚假技能沉淀；
+ * - 若遇到不可重试异常（未登录/离线/执行器已关闭）或任务被中止，立即退出不空等。
+ */
+async function runWithSettleConfirmation<T>(
+  attemptFn: () => Promise<SettlePollAttemptResult<T>>,
+  delaysMs: readonly number[],
+  sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>,
+  signal?: AbortSignal,
+): Promise<{ result: SettlePollAttemptResult<T>; settledAfterDelay: boolean; attempts: number }> {
+  let current = await attemptFn();
+  let attempts = 1;
+  if (current.passed || current.fatal) {
+    return { result: current, settledAfterDelay: false, attempts };
+  }
+  for (const delayMs of delaysMs) {
+    if (signal?.aborted) {
+      break;
+    }
+    await sleepFn(delayMs, signal);
+    if (signal?.aborted) {
+      break;
+    }
+    current = await attemptFn();
+    attempts += 1;
+    if (current.passed) {
+      return { result: current, settledAfterDelay: true, attempts };
+    }
+    if (current.fatal) {
+      break;
+    }
+  }
+  return { result: current, settledAfterDelay: false, attempts };
+}
+
+function isReadbackErrorFatal(
+  toolName: string,
+  toolArgs: Record<string, unknown>,
+  rawError: string,
+  did?: string,
+  deviceName?: string,
+): boolean {
+  const classified = classifyToolError(toolName, toolArgs, rawError, { did, deviceName });
+  return !classified.solvable;
 }
 
 function scaleExpectedBrightness(prop: PropInfo, pct: number): number {
@@ -327,17 +445,25 @@ function valuesMatch(expected: unknown, actual: unknown, prop?: PropInfo | null)
 export async function verifyExecutedToolCalls(
   traces: readonly ExecutedToolTrace[],
   deps: SmartHomeToolDeps,
-  options: { isCloudLlm?: boolean } = {},
+  options: VerifyExecutedToolCallsOptions = {},
 ): Promise<TaskVerificationOutcome> {
   const checks: VerificationCheckItem[] = [];
   const issues: VerificationIssue[] = [];
   const specs: AgentSkillVerificationSpec[] = [];
   const devices = deps.mainWindow.activeDevices();
   const deviceByDid = new Map<string, DeviceInfo>(devices.map((d) => [d.did, d]));
+  const settleDelays = options.settleDelaysMs ?? DEFAULT_VERIFY_SETTLE_DELAYS_MS;
+  const speakerPlaybackDelays =
+    options.speakerPlaybackSettleDelaysMs ?? DEFAULT_SPEAKER_PLAYBACK_SETTLE_DELAYS_MS;
+  const sleepFn = options.sleep ?? sleepWithAbort;
+  const signal = options.signal;
   let anyMutatingOrError = false;
   let stateMutated = false;
 
   for (const trace of traces) {
+    if (signal?.aborted) {
+      break;
+    }
     const isMutating = MUTATING_TOOLS.has(trace.name);
     if (!isMutating && !trace.isError) {
       continue;
@@ -382,6 +508,7 @@ export async function verifyExecutedToolCalls(
       }
 
       for (const s of succeeded) {
+        if (signal?.aborted) break;
         const did = typeof s.did === "string" ? s.did : "";
         const name = typeof s.name === "string" && s.name ? s.name : did || "设备";
         if (!did || typeof s.state !== "boolean") continue;
@@ -395,129 +522,237 @@ export async function verifyExecutedToolCalls(
         });
 
         if (dev && isSpeaker(dev)) {
-          try {
-            const detail = await runJob(deps.jobs, () => deps.service.deviceDetail(did), 2);
-            const { speakerMuteProp, playingStateProp } = findSpeakerProps(detail.props);
-            const toRead = [speakerMuteProp?.name, playingStateProp?.name].filter(
-              (n): n is string => Boolean(n),
-            );
-            if (toRead.length > 0) {
-              const vals = await runJob(deps.jobs, () => deps.service.readProps(did, toRead), 2);
-              const expectedMuted = !s.state;
-              if (speakerMuteProp && typeof vals[speakerMuteProp.name] === "boolean") {
-                const actualMuted = vals[speakerMuteProp.name] as boolean;
-                if (actualMuted !== expectedMuted) {
-                  issues.push({
-                    code: "property_mismatch",
-                    solvable: true,
-                    did,
-                    deviceName: name,
-                    toolName: trace.name,
-                    toolArgs: { target: did, state: s.state ? "on" : "off" },
-                    property: speakerMuteProp.name,
-                    expectedValue: expectedMuted,
-                    expected: expectedMuted ? "静音待机" : "取消静音",
-                    actual: actualMuted ? "静音" : "未静音",
-                    summary: `${name}状态检查异常：当前仍处于${actualMuted ? "静音" : "未静音"}（预期${expectedMuted ? "静音待机" : "唤醒/取消静音"}）`,
-                  });
-                } else {
-                  checks.push({
+          let cachedDetail: Awaited<ReturnType<typeof deps.service.deviceDetail>> | null = null;
+          const pollDelays = !s.state ? speakerPlaybackDelays : settleDelays;
+          const settled = await runWithSettleConfirmation(
+            async () => {
+              try {
+                const detail =
+                  cachedDetail ?? (await runJob(deps.jobs, () => deps.service.deviceDetail(did), 2));
+                cachedDetail = detail;
+                const { speakerMuteProp, playingStateProp } = findSpeakerProps(detail.props);
+                const toRead = [speakerMuteProp?.name, playingStateProp?.name].filter(
+                  (n): n is string => Boolean(n),
+                );
+                if (toRead.length === 0) {
+                  return {
+                    passed: true,
+                    value: {
+                      checks: [
+                        {
+                          did,
+                          deviceName: name,
+                          toolName: trace.name,
+                          passed: true,
+                          summary: `${name}指令已执行`,
+                        },
+                      ] as VerificationCheckItem[],
+                      issues: [] as VerificationIssue[],
+                    },
+                  };
+                }
+                const vals = await runJob(deps.jobs, () => deps.service.readProps(did, toRead), 2);
+                const expectedMuted = !s.state;
+                const roundChecks: VerificationCheckItem[] = [];
+                const roundIssues: VerificationIssue[] = [];
+                if (speakerMuteProp && typeof vals[speakerMuteProp.name] === "boolean") {
+                  const actualMuted = vals[speakerMuteProp.name] as boolean;
+                  if (actualMuted !== expectedMuted) {
+                    roundIssues.push({
+                      code: "property_mismatch",
+                      solvable: true,
+                      did,
+                      deviceName: name,
+                      toolName: trace.name,
+                      toolArgs: { target: did, state: s.state ? "on" : "off" },
+                      property: speakerMuteProp.name,
+                      expectedValue: expectedMuted,
+                      expected: expectedMuted ? "静音待机" : "取消静音",
+                      actual: actualMuted ? "静音" : "未静音",
+                      summary: `${name}状态检查异常：当前仍处于${actualMuted ? "静音" : "未静音"}（预期${expectedMuted ? "静音待机" : "唤醒/取消静音"}）`,
+                    });
+                  } else {
+                    roundChecks.push({
+                      did,
+                      deviceName: name,
+                      toolName: trace.name,
+                      passed: true,
+                      summary: `${name}状态核验通过（${expectedMuted ? "已静音待机" : "已唤醒"}）`,
+                    });
+                  }
+                }
+                if (!s.state && playingStateProp && typeof vals[playingStateProp.name] === "number") {
+                  const playingVal = resolveSpeakerPlayingValue(playingStateProp);
+                  if ((vals[playingStateProp.name] as number) === playingVal) {
+                    roundIssues.push({
+                      code: "playback_mismatch",
+                      solvable: true,
+                      did,
+                      deviceName: name,
+                      toolName: trace.name,
+                      toolArgs: { target: did, state: "off" },
+                      property: playingStateProp.name,
+                      expectedValue: 2,
+                      expected: "暂停/停止播放",
+                      actual: "仍在播放",
+                      summary: `${name}状态检查异常：仍在播放中，未停止`,
+                    });
+                  }
+                }
+                if (roundIssues.length === 0 && roundChecks.length === 0) {
+                  roundChecks.push({
                     did,
                     deviceName: name,
                     toolName: trace.name,
                     passed: true,
-                    summary: `${name}状态核验通过（${expectedMuted ? "已静音待机" : "已唤醒"}）`,
+                    summary: `${name}状态核验通过`,
                   });
                 }
+                return {
+                  passed: roundIssues.length === 0,
+                  value: { checks: roundChecks, issues: roundIssues },
+                };
+              } catch (err) {
+                const rawErr = err instanceof Error ? err.message : String(err);
+                const toolArgs = { target: did, state: s.state ? "on" : "off" };
+                const fatal = isReadbackErrorFatal(trace.name, toolArgs, rawErr, did, name);
+                return {
+                  passed: false,
+                  fatal,
+                  value: {
+                    checks: [] as VerificationCheckItem[],
+                    issues: [
+                      {
+                        code: "readback_error",
+                        solvable: !fatal,
+                        did,
+                        deviceName: name,
+                        toolName: trace.name,
+                        toolArgs,
+                        summary: `${name}状态回读失败（${rawErr}）`,
+                        rawError: rawErr,
+                      },
+                    ] as VerificationIssue[],
+                  },
+                };
               }
-              if (!s.state && playingStateProp && vals[playingStateProp.name] === 1) {
-                issues.push({
-                  code: "playback_mismatch",
-                  solvable: true,
-                  did,
-                  deviceName: name,
-                  toolName: trace.name,
-                  toolArgs: { target: did, state: "off" },
-                  property: playingStateProp.name,
-                  expectedValue: 2,
-                  expected: "暂停/停止播放",
-                  actual: "仍在播放",
-                  summary: `${name}状态检查异常：仍在播放中，未停止`,
-                });
-              }
-            } else {
-              checks.push({
-                did,
-                deviceName: name,
-                toolName: trace.name,
-                passed: true,
-                summary: `${name}指令已执行`,
-              });
-            }
-          } catch (err) {
-            issues.push({
-              code: "readback_error",
-              solvable: true,
-              did,
-              deviceName: name,
-              toolName: trace.name,
-              toolArgs: { target: did, state: s.state ? "on" : "off" },
-              summary: `${name}状态回读失败（${err instanceof Error ? err.message : String(err)}）`,
-              rawError: err instanceof Error ? err.message : String(err),
-            });
+            },
+            pollDelays,
+            sleepFn,
+            signal,
+          );
+          for (const c of settled.result.value.checks) {
+            checks.push(
+              settled.settledAfterDelay ? { ...c, summary: `${c.summary}（延迟同步确认）` } : c,
+            );
+          }
+          for (const iss of settled.result.value.issues) {
+            issues.push(iss);
           }
           continue;
         }
 
-        try {
-          const actualPower = await runJob(deps.jobs, () => deps.service.powerState(did), 2);
-          if (typeof actualPower === "boolean") {
-            if (deps.mainWindow.knownPower[did] !== actualPower) {
-              deps.mainWindow.applyPowerState(did, actualPower);
-              stateMutated = true;
-            }
-            if (actualPower !== s.state) {
-              issues.push({
-                code: "power_mismatch",
-                solvable: true,
-                did,
-                deviceName: name,
-                toolName: trace.name,
-                toolArgs: { target: did, state: s.state ? "on" : "off" },
-                expectedValue: s.state,
-                expected: s.state ? "开启" : "关闭",
-                actual: actualPower ? "开启" : "关闭",
-                summary: `${name}状态检查未生效：当前仍为${actualPower ? "开启" : "关闭"}（预期${s.state ? "开启" : "关闭"}）`,
-              });
-            } else {
-              checks.push({
-                did,
-                deviceName: name,
-                toolName: trace.name,
+        const powerSettled = await runWithSettleConfirmation<{
+          actualPower: boolean | null;
+          check: VerificationCheckItem | null;
+          issue: VerificationIssue | null;
+        }>(
+          async () => {
+            try {
+              const actualPower = await runJob(deps.jobs, () => deps.service.powerState(did), 2);
+              if (typeof actualPower === "boolean") {
+                if (actualPower !== s.state) {
+                  return {
+                    passed: false,
+                    value: {
+                      actualPower,
+                      check: null as VerificationCheckItem | null,
+                      issue: {
+                        code: "power_mismatch",
+                        solvable: true,
+                        did,
+                        deviceName: name,
+                        toolName: trace.name,
+                        toolArgs: { target: did, state: s.state ? "on" : "off" },
+                        expectedValue: s.state,
+                        expected: s.state ? "开启" : "关闭",
+                        actual: actualPower ? "开启" : "关闭",
+                        summary: `${name}状态检查未生效：当前仍为${actualPower ? "开启" : "关闭"}（预期${s.state ? "开启" : "关闭"}）`,
+                      } as VerificationIssue,
+                    },
+                  };
+                }
+                return {
+                  passed: true,
+                  value: {
+                    actualPower,
+                    check: {
+                      did,
+                      deviceName: name,
+                      toolName: trace.name,
+                      passed: true,
+                      summary: `${name}电源状态核验通过（已${s.state ? "开启" : "关闭"}）`,
+                    } as VerificationCheckItem,
+                    issue: null as VerificationIssue | null,
+                  },
+                };
+              }
+              return {
                 passed: true,
-                summary: `${name}电源状态核验通过（已${s.state ? "开启" : "关闭"}）`,
-              });
+                value: {
+                  actualPower: null as boolean | null,
+                  check: {
+                    did,
+                    deviceName: name,
+                    toolName: trace.name,
+                    passed: true,
+                    summary: `${name}开关指令已送达`,
+                  } as VerificationCheckItem,
+                  issue: null as VerificationIssue | null,
+                },
+              };
+            } catch (err) {
+              const rawErr = err instanceof Error ? err.message : String(err);
+              const toolArgs = { target: did, state: s.state ? "on" : "off" };
+              const fatal = isReadbackErrorFatal(trace.name, toolArgs, rawErr, did, name);
+              return {
+                passed: false,
+                fatal,
+                value: {
+                  actualPower: null as boolean | null,
+                  check: null as VerificationCheckItem | null,
+                  issue: {
+                    code: "readback_error",
+                    solvable: !fatal,
+                    did,
+                    deviceName: name,
+                    toolName: trace.name,
+                    toolArgs,
+                    summary: `${name}状态回读失败（${rawErr}）`,
+                    rawError: rawErr,
+                  } as VerificationIssue,
+                },
+              };
             }
-          } else {
-            checks.push({
-              did,
-              deviceName: name,
-              toolName: trace.name,
-              passed: true,
-              summary: `${name}开关指令已送达`,
-            });
+          },
+          settleDelays,
+          sleepFn,
+          signal,
+        );
+        if (typeof powerSettled.result.value.actualPower === "boolean") {
+          if (deps.mainWindow.knownPower[did] !== powerSettled.result.value.actualPower) {
+            deps.mainWindow.applyPowerState(did, powerSettled.result.value.actualPower);
+            stateMutated = true;
           }
-        } catch (err) {
-          issues.push({
-            code: "readback_error",
-            solvable: true,
-            did,
-            deviceName: name,
-            toolName: trace.name,
-            toolArgs: { target: did, state: s.state ? "on" : "off" },
-            summary: `${name}状态回读失败（${err instanceof Error ? err.message : String(err)}）`,
-            rawError: err instanceof Error ? err.message : String(err),
-          });
+        }
+        if (powerSettled.result.value.check) {
+          const c = powerSettled.result.value.check;
+          checks.push(
+            powerSettled.settledAfterDelay ? { ...c, summary: `${c.summary}（延迟同步确认）` } : c,
+          );
+        }
+        if (powerSettled.result.value.issue) {
+          issues.push(powerSettled.result.value.issue);
         }
       }
       continue;
@@ -557,160 +792,192 @@ export async function verifyExecutedToolCalls(
         ...(Object.keys(expectedPropsSpec).length > 0 ? { expectedProps: expectedPropsSpec } : {}),
       });
 
-      try {
-        const detail = await runJob(deps.jobs, () => deps.service.deviceDetail(did), 2);
-        const controls = lightControls(detail.props);
-        const powerProp = findPowerProp(detail.props);
-        const modeProp = detail.props.find((p) => p.name === "mode" && p.readable) ?? null;
+      let cachedDetail: Awaited<ReturnType<typeof deps.service.deviceDetail>> | null = null;
+      const lightSettled = await runWithSettleConfirmation(
+        async () => {
+          try {
+            const detail =
+              cachedDetail ?? (await runJob(deps.jobs, () => deps.service.deviceDetail(did), 2));
+            cachedDetail = detail;
+            const controls = lightControls(detail.props);
+            const powerProp = findPowerProp(detail.props);
+            const modeProp = detail.props.find((p) => p.name === "mode" && p.readable) ?? null;
 
-        const toRead = [
-          powerProp?.readable ? powerProp.name : null,
-          typeof d.brightness === "number" && controls.brightness?.readable ? controls.brightness.name : null,
-          typeof d.colorTemperature === "number" && controls.temperature?.readable
-            ? controls.temperature.name
-            : null,
-          typeof d.color === "string" && controls.color?.readable ? controls.color.name : null,
-          typeof d.mode === "string" && modeProp ? modeProp.name : null,
-        ].filter((n): n is string => Boolean(n));
+            const toRead = [
+              powerProp?.readable ? powerProp.name : null,
+              typeof d.brightness === "number" && controls.brightness?.readable ? controls.brightness.name : null,
+              typeof d.colorTemperature === "number" && controls.temperature?.readable
+                ? controls.temperature.name
+                : null,
+              typeof d.color === "string" && controls.color?.readable ? controls.color.name : null,
+              typeof d.mode === "string" && modeProp ? modeProp.name : null,
+            ].filter((n): n is string => Boolean(n));
 
-        const vals =
-          toRead.length > 0
-            ? await runJob(deps.jobs, () => deps.service.readProps(did, toRead), 2)
-            : {};
+            const vals =
+              toRead.length > 0
+                ? await runJob(deps.jobs, () => deps.service.readProps(did, toRead), 2)
+                : {};
 
-        let lightIssues = 0;
+            const roundIssues: VerificationIssue[] = [];
+            let observedPower: boolean | null = null;
 
-        if (powerProp && typeof vals[powerProp.name] === "boolean") {
-          const actualOn = vals[powerProp.name] as boolean;
-          if (deps.mainWindow.knownPower[did] !== actualOn) {
-            deps.mainWindow.applyPowerState(did, actualOn);
-            stateMutated = true;
-          }
-          if (expectOff && actualOn !== false) {
-            lightIssues += 1;
-            issues.push({
-              code: "power_mismatch",
-              solvable: true,
-              did,
-              deviceName: name,
-              toolName: trace.name,
-              toolArgs: { ...trace.args, target: did, on: false },
-              property: powerProp.name,
-              expectedValue: false,
-              expected: "关闭",
-              actual: "开启",
-              summary: `${name}状态检查未生效：当前仍为开启（预期关闭）`,
-            });
-          } else if (expectOn && actualOn !== true) {
-            lightIssues += 1;
-            issues.push({
-              code: "power_mismatch",
-              solvable: true,
-              did,
-              deviceName: name,
-              toolName: trace.name,
-              toolArgs: { ...trace.args, target: did, on: true },
-              property: powerProp.name,
-              expectedValue: true,
-              expected: "开启",
-              actual: "关闭",
-              summary: `${name}状态检查未生效：灯具电源仍为关闭（预期开启）`,
-            });
-          }
-        }
-
-        if (!expectOff && typeof d.brightness === "number" && controls.brightness) {
-          const actualRaw = vals[controls.brightness.name];
-          if (typeof actualRaw === "number" && Number.isFinite(actualRaw)) {
-            const expectedRaw = scaleExpectedBrightness(controls.brightness, d.brightness);
-            const high =
-              controls.brightness.range && controls.brightness.range.length >= 2
-                ? controls.brightness.range[1]
-                : 100;
-            const tol = Math.max(2, Math.ceil(high * 0.02));
-            if (Math.abs(actualRaw - expectedRaw) > tol) {
-              lightIssues += 1;
-              const actualPct = formatBrightnessPct(controls.brightness, actualRaw);
-              issues.push({
-                code: "property_mismatch",
-                solvable: true,
-                did,
-                deviceName: name,
-                toolName: trace.name,
-                toolArgs: { ...trace.args, target: did, brightness: d.brightness },
-                property: controls.brightness.name,
-                expectedValue: expectedRaw,
-                expected: `${d.brightness}%`,
-                actual: `${actualPct}%`,
-                summary: `${name}亮度状态检查未生效：当前为 ${actualPct}%（目标 ${d.brightness}%）`,
-              });
+            if (powerProp && typeof vals[powerProp.name] === "boolean") {
+              const actualOn = vals[powerProp.name] as boolean;
+              observedPower = actualOn;
+              if (expectOff && actualOn !== false) {
+                roundIssues.push({
+                  code: "power_mismatch",
+                  solvable: true,
+                  did,
+                  deviceName: name,
+                  toolName: trace.name,
+                  toolArgs: { ...trace.args, target: did, on: false },
+                  property: powerProp.name,
+                  expectedValue: false,
+                  expected: "关闭",
+                  actual: "开启",
+                  summary: `${name}状态检查未生效：当前仍为开启（预期关闭）`,
+                });
+              } else if (expectOn && actualOn !== true) {
+                roundIssues.push({
+                  code: "power_mismatch",
+                  solvable: true,
+                  did,
+                  deviceName: name,
+                  toolName: trace.name,
+                  toolArgs: { ...trace.args, target: did, on: true },
+                  property: powerProp.name,
+                  expectedValue: true,
+                  expected: "开启",
+                  actual: "关闭",
+                  summary: `${name}状态检查未生效：灯具电源仍为关闭（预期开启）`,
+                });
+              }
             }
-          }
-        }
 
-        if (!expectOff && typeof d.colorTemperature === "number" && controls.temperature) {
-          const actualK = vals[controls.temperature.name];
-          if (typeof actualK === "number" && Number.isFinite(actualK)) {
-            if (Math.abs(actualK - d.colorTemperature) > 80) {
-              lightIssues += 1;
-              issues.push({
-                code: "property_mismatch",
-                solvable: true,
-                did,
-                deviceName: name,
-                toolName: trace.name,
-                toolArgs: { ...trace.args, target: did, color_temperature: d.colorTemperature },
-                property: controls.temperature.name,
-                expectedValue: d.colorTemperature,
-                expected: `${d.colorTemperature}K`,
-                actual: `${actualK}K`,
-                summary: `${name}色温状态检查未生效：当前为 ${actualK}K（目标 ${d.colorTemperature}K）`,
-              });
+            if (!expectOff && typeof d.brightness === "number" && controls.brightness) {
+              const actualRaw = vals[controls.brightness.name];
+              if (typeof actualRaw === "number" && Number.isFinite(actualRaw)) {
+                const expectedRaw = scaleExpectedBrightness(controls.brightness, d.brightness);
+                const high =
+                  controls.brightness.range && controls.brightness.range.length >= 2
+                    ? controls.brightness.range[1]
+                    : 100;
+                const tol = Math.max(2, Math.ceil(high * 0.02));
+                if (Math.abs(actualRaw - expectedRaw) > tol) {
+                  const actualPct = formatBrightnessPct(controls.brightness, actualRaw);
+                  roundIssues.push({
+                    code: "property_mismatch",
+                    solvable: true,
+                    did,
+                    deviceName: name,
+                    toolName: trace.name,
+                    toolArgs: { ...trace.args, target: did, brightness: d.brightness },
+                    property: controls.brightness.name,
+                    expectedValue: expectedRaw,
+                    expected: `${d.brightness}%`,
+                    actual: `${actualPct}%`,
+                    summary: `${name}亮度状态检查未生效：当前为 ${actualPct}%（目标 ${d.brightness}%）`,
+                  });
+                }
+              }
             }
-          }
-        }
 
-        if (!expectOff && typeof d.color === "string" && controls.color) {
-          const expectedRgb = parseColorToRgbInt(d.color);
-          const actualRgb = vals[controls.color.name];
-          if (expectedRgb !== null && typeof actualRgb === "number" && actualRgb !== expectedRgb) {
-            lightIssues += 1;
-            issues.push({
-              code: "property_mismatch",
-              solvable: true,
-              did,
-              deviceName: name,
-              toolName: trace.name,
-              toolArgs: { ...trace.args, target: did, color: d.color },
-              property: controls.color.name,
-              expectedValue: expectedRgb,
-              expected: d.color,
-              actual: `#${actualRgb.toString(16).padStart(6, "0")}`,
-              summary: `${name}颜色状态检查未生效（目标 ${d.color}）`,
-            });
-          }
-        }
+            if (!expectOff && typeof d.colorTemperature === "number" && controls.temperature) {
+              const actualK = vals[controls.temperature.name];
+              if (typeof actualK === "number" && Number.isFinite(actualK)) {
+                if (Math.abs(actualK - d.colorTemperature) > 80) {
+                  roundIssues.push({
+                    code: "property_mismatch",
+                    solvable: true,
+                    did,
+                    deviceName: name,
+                    toolName: trace.name,
+                    toolArgs: { ...trace.args, target: did, color_temperature: d.colorTemperature },
+                    property: controls.temperature.name,
+                    expectedValue: d.colorTemperature,
+                    expected: `${d.colorTemperature}K`,
+                    actual: `${actualK}K`,
+                    summary: `${name}色温状态检查未生效：当前为 ${actualK}K（目标 ${d.colorTemperature}K）`,
+                  });
+                }
+              }
+            }
 
-        if (lightIssues === 0) {
-          checks.push({
-            did,
-            deviceName: name,
-            toolName: trace.name,
-            passed: true,
-            summary: `${name}灯光状态核验通过`,
-          });
+            if (!expectOff && typeof d.color === "string" && controls.color) {
+              const expectedRgb = parseColorToRgbInt(d.color);
+              const actualRgb = vals[controls.color.name];
+              if (expectedRgb !== null && typeof actualRgb === "number" && actualRgb !== expectedRgb) {
+                roundIssues.push({
+                  code: "property_mismatch",
+                  solvable: true,
+                  did,
+                  deviceName: name,
+                  toolName: trace.name,
+                  toolArgs: { ...trace.args, target: did, color: d.color },
+                  property: controls.color.name,
+                  expectedValue: expectedRgb,
+                  expected: d.color,
+                  actual: `#${actualRgb.toString(16).padStart(6, "0")}`,
+                  summary: `${name}颜色状态检查未生效（目标 ${d.color}）`,
+                });
+              }
+            }
+
+            return {
+              passed: roundIssues.length === 0,
+              value: { observedPower, issues: roundIssues },
+            };
+          } catch (err) {
+            const rawErr = err instanceof Error ? err.message : String(err);
+            const toolArgs = { ...trace.args, target: did };
+            const fatal = isReadbackErrorFatal(trace.name, toolArgs, rawErr, did, name);
+            return {
+              passed: false,
+              fatal,
+              value: {
+                observedPower: null as boolean | null,
+                issues: [
+                  {
+                    code: "readback_error",
+                    solvable: !fatal,
+                    did,
+                    deviceName: name,
+                    toolName: trace.name,
+                    toolArgs,
+                    summary: `${name}状态回读失败（${rawErr}）`,
+                    rawError: rawErr,
+                  },
+                ] as VerificationIssue[],
+              },
+            };
+          }
+        },
+        settleDelays,
+        sleepFn,
+        signal,
+      );
+
+      if (typeof lightSettled.result.value.observedPower === "boolean") {
+        if (deps.mainWindow.knownPower[did] !== lightSettled.result.value.observedPower) {
+          deps.mainWindow.applyPowerState(did, lightSettled.result.value.observedPower);
+          stateMutated = true;
         }
-      } catch (err) {
-        issues.push({
-          code: "readback_error",
-          solvable: true,
+      }
+      if (lightSettled.result.passed) {
+        checks.push({
           did,
           deviceName: name,
           toolName: trace.name,
-          toolArgs: { ...trace.args, target: did },
-          summary: `${name}状态回读失败（${err instanceof Error ? err.message : String(err)}）`,
-          rawError: err instanceof Error ? err.message : String(err),
+          passed: true,
+          summary: lightSettled.settledAfterDelay
+            ? `${name}灯光状态核验通过（延迟同步确认）`
+            : `${name}灯光状态核验通过`,
         });
+      } else {
+        for (const iss of lightSettled.result.value.issues) {
+          issues.push(iss);
+        }
       }
       continue;
     }
@@ -740,154 +1007,193 @@ export async function verifyExecutedToolCalls(
         ...(Object.keys(expectedPropsSpec).length > 0 ? { expectedProps: expectedPropsSpec } : {}),
       });
 
-      try {
-        const detail = await runJob(deps.jobs, () => deps.service.deviceDetail(did), 2);
-        const { volumeProp, speakerMuteProp, micMuteProp, playingStateProp } = findSpeakerProps(
-          detail.props,
-        );
-        const toRead = [
-          typeof d.volume === "number" && volumeProp ? volumeProp.name : null,
-          (typeof d.mute === "boolean" || trace.args.power === "on" || trace.args.power === "off") &&
-          speakerMuteProp
-            ? speakerMuteProp.name
-            : null,
-          typeof d.micMute === "boolean" && micMuteProp ? micMuteProp.name : null,
-          (d.playback === "stop" || d.playback === "pause" || d.playback === "play" || trace.args.power === "off") &&
-          playingStateProp
-            ? playingStateProp.name
-            : null,
-        ].filter((n): n is string => Boolean(n));
+      const needsPlaybackCheck =
+        d.playback === "stop" ||
+        d.playback === "pause" ||
+        d.playback === "play" ||
+        trace.args.power === "off";
+      const executedAction =
+        typeof d.executedPlaybackAction === "string" ? d.executedPlaybackAction : undefined;
+      let cachedDetail: Awaited<ReturnType<typeof deps.service.deviceDetail>> | null = null;
+      const pollDelays = needsPlaybackCheck ? speakerPlaybackDelays : settleDelays;
 
-        const vals =
-          toRead.length > 0
-            ? await runJob(deps.jobs, () => deps.service.readProps(did, toRead), 2)
-            : {};
+      const spkSettled = await runWithSettleConfirmation(
+        async () => {
+          try {
+            const detail =
+              cachedDetail ?? (await runJob(deps.jobs, () => deps.service.deviceDetail(did), 2));
+            cachedDetail = detail;
+            const { volumeProp, speakerMuteProp, micMuteProp, playingStateProp } = findSpeakerProps(
+              detail.props,
+            );
+            const toRead = [
+              typeof d.volume === "number" && volumeProp ? volumeProp.name : null,
+              (typeof d.mute === "boolean" || trace.args.power === "on" || trace.args.power === "off") &&
+              speakerMuteProp
+                ? speakerMuteProp.name
+                : null,
+              typeof d.micMute === "boolean" && micMuteProp ? micMuteProp.name : null,
+              needsPlaybackCheck && playingStateProp ? playingStateProp.name : null,
+            ].filter((n): n is string => Boolean(n));
 
-        let spkIssues = 0;
+            const vals =
+              toRead.length > 0
+                ? await runJob(deps.jobs, () => deps.service.readProps(did, toRead), 2)
+                : {};
 
-        if (typeof d.volume === "number" && volumeProp) {
-          const actualVol = vals[volumeProp.name];
-          if (typeof actualVol === "number" && Math.abs(actualVol - d.volume) > 2) {
-            spkIssues += 1;
-            issues.push({
-              code: "property_mismatch",
-              solvable: true,
-              did,
-              deviceName: name,
-              toolName: trace.name,
-              toolArgs: { ...trace.args, target: did, volume: d.volume },
-              property: volumeProp.name,
-              expectedValue: d.volume,
-              expected: `音量 ${d.volume}%`,
-              actual: `音量 ${actualVol}%`,
-              summary: `${name}音量状态检查未生效：当前为 ${actualVol}%（目标 ${d.volume}%）`,
-            });
+            const roundIssues: VerificationIssue[] = [];
+
+            if (typeof d.volume === "number" && volumeProp) {
+              const actualVol = vals[volumeProp.name];
+              if (typeof actualVol === "number" && Math.abs(actualVol - d.volume) > 2) {
+                roundIssues.push({
+                  code: "property_mismatch",
+                  solvable: true,
+                  did,
+                  deviceName: name,
+                  toolName: trace.name,
+                  toolArgs: { ...trace.args, target: did, volume: d.volume },
+                  property: volumeProp.name,
+                  expectedValue: d.volume,
+                  expected: `音量 ${d.volume}%`,
+                  actual: `音量 ${actualVol}%`,
+                  summary: `${name}音量状态检查未生效：当前为 ${actualVol}%（目标 ${d.volume}%）`,
+                });
+              }
+            }
+
+            const expectedMute =
+              typeof d.mute === "boolean"
+                ? d.mute
+                : trace.args.power === "off"
+                  ? true
+                  : trace.args.power === "on"
+                    ? false
+                    : undefined;
+            if (expectedMute !== undefined && speakerMuteProp) {
+              const actualMute = vals[speakerMuteProp.name];
+              if (typeof actualMute === "boolean" && actualMute !== expectedMute) {
+                roundIssues.push({
+                  code: "property_mismatch",
+                  solvable: true,
+                  did,
+                  deviceName: name,
+                  toolName: trace.name,
+                  toolArgs: { ...trace.args, target: did, mute: expectedMute },
+                  property: speakerMuteProp.name,
+                  expectedValue: expectedMute,
+                  expected: expectedMute ? "静音" : "取消静音",
+                  actual: actualMute ? "静音" : "未静音",
+                  summary: `${name}静音状态检查未生效：当前仍为${actualMute ? "静音" : "未静音"}（预期${expectedMute ? "静音" : "取消静音"}）`,
+                });
+              }
+            }
+
+            if (typeof d.micMute === "boolean" && micMuteProp) {
+              const actualMicMute = vals[micMuteProp.name];
+              if (typeof actualMicMute === "boolean" && actualMicMute !== d.micMute) {
+                roundIssues.push({
+                  code: "property_mismatch",
+                  solvable: true,
+                  did,
+                  deviceName: name,
+                  toolName: trace.name,
+                  toolArgs: { ...trace.args, target: did, mic_mute: d.micMute },
+                  property: micMuteProp.name,
+                  expectedValue: d.micMute,
+                  expected: d.micMute ? "麦克风静音" : "麦克风开启",
+                  actual: actualMicMute ? "麦克风静音" : "麦克风开启",
+                  summary: `${name}麦克风状态检查未生效`,
+                });
+              }
+            }
+
+            if (playingStateProp && typeof vals[playingStateProp.name] === "number") {
+              const ps = vals[playingStateProp.name] as number;
+              const playingVal = resolveSpeakerPlayingValue(playingStateProp);
+              if (
+                (d.playback === "stop" || d.playback === "pause" || trace.args.power === "off") &&
+                ps === playingVal
+              ) {
+                roundIssues.push({
+                  code: "playback_mismatch",
+                  solvable: true,
+                  did,
+                  deviceName: name,
+                  toolName: trace.name,
+                  toolArgs: { ...trace.args, target: did, playback: d.playback ?? "pause" },
+                  property: playingStateProp.name,
+                  expectedValue: 2,
+                  expected: "已暂停/停止播放",
+                  actual: "仍在播放",
+                  ...(executedAction ? { executedAction } : {}),
+                  summary: `${name}播放状态检查未生效：音箱仍在播放中`,
+                });
+              } else if (d.playback === "play" && ps !== playingVal) {
+                roundIssues.push({
+                  code: "playback_mismatch",
+                  solvable: true,
+                  did,
+                  deviceName: name,
+                  toolName: trace.name,
+                  toolArgs: { ...trace.args, target: did, playback: "play" },
+                  property: playingStateProp.name,
+                  expectedValue: playingVal,
+                  expected: "正在播放",
+                  actual: "未在播放",
+                  ...(executedAction ? { executedAction } : {}),
+                  summary: `${name}播放状态检查未生效：音箱尚未恢复播放`,
+                });
+              }
+            }
+
+            return {
+              passed: roundIssues.length === 0,
+              value: { issues: roundIssues },
+            };
+          } catch (err) {
+            const rawErr = err instanceof Error ? err.message : String(err);
+            const toolArgs = { ...trace.args, target: did };
+            const fatal = isReadbackErrorFatal(trace.name, toolArgs, rawErr, did, name);
+            return {
+              passed: false,
+              fatal,
+              value: {
+                issues: [
+                  {
+                    code: "readback_error",
+                    solvable: !fatal,
+                    did,
+                    deviceName: name,
+                    toolName: trace.name,
+                    toolArgs,
+                    summary: `${name}状态回读失败（${rawErr}）`,
+                    rawError: rawErr,
+                  },
+                ] as VerificationIssue[],
+              },
+            };
           }
-        }
+        },
+        pollDelays,
+        sleepFn,
+        signal,
+      );
 
-        const expectedMute =
-          typeof d.mute === "boolean"
-            ? d.mute
-            : trace.args.power === "off"
-              ? true
-              : trace.args.power === "on"
-                ? false
-                : undefined;
-        if (expectedMute !== undefined && speakerMuteProp) {
-          const actualMute = vals[speakerMuteProp.name];
-          if (typeof actualMute === "boolean" && actualMute !== expectedMute) {
-            spkIssues += 1;
-            issues.push({
-              code: "property_mismatch",
-              solvable: true,
-              did,
-              deviceName: name,
-              toolName: trace.name,
-              toolArgs: { ...trace.args, target: did, mute: expectedMute },
-              property: speakerMuteProp.name,
-              expectedValue: expectedMute,
-              expected: expectedMute ? "静音" : "取消静音",
-              actual: actualMute ? "静音" : "未静音",
-              summary: `${name}静音状态检查未生效：当前仍为${actualMute ? "静音" : "未静音"}（预期${expectedMute ? "静音" : "取消静音"}）`,
-            });
-          }
-        }
-
-        if (typeof d.micMute === "boolean" && micMuteProp) {
-          const actualMicMute = vals[micMuteProp.name];
-          if (typeof actualMicMute === "boolean" && actualMicMute !== d.micMute) {
-            spkIssues += 1;
-            issues.push({
-              code: "property_mismatch",
-              solvable: true,
-              did,
-              deviceName: name,
-              toolName: trace.name,
-              toolArgs: { ...trace.args, target: did, mic_mute: d.micMute },
-              property: micMuteProp.name,
-              expectedValue: d.micMute,
-              expected: d.micMute ? "麦克风静音" : "麦克风开启",
-              actual: actualMicMute ? "麦克风静音" : "麦克风开启",
-              summary: `${name}麦克风状态检查未生效`,
-            });
-          }
-        }
-
-        if (playingStateProp && typeof vals[playingStateProp.name] === "number") {
-          const ps = vals[playingStateProp.name] as number;
-          if ((d.playback === "stop" || d.playback === "pause" || trace.args.power === "off") && ps === 1) {
-            spkIssues += 1;
-            issues.push({
-              code: "playback_mismatch",
-              solvable: true,
-              did,
-              deviceName: name,
-              toolName: trace.name,
-              toolArgs: { ...trace.args, target: did, playback: d.playback ?? "pause" },
-              property: playingStateProp.name,
-              expectedValue: 2,
-              expected: "已暂停/停止播放",
-              actual: "仍在播放",
-              summary: `${name}播放状态检查未生效：音箱仍在播放中`,
-            });
-          } else if (d.playback === "play" && ps !== 1) {
-            spkIssues += 1;
-            issues.push({
-              code: "playback_mismatch",
-              solvable: true,
-              did,
-              deviceName: name,
-              toolName: trace.name,
-              toolArgs: { ...trace.args, target: did, playback: "play" },
-              property: playingStateProp.name,
-              expectedValue: 1,
-              expected: "正在播放",
-              actual: "未在播放",
-              summary: `${name}播放状态检查未生效：音箱尚未恢复播放`,
-            });
-          }
-        }
-
-        if (spkIssues === 0) {
-          checks.push({
-            did,
-            deviceName: name,
-            toolName: trace.name,
-            passed: true,
-            summary: `${name}音箱状态核验通过`,
-          });
-        }
-      } catch (err) {
-        issues.push({
-          code: "readback_error",
-          solvable: true,
+      if (spkSettled.result.passed) {
+        checks.push({
           did,
           deviceName: name,
           toolName: trace.name,
-          toolArgs: { ...trace.args, target: did },
-          summary: `${name}状态回读失败（${err instanceof Error ? err.message : String(err)}）`,
-          rawError: err instanceof Error ? err.message : String(err),
+          passed: true,
+          summary: spkSettled.settledAfterDelay
+            ? `${name}音箱状态核验通过（延迟同步确认）`
+            : `${name}音箱状态核验通过`,
         });
+      } else {
+        for (const iss of spkSettled.result.value.issues) {
+          issues.push(iss);
+        }
       }
       continue;
     }
@@ -916,54 +1222,103 @@ export async function verifyExecutedToolCalls(
         expectedProps: { [propName]: expectedVal },
       });
 
-      try {
-        const detail = await runJob(deps.jobs, () => deps.service.deviceDetail(did), 2);
-        const propInfo = detail.props.find((p) => p.name === propName) ?? null;
-        if (propInfo?.readable) {
-          const actualVal = await runJob(deps.jobs, () => deps.service.readProp(did, propName), 2);
-          if (actualVal !== null && actualVal !== undefined && !valuesMatch(expectedVal, actualVal, propInfo)) {
-            issues.push({
-              code: "property_mismatch",
-              solvable: true,
-              did,
-              deviceName: name,
-              toolName: trace.name,
-              toolArgs: { target: did, property: propName, value: expectedVal },
-              property: propName,
-              expectedValue: expectedVal,
-              expected: String(expectedVal),
-              actual: String(actualVal),
-              summary: `${name}属性「${propLabel}」状态检查未生效：当前为 ${String(actualVal)}（目标 ${String(expectedVal)}）`,
-            });
-          } else {
-            checks.push({
-              did,
-              deviceName: name,
-              toolName: trace.name,
+      let cachedDetail: Awaited<ReturnType<typeof deps.service.deviceDetail>> | null = null;
+      const propSettled = await runWithSettleConfirmation<{
+        check: VerificationCheckItem | null;
+        issue: VerificationIssue | null;
+      }>(
+        async () => {
+          try {
+            const detail =
+              cachedDetail ?? (await runJob(deps.jobs, () => deps.service.deviceDetail(did), 2));
+            cachedDetail = detail;
+            const propInfo = detail.props.find((p) => p.name === propName) ?? null;
+            if (!propInfo?.readable) {
+              return {
+                passed: true,
+                value: {
+                  check: {
+                    did,
+                    deviceName: name,
+                    toolName: trace.name,
+                    passed: true,
+                    summary: `${name}属性「${propLabel}」已写入`,
+                  } as VerificationCheckItem,
+                  issue: null as VerificationIssue | null,
+                },
+              };
+            }
+            const actualVal = await runJob(deps.jobs, () => deps.service.readProp(did, propName), 2);
+            if (actualVal !== null && actualVal !== undefined && !valuesMatch(expectedVal, actualVal, propInfo)) {
+              return {
+                passed: false,
+                value: {
+                  check: null as VerificationCheckItem | null,
+                  issue: {
+                    code: "property_mismatch",
+                    solvable: true,
+                    did,
+                    deviceName: name,
+                    toolName: trace.name,
+                    toolArgs: { target: did, property: propName, value: expectedVal },
+                    property: propName,
+                    expectedValue: expectedVal,
+                    expected: String(expectedVal),
+                    actual: String(actualVal),
+                    summary: `${name}属性「${propLabel}」状态检查未生效：当前为 ${String(actualVal)}（目标 ${String(expectedVal)}）`,
+                  } as VerificationIssue,
+                },
+              };
+            }
+            return {
               passed: true,
-              summary: `${name}属性「${propLabel}」状态核验通过`,
-            });
+              value: {
+                check: {
+                  did,
+                  deviceName: name,
+                  toolName: trace.name,
+                  passed: true,
+                  summary: `${name}属性「${propLabel}」状态核验通过`,
+                } as VerificationCheckItem,
+                issue: null as VerificationIssue | null,
+              },
+            };
+          } catch (err) {
+            const rawErr = err instanceof Error ? err.message : String(err);
+            const toolArgs = { target: did, property: propName, value: expectedVal };
+            const fatal = isReadbackErrorFatal(trace.name, toolArgs, rawErr, did, name);
+            return {
+              passed: false,
+              fatal,
+              value: {
+                check: null as VerificationCheckItem | null,
+                issue: {
+                  code: "readback_error",
+                  solvable: !fatal,
+                  did,
+                  deviceName: name,
+                  toolName: trace.name,
+                  toolArgs,
+                  summary: `${name}属性「${propLabel}」状态回读失败（${rawErr}）`,
+                  rawError: rawErr,
+                } as VerificationIssue,
+              },
+            };
           }
-        } else {
-          checks.push({
-            did,
-            deviceName: name,
-            toolName: trace.name,
-            passed: true,
-            summary: `${name}属性「${propLabel}」已写入`,
-          });
-        }
-      } catch (err) {
-        issues.push({
-          code: "readback_error",
-          solvable: true,
-          did,
-          deviceName: name,
-          toolName: trace.name,
-          toolArgs: { target: did, property: propName, value: expectedVal },
-          summary: `${name}属性「${propLabel}」状态回读失败（${err instanceof Error ? err.message : String(err)}）`,
-          rawError: err instanceof Error ? err.message : String(err),
-        });
+        },
+        settleDelays,
+        sleepFn,
+        signal,
+      );
+
+      if (propSettled.result.value.check) {
+        const c = propSettled.result.value.check;
+        checks.push(
+          propSettled.settledAfterDelay ? { ...c, summary: `${c.summary}（延迟同步确认）` } : c,
+        );
+      }
+      if (propSettled.result.value.issue) {
+        issues.push(propSettled.result.value.issue);
       }
       continue;
     }
@@ -986,6 +1341,103 @@ export async function verifyExecutedToolCalls(
         toolName: trace.name,
         note: trace.text.slice(0, 120),
       });
+
+      // 当通过 send_xiaoai_command 兜底执行停止/暂停播放指令时，同样用延迟确认回读 playing-state 核验停播生效
+      const directiveText =
+        trace.name === "send_xiaoai_command"
+          ? typeof d.text === "string"
+            ? d.text
+            : typeof trace.args.text === "string"
+              ? trace.args.text
+              : ""
+          : "";
+      const stopDirectiveKind = directiveText ? isStopOrPauseXiaoAiDirective(directiveText) : null;
+      const dev = did ? deviceByDid.get(did) : undefined;
+      if (trace.name === "send_xiaoai_command" && did && dev && isSpeaker(dev) && stopDirectiveKind) {
+        let cachedDetail: Awaited<ReturnType<typeof deps.service.deviceDetail>> | null = null;
+        const xiaoAiSettled = await runWithSettleConfirmation(
+          async () => {
+            try {
+              const detail =
+                cachedDetail ?? (await runJob(deps.jobs, () => deps.service.deviceDetail(did), 2));
+              cachedDetail = detail;
+              const { playingStateProp } = findSpeakerProps(detail.props);
+              if (!playingStateProp) {
+                return { passed: true, value: { issue: null as VerificationIssue | null } };
+              }
+              const vals = await runJob(
+                deps.jobs,
+                () => deps.service.readProps(did, [playingStateProp.name]),
+                2,
+              );
+              const rawPs = vals[playingStateProp.name];
+              if (typeof rawPs === "number") {
+                const playingVal = resolveSpeakerPlayingValue(playingStateProp);
+                if (rawPs === playingVal) {
+                  return {
+                    passed: false,
+                    value: {
+                      issue: {
+                        code: "playback_mismatch",
+                        solvable: true,
+                        did,
+                        deviceName: name,
+                        toolName: trace.name,
+                        toolArgs: { ...trace.args, speaker: did },
+                        property: playingStateProp.name,
+                        expectedValue: 2,
+                        expected: "已暂停/停止播放",
+                        actual: "仍在播放",
+                        executedAction: "execute-text-directive",
+                        summary: `${name}播放状态检查未生效：音箱仍在播放中`,
+                      } as VerificationIssue,
+                    },
+                  };
+                }
+              }
+              return { passed: true, value: { issue: null as VerificationIssue | null } };
+            } catch (err) {
+              const rawErr = err instanceof Error ? err.message : String(err);
+              const toolArgs = { ...trace.args, speaker: did };
+              const fatal = isReadbackErrorFatal(trace.name, toolArgs, rawErr, did, name);
+              return {
+                passed: false,
+                fatal,
+                value: {
+                  issue: {
+                    code: "readback_error",
+                    solvable: !fatal,
+                    did,
+                    deviceName: name,
+                    toolName: trace.name,
+                    toolArgs,
+                    summary: `${name}状态回读失败（${rawErr}）`,
+                    rawError: rawErr,
+                  } as VerificationIssue,
+                },
+              };
+            }
+          },
+          speakerPlaybackDelays,
+          sleepFn,
+          signal,
+        );
+        if (xiaoAiSettled.result.passed) {
+          checks.push({
+            did,
+            deviceName: name,
+            toolName: trace.name,
+            passed: true,
+            summary: xiaoAiSettled.settledAfterDelay
+              ? `${name}停播指令状态核验通过（延迟同步确认）`
+              : `${name}停播指令状态核验通过`,
+          });
+        } else if (xiaoAiSettled.result.value.issue) {
+          issues.push(xiaoAiSettled.result.value.issue);
+        }
+        continue;
+      }
+
       checks.push({
         ...(did ? { did } : {}),
         deviceName: name,
@@ -1224,7 +1676,10 @@ export async function analyzeAndPlanRecovery(
     // 3. 音箱播放状态未停止/未恢复
     if (issue.code === "playback_mismatch") {
       const targetRef = issue.did || (typeof issue.toolArgs.target === "string" ? issue.toolArgs.target : devLabel);
-      const wantPlay = issue.expectedValue === 1;
+      const wantPlay =
+        issue.expected === "正在播放" ||
+        issue.toolArgs.playback === "play" ||
+        (!issue.expected && issue.expectedValue === 1);
       if (wantPlay) {
         steps.push({
           toolName: "control_speaker",
@@ -1232,27 +1687,97 @@ export async function analyzeAndPlanRecovery(
           note: "取消静音并恢复音箱播放",
         });
         planParts.push(`为${devLabel}取消静音并重新触发继续播放`);
-      } else if (attempt === 1) {
-        steps.push({
-          toolName: "control_speaker",
-          args: { target: targetRef, playback: "pause" },
-          note: "切换 pause 动作停止音箱播放",
-        });
-        planParts.push(`改用暂停指令停止${devLabel}播放`);
-      } else if (attempt === 2) {
-        steps.push({
-          toolName: "control_speaker",
-          args: { target: targetRef, playback: "pause", mute: true },
-          note: "暂停播放并同时静音兜底",
-        });
-        planParts.push(`对${devLabel}同时执行暂停并开启静音兜底`);
       } else {
-        steps.push({
-          toolName: "send_xiaoai_command",
-          args: { speaker: targetRef, text: "停止播放" },
-          note: "通过小爱文本指令兜底停止播放",
-        });
-        planParts.push(`改用小爱文本指令要求${devLabel}停止播放`);
+        let hasTextDirective = false;
+        if (issue.did) {
+          try {
+            const detail = await runJob(deps.jobs, () => deps.service.deviceDetail(issue.did!), 2);
+            hasTextDirective = detail.actions.some((a) => a.name === "execute-text-directive");
+          } catch {
+            hasTextDirective = false;
+          }
+        }
+        const alreadyUsedPause =
+          issue.toolArgs.playback === "pause" ||
+          issue.executedAction?.replace(/-\d+$/, "") === "pause";
+        const alreadyUsedTextDirective =
+          issue.toolName === "send_xiaoai_command" ||
+          issue.executedAction === "execute-text-directive";
+        const stopDirectiveText = issue.toolArgs.playback === "pause" ? "暂停播放" : "停止播放";
+
+        if (alreadyUsedTextDirective) {
+          if (attempt <= 2) {
+            steps.push({
+              toolName: "control_speaker",
+              args: { target: targetRef, playback: "pause" },
+              note: "改用暂停动作停止音箱播放",
+            });
+            planParts.push(`改用暂停动作停止${devLabel}播放`);
+          } else {
+            steps.push({
+              toolName: "control_speaker",
+              args: { target: targetRef, playback: "pause", mute: true },
+              note: "暂停播放并同时静音兜底",
+            });
+            planParts.push(`对${devLabel}同时执行暂停并开启静音兜底`);
+          }
+        } else if (alreadyUsedPause) {
+          if (attempt === 1 && hasTextDirective) {
+            steps.push({
+              toolName: "send_xiaoai_command",
+              args: { speaker: targetRef, text: stopDirectiveText, silent: true },
+              note: "通过静默小爱文本指令兜底停止播放",
+            });
+            planParts.push(`改用静默小爱文本指令要求${devLabel}${stopDirectiveText}`);
+          } else if (attempt <= 2) {
+            steps.push({
+              toolName: "control_speaker",
+              args: { target: targetRef, playback: "pause", mute: true },
+              note: "暂停播放并同时静音兜底",
+            });
+            planParts.push(`对${devLabel}同时执行暂停并开启静音兜底`);
+          } else if (hasTextDirective) {
+            steps.push({
+              toolName: "send_xiaoai_command",
+              args: { speaker: targetRef, text: "停止播放", silent: true },
+              note: "通过静默小爱文本指令再次兜底停止播放",
+            });
+            steps.push({
+              toolName: "control_speaker",
+              args: { target: targetRef, mute: true },
+              note: "同时保持扬声器静音兜底",
+            });
+            planParts.push(`通过静默小爱文本指令要求${devLabel}停止播放并静音兜底`);
+          } else {
+            steps.push({
+              toolName: "control_speaker",
+              args: { target: targetRef, playback: "pause", mute: true },
+              note: "暂停播放并同时静音兜底",
+            });
+            planParts.push(`对${devLabel}同时执行暂停并开启静音兜底`);
+          }
+        } else if (attempt === 1) {
+          steps.push({
+            toolName: "control_speaker",
+            args: { target: targetRef, playback: "pause" },
+            note: "切换 pause 动作停止音箱播放",
+          });
+          planParts.push(`改用暂停指令停止${devLabel}播放`);
+        } else if (attempt === 2 && hasTextDirective) {
+          steps.push({
+            toolName: "send_xiaoai_command",
+            args: { speaker: targetRef, text: stopDirectiveText, silent: true },
+            note: "通过静默小爱文本指令兜底停止播放（不额外静音）",
+          });
+          planParts.push(`改用静默小爱文本指令要求${devLabel}${stopDirectiveText}`);
+        } else {
+          steps.push({
+            toolName: "control_speaker",
+            args: { target: targetRef, playback: "pause", mute: true },
+            note: "暂停播放并同时静音兜底",
+          });
+          planParts.push(`对${devLabel}同时执行暂停并开启静音兜底`);
+        }
       }
       continue;
     }

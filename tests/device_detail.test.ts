@@ -467,6 +467,11 @@ describe("DeviceDetail Spec & Model", () => {
         { did: "504337266", siid: 3, aiid: 3, in: [] },
       ]);
 
+      // Subsequent stop on the same l05b skips the failing s3a4 RPC and invokes pause (s3a3) directly
+      actionPayloads.length = 0;
+      await service.runAction("504337266", "stop");
+      expect(actionPayloads).toEqual([{ did: "504337266", siid: 3, aiid: 3, in: [] }]);
+
       // An unsupported action with no fallback produces a friendly Chinese MIoT error
       await expect(service.runAction("504337266", "stop-alarm")).rejects.toThrow(
         "当前设备固件不支持该功能或动作（错误码 -704220008）",

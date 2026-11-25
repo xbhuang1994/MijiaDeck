@@ -186,6 +186,7 @@ import {
   type RecoveryPlan,
   type TaskVerificationOutcome,
   type TaskVerificationSummary,
+  type VerifyExecutedToolCallsOptions,
 } from "./taskVerificationLoop.ts";
 
 export {
@@ -454,6 +455,11 @@ export interface PiAgentServiceOptions {
   systemOneFetcher?: FetchLike;
   /** 可选：注入时钟函数（用于确定性测试时间衰减与休眠重确认） */
   now?: () => number;
+  /** 可选：覆写状态核验的延迟确认轮询参数（用于确定性单元测试或自定义调优） */
+  verificationOptions?: Pick<
+    VerifyExecutedToolCallsOptions,
+    "settleDelaysMs" | "speakerPlaybackSettleDelaysMs" | "sleep"
+  >;
 }
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -910,6 +916,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   private readonly _customModel?: Model<Api>;
   private readonly _systemOneFetcher?: FetchLike;
   private readonly _now: () => number;
+  private readonly _verificationOptions?: PiAgentServiceOptions["verificationOptions"];
   private readonly _pendingConfirm: PendingConfirmationManager;
   private readonly _safetyRegistry: SafetyConfirmationRegistry;
   private _lastAutoExecutedMemory: { memoryId: string; taskId: string; executedAt: number } | null = null;
@@ -949,6 +956,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     this._currentModel = this._customModel ?? buildModelForConfig(this._config);
     this._systemOneFetcher = options.systemOneFetcher;
     this._now = options.now ?? (() => getReinforcementNow());
+    this._verificationOptions = options.verificationOptions;
     this._pendingConfirm = new PendingConfirmationManager({ now: this._now });
     this._safetyRegistry = new SafetyConfirmationRegistry(this._now);
     this._systemOne = SystemOneClient.fromConfig(this._config, this._systemOneFetcher);
@@ -1381,7 +1389,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       "3. 技能复用：优先借鉴下方「已沉淀技能（Skills）」避坑路径，但必先核对设备在线且按当前新数值与安全红线动态适配，绝不照搬旧值。",
       "4. 3 轮自愈协议（收到 `[状态校验未通过 · 第 X/3 轮自愈排错]` 严格二选一）：",
       "   - **不可解 → 立即止损**：离线、未登录、不存在/已屏蔽、硬件不支持（通断灯调光、红外音响绝对音量/点歌/播报、逆变器只读、水满/缺水/门未关、红外 2050）或**非幂等动作超时**（喂食器出粮/开水阀超时防重发）→ 不要调用任何变更工具，直接以 `[UNSOLVABLE]` 为首字符输出简短中文原因。",
-      "   - **可解 → 递进换路定点修复**：禁重复同一失败调用、禁调破坏性重启/重置偏方、禁重跑已成功或离线设备、自愈轮禁传 `toggle`。属性/枚举/按键错先 `get_device_detail` 并在**同轮内完成变更修复**；关机灯拒写先开灯再写属性；音箱未停播按 `pause` → `pause+mute` → `send_xiaoai_command(\"停止播放\")` 递进兜底。",
+      "   - **可解 → 递进换路定点修复**：禁重复同一失败调用、禁调破坏性重启/重置偏方、禁重跑已成功或离线设备、自愈轮禁传 `toggle`。属性/枚举/按键错先 `get_device_detail` 并在**同轮内完成变更修复**；关机灯拒写先开灯再写属性；音箱未停播按 `pause` → `send_xiaoai_command(\"停止播放\", silent=true)` → `pause+mute` 递进兜底。",
       "5. 长期附加指令规则管理：当用户通过语音或文字告知未来的默认偏好或条件规则（例如“以后记得洗衣默认用智洗烘模式”、“以后我说打开空调你要自己判断室外温度，根据室外温度自动选择对应正确的模式和温度”、“记住……”）时，必须调用 `save_custom_instruction` 持久化保存，且不要在仅保存规则时误执行设备操作（除非用户明确要求同时立即执行）；查询规则用 `list_custom_instructions`，删除规则用 `delete_custom_instruction`。下方已保存的多条附加指令规则若存在冲突，必须严格以最新保存（优先级最高）的规则为准，覆盖旧规则中与之冲突的部分（且不得覆写上方第四节安全防线）。",
       "",
       cavemanBlock,
@@ -3085,7 +3093,11 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
 
     ctx.phase = "verifying";
     this.emit("stateChanged", this.snapshot());
-    const verify = await verifyExecutedToolCalls(exec.traces, this._deps, { isCloudLlm: false });
+    const verify = await verifyExecutedToolCalls(exec.traces, this._deps, {
+      ...this._verificationOptions,
+      isCloudLlm: false,
+      signal,
+    });
     entry.verification = toVerificationSummary(verify, 0);
     this.emit("streamEvent", {
       kind: "verification_result",
@@ -3336,7 +3348,11 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     if (capMatch.intent.domain === "irrigation" && capMatch.intent.action === "stop_water" && !capMatch.ambiguousDevices) {
       const exec = await this._executeDirectToolSteps(this._bindingStepsToSkillSteps(provisionalBinding), ctx, signal);
       if (signal.aborted) return true;
-      const verify = await verifyExecutedToolCalls(exec.traces, this._deps, { isCloudLlm: false });
+      const verify = await verifyExecutedToolCalls(exec.traces, this._deps, {
+      ...this._verificationOptions,
+      isCloudLlm: false,
+      signal,
+    });
       entry.verification = toVerificationSummary(verify, 0);
       entry.text = verify.passed
         ? `已立即关闭「${firstEntry.name}」（安全降级操作免确认执行）。`
@@ -3393,7 +3409,11 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         if (signal.aborted) return true;
         ctx.phase = "verifying";
         this.emit("stateChanged", this.snapshot());
-        const verify = await verifyExecutedToolCalls(exec.traces, this._deps, { isCloudLlm: false });
+        const verify = await verifyExecutedToolCalls(exec.traces, this._deps, {
+      ...this._verificationOptions,
+      isCloudLlm: false,
+      signal,
+    });
         entry.verification = toVerificationSummary(verify, 0);
         this.emit("streamEvent", {
           kind: "verification_result",
@@ -3736,7 +3756,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           ctx.phase = "verifying";
           this.emit("stateChanged", this.snapshot());
           const skillVerify = await verifyExecutedToolCalls(skillExec.traces, this._deps, {
+            ...this._verificationOptions,
             isCloudLlm: false,
+            signal,
           });
           currentOutcome = skillVerify;
           assistantEntry.verification = toVerificationSummary(skillVerify, 0);
@@ -3828,7 +3850,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           ctx.phase = "verifying";
           this.emit("stateChanged", this.snapshot());
           currentOutcome = await verifyExecutedToolCalls(ctx.roundToolTraces, this._deps, {
+            ...this._verificationOptions,
             isCloudLlm: effectiveCloudLlm,
+            signal,
           });
           assistantEntry.verification = toVerificationSummary(currentOutcome, 0);
           this.emit("streamEvent", {
@@ -3885,7 +3909,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         }
       }
 
-      // Step 3B：检查有问题且思考后可尝试解决 -> 最多 3 轮「告知问题与做法 -> 尝试解决 -> 再次状态检查」
+      // Step 3B：检查有问题且思考后可尝试解决 -> 最多 3 轮静默自愈重试（记录排错卡片但不语音播报 -> 尝试解决 -> 再次状态检查）
       if (
         !handledBySkill &&
         currentOutcome &&
@@ -3924,7 +3948,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             break;
           }
 
-          // 每次重新尝试前，主动告诉用户出了什么问题、准备怎么做
+          // 静默自愈重试：仅在时间线与流事件中静默记录排错详情，绝不触发 TTS 语音播报
           const retryRecord: AgentRetryNotice = {
             attempt,
             maxAttempts: MAX_RECOVERY_ROUNDS,
@@ -3949,16 +3973,6 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             ...retryRecord,
           });
           this.emit("stateChanged", this.snapshot());
-          if (source === "voice" && this._config.autoSpeakReply) {
-            ctx.emittedSpeakChunks = true;
-            this.emit("speakChunk", {
-              entryId: assistantEntry.id,
-              taskId: ctx.taskId,
-              text: plan.noticeText,
-              final: false,
-              priority: "normal",
-            });
-          }
 
           // 执行本轮排错修复
           let attemptTraces: ExecutedToolTrace[];
@@ -3995,7 +4009,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
           // 修复完成后再次执行状态检查
           ctx.phase = "verifying";
           currentOutcome = await verifyExecutedToolCalls(attemptTraces, this._deps, {
+            ...this._verificationOptions,
             isCloudLlm: effectiveCloudLlm,
+            signal,
           });
           assistantEntry.verification = toVerificationSummary(currentOutcome, retriesUsed);
           this.emit("streamEvent", {
