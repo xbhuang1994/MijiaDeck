@@ -275,7 +275,7 @@ const DIRECT_COMMAND_START_RE =
 
 // 真实智能家居设备与控制领域语义词表（用于区分设备指令与 "你好，帮我递杯水" 等日常家务聊天）
 const SMART_HOME_DOMAIN_RE =
-  /(?:灯|吸顶灯|台灯|照明|空调|温度|湿度|空气|净化器|风扇|窗帘|窗户|电视|音响|音箱|音量|声音|静音|闭麦|开麦|音乐|歌|播放|暂停|继续|停止|下一首|上一首|切歌|换歌|换一首|亮度|调亮|调暗|亮一点|暗一点|大一点|小一点|高一点|低一点|暖一点|冷一点|色温|插座|开关|喂猫|喂狗|喂食|喂食器|出粮|场景|模式|观影|睡眠|回家|离家|全屋|客厅|卧室|书房|餐厅|厨房|阳台|主卧|次卧|玄关|卫生间|light|lamp|ac|air\s*conditioner|fan|curtain|tv|speaker|volume|music|pause|play|mute|bright|dim|temp|humidity)/i;
+  /(?:灯|吸顶灯|台灯|照明|空调|温度|湿度|空气|净化器|加湿器|除湿|扫地|摄像头|摄像机|监控|传感|设备|风扇|窗帘|窗户|电视|音响|音箱|小爱|音量|声音|静音|闭麦|开麦|音乐|歌|播放|暂停|继续|停止|下一首|上一首|切歌|换歌|换一首|亮度|调亮|调暗|亮一点|暗一点|大一点|小一点|高一点|低一点|暖一点|冷一点|色温|暖光|冷光|白光|黄光|红光|蓝光|绿光|插座|开关|喂猫|喂狗|喂食|喂食器|出粮|投喂|场景|模式|观影|睡眠|回家|离家|全屋|客厅|卧室|书房|餐厅|厨房|阳台|走廊|浴室|主卧|次卧|玄关|卫生间|light|lamp|ac|air\s*conditioner|fan|curtain|tv|speaker|volume|music|pause|play|mute|bright|dim|temp|humidity)/i;
 
 // 严防声学唤醒覆盖第三人称讨论或否定呼唤语境（含噪声下 SenseVoice 把 "别管Neo" 听成 "别管你用/别管你了"）
 const STRICT_THIRD_PERSON_NEO_RE =
@@ -542,12 +542,84 @@ export function trimTrailingMusicLyrics(command: string): string {
 const CLEAR_FOLLOWUP_RE =
   /^(?:再|稍微|稍微再|还是|那就|帮我再|把它|把音量|把亮度|把色温|调大|调小|大一点|小一点|高一点|低一点|亮一点|暗一点|暖一点|冷一点|关了吧|关掉|打开|暂停|继续|停止|停一下|停掉|结束播放|(?:别|不要)(?:再)?(?:放|播)|静音|取消静音|下一首|上一首|换一首|再来一份|出粮)/i;
 
-// 仅当整句（去除标点空白后）完全匹配时才触发零延迟退出连续对话，绝不误伤“好了，再把台灯关了”
-export const EXPLICIT_EXIT_RE =
-  /^(?:好的?谢谢|谢谢|算了|取消|不用了|没事了|退下|休息吧|再见|拜拜|退出对话|结束对话|先这样(?:吧)?|可以了|好了|行了|闭嘴|安静)$/i;
+// 仅当整句（去除标点空白后）完全由结束/告别短语构成时才触发零延迟退出连续对话，绝不误伤“好了，再把台灯关了”
+const SINGLE_EXIT_PHRASE_SRC =
+  "(?:好的?谢谢(?:你|啦|了)?|谢谢(?:你|啦|了)?|算了|取消|不用了?|没事了?|退下(?:吧)?|休息吧|再见|拜拜|退出对话|结束对话|先这样(?:吧)?|可以了|好了|行了|闭嘴|安静)";
+export const EXPLICIT_EXIT_RE = new RegExp(`^(?:${SINGLE_EXIT_PHRASE_SRC}){1,3}$`, "i");
 
 function normalizeForExit(text: string): string {
   return text.replace(/[\s,，。．.、!！?？:：;；\-—~～"'“”‘’]+/g, "").trim();
+}
+
+export function isExplicitExitPhrase(text: string): boolean {
+  const norm = normalizeForExit(text);
+  return norm.length > 0 && EXPLICIT_EXIT_RE.test(norm);
+}
+
+// 连续对话中可独立成立的简短设备/播放/喂食控制指令（无需再提设备名）
+const STANDALONE_CONVERSATION_CMD_RE =
+  /^(?:(?:请|帮我|给我|麻烦|再|稍微|稍微再|还是|那就|帮我再|把它|把(?:它|这个|那个)?|先|快|赶紧|顺便)?(?:打开|开启|开一下|关掉|关闭|关上|关了吧|关一下|停一下|停掉|停止|暂停|继续|结束播放|(?:别|不要)(?:再)?(?:放|播)(?:了|歌|音乐)?|静音|取消静音|解除静音|恢复声音|闭麦|开麦|下一首|上一首|下一曲|上一曲|换一首|换首歌|切歌|换歌|再来一份|出粮|投喂|调大|调小|调亮|调暗|调高|调低|大一点|小一点|亮一点|暗一点|高一点|低一点|暖一点|冷一点|开灯|关灯|熄灯|灭灯|亮灯|全开|全关))(?:吧|呀|啊|哦|呢|一下|一点|一些|了)?$/i;
+
+// 连续对话中明确面向智能家居设备的控制/查询动作词（防止“非常累的时候就会站在阳台凑出”等纯描述/电视旁白被误放行）
+const CONVERSATION_ACTION_OR_QUERY_RE =
+  /(?:打开|开启|开灯|关灯|熄灯|灭灯|亮灯|开机|关机|开空调|关空调|开风扇|关风扇|开窗|关窗|开电视|关电视|开音箱|关音箱|开音响|关音响|开插座|关插座|开开关|关开关|全开|全关|关掉|关闭|关上|开一下|关一下|调|设置|设定|设为|改成|换成|切换|播放|放一首|点一首|放首|来一首|来首|想听|听一首|放歌|放音乐|播音乐|听歌|切歌|换歌|换一首|换首歌|下一首|上一首|下一曲|上一曲|暂停|继续|停止|停一下|停掉|结束播放|静音|取消静音|解除静音|闭麦|开麦|朗读|播报|念一下|亮一点|暗一点|大一点|小一点|高一点|低一点|暖一点|冷一点|查|查看|查询|看看|多少|几度|怎么样|开着吗|关着吗|在线吗|出粮|投喂|喂食|喂猫|喂狗|执行|启动|模式|场景|让小爱|叫小爱|问小爱|对小爱说|小爱同学|turn\s+(?:on|off)|open|close|set|play|pause|stop|mute|unmute|dim|bright|check|what)/i;
+
+// 连续对话唤醒窗口内对助手本身的明确问候或能力/设备/场景列表查询
+const EXPLICIT_ASSISTANT_QUERY_RE =
+  /^(?:(?:你好|您好|在吗|你在吗|在不在|你是谁|你能做什么|你会做什么|有什么功能|帮助|help)|(?:查看|看看|列出)?(?:家里)?(?:有)?(?:哪些|什么|所有|全部)?(?:设备|场景)|(?:设备|场景)列表)$/i;
+
+// 明显非设备控制的描述/家务旁白信号（避免电视旁白/家务聊天在唤醒或对话窗口内误触发）
+const NON_COMMAND_CHAT_RE =
+  /(?:晚饭|午饭|早饭|吃什么|吃饭|火锅|烤鱼|筷子|倒水|杯水|递过来|递一下|拿一下|快递|外卖|垃圾|收拾一下|加班|太累了|早点睡|接电话|雨伞|电影票|上班|地铁|泡茶|好像|有点松|修好之后|挺好的|挺好看|挺舒服|舒服多了|亮多了|真不错|很好听|什么时候买)/;
+
+/**
+ * 判断连续对话窗口中（无唤醒词）的语句是否为明确的智能家居控制/查询/助手指令，
+ * 防止环境噪声、背景歌词、电视广播或咖啡馆杂音因含“现在/把/再/阳台”等泛化词被误当作指令并无限续期对话窗口。
+ */
+export function isClearConversationCommand(rawCmd: string): boolean {
+  const cmd = rawCmd.replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
+  if (cmd.length < 2 || cmd.length > 36) return false;
+  if (NON_COMMAND_CHAT_RE.test(cmd)) return false;
+  if (STANDALONE_CONVERSATION_CMD_RE.test(cmd)) return true;
+  if (EXPLICIT_ASSISTANT_QUERY_RE.test(cmd)) return true;
+  if (/^(?:让小爱|叫小爱|问小爱|对小爱说|小爱同学)/.test(cmd)) return true;
+  if (hasSmartHomeDomainIntent(cmd) && CONVERSATION_ACTION_OR_QUERY_RE.test(cmd)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 判断无唤醒词文本是否为明显的噪声/BGM 识别幻觉碎片（如单字、纯停用词 "The."/"I."、或跨语种假名/韩文乱码）。
+ */
+export function isNoiseOrGarbledFragment(rawText: string, acousticEvent?: string): boolean {
+  const cmd = rawText.replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
+  const meaningful = cmd.replace(/[\s,，。．.、!！?？:：;；\-—~～"'“”‘’()（）[\]【】]/g, "");
+  if (meaningful.length <= 1) return true;
+  if (isPureNonSpeechEvent(acousticEvent, cmd)) return true;
+  // 连续对话（无唤醒词）中出现日韩假名/谚文乱码且无智能家居意图 -> 典型 SenseVoice 噪声幻觉
+  if (/[\u3040-\u30ff\uac00-\ud7af]/.test(cmd) && !hasSmartHomeDomainIntent(cmd)) {
+    return true;
+  }
+  // 纯英文短停用词幻觉（如 BGM/键盘声被误听为 "The." / "You." / "So it"）
+  if (/^[a-z0-9\s'.,!?-]+$/i.test(cmd)) {
+    const tokens = cmd
+      .toLowerCase()
+      .replace(/[^a-z\s]/g, " ")
+      .split(/\s+/)
+      .filter(Boolean);
+    if (
+      tokens.length > 0 &&
+      tokens.length <= 2 &&
+      tokens.every((t) => t.length <= 2 || COMMON_EN_STOPWORDS.has(t)) &&
+      !hasSmartHomeDomainIntent(cmd) &&
+      !STANDALONE_CONVERSATION_CMD_RE.test(cmd) &&
+      !EXPLICIT_EXIT_RE.test(normalizeForExit(cmd))
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // 明显是家庭/旁白聊天的负向模式
@@ -852,7 +924,7 @@ function buildAttentionPrompt(params: {
     "- 若用户直接呼唤你执行设备控制/查询/提问（如“小派，关灯”、“帮我把音量调大一点”、“那卧室灯也关掉”），addressed=true。",
     "- 注意背景音乐/电视干扰：如果环境中正在放歌，唤醒词前后可能混入无关歌词碎片（例如“也甘愿赴汤蹈火去走小派打开客厅吸顶灯，间走过这世间”）。只要唤醒词后紧跟明确的设备控制/查询指令，就判定 addressed=true，并在 command 字段中只提取干净的用户指令（去掉前后无关歌词）！",
     "- 若用户只是提到你的名字讨论/夸奖/抱怨/叫别人别管你（如“我刚跟朋友聊到小派挺好用的”、“你觉得小派怎么样”、“别管小派了吃饭吧”、“有人叫小派吗”），addressed=false！",
-    "- 若处于连续对话窗口，但新句子明显是在和家人说话（如“晚饭吃什么”、“帮我拿双筷子”），addressed=false, inConversation=false！",
+    "- 若处于连续对话窗口，但新句子明显是在和家人说话（如“晚饭吃什么”、“帮我拿双筷子”），或属于背景音乐歌词、电视广播对话、咖啡馆/环境杂音识别碎片，addressed=false, inConversation=false！",
     "- 若只是在叫你的名字等待回应（如“小派在吗”、“嘿小派”），addressed=true 且 command 留空字符串。",
     "- 拿不准时宁可保守拒绝（addressed=false），避免误操作智能设备。",
     "",
@@ -1459,8 +1531,23 @@ export async function evaluateVoiceAttention(
       });
     }
 
-    // B2. 明显是旁白/拟声词 -> 0ms 忽略并保留剩余对话窗口
-    if (cmd.length <= 1 || OBVIOUS_SIDETALK_RE.test(cmd)) {
+    // B2. 明显是旁白/噪声幻觉碎片 -> 0ms 忽略并保留剩余对话窗口
+    const isBgmConv = Boolean(input.acousticEvent?.toUpperCase().includes("BGM"));
+    if (isNoiseOrGarbledFragment(cmd, input.acousticEvent)) {
+      return wrap({
+        accept: false,
+        wokeOnly: false,
+        addressed: false,
+        inConversation: true,
+        confidence: 0.9,
+        stage: "acoustic",
+        reason: "识别为环境噪声/背景音识别碎片，未触发设备控制",
+        wakeWord: null,
+        command: "",
+        usedLlm: false,
+      });
+    }
+    if (OBVIOUS_SIDETALK_RE.test(cmd)) {
       return wrap({
         accept: false,
         wokeOnly: false,
@@ -1478,13 +1565,13 @@ export async function evaluateVoiceAttention(
     // B2.5. 连续对话中的明确直接智能家居控制指令（smart 模式、非 BGM、短句、含明确控制动词与智能家居域意图）：
     // 借鉴 Home Assistant 本地确定性意图优先原则，0ms 直通免等待云端 SystemOne 往返；
     // 隐式/口语表达（如“有点刺眼”、“好冷啊”）与家庭闲聊仍交由 SystemOne 语义决策。
-    const isBgmConv = Boolean(input.acousticEvent?.toUpperCase().includes("BGM"));
+    const isClearDeviceCmd = isClearConversationCommand(cmd);
     if (
       input.attentionMode === "smart" &&
       !isBgmConv &&
       cmd.length <= 18 &&
       DIRECT_COMMAND_START_RE.test(cmd) &&
-      hasSmartHomeDomainIntent(cmd)
+      isClearDeviceCmd
     ) {
       return wrap({
         accept: true,
@@ -1611,8 +1698,7 @@ export async function evaluateVoiceAttention(
       sysOneTransientFailure = fk === "timeout" || fk === "network";
     }
 
-    // B4. SystemOne 未启用或降级链：保持原有 smart 快速续聊 + llmEvaluator + 确定性降级
-    const isClearDeviceCmd = DIRECT_COMMAND_START_RE.test(cmd) || CLEAR_FOLLOWUP_RE.test(cmd);
+    // B4. SystemOne 未启用或降级链：仅放行明确智能家居续聊/控制指令，防止泛化词/歌词/环境杂音在对话中误触发
     if (input.attentionMode === "smart" && isClearDeviceCmd && (input.awakeActive || cmd.length <= 18)) {
       return wrap({
         accept: true,
@@ -1676,16 +1762,16 @@ export async function evaluateVoiceAttention(
       }
     }
 
-    // 离线降级：显式唤醒窗口放行，普通对话窗口仅放行明确控制词
-    if (input.awakeActive || isClearDeviceCmd) {
+    // 离线降级：严禁在无云端语义判别时因 awakeActive 盲目放行歌词/电视/咖啡馆杂音，仅放行明确设备/助手指令
+    if (isClearDeviceCmd) {
       return wrap({
         accept: true,
         wokeOnly: false,
         addressed: true,
         inConversation: true,
-        confidence: 0.8,
+        confidence: 0.84,
         stage: "fast-followup",
-        reason: input.awakeActive ? "处于唤醒等待窗口内" : "连续对话续聊指令",
+        reason: input.awakeActive ? "唤醒窗口内明确控制指令" : "连续对话续聊指令",
         wakeWord: null,
         command: cmd,
         usedLlm: false,
@@ -1698,8 +1784,10 @@ export async function evaluateVoiceAttention(
       addressed: false,
       inConversation: true,
       confidence: 0.85,
-      stage: "pragmatic-reject",
-      reason: "连续对话窗口内未识别为明确指令，已忽略并保留对话窗口",
+      stage: isBgmConv ? "acoustic" : "pragmatic-reject",
+      reason: isBgmConv
+        ? "背景音乐/噪声中未识别为明确设备指令，已忽略"
+        : "连续对话窗口内未识别为明确指令，已忽略并保留对话窗口",
       wakeWord: null,
       command: "",
       usedLlm: false,

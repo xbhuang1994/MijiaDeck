@@ -40,6 +40,7 @@ import {
   extractCommandAfterAcousticWake,
   findWakeWordSpan,
   hasSmartHomeDomainIntent,
+  isExplicitExitPhrase,
   isThirdPersonNeoMention,
   isWakeQueryText,
   looksLikeDirectDeviceCommand,
@@ -1350,13 +1351,18 @@ export class AudioSourceSeparator {
     }
 
     const hasDomain = hasSmartHomeDomainIntent(bestText);
+    const isExitCmd = isExplicitExitPhrase(bestText);
     if (
       !opts.bypassWakeWord &&
       inConv &&
       !findWakeWordSpan(bestText, wakeWords) &&
-      scene.singingProb >= 0.10 &&
-      scene.speechProb < 0.28 &&
-      !hasDomain
+      !isExitCmd &&
+      !hasDomain &&
+      ((scene.singingProb >= 0.10 && scene.speechProb < 0.28) ||
+        (scene.singingProb >= 0.14 &&
+          scene.musicProb >= 0.45 &&
+          !opts.systemOneClient?.enabled &&
+          !opts.llmEvaluator))
     ) {
       return makeRejected("acoustic", "连续对话窗口内识别为纯歌曲演唱歌词，已拦截");
     }
@@ -2387,6 +2393,23 @@ export class AudioSourceSeparator {
         if (bridgedMusic) allCandidates.push(bridgedMusic);
 
         const globalMusicText = globalTranscriptParts.join(" ");
+        const musicExit = allCandidates.find((c) => c.decision.exitConversation === true);
+        if (musicExit) {
+          return buildReturn({
+            speechDetected: true,
+            text: musicExit.rawText,
+            altText: musicExit.altText,
+            acousticEvent: musicExit.acousticEvent,
+            denoiseEngine: "spleeter",
+            vadEngine: "silero",
+            asrEngine: `sensevoice-sep-${musicExit.branch}`,
+            outputSnrDb: vocOutSnr,
+            detectedSpeakerCount: Math.max(1, detectedSpeakerCount),
+            acousticWake: musicExit.acousticWake,
+            attention: musicExit.decision,
+            bestSpeechPcm: musicExit.segPcm,
+          });
+        }
         const musicAccepted = allCandidates
           .filter((c) => c.decision.accept)
           .sort((a, b) => b.priority - a.priority);
@@ -2738,6 +2761,23 @@ export class AudioSourceSeparator {
     if (bridged1) allCandidates.push(bridged1);
 
     const globalText = globalTranscriptParts.join(" ");
+    const stage1Exit = allCandidates.find((c) => c.decision.exitConversation === true);
+    if (stage1Exit) {
+      return buildReturn({
+        speechDetected: true,
+        text: stage1Exit.rawText,
+        altText: stage1Exit.altText,
+        acousticEvent: stage1Exit.acousticEvent,
+        denoiseEngine: denoiseEngineName,
+        vadEngine: "silero-diar",
+        asrEngine: "sensevoice-sep-stage1",
+        outputSnrDb: denoiseOutSnr,
+        detectedSpeakerCount: Math.max(1, detectedSpeakerCount),
+        acousticWake: stage1Exit.acousticWake,
+        attention: stage1Exit.decision,
+        bestSpeechPcm: stage1Exit.segPcm,
+      });
+    }
     const stage1Accepted = allCandidates
       .filter((c) => c.decision.accept)
       .sort((a, b) => b.priority - a.priority);
@@ -2982,6 +3022,23 @@ export class AudioSourceSeparator {
     }
 
     // Stage 3: 最终择优输出
+    const finalExit = allCandidates.find((c) => c.decision.exitConversation === true);
+    if (finalExit) {
+      return buildReturn({
+        speechDetected: true,
+        text: finalExit.rawText,
+        altText: finalExit.altText,
+        acousticEvent: finalExit.acousticEvent,
+        denoiseEngine: denoiseEngineName,
+        vadEngine: "silero-sep",
+        asrEngine: `sensevoice-sep-${finalExit.branch}`,
+        outputSnrDb: denoiseOutSnr,
+        detectedSpeakerCount: Math.max(1, detectedSpeakerCount),
+        acousticWake: finalExit.acousticWake,
+        attention: finalExit.decision,
+        bestSpeechPcm: finalExit.segPcm,
+      });
+    }
     const accepted = allCandidates
       .filter((c) => c.decision.accept)
       .sort((a, b) => b.priority - a.priority);

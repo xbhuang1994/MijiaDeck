@@ -32,6 +32,7 @@ import {
 export interface WsData {
   connectedAt: number;
   voiceStream?: VoiceStreamSession | null;
+  ttsSpeaking?: boolean;
 }
 
 export interface StartServerOptions {
@@ -266,6 +267,10 @@ function handleWsMessage(
         ws.data.voiceStream = null;
       }
       runtime.voiceListener?.setSpeechInProgress(false);
+      if (ws.data.ttsSpeaking) {
+        ws.data.ttsSpeaking = false;
+        runtime.voiceListener?.setTtsSpeaking(false);
+      }
     } else if (parsed.type === "voice_dialog_control") {
       const vl = runtime.voiceListener;
       if (!vl) return;
@@ -282,6 +287,7 @@ function handleWsMessage(
       const vl = runtime.voiceListener;
       if (!vl) return;
       if (typeof parsed.speaking === "boolean") {
+        ws.data.ttsSpeaking = parsed.speaking;
         vl.setTtsSpeaking(parsed.speaking);
         ws.data.voiceStream?.resetAfterTts();
       }
@@ -542,6 +548,10 @@ export async function startMijiaDeckServer(
           ws.data.voiceStream.dispose();
           ws.data.voiceStream = null;
           runtime.voiceListener?.setSpeechInProgress(false);
+        }
+        if (ws.data.ttsSpeaking) {
+          ws.data.ttsSpeaking = false;
+          runtime.voiceListener?.setTtsSpeaking(false);
         }
         broadcaster.remove(ws);
       },

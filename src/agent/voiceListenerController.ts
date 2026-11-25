@@ -215,6 +215,9 @@ export type VoiceListenerEvents = {
 
 const LEADING_PUNCT_RE = /^[\s,，。．.、!！?？:：;；\-—~～]+/;
 const TRAILING_PUNCT_RE = /[\s,，。．.、!！?？:：;；]+$/;
+const MAX_SPEECH_GRACE_MS = 3500;
+const CONTINUOUS_VAD_STALE_MS = 5000;
+const TTS_PAUSE_WATCHDOG_MS = 30_000;
 
 /**
  * 兼容式唤醒词提取器（供单元测试与轻量调用使用，现支持常见中文同音纠错）。
@@ -274,9 +277,15 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   private _dialogState: VoiceDialogState = "standby";
   private _dialogEpoch = 0;
   private _conversationTimer: ReturnType<typeof setTimeout> | null = null;
+  private _ttsPauseWatchdog: ReturnType<typeof setTimeout> | null = null;
   private _timerPaused = false;
   private _remainingConversationMs = 0;
+  private _conversationBaseUntil: number | null = null;
+  private _conversationHardUntil: number | null = null;
   private _speechInProgress = false;
+  private _speechActivityStartedAt: number | null = null;
+  private _speechGraceSuppressed = false;
+  private _consecutiveAmbientNoiseCount = 0;
   private _consecutiveSidetalkCount = 0;
   private _lastTransitionReason: string | null = null;
   private _lastWakeHit: WakeWordSpotRecord | null = null;
@@ -334,6 +343,87 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     }
   }
 
+  private _clearTtsPauseWatchdog(): void {
+    if (this._ttsPauseWatchdog !== null) {
+      clearTimeout(this._ttsPauseWatchdog);
+      this._ttsPauseWatchdog = null;
+    }
+  }
+
+  private _setConversationDeadlines(baseUntil: number | null, allowSpeechGrace = true): void {
+    this._conversationBaseUntil = baseUntil;
+    this._conversationHardUntil =
+      baseUntil !== null ? baseUntil + (allowSpeechGrace ? MAX_SPEECH_GRACE_MS : 0) : null;
+  }
+
+  /**
+   * 计算当前对话轮次还剩余多少“说话中防截断顺延”额度（严格有界，防止背景音乐/环境噪音驱动 VAD 无限续期）。
+   */
+  private _remainingSpeechGraceMs(now: number): number {
+    if (
+      this._dialogState !== "conversation" ||
+      this._timerPaused ||
+      !this._speechInProgress ||
+      this._speechGraceSuppressed ||
+      this._conversationHardUntil === null
+    ) {
+      return 0;
+    }
+    if (
+      this._speechActivityStartedAt !== null &&
+      now - this._speechActivityStartedAt > CONTINUOUS_VAD_STALE_MS
+    ) {
+      return 0;
+    }
+    return Math.max(0, this._conversationHardUntil - now);
+  }
+
+  /**
+   * 记录连续对话期间收到一段纯背景噪音/背景音乐或被注意力门控拒绝的片段：
+   * - 连续 >= 2 段纯背景音/音乐时抑制 VAD 说话顺延并回收已提前扩展的窗口；
+   * - 若已超过基础对话截止时间（仅靠顺延等待中），立即退出对话模式。
+   */
+  private _noteNonConversationSegment(
+    kind: "ambient_noise" | "rejected",
+    now = Date.now(),
+  ): boolean {
+    if (this._dialogState !== "conversation" || this._timerPaused) {
+      return false;
+    }
+    if (kind === "ambient_noise") {
+      this._consecutiveAmbientNoiseCount += 1;
+      if (this._consecutiveAmbientNoiseCount >= 2) {
+        this._speechGraceSuppressed = true;
+      }
+    }
+
+    if (this._conversationBaseUntil !== null && now >= this._conversationBaseUntil) {
+      this.exitConversation("timeout", { speakAck: false, now });
+      return true;
+    }
+
+    if (this._speechGraceSuppressed && this._conversationBaseUntil !== null) {
+      this._conversationHardUntil = this._conversationBaseUntil;
+      const currentDeadline = this._conversationUntil ?? this._awakeUntil;
+      if (currentDeadline !== null && currentDeadline > this._conversationBaseUntil) {
+        const clamped = this._conversationBaseUntil;
+        if (this._conversationUntil !== null) {
+          this._conversationUntil = clamped;
+        } else if (this._awakeUntil !== null) {
+          this._awakeUntil = clamped;
+        }
+        const remaining = clamped - now;
+        if (remaining <= 0) {
+          this.exitConversation("timeout", { speakAck: false, now });
+          return true;
+        }
+        this._armConversationTimer(remaining, this._dialogEpoch);
+        this.emit("stateChanged", this.snapshot());
+      }
+    }
+    return false;
+  }
+
   private _armConversationTimer(durationMs: number, epoch: number): void {
     this._clearConversationTimer();
     if (durationMs <= 0 || this._dialogState !== "conversation") {
@@ -351,9 +441,16 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       if (this._timerPaused) {
         return;
       }
-      if (this._speechInProgress) {
-        const extendMs = 3500;
-        this._conversationUntil = Date.now() + extendMs;
+      const now = Date.now();
+      const graceMs = this._remainingSpeechGraceMs(now);
+      if (graceMs >= 250) {
+        const extendMs = Math.min(MAX_SPEECH_GRACE_MS, graceMs);
+        const nextUntil = now + extendMs;
+        if (this._conversationUntil !== null) {
+          this._conversationUntil = nextUntil;
+        } else if (this._awakeUntil !== null) {
+          this._awakeUntil = nextUntil;
+        }
         this._armConversationTimer(extendMs, epoch);
         this.emit("stateChanged", this.snapshot());
         return;
@@ -377,19 +474,25 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const ttsGraceMs = willSpeakAck ? 1200 : 0;
     this._dialogEpoch += 1;
     const epoch = this._dialogEpoch;
+    this._clearTtsPauseWatchdog();
     this._dialogState = "conversation";
     this._consecutiveSidetalkCount = 0;
+    this._consecutiveAmbientNoiseCount = 0;
+    this._speechGraceSuppressed = false;
     this._lastTransitionReason = reason;
     this._timerPaused = false;
-    this._awakeUntil = now + cfg.wakeWindowSec * 1000 + ttsGraceMs;
+    const wakeMs = cfg.wakeWindowSec * 1000 + ttsGraceMs;
+    this._awakeUntil = now + wakeMs;
     const convMs =
       cfg.conversationWindowSec > 0 ? cfg.conversationWindowSec * 1000 + ttsGraceMs : 0;
     this._conversationUntil = convMs > 0 ? now + convMs : null;
-    this._remainingConversationMs = convMs > 0 ? convMs : cfg.wakeWindowSec * 1000 + ttsGraceMs;
+    const timerMs = convMs > 0 ? convMs : reason === "wake_only" ? wakeMs : 0;
+    this._remainingConversationMs = convMs > 0 ? convMs : wakeMs;
+    this._setConversationDeadlines(timerMs > 0 ? now + timerMs : null, true);
     this._mode = "awake";
 
-    if (convMs > 0) {
-      this._armConversationTimer(convMs, epoch);
+    if (timerMs > 0) {
+      this._armConversationTimer(timerMs, epoch);
     } else {
       this._clearConversationTimer();
     }
@@ -414,12 +517,17 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const cfg = this.config;
     this._dialogEpoch += 1;
     this._clearConversationTimer();
+    this._clearTtsPauseWatchdog();
     this._dialogState = "standby";
     this._awakeUntil = null;
     this._conversationUntil = null;
+    this._conversationBaseUntil = null;
+    this._conversationHardUntil = null;
     this._remainingConversationMs = 0;
     this._timerPaused = false;
     this._consecutiveSidetalkCount = 0;
+    this._consecutiveAmbientNoiseCount = 0;
+    this._speechGraceSuppressed = false;
     this._lastTransitionReason = reason;
     this._resetDedupState();
     if (this._mode !== "processing" && this._mode !== "error") {
@@ -451,46 +559,103 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
    */
   setTtsSpeaking(speaking: boolean): void {
     if (speaking) {
-      if (!this._timerPaused && this._dialogState === "conversation" && this._conversationUntil !== null) {
-        this._remainingConversationMs = Math.max(1000, this._conversationUntil - Date.now());
+      const currentDeadline = this._conversationUntil ?? this._awakeUntil;
+      if (!this._timerPaused && this._dialogState === "conversation" && currentDeadline !== null) {
+        this._remainingConversationMs = Math.max(1000, currentDeadline - Date.now());
       }
+      const changed = !this._timerPaused;
       this._timerPaused = true;
       this._clearConversationTimer();
+      this._clearTtsPauseWatchdog();
+      const pauseEpoch = this._dialogEpoch;
+      this._ttsPauseWatchdog = setTimeout(() => {
+        this._ttsPauseWatchdog = null;
+        if (this._timerPaused && this._dialogEpoch === pauseEpoch) {
+          this.setTtsSpeaking(false);
+        }
+      }, TTS_PAUSE_WATCHDOG_MS);
+      (this._ttsPauseWatchdog as { unref?: () => void }).unref?.();
+      if (changed) {
+        this.emit("stateChanged", this.snapshot());
+      }
       return;
     }
+    this._clearTtsPauseWatchdog();
     if (!this._timerPaused) return;
     this._timerPaused = false;
-    if (this._dialogState === "conversation" && this.config.conversationWindowSec > 0) {
-      const resumeMs = Math.max(
-        3000,
-        this._remainingConversationMs > 0
-          ? this._remainingConversationMs
-          : this.config.conversationWindowSec * 1000,
-      );
-      this._conversationUntil = Date.now() + resumeMs;
-      this._armConversationTimer(resumeMs, this._dialogEpoch);
-      this.emit("stateChanged", this.snapshot());
+    if (this._dialogState === "conversation") {
+      const cfg = this.config;
+      if (cfg.conversationWindowSec > 0) {
+        const resumeMs = Math.max(
+          3000,
+          this._remainingConversationMs > 0
+            ? this._remainingConversationMs
+            : cfg.conversationWindowSec * 1000,
+        );
+        const nextUntil = Date.now() + resumeMs;
+        this._conversationUntil = nextUntil;
+        this._setConversationDeadlines(nextUntil, !this._speechGraceSuppressed);
+        this._armConversationTimer(resumeMs, this._dialogEpoch);
+        this.emit("stateChanged", this.snapshot());
+      } else if (this._awakeUntil !== null) {
+        const resumeMs = Math.max(
+          3000,
+          this._remainingConversationMs > 0
+            ? this._remainingConversationMs
+            : cfg.wakeWindowSec * 1000,
+        );
+        const nextUntil = Date.now() + resumeMs;
+        this._awakeUntil = nextUntil;
+        this._setConversationDeadlines(nextUntil, !this._speechGraceSuppressed);
+        this._armConversationTimer(resumeMs, this._dialogEpoch);
+        this.emit("stateChanged", this.snapshot());
+      } else {
+        this.emit("stateChanged", this.snapshot());
+      }
     }
   }
 
   /**
-   * 实时说话活动通知：若用户正说到一半临近超时，自动顺延 +3500ms 防止中断。
+   * 实时说话活动通知：若用户正说到一半临近超时，在单轮有界顺延额度（最多 +3.5s）内防截断，
+   * 绝不被持续环境噪音/背景音乐触发的 VAD 无限续期。
    */
   setSpeechInProgress(speaking: boolean): void {
+    const now = Date.now();
+    const wasSpeaking = this._speechInProgress;
     this._speechInProgress = speaking;
+    if (speaking) {
+      if (!wasSpeaking) {
+        this._speechActivityStartedAt = now;
+      }
+    } else {
+      this._speechActivityStartedAt = null;
+      return;
+    }
+
+    const currentDeadline = this._conversationUntil ?? this._awakeUntil;
     if (
-      speaking &&
       this._dialogState === "conversation" &&
       !this._timerPaused &&
-      this.config.conversationWindowSec > 0 &&
-      this._conversationUntil !== null
+      currentDeadline !== null &&
+      this._conversationHardUntil !== null
     ) {
-      const remaining = this._conversationUntil - Date.now();
-      if (remaining < 3500) {
-        const extended = Math.max(3500, remaining + 3500);
-        this._conversationUntil = Date.now() + extended;
-        this._armConversationTimer(extended, this._dialogEpoch);
-        this.emit("stateChanged", this.snapshot());
+      const graceLeft = this._remainingSpeechGraceMs(now);
+      const remaining = currentDeadline - now;
+      if (
+        graceLeft >= 250 &&
+        remaining < MAX_SPEECH_GRACE_MS &&
+        currentDeadline < this._conversationHardUntil
+      ) {
+        const nextUntil = Math.min(this._conversationHardUntil, now + MAX_SPEECH_GRACE_MS);
+        if (nextUntil > currentDeadline + 100) {
+          if (this._conversationUntil !== null) {
+            this._conversationUntil = nextUntil;
+          } else if (this._awakeUntil !== null) {
+            this._awakeUntil = nextUntil;
+          }
+          this._armConversationTimer(nextUntil - now, this._dialogEpoch);
+          this.emit("stateChanged", this.snapshot());
+        }
       }
     }
   }
@@ -551,15 +716,21 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       this._active = Boolean(patch.active);
       if (!this._active) {
         this._clearConversationTimer();
+        this._clearTtsPauseWatchdog();
         this._dialogEpoch += 1;
         this._dialogState = "standby";
         this._mode = "idle";
         this._interimTranscript = "";
         this._awakeUntil = null;
         this._conversationUntil = null;
+        this._conversationBaseUntil = null;
+        this._conversationHardUntil = null;
         this._remainingConversationMs = 0;
         this._timerPaused = false;
         this._speechInProgress = false;
+        this._speechActivityStartedAt = null;
+        this._speechGraceSuppressed = false;
+        this._consecutiveAmbientNoiseCount = 0;
         this._consecutiveSidetalkCount = 0;
         this._lastTransitionReason = "stopped";
         this._resetDedupState();
@@ -685,13 +856,24 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       !convWindowActive &&
       !this._timerPaused
     ) {
+      this._dialogEpoch += 1;
       this._dialogState = "standby";
       this._clearConversationTimer();
+      this._clearTtsPauseWatchdog();
+      this._conversationBaseUntil = null;
+      this._conversationHardUntil = null;
+      this._remainingConversationMs = 0;
       this._consecutiveSidetalkCount = 0;
+      this._consecutiveAmbientNoiseCount = 0;
+      this._speechGraceSuppressed = false;
       this._lastTransitionReason = "timeout";
+      if (this._mode !== "processing" && this._mode !== "error") {
+        this._mode = this._active ? "listening" : "idle";
+      }
     }
     const inConversation =
       this._dialogState === "conversation" || awakeActive || convWindowActive;
+    const preEvalEpoch = this._dialogEpoch;
 
     const llmEvaluator: AttentionLlmEvaluator | undefined =
       options.llmAttentionOverride ??
@@ -830,8 +1012,18 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       };
     }
 
-    // 注意力门控拒绝（非定向提及/旁白/回声/声纹未通过/声学否决）
-    if (!decision.accept || !decision.command) {
+    // 防止在异步注意力门控期间对话已超时或被手动退出，结果又被旧轮次的免唤醒判定重新复活
+    const staleFollowupAfterExit =
+      inConversation &&
+      this._dialogEpoch !== preEvalEpoch &&
+      this._dialogState === "standby" &&
+      decision.accept &&
+      !decision.wakeWord &&
+      !options.bypassWakeWord &&
+      cfg.wakeWordEnabled;
+
+    // 注意力门控拒绝（非定向提及/旁白/回声/声纹未通过/声学否决/旧轮次已过期）
+    if (staleFollowupAfterExit || !decision.accept || !decision.command) {
       if (this._dialogState === "conversation") {
         if (decision.stage !== "echo") {
           this._consecutiveSidetalkCount += 1;
@@ -847,6 +1039,24 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
               acousticWake: options.acousticWake ?? null,
               timings,
               voiceState: snap,
+            };
+          }
+          if (
+            this._noteNonConversationSegment(
+              decision.stage === "acoustic" ? "ambient_noise" : "rejected",
+              now,
+            )
+          ) {
+            return {
+              ok: true,
+              matched: false,
+              wokeOnly: false,
+              command: "",
+              attention: decision,
+              voiceprint: options.voiceprint,
+              acousticWake: options.acousticWake ?? null,
+              timings,
+              voiceState: this.snapshot(),
             };
           }
         }
@@ -872,6 +1082,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     // 确认在呼叫/对话：进入 Pi Agent 工具执行循环
     const commandEpoch = this._dialogEpoch;
     this._consecutiveSidetalkCount = 0;
+    this._consecutiveAmbientNoiseCount = 0;
+    this._speechGraceSuppressed = false;
     this._awakeUntil = null;
     this._lastDispatchedText = text;
     this._lastDispatchedNormText = normText;
@@ -918,15 +1130,24 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         const convMs = cfg.conversationWindowSec * 1000;
         this._dialogState = "conversation";
         this._consecutiveSidetalkCount = 0;
+        this._consecutiveAmbientNoiseCount = 0;
+        this._speechGraceSuppressed = false;
         this._lastTransitionReason = "command_done";
-        this._conversationUntil = Date.now() + convMs;
+        const nextUntil = Date.now() + convMs;
+        this._conversationUntil = nextUntil;
         this._remainingConversationMs = convMs;
+        this._setConversationDeadlines(nextUntil, true);
         this._armConversationTimer(convMs, this._dialogEpoch);
       } else if (cfg.conversationWindowSec <= 0) {
         this._dialogState = "standby";
         this._conversationUntil = null;
+        this._conversationBaseUntil = null;
+        this._conversationHardUntil = null;
         this._remainingConversationMs = 0;
+        this._consecutiveAmbientNoiseCount = 0;
+        this._speechGraceSuppressed = false;
         this._clearConversationTimer();
+        this._clearTtsPauseWatchdog();
         this._lastTransitionReason = "command_done_no_window";
       }
       this._mode = this._active ? "listening" : "idle";
@@ -1048,6 +1269,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       engineStatusPre.readyForSourceSeparation
     ) {
       const now = Date.now();
+      const preSepEpoch = this._dialogEpoch;
       const segDurMs = Math.round((pcm16k.length / 16000) * 1000);
       const speechStartedAt = Math.max(0, now - Math.min(8000, segDurMs));
       const awakeActive =
@@ -1148,6 +1370,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       };
 
       if (!sep.speechDetected || !sep.text.trim()) {
+        if (autoDispatch) {
+          this._noteNonConversationSegment("ambient_noise");
+        }
         return {
           ok: true,
           text: sep.text,
@@ -1199,11 +1424,17 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         };
       }
 
+      const staleConversationDecision =
+        inConversation &&
+        this._dialogEpoch !== preSepEpoch &&
+        this._dialogState === "standby" &&
+        !sep.attention.wakeWord;
+
       const dispatched = await this.handleTranscript(sep.text, {
         isFinal: true,
         bypassWakeWord: options.bypassWakeWord,
         engine: "local",
-        now,
+        now: staleConversationDecision ? Date.now() : now,
         segmentDurationMs: segDurMs,
         acousticEvent: sep.acousticEvent,
         altText: sep.altText,
@@ -1213,7 +1444,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         snrGainDb: sep.snrGainDb,
         timingsBase,
         llmAttentionOverride: options.llmAttentionOverride,
-        precomputedAttention: sep.attention,
+        precomputedAttention: staleConversationDecision ? undefined : sep.attention,
       });
 
       return {
@@ -1243,6 +1474,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     });
 
     if (!vad.hasSpeech || vad.speechSamples.length < 1600) {
+      if (autoDispatch) {
+        this._noteNonConversationSegment("ambient_noise");
+      }
       const timings: VoicePipelineTimings = {
         denoiseMs: denoised.durationMs,
         vadMs: vad.durationMs,
@@ -1511,6 +1745,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     if (useLocal) {
       if (sepReady) {
         const now = Date.now();
+        const preSepEpoch = this._dialogEpoch;
         const segDurMs = Math.round(segment.durationSec * 1000);
         const speechStartedAt = Math.max(0, now - Math.min(8000, segDurMs));
         const awakeActive =
@@ -1591,6 +1826,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         };
 
         if (!sep.speechDetected || !sep.text.trim()) {
+          this._noteNonConversationSegment("ambient_noise");
           return {
             ok: true,
             text: "",
@@ -1616,11 +1852,17 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           };
         }
 
+        const staleConversationDecision =
+          inConversation &&
+          this._dialogEpoch !== preSepEpoch &&
+          this._dialogState === "standby" &&
+          !sep.attention.wakeWord;
+
         const dispatched = await this.handleTranscript(sep.text, {
           isFinal: true,
           bypassWakeWord: options.bypassWakeWord,
           engine: "local",
-          now,
+          now: staleConversationDecision ? Date.now() : now,
           segmentDurationMs: segDurMs,
           acousticEvent: sep.acousticEvent,
           altText: sep.altText,
@@ -1630,7 +1872,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           snrGainDb: sep.snrGainDb,
           timingsBase: { voiceprintMs, asrMs: sep.totalMs },
           llmAttentionOverride: options.llmAttentionOverride,
-          precomputedAttention: sep.attention,
+          precomputedAttention: staleConversationDecision ? undefined : sep.attention,
         });
 
         return {
@@ -1691,6 +1933,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     };
 
     if (!transcript.trim()) {
+      this._noteNonConversationSegment("ambient_noise");
       return {
         ok: true,
         text: "",
@@ -2007,6 +2250,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
 
   clearHistory(): void {
     this._clearConversationTimer();
+    this._clearTtsPauseWatchdog();
     this._dialogEpoch += 1;
     this._dialogState = "standby";
     this._history = [];
@@ -2014,8 +2258,13 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._lastCommand = "";
     this._awakeUntil = null;
     this._conversationUntil = null;
+    this._conversationBaseUntil = null;
+    this._conversationHardUntil = null;
     this._remainingConversationMs = 0;
+    this._timerPaused = false;
     this._consecutiveSidetalkCount = 0;
+    this._consecutiveAmbientNoiseCount = 0;
+    this._speechGraceSuppressed = false;
     this._lastTransitionReason = "cleared";
     this.emit("stateChanged", this.snapshot());
   }
@@ -2082,6 +2331,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
 
   dispose(): void {
     this._clearConversationTimer();
+    this._clearTtsPauseWatchdog();
     this._unsubAgentSpeak();
     this._localEngine.dispose();
     this._active = false;
@@ -2089,9 +2339,14 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._mode = "idle";
     this._awakeUntil = null;
     this._conversationUntil = null;
+    this._conversationBaseUntil = null;
+    this._conversationHardUntil = null;
     this._remainingConversationMs = 0;
     this._timerPaused = false;
     this._speechInProgress = false;
+    this._speechActivityStartedAt = null;
+    this._speechGraceSuppressed = false;
+    this._consecutiveAmbientNoiseCount = 0;
     this.clear();
   }
 }
