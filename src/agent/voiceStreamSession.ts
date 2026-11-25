@@ -30,6 +30,10 @@ import type {
   OnlineDenoiserHandleLike,
   StreamingVadHandleLike,
 } from "./localVoiceEngine.ts";
+import {
+  ConversationTrackMuteManager,
+  type MutedTrackRecord,
+} from "./multiTrackNoiseFilter.ts";
 import type { OpenWakeWordStreamSession, WakeWordAcousticHit } from "./openWakeWordEngine.ts";
 import {
   joinUtteranceFragments,
@@ -40,6 +44,7 @@ import {
   type StreamingCommitReason,
   type StreamingPartialUpdate,
 } from "./qwen3StreamingTranscriber.ts";
+import type { SystemOneClient, SystemOneHistoryEntry } from "./systemOneClient.ts";
 import {
   StreamingAutoGain,
   vadSensitivityToSeconds,
@@ -156,6 +161,14 @@ export interface VoiceStreamSessionOptions {
   streamingPollIntervalMs?: number;
   /** 句末标点+短停顿快速断句静音阈值（ms，仅在显式开启 streamingSentenceSplit 时生效，默认 320ms） */
   streamingPunctuationPauseMs?: number;
+  /** 可选多轨背景音/电视屏蔽管理器（通常与 VoiceListenerController 共享；未传入时会话内部独立维护） */
+  trackMuteManager?: ConversationTrackMuteManager;
+  /** 可选 SystemOne 客户端获取器（供多轨流式预览超 20 字时实时识别并屏蔽背景音/旁白/噪音/电视音轨） */
+  getSystemOneClient?: () => SystemOneClient | null;
+  /** 可选近期对话历史获取器（供 SystemOne 多轨噪音判别使用） */
+  getRecentHistory?: () => ReadonlyArray<SystemOneHistoryEntry>;
+  /** 可选对话轮次号获取器（防异步 SystemOne 返回前对话已退出导致陈旧屏蔽） */
+  getDialogEpoch?: () => number;
   onWakeWordSpot?: (hit: WakeWordAcousticHit) => void;
   onSpeechActivity?: (speaking: boolean) => void;
   onSegmentReady: (
@@ -245,6 +258,8 @@ export class VoiceStreamSession {
   // ClearVoice GPU 多轨盲源分离 + 分轨降噪准实时切片管线状态（按需惰性初始化，支持运行期无缝热切换）
   private _cvChunker: ClearVoiceRealtimeChunker | null = null;
   private _cvAssembler: ClearVoiceMultiTrackAssembler | null = null;
+  private readonly _trackMuteManager: ConversationTrackMuteManager;
+  private readonly _ownsTrackMuteManager: boolean;
   private _cvSliceQueue: ClearVoiceQueuedSlice[] = [];
   private _cvInFlight = false;
   private _cvIdleResolvers: Array<() => void> = [];
@@ -308,6 +323,8 @@ export class VoiceStreamSession {
 
   constructor(options: VoiceStreamSessionOptions) {
     this._opts = options;
+    this._ownsTrackMuteManager = !options.trackMuteManager;
+    this._trackMuteManager = options.trackMuteManager ?? new ConversationTrackMuteManager();
     this._inputRate = options.sampleRate ?? TARGET_SR;
     this._wakeWords = [...(options.wakeWords ?? [])];
     this._owwThreshold = options.owwThreshold;
@@ -676,6 +693,10 @@ export class VoiceStreamSession {
     return this._voicePipelineMode;
   }
 
+  get mutedTracks(): MutedTrackRecord[] {
+    return this._trackMuteManager.getMutedTracks();
+  }
+
   /**
    * 运行期无缝热切换新旧语音方案（原方案 legacy <-> 新方案 clearvoice GPU 准实时切片），
    * 切换后立即清理挂起缓冲，无需断开或重连 WebSocket。
@@ -686,6 +707,9 @@ export class VoiceStreamSession {
     this._voicePipelineMode = next;
     this._clearHeldLegacySegment();
     this._resetClearVoiceState();
+    if (this._ownsTrackMuteManager) {
+      this._trackMuteManager.reset();
+    }
     this._resetVadState();
     this._resetStreamingState(true);
     this._wakeAnchorSample = null;
@@ -808,6 +832,9 @@ export class VoiceStreamSession {
   }
 
   private _onEnterStandby(explicitExit = false): void {
+    if (explicitExit && this._ownsTrackMuteManager) {
+      this._trackMuteManager.reset();
+    }
     if (!explicitExit && this._heldSegment) {
       this._flushHeldLegacySegment();
     } else {
@@ -1228,18 +1255,32 @@ export class VoiceStreamSession {
                 (status.activeQwen3Device === "gpu" || this._cvSliceQueue.length === 0);
               if (allowPreview) {
                 const prunedPreview = assembler.getTracks({ prune: true });
-                const previewTracks: Array<{
+                const totalPreviewTracks = prunedPreview.tracks.length;
+                const rawPreviewEntries: Array<{
                   trackId: string;
                   trackIndex: number;
+                  sourceSlot: number;
                   text: string;
-                  energyRatio?: number;
+                  energyRatio: number;
+                  engine: string;
+                  durationMs: number;
+                  acousticEvent: string;
                 }> = [];
-                let primaryPartial: StreamingPartialUpdate | null = null;
-                let anyIncomplete = false;
                 let previewEngine = "qwen3-asr-stream";
                 let previewLatencyMs = 0;
 
                 for (const tr of prunedPreview.tracks) {
+                  const trackId = `cv_track_${tr.trackIndex}`;
+                  // 当前对话内已被屏蔽的背景音/旁白/噪音/电视音轨：直接跳过语音转文字（零 ASR 开销）
+                  if (
+                    totalPreviewTracks > 1 &&
+                    this._trackMuteManager.isTrackMuted(
+                      { trackId, trackIndex: tr.trackIndex, sourceSlot: tr.sourceSlot },
+                      totalPreviewTracks,
+                    )
+                  ) {
+                    continue;
+                  }
                   if (tr.samples.length < TARGET_SR * 0.35) continue;
                   const asrRes = await this._opts.localEngine.transcribeLocal(
                     tr.samples,
@@ -1254,19 +1295,80 @@ export class VoiceStreamSession {
                   previewLatencyMs += asrRes.durationMs;
                   const cleanedText = asrRes.text.trim();
                   if (!cleanedText) continue;
-                  previewTracks.push({
-                    trackId: `cv_track_${tr.trackIndex}`,
+                  rawPreviewEntries.push({
+                    trackId,
                     trackIndex: tr.trackIndex,
+                    sourceSlot: tr.sourceSlot,
                     text: cleanedText,
                     energyRatio: tr.energyRatio,
+                    engine: asrRes.engine,
+                    durationMs: asrRes.durationMs,
+                    acousticEvent: asrRes.event,
                   });
-                  if (looksLikeIncompleteUtterance(cleanedText, this._wakeWords)) {
+                }
+
+                // 多轨场景下转换出来的文字超出 20 字后，由 SystemOne 判别背景音/旁白/噪音/电视并即时在当前对话内屏蔽该音轨
+                if (totalPreviewTracks > 1 && rawPreviewEntries.length > 0) {
+                  const preEpoch = this._opts.getDialogEpoch?.();
+                  await this._trackMuteManager.evaluateTracks(
+                    rawPreviewEntries.map((e) => ({
+                      trackId: e.trackId,
+                      trackIndex: e.trackIndex,
+                      sourceSlot: e.sourceSlot,
+                      text: e.text,
+                      acousticEvent: e.acousticEvent,
+                    })),
+                    {
+                      totalTracksInBatch: totalPreviewTracks,
+                      mode: "preview",
+                      systemOneClient: this._opts.getSystemOneClient?.() ?? null,
+                      wakeWords: this._wakeWords,
+                      recentHistory: this._opts.getRecentHistory?.(),
+                      isStale: () =>
+                        this._disposed ||
+                        gen !== this._cvGen ||
+                        (preEpoch !== undefined && this._opts.getDialogEpoch?.() !== preEpoch),
+                    },
+                  );
+                  if (this._disposed || gen !== this._cvGen) return;
+                }
+
+                const previewTracks: Array<{
+                  trackId: string;
+                  trackIndex: number;
+                  text: string;
+                  energyRatio?: number;
+                }> = [];
+                let primaryPartial: StreamingPartialUpdate | null = null;
+                let anyIncomplete = false;
+
+                for (const entry of rawPreviewEntries) {
+                  if (
+                    totalPreviewTracks > 1 &&
+                    this._trackMuteManager.isTrackMuted(
+                      {
+                        trackId: entry.trackId,
+                        trackIndex: entry.trackIndex,
+                        sourceSlot: entry.sourceSlot,
+                      },
+                      totalPreviewTracks,
+                    )
+                  ) {
+                    continue;
+                  }
+                  previewTracks.push({
+                    trackId: entry.trackId,
+                    trackIndex: entry.trackIndex,
+                    text: entry.text,
+                    energyRatio: entry.energyRatio,
+                  });
+                  if (looksLikeIncompleteUtterance(entry.text, this._wakeWords)) {
                     anyIncomplete = true;
                   }
                   if (primaryPartial === null) {
-                    const ingested = this._streamTracker.ingestHypothesis(cleanedText, {
-                      engine: asrRes.engine,
-                      latencyMs: asrRes.durationMs,
+                    const ingested = this._streamTracker.ingestHypothesis(entry.text, {
+                      engine: entry.engine,
+                      latencyMs: entry.durationMs,
                     });
                     if (this._streamTracker.isLatestIncomplete) {
                       anyIncomplete = true;
@@ -1386,6 +1488,9 @@ export class VoiceStreamSession {
     this._streamTracker.reset();
     this._oww?.resetSegmentTracking();
     this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, endGlobalSample);
+    if (this._ownsTrackMuteManager) {
+      this._trackMuteManager.commitActiveUtterance();
+    }
 
     if (pruned.tracks.length === 0) {
       return;
@@ -2725,6 +2830,9 @@ export class VoiceStreamSession {
     this._disposed = true;
     this._clearHeldLegacySegment();
     this._resetClearVoiceState();
+    if (this._ownsTrackMuteManager) {
+      this._trackMuteManager.reset();
+    }
     this._cvChunker = null;
     this._cvAssembler = null;
     this._resetStreamingState(true);
