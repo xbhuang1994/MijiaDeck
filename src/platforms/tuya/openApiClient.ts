@@ -26,6 +26,7 @@ export interface TuyaOpenApiDevice {
   product_name?: string;
   model?: string;
   online: boolean;
+  sub?: boolean;
   local_key?: string;
   ip?: string;
   uid?: string;
@@ -51,6 +52,36 @@ export interface TuyaOpenApiScene {
   name: string;
   home_id?: string;
   enabled?: boolean;
+}
+
+export interface TuyaOpenApiIrRemote {
+  remote_id: string;
+  remote_name: string;
+  category_id: number;
+  remote_index?: number;
+  brand_id?: number;
+  brand_name?: string;
+}
+
+export interface TuyaOpenApiIrKey {
+  key: string;
+  key_id?: number;
+  key_name?: string;
+  standard_key?: boolean;
+}
+
+export interface TuyaOpenApiIrRemoteKeysResult {
+  category_id?: number;
+  remote_index?: number;
+  brand_id?: number;
+  key_list: TuyaOpenApiIrKey[];
+}
+
+export interface TuyaOpenApiIrLearningCode {
+  id?: number;
+  key: string;
+  key_name?: string;
+  code: string;
 }
 
 export class TuyaOpenApiError extends Error {
@@ -409,6 +440,140 @@ export class TuyaOpenApiClient {
     const res = await this._authorizedRequest<unknown>(
       "POST",
       `/v1.0/homes/${encodeURIComponent(homeId)}/scenes/${encodeURIComponent(sceneId)}/trigger`,
+    );
+    return res !== false;
+  }
+
+  // ---------- OpenAPI v2.0 红外遥控器 (IR Control Hub) 业务方法 ----------
+
+  async listInfraredRemotes(infraredId: string): Promise<TuyaOpenApiIrRemote[]> {
+    const trimmed = infraredId.trim();
+    if (!trimmed) return [];
+    const res = await this._authorizedRequest<unknown>(
+      "GET",
+      `/v2.0/infrareds/${encodeURIComponent(trimmed)}/remotes`,
+    );
+    if (!Array.isArray(res)) return [];
+    return res
+      .filter(isRecord)
+      .map((item) => ({
+        remote_id: String(item.remote_id ?? "").trim(),
+        remote_name: String(item.remote_name ?? item.remote_id ?? "").trim(),
+        category_id: Number(item.category_id ?? 0),
+        ...(typeof item.remote_index === "number" ? { remote_index: item.remote_index } : {}),
+        ...(typeof item.brand_id === "number" ? { brand_id: item.brand_id } : {}),
+        ...(typeof item.brand_name === "string" ? { brand_name: item.brand_name } : {}),
+      }))
+      .filter((r) => r.remote_id.length > 0);
+  }
+
+  async getInfraredRemoteKeys(
+    infraredId: string,
+    remoteId: string,
+  ): Promise<TuyaOpenApiIrRemoteKeysResult | null> {
+    const res = await this._authorizedRequest<unknown>(
+      "GET",
+      `/v2.0/infrareds/${encodeURIComponent(infraredId)}/remotes/${encodeURIComponent(remoteId)}/keys`,
+    );
+    if (!isRecord(res)) return null;
+    const rawList = Array.isArray(res.key_list) ? res.key_list : [];
+    const key_list: TuyaOpenApiIrKey[] = rawList
+      .filter(isRecord)
+      .filter((k) => typeof k.key === "string" && k.key.trim().length > 0)
+      .map((k) => ({
+        key: String(k.key).trim(),
+        ...(typeof k.key_id === "number" ? { key_id: k.key_id } : {}),
+        ...(typeof k.key_name === "string" ? { key_name: k.key_name } : {}),
+        ...(typeof k.standard_key === "boolean" ? { standard_key: k.standard_key } : {}),
+      }));
+    return {
+      ...(typeof res.category_id === "number" ? { category_id: res.category_id } : {}),
+      ...(typeof res.remote_index === "number" ? { remote_index: res.remote_index } : {}),
+      ...(typeof res.brand_id === "number" ? { brand_id: res.brand_id } : {}),
+      key_list,
+    };
+  }
+
+  async listInfraredLearningCodes(
+    infraredId: string,
+    remoteId: string,
+  ): Promise<TuyaOpenApiIrLearningCode[]> {
+    const res = await this._authorizedRequest<unknown>(
+      "GET",
+      `/v2.0/infrareds/${encodeURIComponent(infraredId)}/remotes/${encodeURIComponent(remoteId)}/learning-codes`,
+    );
+    if (!Array.isArray(res)) return [];
+    return res
+      .filter(isRecord)
+      .filter((item) => typeof item.code === "string" && item.code.trim().length > 0)
+      .map((item) => ({
+        ...(typeof item.id === "number" ? { id: item.id } : {}),
+        key: String(item.key ?? item.key_name ?? item.id ?? "").trim(),
+        ...(typeof item.key_name === "string" ? { key_name: item.key_name } : {}),
+        code: String(item.code).trim(),
+      }))
+      .filter((item) => item.key.length > 0);
+  }
+
+  async getInfraredAcStatus(infraredId: string, remoteId: string): Promise<Record<string, unknown>> {
+    const res = await this._authorizedRequest<unknown>(
+      "GET",
+      `/v2.0/infrareds/${encodeURIComponent(infraredId)}/remotes/${encodeURIComponent(remoteId)}/ac/status`,
+    );
+    return isRecord(res) ? { ...res } : {};
+  }
+
+  async sendInfraredRawCommand(
+    infraredId: string,
+    remoteId: string,
+    payload: {
+      category_id: number;
+      remote_index?: number;
+      key: string;
+      key_id?: number;
+    },
+  ): Promise<boolean> {
+    const body: Record<string, unknown> = {
+      category_id: payload.category_id,
+      key: payload.key,
+    };
+    if (payload.remote_index !== undefined) body.remote_index = payload.remote_index;
+    if (payload.key_id !== undefined) body.key_id = payload.key_id;
+    const res = await this._authorizedRequest<unknown>(
+      "POST",
+      `/v2.0/infrareds/${encodeURIComponent(infraredId)}/remotes/${encodeURIComponent(remoteId)}/raw/command`,
+      body,
+    );
+    return res !== false;
+  }
+
+  async sendInfraredLearningCode(
+    infraredId: string,
+    remoteId: string,
+    code: string,
+  ): Promise<boolean> {
+    const res = await this._authorizedRequest<unknown>(
+      "POST",
+      `/v2.0/infrareds/${encodeURIComponent(infraredId)}/remotes/${encodeURIComponent(remoteId)}/learning-codes`,
+      { code },
+    );
+    return res !== false;
+  }
+
+  async sendInfraredAcCommand(
+    infraredId: string,
+    remoteId: string,
+    payload: { power?: number; mode?: number; temp?: number; wind?: number },
+  ): Promise<boolean> {
+    const body: Record<string, unknown> = {};
+    if (payload.power !== undefined) body.power = payload.power;
+    if (payload.mode !== undefined) body.mode = payload.mode;
+    if (payload.temp !== undefined) body.temp = payload.temp;
+    if (payload.wind !== undefined) body.wind = payload.wind;
+    const res = await this._authorizedRequest<unknown>(
+      "POST",
+      `/v2.0/infrareds/${encodeURIComponent(infraredId)}/air-conditioners/${encodeURIComponent(remoteId)}/scenes/command`,
+      body,
     );
     return res !== false;
   }

@@ -87,12 +87,51 @@ export const TUYA_CATEGORY_KIND_MAP: Readonly<Record<string, string>> = {
   sd: "vacuum",
   cwwsq: "pet-feeder",
   sp: "camera",
+
+  // Infrared Hub & Virtual IR Remotes (涂鸦万能红外遥控器及其虚拟红外子设备)
+  wnykq: "ir-hub",
+  infrared_ac: "air-conditioner",
+  infrared_tv: "television",
+  infrared_amplifier: "amplifier",
+  infrared_audio: "amplifier",
+  infrared_soundbar: "amplifier",
+  infrared_speaker: "amplifier",
+  infrared_fan: "fan",
+  infrared_air_purifier: "air-purifier",
+  infrared_purifier: "air-purifier",
+  infrared_heater: "heater",
+  infrared_water_heater: "water-heater",
+  infrared_humidifier: "humidifier",
+  infrared_dehumidifier: "dehumidifier",
+  infrared_stb: "set-top-box",
+  infrared_box: "set-top-box",
+  infrared_tv_box: "set-top-box",
+  infrared_projector: "projector",
+  infrared_dvd: "dvd-player",
+  infrared_diy: "ir-remote",
 };
+
+export function isTuyaInfraredCategory(category?: string | null): boolean {
+  if (!category) return false;
+  return category.trim().toLowerCase().startsWith("infrared_");
+}
+
+export function isTuyaIrHubCategory(category?: string | null): boolean {
+  if (!category) return false;
+  const key = category.trim().toLowerCase();
+  return key === "wnykq" || key === "qt";
+}
 
 export function tuyaCategoryToKind(category?: string | null): string {
   if (!category) return "device";
   const key = category.trim().toLowerCase();
-  return TUYA_CATEGORY_KIND_MAP[key] ?? "device";
+  if (key in TUYA_CATEGORY_KIND_MAP) {
+    return TUYA_CATEGORY_KIND_MAP[key]!;
+  }
+  if (key.startsWith("infrared_")) {
+    return "ir-remote";
+  }
+  return "device";
 }
 
 /** LocalTuya / TinyTuya 局域网帧头帧尾魔数 */
@@ -358,4 +397,120 @@ export const TUYA_ENUM_DESC_ZH: Readonly<Record<string, string>> = {
   chargego: "回充",
   standby: "待机",
   cleaning: "清扫中",
+};
+
+/** 涂鸦红外遥控器标准按键代码 -> 中文展示文案（小写索引，大小写不敏感匹配） */
+export const TUYA_IR_KEY_DESC_ZH: Readonly<Record<string, string>> = {
+  power: "电源",
+  poweron: "开机",
+  power_on: "开机",
+  poweroff: "关机",
+  power_off: "关机",
+  poweronoff: "电源开关",
+  standby: "待机",
+  "volume+": "音量+",
+  "vol+": "音量+",
+  volumeup: "音量+",
+  volume_up: "音量+",
+  "volume-": "音量-",
+  "vol-": "音量-",
+  volumedown: "音量-",
+  volume_down: "音量-",
+  mute: "静音",
+  play: "播放",
+  pause: "暂停",
+  playpause: "播放/暂停",
+  "play/pause": "播放/暂停",
+  play_pause: "播放/暂停",
+  stop: "停止",
+  next: "下一首",
+  nexttrack: "下一首",
+  next_track: "下一首",
+  previous: "上一首",
+  prev: "上一首",
+  previoustrack: "上一首",
+  previous_track: "上一首",
+  fastforward: "快进",
+  ff: "快进",
+  rewind: "快退",
+  rew: "快退",
+  "channel+": "频道+",
+  "ch+": "频道+",
+  channelup: "频道+",
+  channel_up: "频道+",
+  "channel-": "频道-",
+  "ch-": "频道-",
+  channeldown: "频道-",
+  channel_down: "频道-",
+  up: "上",
+  down: "下",
+  left: "左",
+  right: "右",
+  ok: "确认",
+  enter: "确认",
+  select: "确认",
+  menu: "菜单",
+  home: "主页",
+  back: "返回",
+  return: "返回",
+  exit: "退出",
+  source: "信号源",
+  input: "输入源",
+  signal: "信号源",
+  mode: "模式",
+  eq: "音效",
+  soundmode: "音效模式",
+  bt: "蓝牙",
+  bluetooth: "蓝牙",
+  aux: "AUX",
+  optical: "光纤",
+  coaxial: "同轴",
+  hdmi: "HDMI",
+  usb: "USB",
+  av: "AV",
+  "bass+": "低音+",
+  "bass-": "低音-",
+  "treble+": "高音+",
+  "treble-": "高音-",
+  sleep: "定时睡眠",
+  timer: "定时",
+  swing: "摆风",
+  oscillate: "摇头",
+  speed: "风速",
+  fanspeed: "风速",
+  windspeed: "风速",
+  light: "灯光",
+  lamp: "灯光",
+  "-/--": "-/--",
+};
+
+export function tuyaIrKeyDescZh(code: string, fallback?: string): string {
+  const trimmed = code.trim();
+  const key = trimmed.toLowerCase();
+  if (key in TUYA_IR_KEY_DESC_ZH) {
+    return TUYA_IR_KEY_DESC_ZH[key]!;
+  }
+  if (/^[0-9]$/.test(trimmed)) {
+    return trimmed;
+  }
+  if (fallback && fallback.trim() && fallback.trim() !== trimmed) {
+    return fallback.trim();
+  }
+  return trimmed;
+}
+
+/** 涂鸦红外空调 (infrared_ac) M（模式）与 F（风速）标准数值映射（对齐 Tuya IR AC 规范） */
+export const TUYA_IR_AC_MODE_LABELS: Readonly<Record<number, { description: string; desc_zh_cn: string }>> = {
+  0: { description: "cool", desc_zh_cn: "制冷" },
+  1: { description: "heat", desc_zh_cn: "制热" },
+  2: { description: "auto", desc_zh_cn: "自动" },
+  3: { description: "fan", desc_zh_cn: "送风" },
+  4: { description: "dry", desc_zh_cn: "除湿" },
+};
+
+export const TUYA_IR_AC_FAN_LABELS: Readonly<Record<number, { description: string; desc_zh_cn: string }>> = {
+  0: { description: "auto", desc_zh_cn: "自动" },
+  1: { description: "low", desc_zh_cn: "低速" },
+  2: { description: "medium", desc_zh_cn: "中速" },
+  3: { description: "high", desc_zh_cn: "高速" },
 };

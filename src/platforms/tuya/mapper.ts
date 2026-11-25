@@ -15,8 +15,12 @@ import { formatMetricsText } from "../../core/service.ts";
 import {
   TUYA_DP_DESC_ZH,
   TUYA_ENUM_DESC_ZH,
+  TUYA_IR_AC_FAN_LABELS,
+  TUYA_IR_AC_MODE_LABELS,
   TUYA_POWER_DP_CANDIDATES,
+  isTuyaInfraredCategory,
   tuyaCategoryToKind,
+  tuyaIrKeyDescZh,
 } from "./constants.ts";
 import type { TuyaDeviceSpecification, TuyaSpecFunctionItem } from "./sharingClient.ts";
 
@@ -39,6 +43,23 @@ const HUM_DP_CODES = [
   "humidity",
 ] as const;
 
+export interface TuyaIrRemoteKey {
+  key: string;
+  keyName?: string;
+  keyId?: number;
+  standardKey?: boolean;
+  learningCode?: string;
+}
+
+export interface TuyaIrRemoteMeta {
+  hubId: string;
+  remoteId: string;
+  categoryId?: number;
+  remoteIndex?: number;
+  brandName?: string;
+  keys: TuyaIrRemoteKey[];
+}
+
 export interface TuyaDeviceRecord {
   id: string;
   name: string;
@@ -48,10 +69,12 @@ export interface TuyaDeviceRecord {
   homeName?: string;
   roomName?: string;
   online: boolean;
+  sub?: boolean;
   localKey?: string;
   ip?: string;
   status: Record<string, unknown>;
   spec?: TuyaDeviceSpecification | null;
+  irRemote?: TuyaIrRemoteMeta | null;
   /** DP 代码 -> 局域网数字 DP ID（例如 "switch_led" -> "20"） */
   codeToDpId?: Record<string, string>;
   /** 局域网数字 DP ID -> DP 代码（例如 "20" -> "switch_led"） */
@@ -61,17 +84,21 @@ export interface TuyaDeviceRecord {
 
 export type TuyaBindingKind =
   | "power"
+  | "ir-power"
   | "brightness"
   | "color-temperature"
   | "color-v2"
   | "color-v1"
   | "scaled-int"
+  | "int-enum"
   | "bool"
   | "raw";
 
 export interface TuyaPropBinding {
   propName: string;
   dpCode: string;
+  /** 可选：读取状态时使用的 DP 代码（例如红外空调写入为 M/T/F，状态回传为 mode/temp/wind） */
+  statusDpCode?: string;
   kind: TuyaBindingKind;
   min: number;
   max: number;
@@ -81,11 +108,33 @@ export interface TuyaPropBinding {
   writable: boolean;
 }
 
+export interface TuyaIrActionBinding {
+  actionName: string;
+  desc: string;
+  dpCode: string;
+  sendValue: unknown;
+  hubId?: string;
+  remoteId?: string;
+  categoryId?: number;
+  remoteIndex?: number;
+  keyId?: number;
+  learningCode?: string;
+}
+
+export interface TuyaIrPowerConfig {
+  onAction: TuyaIrActionBinding | null;
+  offAction: TuyaIrActionBinding | null;
+  toggleAction: TuyaIrActionBinding | null;
+  statusDpCode: string | null;
+  assumedState: boolean | null;
+}
+
 export interface TuyaDeviceProfile {
   did: string;
   hardwareId: string;
   channel: number | null;
   isSplitParent: boolean;
+  isInfraredRemote: boolean;
   info: DeviceInfo;
   detail: DeviceDetail;
   powerDpCode: string | null;
@@ -95,6 +144,9 @@ export interface TuyaDeviceProfile {
   humScale: number;
   bindingsByPropName: Map<string, TuyaPropBinding>;
   bindingsByDpCode: Map<string, TuyaPropBinding>;
+  irActionsByName: Map<string, TuyaIrActionBinding>;
+  irPower: TuyaIrPowerConfig | null;
+  irRemote: TuyaIrRemoteMeta | null;
 }
 
 interface ParsedSpecValues {
@@ -104,6 +156,7 @@ interface ParsedSpecValues {
   scale?: number;
   unit?: string;
   enumRange?: string[];
+  valueType?: string;
 }
 
 function clamp(val: number, min: number, max: number): number {
@@ -310,6 +363,7 @@ function parseSpecValues(rawValues: string | undefined): ParsedSpecValues {
     if (typeof parsed.step === "number" && Number.isFinite(parsed.step)) out.step = parsed.step;
     if (typeof parsed.scale === "number" && Number.isFinite(parsed.scale)) out.scale = parsed.scale;
     if (typeof parsed.unit === "string" && parsed.unit.trim()) out.unit = parsed.unit.trim();
+    if (typeof parsed.type === "string" && parsed.type.trim()) out.valueType = parsed.type.trim();
     if (Array.isArray(parsed.range)) {
       out.enumRange = parsed.range.map((v) => String(v));
     }
@@ -317,6 +371,120 @@ function parseSpecValues(rawValues: string | undefined): ParsedSpecValues {
   } catch {
     return {};
   }
+}
+
+function isIntegerRangeEnum(typeLower: string, values: ParsedSpecValues): boolean {
+  return (
+    typeLower === "enum" &&
+    (!values.enumRange || values.enumRange.length === 0) &&
+    values.min !== undefined &&
+    values.max !== undefined
+  );
+}
+
+function isInfraredKeyFunction(item: TuyaSpecFunctionItem): boolean {
+  const typeLower = (item.type || "").trim().toLowerCase();
+  const parsed = parseSpecValues(item.values);
+  if (
+    parsed.min !== undefined ||
+    parsed.max !== undefined ||
+    (parsed.enumRange && parsed.enumRange.length > 0)
+  ) {
+    return false;
+  }
+  return typeLower === "string" || typeLower === "boolean" || typeLower === "";
+}
+
+function resolveIrKeySendValue(item: TuyaSpecFunctionItem): string {
+  const raw = typeof item.values === "string" ? item.values.trim() : "";
+  if (raw && !raw.startsWith("{") && !raw.startsWith("[")) {
+    return raw;
+  }
+  return item.code;
+}
+
+const IR_KEY_SORT_ORDER: Readonly<Record<string, number>> = {
+  poweron: 10,
+  power_on: 10,
+  poweroff: 11,
+  power_off: 11,
+  power: 12,
+  poweronoff: 12,
+  standby: 13,
+  "volume+": 20,
+  "vol+": 20,
+  volumeup: 20,
+  volume_up: 20,
+  "volume-": 21,
+  "vol-": 21,
+  volumedown: 21,
+  volume_down: 21,
+  mute: 22,
+  previous: 30,
+  prev: 30,
+  previoustrack: 30,
+  previous_track: 30,
+  rewind: 31,
+  rew: 31,
+  play: 32,
+  pause: 33,
+  playpause: 34,
+  "play/pause": 34,
+  play_pause: 34,
+  stop: 35,
+  fastforward: 36,
+  ff: 36,
+  next: 37,
+  nexttrack: 37,
+  next_track: 37,
+  up: 40,
+  down: 41,
+  left: 42,
+  right: 43,
+  ok: 44,
+  enter: 44,
+  select: 44,
+  menu: 45,
+  home: 46,
+  back: 47,
+  return: 47,
+  exit: 48,
+  "channel+": 50,
+  "ch+": 50,
+  channelup: 50,
+  channel_up: 50,
+  "channel-": 51,
+  "ch-": 51,
+  channeldown: 51,
+  channel_down: 51,
+  source: 60,
+  input: 61,
+  signal: 62,
+  mode: 63,
+  eq: 64,
+  bt: 65,
+  bluetooth: 65,
+  aux: 66,
+  optical: 67,
+  hdmi: 68,
+  usb: 69,
+};
+
+function irKeyOrderWeight(code: string): number {
+  const lower = code.trim().toLowerCase();
+  if (lower in IR_KEY_SORT_ORDER) {
+    return IR_KEY_SORT_ORDER[lower]!;
+  }
+  if (/^[1-9]$/.test(lower)) {
+    return 80 + Number(lower);
+  }
+  if (lower === "0") {
+    return 90;
+  }
+  if (lower === "-/--") {
+    return 91;
+  }
+  return 75;
 }
 
 export function tuyaDpDescZh(code: string, fallback?: string): string {
@@ -650,7 +818,7 @@ function buildBindingAndPropForDp(
     };
   }
 
-  if (typeLower === "integer") {
+  if (typeLower === "integer" || isIntegerRangeEnum(typeLower, values)) {
     const scale = values.scale ?? 0;
     const factor = 10 ** scale;
     const rawMin = values.min ?? 0;
@@ -668,7 +836,7 @@ function buildBindingAndPropForDp(
     return {
       prop: createPropInfo({
         name: code,
-        desc,
+        desc: code === "C" ? "频道" : desc,
         type: scale > 0 ? "float" : rawMin >= 0 ? "uint" : "int",
         readable,
         writable,
@@ -742,6 +910,7 @@ export function tuyaRawValueToMijiaProp(binding: TuyaPropBinding, rawValue: unkn
   if (rawValue === undefined || rawValue === null) return null;
   switch (binding.kind) {
     case "power":
+    case "ir-power":
     case "bool":
       return Boolean(rawValue);
     case "brightness":
@@ -752,6 +921,10 @@ export function tuyaRawValueToMijiaProp(binding: TuyaPropBinding, rawValue: unkn
       return tuyaHsvV2ToRgbInt(rawValue);
     case "color-v1":
       return typeof rawValue === "string" ? tuyaColourV1HexToRgbInt(rawValue) : null;
+    case "int-enum": {
+      const num = Number(rawValue);
+      return Number.isFinite(num) ? Math.round(num) : null;
+    }
     case "scaled-int": {
       const num = Number(rawValue);
       if (!Number.isFinite(num)) return null;
@@ -769,6 +942,7 @@ export function tuyaRawValueToMijiaProp(binding: TuyaPropBinding, rawValue: unkn
 export function mijiaPropValueToTuyaRaw(binding: TuyaPropBinding, userValue: unknown): unknown {
   switch (binding.kind) {
     case "power":
+    case "ir-power":
     case "bool": {
       if (typeof userValue === "boolean") return userValue;
       if (typeof userValue === "number") return userValue !== 0;
@@ -786,6 +960,14 @@ export function mijiaPropValueToTuyaRaw(binding: TuyaPropBinding, userValue: unk
       return JSON.stringify(rgbIntToTuyaHsvV2(Number(userValue)));
     case "color-v1":
       return rgbIntToTuyaColourV1Hex(Number(userValue));
+    case "int-enum": {
+      const num = Number(userValue);
+      if (!Number.isFinite(num)) {
+        throw new Error(`属性 ${binding.propName} 需要整数枚举值`);
+      }
+      const rounded = Math.round(num);
+      return binding.max >= binding.min ? clamp(rounded, binding.min, binding.max) : rounded;
+    }
     case "scaled-int": {
       const num = Number(userValue);
       if (!Number.isFinite(num)) {
@@ -887,15 +1069,420 @@ export function formatTuyaDeviceMetrics(
   return extras.length > 0 ? extras.join(" ") : null;
 }
 
+function buildIrAcIntEnumOptions(
+  min: number,
+  max: number,
+  step: number,
+  labelMap: Readonly<Record<number, { description: string; desc_zh_cn: string }>>,
+): PropEnumOption[] {
+  const options: PropEnumOption[] = [];
+  const safeStep = step > 0 ? step : 1;
+  for (let v = min; v <= max; v += safeStep) {
+    const meta = labelMap[v];
+    options.push({
+      value: v,
+      description: meta?.description ?? String(v),
+      ...(meta?.desc_zh_cn ? { desc_zh_cn: meta.desc_zh_cn } : {}),
+    });
+  }
+  return options;
+}
+
+function mapInfraredRemoteDevice(
+  record: TuyaDeviceRecord,
+  category: string,
+  baseKind: string,
+  model: string,
+  homeName: string,
+  roomName: string,
+): {
+  cards: DeviceInfo[];
+  profiles: Map<string, TuyaDeviceProfile>;
+} {
+  const specType = `urn:tuya:device:${baseKind}:1`;
+  const props: PropInfo[] = [];
+  const actions: ActionInfo[] = [];
+  const bindingsByPropName = new Map<string, TuyaPropBinding>();
+  const bindingsByDpCode = new Map<string, TuyaPropBinding>();
+  const irActionsByName = new Map<string, TuyaIrActionBinding>();
+
+  const statusCodes = new Set<string>([
+    ...(record.spec?.status ?? []).map((s) => s.code),
+    ...(record.spec?.status_range ?? []).map((s) => s.code),
+    ...Object.keys(record.status),
+  ]);
+
+  const rawActions: Array<{ action: ActionInfo; binding: TuyaIrActionBinding; index: number }> = [];
+  const consumedFuncCodes = new Set<string>();
+  const consumedStatusCodes = new Set<string>();
+
+  // 1. 优先从云端 specifications.functions 提取红外遥控按键与红外空调参数
+  const functions = record.spec?.functions ?? [];
+  const isIrAc = category === "infrared_ac";
+
+  for (const fn of functions) {
+    if (!fn.code) continue;
+    if (isInfraredKeyFunction(fn)) {
+      consumedFuncCodes.add(fn.code);
+      const desc = tuyaIrKeyDescZh(fn.code, fn.name || fn.desc);
+      const binding: TuyaIrActionBinding = {
+        actionName: fn.code,
+        desc,
+        dpCode: fn.code,
+        sendValue: resolveIrKeySendValue(fn),
+      };
+      rawActions.push({
+        action: {
+          name: fn.code,
+          desc,
+          service: "ir-remote",
+          service_desc: "红外遥控",
+        },
+        binding,
+        index: rawActions.length,
+      });
+    }
+  }
+
+  // 2. 合并 OpenAPI v2.0 /v2.0/infrareds/{hubId}/remotes/{remoteId}/keys 返回的按键元数据（支持学习码/DIY遥控）
+  if (record.irRemote) {
+    const meta = record.irRemote;
+    for (const k of meta.keys) {
+      const keyCode = k.key.trim();
+      if (!keyCode) continue;
+      const existing = rawActions.find(
+        (entry) => entry.binding.actionName.toLowerCase() === keyCode.toLowerCase(),
+      );
+      if (existing) {
+        existing.binding.hubId = meta.hubId;
+        existing.binding.remoteId = meta.remoteId;
+        if (meta.categoryId !== undefined) existing.binding.categoryId = meta.categoryId;
+        if (meta.remoteIndex !== undefined) existing.binding.remoteIndex = meta.remoteIndex;
+        if (k.keyId !== undefined) existing.binding.keyId = k.keyId;
+        if (k.learningCode) existing.binding.learningCode = k.learningCode;
+        if (k.keyName && k.keyName.trim() && existing.action.desc === existing.action.name) {
+          const nextDesc = tuyaIrKeyDescZh(keyCode, k.keyName);
+          existing.action.desc = nextDesc;
+          existing.binding.desc = nextDesc;
+        }
+      } else {
+        const desc = tuyaIrKeyDescZh(keyCode, k.keyName);
+        const binding: TuyaIrActionBinding = {
+          actionName: keyCode,
+          desc,
+          dpCode: keyCode,
+          sendValue: keyCode,
+          hubId: meta.hubId,
+          remoteId: meta.remoteId,
+          ...(meta.categoryId !== undefined ? { categoryId: meta.categoryId } : {}),
+          ...(meta.remoteIndex !== undefined ? { remoteIndex: meta.remoteIndex } : {}),
+          ...(k.keyId !== undefined ? { keyId: k.keyId } : {}),
+          ...(k.learningCode ? { learningCode: k.learningCode } : {}),
+        };
+        rawActions.push({
+          action: {
+            name: keyCode,
+            desc,
+            service: "ir-remote",
+            service_desc: "红外遥控",
+          },
+          binding,
+          index: rawActions.length,
+        });
+      }
+    }
+  }
+
+  // 按遥控器自然分区顺序排序（电源 -> 音量 -> 播放 -> 方向 -> 频道 -> 信号源 -> 自定义 -> 数字）
+  rawActions.sort(
+    (a, b) =>
+      irKeyOrderWeight(a.action.name) - irKeyOrderWeight(b.action.name) || a.index - b.index,
+  );
+  for (const entry of rawActions) {
+    actions.push(entry.action);
+    irActionsByName.set(entry.binding.actionName, entry.binding);
+  }
+
+  // 3. 识别红外电源键（独立 PowerOn/PowerOff 或单键 Power/PowerOnOff），映射为标准可写 `on` 属性
+  const findIrAction = (candidates: readonly string[]): TuyaIrActionBinding | null => {
+    for (const c of candidates) {
+      for (const binding of irActionsByName.values()) {
+        if (binding.actionName.toLowerCase() === c) {
+          return binding;
+        }
+      }
+    }
+    return null;
+  };
+  const onAction = findIrAction(["poweron", "power_on"]);
+  const offAction = findIrAction(["poweroff", "power_off"]);
+  const toggleAction = findIrAction(["power", "poweronoff", "power_toggle"]);
+  const powerStatusDpCode = statusCodes.has("power") ? "power" : null;
+
+  let irPower: TuyaIrPowerConfig | null = null;
+  if (onAction || offAction || toggleAction) {
+    const initialPower =
+      powerStatusDpCode && typeof record.status[powerStatusDpCode] === "boolean"
+        ? (record.status[powerStatusDpCode] as boolean)
+        : null;
+    irPower = {
+      onAction,
+      offAction,
+      toggleAction,
+      statusDpCode: powerStatusDpCode,
+      assumedState: initialPower,
+    };
+    if (powerStatusDpCode) {
+      consumedStatusCodes.add(powerStatusDpCode);
+    }
+    const powerBinding: TuyaPropBinding = {
+      propName: "on",
+      dpCode: onAction?.dpCode ?? toggleAction?.dpCode ?? powerStatusDpCode ?? "PowerOn",
+      ...(powerStatusDpCode ? { statusDpCode: powerStatusDpCode } : {}),
+      kind: "ir-power",
+      min: 0,
+      max: 1,
+      step: 1,
+      scale: 0,
+      readable: Boolean(powerStatusDpCode),
+      writable: true,
+    };
+    props.push(
+      createPropInfo({
+        name: "on",
+        desc: "开关",
+        type: "bool",
+        readable: Boolean(powerStatusDpCode),
+        writable: true,
+        service: "power",
+        service_desc: "电源",
+      }),
+    );
+    bindingsByPropName.set("on", powerBinding);
+    if (powerStatusDpCode) {
+      bindingsByDpCode.set(powerStatusDpCode, powerBinding);
+    }
+  }
+
+  // 4. 针对红外空调 (infrared_ac) 映射 M / T / F -> 标准 mode / target-temperature / fan-level
+  if (isIrAc) {
+    const funcByCode = new Map(functions.map((f) => [f.code, f]));
+
+    const modeFn = funcByCode.get("M");
+    if (modeFn) {
+      consumedFuncCodes.add("M");
+      const parsed = parseSpecValues(modeFn.values);
+      const min = parsed.min ?? 0;
+      const max = parsed.max ?? 4;
+      const step = parsed.step ?? 1;
+      const hasStatus = statusCodes.has("mode");
+      if (hasStatus) consumedStatusCodes.add("mode");
+      const binding: TuyaPropBinding = {
+        propName: "mode",
+        dpCode: "M",
+        ...(hasStatus ? { statusDpCode: "mode" } : {}),
+        kind: "int-enum",
+        min,
+        max,
+        step,
+        scale: 0,
+        readable: hasStatus,
+        writable: true,
+      };
+      props.push(
+        createPropInfo({
+          name: "mode",
+          desc: "运行模式",
+          type: "int",
+          readable: hasStatus,
+          writable: true,
+          value_list: buildIrAcIntEnumOptions(min, max, step, TUYA_IR_AC_MODE_LABELS),
+          service: "air-conditioner",
+          service_desc: "空调控制",
+        }),
+      );
+      bindingsByPropName.set("mode", binding);
+      bindingsByDpCode.set("M", binding);
+      bindingsByDpCode.set("mode", binding);
+    }
+
+    const tempFn = funcByCode.get("T");
+    if (tempFn) {
+      consumedFuncCodes.add("T");
+      const parsed = parseSpecValues(tempFn.values);
+      const min = parsed.min ?? 16;
+      const max = parsed.max ?? 30;
+      const step = parsed.step ?? 1;
+      const hasStatus = statusCodes.has("temp");
+      if (hasStatus) consumedStatusCodes.add("temp");
+      const binding: TuyaPropBinding = {
+        propName: "target-temperature",
+        dpCode: "T",
+        ...(hasStatus ? { statusDpCode: "temp" } : {}),
+        kind: "scaled-int",
+        min,
+        max,
+        step,
+        scale: 0,
+        readable: hasStatus,
+        writable: true,
+      };
+      props.push(
+        createPropInfo({
+          name: "target-temperature",
+          desc: "目标温度",
+          type: "uint",
+          readable: hasStatus,
+          writable: true,
+          range: [min, max, step],
+          unit: "celsius",
+          service: "air-conditioner",
+          service_desc: "空调控制",
+        }),
+      );
+      bindingsByPropName.set("target-temperature", binding);
+      bindingsByDpCode.set("T", binding);
+      bindingsByDpCode.set("temp", binding);
+    }
+
+    const fanFn = funcByCode.get("F");
+    if (fanFn) {
+      consumedFuncCodes.add("F");
+      const parsed = parseSpecValues(fanFn.values);
+      const min = parsed.min ?? 0;
+      const max = parsed.max ?? 3;
+      const step = parsed.step ?? 1;
+      const hasStatus = statusCodes.has("wind");
+      if (hasStatus) consumedStatusCodes.add("wind");
+      const binding: TuyaPropBinding = {
+        propName: "fan-level",
+        dpCode: "F",
+        ...(hasStatus ? { statusDpCode: "wind" } : {}),
+        kind: "int-enum",
+        min,
+        max,
+        step,
+        scale: 0,
+        readable: hasStatus,
+        writable: true,
+      };
+      props.push(
+        createPropInfo({
+          name: "fan-level",
+          desc: "风速",
+          type: "int",
+          readable: hasStatus,
+          writable: true,
+          value_list: buildIrAcIntEnumOptions(min, max, step, TUYA_IR_AC_FAN_LABELS),
+          service: "air-conditioner",
+          service_desc: "空调控制",
+        }),
+      );
+      bindingsByPropName.set("fan-level", binding);
+      bindingsByDpCode.set("F", binding);
+      bindingsByDpCode.set("wind", binding);
+    }
+  }
+
+  // 5. 保留其他非按键类可调参数（例如红外电视的 C 频道数值枚举 1-999）与其他只读状态
+  const remainingDps = new Map<string, MergedDpMeta>();
+  for (const item of record.spec?.status ?? []) {
+    if (!item.code || consumedStatusCodes.has(item.code) || consumedFuncCodes.has(item.code)) continue;
+    remainingDps.set(item.code, {
+      code: item.code,
+      name: item.name || item.desc,
+      type: item.type || "String",
+      values: parseSpecValues(item.values),
+      readable: true,
+      writable: false,
+    });
+  }
+  for (const item of functions) {
+    if (!item.code || consumedFuncCodes.has(item.code)) continue;
+    const parsed = parseSpecValues(item.values);
+    const existing = remainingDps.get(item.code);
+    if (existing) {
+      existing.writable = true;
+      existing.values = { ...existing.values, ...parsed };
+    } else {
+      remainingDps.set(item.code, {
+        code: item.code,
+        name: item.name || item.desc,
+        type: item.type || "String",
+        values: parsed,
+        readable: statusCodes.has(item.code),
+        writable: true,
+      });
+    }
+  }
+
+  for (const meta of remainingDps.values()) {
+    const built = buildBindingAndPropForDp(meta, null, false, {
+      bright: false,
+      temp: false,
+      colour: false,
+    });
+    if (!built || bindingsByPropName.has(built.binding.propName)) continue;
+    props.push(built.prop);
+    bindingsByPropName.set(built.binding.propName, built.binding);
+    bindingsByDpCode.set(built.binding.dpCode, built.binding);
+  }
+
+  const info = createDeviceInfo({
+    did: record.id,
+    name: record.name,
+    model,
+    home_name: homeName,
+    room_name: roomName,
+    online: record.online,
+    spec_type: specType,
+    switch_channels: [],
+    light_features: [],
+    metric_features: [],
+    platform: "tuya",
+  });
+
+  const detail: DeviceDetail = {
+    did: record.id,
+    name: record.name,
+    model,
+    props,
+    actions,
+  };
+
+  const profiles = new Map<string, TuyaDeviceProfile>();
+  profiles.set(record.id, {
+    did: record.id,
+    hardwareId: record.id,
+    channel: null,
+    isSplitParent: false,
+    isInfraredRemote: true,
+    info,
+    detail,
+    powerDpCode: null,
+    tempDpCode: null,
+    tempScale: 0,
+    humDpCode: null,
+    humScale: 0,
+    bindingsByPropName,
+    bindingsByDpCode,
+    irActionsByName,
+    irPower,
+    irRemote: record.irRemote ?? null,
+  });
+
+  return { cards: [info], profiles };
+}
+
 /**
  * 将单台涂鸦设备映射为一个或多个 MijiaDeck `DeviceInfo` 卡片与 `TuyaDeviceProfile`：
- * - 多路开关（含 >=2 路 `switch_1`, `switch_2`, ...）自动拆分为父面板卡片 + `<id>.s1`, `<id>.s2`, ... 子卡片。
+ * - 多路开关（含 >=2 路 `switch_1`, `switch_2`, ...）自动拆分为父面板卡片 + `<id>.s1`, `<id>.s2`, ... 子卡片；
+ * - 涂鸦红外虚拟遥控器（`infrared_*`）映射为按键动作集合与红外开关/空调控制模型。
  */
 export function mapTuyaDeviceToCards(record: TuyaDeviceRecord): {
   cards: DeviceInfo[];
   profiles: Map<string, TuyaDeviceProfile>;
 } {
-  const mergedDps = collectMergedDps(record);
   const category = (record.category || record.spec?.category || "").toLowerCase();
   const baseKind = tuyaCategoryToKind(category);
   const model = record.model?.startsWith("tuya.")
@@ -904,6 +1491,11 @@ export function mapTuyaDeviceToCards(record: TuyaDeviceRecord): {
   const homeName = record.homeName?.trim() || "涂鸦家庭";
   const roomName = record.roomName?.trim() || "默认房间";
 
+  if (isTuyaInfraredCategory(category) || Boolean(record.irRemote)) {
+    return mapInfraredRemoteDevice(record, category, baseKind, model, homeName, roomName);
+  }
+
+  const mergedDps = collectMergedDps(record);
   const splitChannels = detectSwitchChannels(record);
   const profiles = new Map<string, TuyaDeviceProfile>();
   const cards: DeviceInfo[] = [];
@@ -955,6 +1547,7 @@ export function mapTuyaDeviceToCards(record: TuyaDeviceRecord): {
       hardwareId: record.id,
       channel: null,
       isSplitParent: true,
+      isInfraredRemote: false,
       info: parentInfo,
       detail: parentDetail,
       powerDpCode: null,
@@ -964,6 +1557,9 @@ export function mapTuyaDeviceToCards(record: TuyaDeviceRecord): {
       humScale: metrics.humScale,
       bindingsByPropName: parentByProp,
       bindingsByDpCode: parentByDp,
+      irActionsByName: new Map(),
+      irPower: null,
+      irRemote: null,
     });
 
     // 2. Child switch channel cards: <id>.s1, <id>.s2, ...
@@ -1034,6 +1630,7 @@ export function mapTuyaDeviceToCards(record: TuyaDeviceRecord): {
         hardwareId: record.id,
         channel: ch,
         isSplitParent: false,
+        isInfraredRemote: false,
         info: childInfo,
         detail: childDetail,
         powerDpCode: dpCode,
@@ -1043,6 +1640,9 @@ export function mapTuyaDeviceToCards(record: TuyaDeviceRecord): {
         humScale: 0,
         bindingsByPropName: childByProp,
         bindingsByDpCode: childByDp,
+        irActionsByName: new Map(),
+        irPower: null,
+        irRemote: null,
       });
     }
 
@@ -1124,6 +1724,7 @@ export function mapTuyaDeviceToCards(record: TuyaDeviceRecord): {
     hardwareId: record.id,
     channel: null,
     isSplitParent: false,
+    isInfraredRemote: false,
     info,
     detail,
     powerDpCode,
@@ -1133,6 +1734,9 @@ export function mapTuyaDeviceToCards(record: TuyaDeviceRecord): {
     humScale: metrics.humScale,
     bindingsByPropName,
     bindingsByDpCode,
+    irActionsByName: new Map(),
+    irPower: null,
+    irRemote: null,
   });
 
   return { cards, profiles };

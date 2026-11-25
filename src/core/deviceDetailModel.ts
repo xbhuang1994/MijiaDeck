@@ -85,6 +85,11 @@ const CAMERA_KINDS: ReadonlySet<string> = new Set(["camera", "ip-camera"]);
 const APPLIANCE_POWER_KINDS: ReadonlySet<string> = new Set([
   "television",
   "tv",
+  "amplifier",
+  "set-top-box",
+  "projector",
+  "dvd-player",
+  "ir-remote",
   "washer",
   "washing-machine",
   "dryer",
@@ -109,6 +114,23 @@ const LIGHT_PROP_MAP = new Map<string, LightPropKind>([
 ]);
 
 const DEVICE_CATEGORY_LABELS: ReadonlyArray<readonly [string, string]> = [
+  ["ir-hub", "万能红外遥控器"],
+  ["wnykq", "万能红外遥控器"],
+  ["infrared_amplifier", "红外音响"],
+  ["infrared_audio", "红外音响"],
+  ["infrared_soundbar", "红外音响"],
+  ["amplifier", "红外音响"],
+  ["infrared_ac", "红外空调"],
+  ["infrared_tv", "红外电视"],
+  ["infrared_fan", "红外风扇"],
+  ["infrared_stb", "红外机顶盒"],
+  ["infrared_box", "红外机顶盒"],
+  ["infrared_projector", "红外投影仪"],
+  ["infrared_dvd", "红外播放器"],
+  ["set-top-box", "机顶盒"],
+  ["projector", "投影仪"],
+  ["dvd-player", "播放器"],
+  ["ir-remote", "红外遥控器"],
   ["air-purifier", "空气净化器"],
   ["airpurifier", "空气净化器"],
   ["purifier", "空气净化器"],
@@ -576,6 +598,28 @@ export function coercePropWriteValue(
     return { ok: true, value: rawValue };
   }
   return { ok: true, value: rawValue };
+}
+
+/** 判断设备是否为红外遥控虚拟子设备（支持涂鸦万能红外遥控下的音响、空调、电视、DIY 等）。 */
+export function isIrRemoteDevice(
+  device: Pick<DeviceInfo, "model" | "spec_type">,
+  actions?: readonly ActionInfo[],
+): boolean {
+  if (actions?.some((a) => a.service === "ir-remote")) {
+    return true;
+  }
+  const modelLower = (device.model ?? "").toLowerCase();
+  if (modelLower.includes(".infrared_")) {
+    return true;
+  }
+  const specType = (device.spec_type ?? "").toLowerCase();
+  return (
+    specType.includes(":device:ir-remote:") ||
+    specType.includes(":device:amplifier:") ||
+    specType.includes(":device:set-top-box:") ||
+    specType.includes(":device:projector:") ||
+    specType.includes(":device:dvd-player:")
+  );
 }
 
 /** 判断设备是否为宠物喂食器（兼容型号、MIoT spec_type 与动作特征）。 */

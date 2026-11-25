@@ -1227,6 +1227,7 @@ export function createRequestHandler(
 
         let values: Record<string, unknown> = {};
         let actionLabel = actionName;
+        let resolvedPowerState: boolean | null = null;
         try {
           const detail = await runInJobs(runtime.jobs, () => runtime.service.deviceDetail(did), 2);
           const matchedAct = detail.actions.find(
@@ -1254,10 +1255,22 @@ export function createRequestHandler(
           const device = runtime.mainWindow.allDevices.find((d) => d.did === did);
           if (
             powerProp &&
-            typeof values[powerProp.name] === "boolean" &&
+            typeof values[powerProp.name] !== "boolean" &&
+            matchedAct?.service === "ir-remote"
+          ) {
+            const pwr = await runInJobs(runtime.jobs, () => runtime.service.powerState(did), 2);
+            if (typeof pwr === "boolean") {
+              values[powerProp.name] = pwr;
+            }
+          }
+          if (powerProp && typeof values[powerProp.name] === "boolean") {
+            resolvedPowerState = values[powerProp.name] as boolean;
+          }
+          if (
+            resolvedPowerState !== null &&
             (!device || supportsCardPower(device) || isCamera(device))
           ) {
-            runtime.mainWindow.applyPowerState(did, values[powerProp.name] as boolean);
+            runtime.mainWindow.applyPowerState(did, resolvedPowerState);
             runtime.mainWindow.updateTrayDevices();
           }
         } catch {
@@ -1273,6 +1286,7 @@ export function createRequestHandler(
           did,
           name: actionName,
           values,
+          ...(resolvedPowerState !== null ? { powerState: resolvedPowerState } : {}),
           message: `已执行「${actionLabel}」`,
         });
       }

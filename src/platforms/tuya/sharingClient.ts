@@ -64,6 +64,8 @@ export interface TuyaSharingDevice {
   productName?: string;
   model?: string;
   online: boolean;
+  sub?: boolean;
+  node_id?: string;
   local_key?: string;
   localKey?: string;
   ip?: string;

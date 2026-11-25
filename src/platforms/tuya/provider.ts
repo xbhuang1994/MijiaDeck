@@ -36,6 +36,8 @@ import {
   TUYA_LOCAL_DEFAULT_PORT,
   TUYA_SCHEMA,
   TUYA_SHARING_AUTH_ENDPOINT,
+  isTuyaInfraredCategory,
+  isTuyaIrHubCategory,
 } from "./constants.ts";
 import { discoverTuyaLanDevices, TuyaLocalClient } from "./localClient.ts";
 import {
@@ -46,9 +48,13 @@ import {
   tuyaRawValueToMijiaProp,
   type TuyaDeviceProfile,
   type TuyaDeviceRecord,
+  type TuyaIrActionBinding,
+  type TuyaIrRemoteMeta,
+  type TuyaPropBinding,
 } from "./mapper.ts";
-import { TuyaOpenApiClient, type TuyaOpenApiDevice } from "./openApiClient.ts";
+import { TuyaOpenApiClient, TuyaOpenApiError, type TuyaOpenApiDevice } from "./openApiClient.ts";
 import {
+  TuyaSharingApiError,
   TuyaSharingClient,
   type TuyaDeviceSpecification,
   type TuyaSharingDevice,
@@ -110,6 +116,52 @@ interface PendingQrSession {
 
 const MASK_PLACEHOLDER = "••••••••";
 const SPEC_CONCURRENCY = 6;
+const IR_REPEAT_DELAY_MS = 180;
+
+const IR_ACTION_ALIASES: Readonly<Record<string, readonly string[]>> = {
+  poweron: ["poweron", "power_on", "开机", "打开", "开启"],
+  poweroff: ["poweroff", "power_off", "关机", "关闭", "关掉"],
+  power: ["power", "poweronoff", "电源", "开关", "电源开关"],
+  "volume+": ["volume+", "vol+", "volumeup", "volume_up", "volume-up", "音量+", "音量加", "调大音量", "声音大"],
+  "volume-": ["volume-", "vol-", "volumedown", "volume_down", "volume-down", "音量-", "音量减", "调小音量", "声音小"],
+  mute: ["mute", "静音", "取消静音"],
+  play: ["play", "播放", "继续播放", "恢复播放"],
+  pause: ["pause", "暂停", "暂停播放"],
+  playpause: ["playpause", "play/pause", "play_pause", "play-pause", "播放/暂停"],
+  stop: ["stop", "停止", "停止播放"],
+  next: ["next", "nexttrack", "next_track", "next-track", "下一首", "下一曲", "切歌"],
+  previous: ["previous", "prev", "previoustrack", "previous_track", "previous-track", "上一首", "上一曲"],
+  "channel+": ["channel+", "ch+", "channelup", "channel_up", "channel-up", "频道+", "频道加", "下一个频道"],
+  "channel-": ["channel-", "ch-", "channeldown", "channel_down", "channel-down", "频道-", "频道减", "上一个频道"],
+  up: ["up", "上"],
+  down: ["down", "下"],
+  left: ["left", "左"],
+  right: ["right", "右"],
+  ok: ["ok", "enter", "select", "确认", "确定"],
+  menu: ["menu", "菜单"],
+  home: ["home", "主页", "首页"],
+  back: ["back", "return", "返回"],
+  source: ["source", "input", "signal", "信号源", "输入源"],
+};
+
+function normalizeIrActionToken(raw: string): string {
+  return raw.trim().toLowerCase().replace(/[\s]+/g, "");
+}
+
+function parseIrRepeatCount(params: unknown): number {
+  let raw: unknown = undefined;
+  if (typeof params === "number") {
+    raw = params;
+  } else if (Array.isArray(params) && params.length === 1 && typeof params[0] === "number") {
+    raw = params[0];
+  } else if (isRecord(params) && typeof params.repeat === "number") {
+    raw = params.repeat;
+  }
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return Math.max(1, Math.min(5, Math.round(raw)));
+  }
+  return 1;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -329,6 +381,12 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
   private _wrapError(err: unknown, context: string): ServiceError {
     if (err instanceof ServiceError) {
       return new ServiceError(this._sanitizeErrorText(err));
+    }
+    if (
+      (err instanceof TuyaSharingApiError || err instanceof TuyaOpenApiError) &&
+      String(err.code ?? "") === "2050"
+    ) {
+      return new ServiceError(`${context}: 当前模式不支持该红外参数组合（红外码库无对应指令，错误码 2050）`);
     }
     return new ServiceError(`${context}: ${this._sanitizeErrorText(err)}`);
   }
@@ -853,6 +911,7 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
             homeName,
             roomName: resolvedRoom || localEntry?.room?.trim() || "默认房间",
             online: Boolean(dev.online),
+            ...(typeof dev.sub === "boolean" ? { sub: dev.sub } : {}),
             localKey: localEntry?.localKey || dev.localKey || dev.local_key,
             ip: localEntry?.ip || dev.ip,
             status: statusArrayToRecord(dev.status),
@@ -941,6 +1000,7 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
               localEntry?.room?.trim() ||
               "默认房间",
             online: Boolean(dev.online),
+            ...(typeof dev.sub === "boolean" ? { sub: dev.sub } : {}),
             localKey: localEntry?.localKey || dev.local_key,
             ip: localEntry?.ip || dev.ip,
             status: statusArrayToRecord(dev.status),
@@ -950,6 +1010,9 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
             source: localEntry && mode === "hybrid" ? "hybrid" : "openapi",
           });
         }
+
+        // OpenAPI v2.0: 若存在万能红外遥控器网关 (wnykq/qt)，尝试补全其下虚拟红外遥控器的按键与学习码元数据
+        await this._enrichOpenApiIrRemotes(recordsById);
       }
 
       // Local-only 或 Hybrid 中的独立局域网设备
@@ -995,11 +1058,22 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
 
       const allCards: DeviceInfo[] = [];
       const nextProfiles = new Map<string, TuyaDeviceProfile>();
+      const prevProfiles = this._profiles;
 
       for (const record of recordsById.values()) {
         const { cards, profiles } = mapTuyaDeviceToCards(record);
         allCards.push(...cards);
         for (const [did, profile] of profiles.entries()) {
+          // 跨刷新保留单向红外遥控器的会话推断电源状态（云端未上报实时状态时）
+          const prev = prevProfiles.get(did);
+          if (
+            profile.irPower &&
+            profile.irPower.assumedState === null &&
+            prev?.irPower &&
+            prev.irPower.assumedState !== null
+          ) {
+            profile.irPower.assumedState = prev.irPower.assumedState;
+          }
           nextProfiles.set(did, profile);
         }
       }
@@ -1026,6 +1100,231 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
     }
   }
 
+  private async _enrichOpenApiIrRemotes(recordsById: Map<string, TuyaDeviceRecord>): Promise<void> {
+    const client = this._openApiClient;
+    if (!client) return;
+    const hubs = [...recordsById.values()].filter(
+      (r) => !r.sub && isTuyaIrHubCategory(r.category),
+    );
+    if (hubs.length === 0) return;
+
+    await Promise.all(
+      hubs.map(async (hub) => {
+        let remotes;
+        try {
+          remotes = await client.listInfraredRemotes(hub.id);
+        } catch {
+          // 用户 OpenAPI 项目未开通 IR Control Hub 订阅时静默回退到标准 specifications
+          return;
+        }
+        await runWithConcurrency(remotes, SPEC_CONCURRENCY, async (remote) => {
+          const target = recordsById.get(remote.remote_id);
+          if (!target) return;
+          try {
+            const keysRes = await client.getInfraredRemoteKeys(hub.id, remote.remote_id);
+            const rawKeys = keysRes?.key_list ?? [];
+            const isIrAc = target.category.toLowerCase() === "infrared_ac";
+            const needsLearning =
+              !isIrAc &&
+              (remote.category_id === 999 ||
+                remote.category_id === 99 ||
+                target.category.toLowerCase() === "infrared_diy" ||
+                rawKeys.length === 0 ||
+                rawKeys.some((k) => k.standard_key === false));
+            const learningByKey = new Map<string, string>();
+            const learningById = new Map<number, string>();
+            const learnedList: Array<{ id?: number; key: string; key_name?: string; code: string }> = [];
+            if (needsLearning) {
+              try {
+                const learned = await client.listInfraredLearningCodes(hub.id, remote.remote_id);
+                for (const lc of learned) {
+                  learnedList.push(lc);
+                  learningByKey.set(lc.key.toLowerCase(), lc.code);
+                  if (lc.id !== undefined) learningById.set(lc.id, lc.code);
+                }
+              } catch {
+                // learning-codes endpoint is best-effort
+              }
+            }
+            const mergedKeys: NonNullable<TuyaIrRemoteMeta["keys"]> = rawKeys.map((k) => {
+              const learningCode =
+                (k.key_id !== undefined ? learningById.get(k.key_id) : undefined) ??
+                learningByKey.get(k.key.toLowerCase());
+              return {
+                key: k.key,
+                ...(k.key_name ? { keyName: k.key_name } : {}),
+                ...(k.key_id !== undefined ? { keyId: k.key_id } : {}),
+                ...(k.standard_key !== undefined ? { standardKey: k.standard_key } : {}),
+                ...(learningCode ? { learningCode } : {}),
+              };
+            });
+            const seenKeys = new Set(mergedKeys.map((k) => k.key.toLowerCase()));
+            const seenIds = new Set(
+              mergedKeys.filter((k) => k.keyId !== undefined).map((k) => k.keyId!),
+            );
+            for (const lc of learnedList) {
+              if (
+                seenKeys.has(lc.key.toLowerCase()) ||
+                (lc.id !== undefined && seenIds.has(lc.id))
+              ) {
+                continue;
+              }
+              seenKeys.add(lc.key.toLowerCase());
+              if (lc.id !== undefined) seenIds.add(lc.id);
+              mergedKeys.push({
+                key: lc.key,
+                ...(lc.key_name ? { keyName: lc.key_name } : {}),
+                ...(lc.id !== undefined ? { keyId: lc.id } : {}),
+                standardKey: false,
+                learningCode: lc.code,
+              });
+            }
+            const irMeta: TuyaIrRemoteMeta = {
+              hubId: hub.id,
+              remoteId: remote.remote_id,
+              categoryId: keysRes?.category_id ?? remote.category_id,
+              ...(keysRes?.remote_index !== undefined || remote.remote_index !== undefined
+                ? { remoteIndex: keysRes?.remote_index ?? remote.remote_index }
+                : {}),
+              ...(remote.brand_name ? { brandName: remote.brand_name } : {}),
+              keys: mergedKeys,
+            };
+            target.irRemote = irMeta;
+
+            if (target.category.toLowerCase() === "infrared_ac") {
+              try {
+                const acStatus = await client.getInfraredAcStatus(hub.id, remote.remote_id);
+                if (Object.keys(acStatus).length > 0) {
+                  target.status = { ...target.status, ...acStatus };
+                }
+              } catch {
+                // ac/status is best-effort
+              }
+            }
+          } catch {
+            // individual remote keys lookup is best-effort
+          }
+        });
+      }),
+    );
+  }
+
+  private _isOpenApiPrimaryChannel(): boolean {
+    return Boolean(
+      this._openApiClient &&
+        (this._config.mode === "openapi" ||
+          (this._config.mode === "hybrid" && !this._hasSharingCredentials())),
+    );
+  }
+
+  private _resolveIrActionBinding(
+    profile: TuyaDeviceProfile,
+    name: string,
+  ): TuyaIrActionBinding | null {
+    if (profile.irActionsByName.size === 0) return null;
+    const trimmed = name.trim();
+    if (!trimmed) return null;
+
+    const exact = profile.irActionsByName.get(trimmed);
+    if (exact) return exact;
+
+    const norm = normalizeIrActionToken(trimmed);
+    for (const binding of profile.irActionsByName.values()) {
+      if (
+        normalizeIrActionToken(binding.actionName) === norm ||
+        normalizeIrActionToken(binding.desc) === norm
+      ) {
+        return binding;
+      }
+    }
+
+    // 别名匹配（兼容音量加/减、上下曲、开关机等中英文表达）
+    for (const [canonical, aliases] of Object.entries(IR_ACTION_ALIASES)) {
+      if (aliases.some((alias) => normalizeIrActionToken(alias) === norm)) {
+        for (const binding of profile.irActionsByName.values()) {
+          const bNorm = normalizeIrActionToken(binding.actionName);
+          if (
+            bNorm === canonical ||
+            aliases.some((alias) => normalizeIrActionToken(alias) === bNorm)
+          ) {
+            return binding;
+          }
+        }
+      }
+    }
+
+    // 子串回退匹配
+    for (const binding of profile.irActionsByName.values()) {
+      const bDesc = normalizeIrActionToken(binding.desc);
+      if (bDesc.length >= 2 && (bDesc.includes(norm) || norm.includes(bDesc))) {
+        return binding;
+      }
+    }
+    return null;
+  }
+
+  private async _sendIrAction(
+    profile: TuyaDeviceProfile,
+    action: TuyaIrActionBinding,
+  ): Promise<void> {
+    if (this._isOpenApiPrimaryChannel() && this._openApiClient && action.hubId && action.remoteId) {
+      try {
+        if (action.learningCode) {
+          const ok = await this._openApiClient.sendInfraredLearningCode(
+            action.hubId,
+            action.remoteId,
+            action.learningCode,
+          );
+          if (!ok) {
+            throw new ServiceError(`涂鸦 OpenAPI 拒绝了红外学习按键「${action.desc}」`);
+          }
+        } else if (action.categoryId !== undefined) {
+          const ok = await this._openApiClient.sendInfraredRawCommand(
+            action.hubId,
+            action.remoteId,
+            {
+              category_id: action.categoryId,
+              ...(action.remoteIndex !== undefined ? { remote_index: action.remoteIndex } : {}),
+              key: action.dpCode,
+              ...(action.keyId !== undefined ? { key_id: action.keyId } : {}),
+            },
+          );
+          if (!ok) {
+            throw new ServiceError(`涂鸦 OpenAPI 拒绝了红外按键「${action.desc}」`);
+          }
+        } else {
+          await this._sendHardwareCommand(profile.hardwareId, action.dpCode, action.sendValue);
+        }
+      } catch (err) {
+        throw this._wrapError(err, `发送涂鸦红外按键「${action.desc}」失败`);
+      }
+    } else {
+      await this._sendHardwareCommand(profile.hardwareId, action.dpCode, action.sendValue);
+    }
+
+    // 同步单向红外电源状态
+    if (profile.irPower) {
+      const record = this._records.get(profile.hardwareId);
+      if (profile.irPower.onAction?.actionName === action.actionName) {
+        profile.irPower.assumedState = true;
+        if (record && profile.irPower.statusDpCode) {
+          record.status[profile.irPower.statusDpCode] = true;
+        }
+      } else if (profile.irPower.offAction?.actionName === action.actionName) {
+        profile.irPower.assumedState = false;
+        if (record && profile.irPower.statusDpCode) {
+          record.status[profile.irPower.statusDpCode] = false;
+        }
+      } else if (profile.irPower.toggleAction?.actionName === action.actionName) {
+        const next = profile.irPower.assumedState === true ? false : true;
+        profile.irPower.assumedState = next;
+        if (record && profile.irPower.statusDpCode) {
+          record.status[profile.irPower.statusDpCode] = next;
+        }
+      }
+    }
+  }
+
   private async _ensureProfile(nativeDid: string): Promise<TuyaDeviceProfile> {
     let profile = this._profiles.get(nativeDid);
     if (!profile) {
@@ -1041,7 +1340,9 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
   private async _fetchHardwareStatus(hardwareId: string): Promise<Record<string, unknown>> {
     const record = this._records.get(hardwareId);
     const localEntry = this._localEntryById(hardwareId);
+    const isVirtualIr = Boolean(record && (record.sub || isTuyaInfraredCategory(record.category)));
     const shouldTryLocal =
+      !isVirtualIr &&
       Boolean(localEntry && localEntry.ip && localEntry.localKey) &&
       (this._config.mode === "local" ||
         (this._config.mode === "hybrid" && this._config.preferLocal));
@@ -1090,6 +1391,38 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
     }
 
     if (this._openApiClient && (this._config.mode === "openapi" || this._config.mode === "hybrid")) {
+      if (
+        record &&
+        record.category.toLowerCase() === "infrared_ac" &&
+        record.irRemote?.hubId &&
+        record.irRemote?.remoteId
+      ) {
+        try {
+          const acStatus = await this._openApiClient.getInfraredAcStatus(
+            record.irRemote.hubId,
+            record.irRemote.remoteId,
+          );
+          if (acStatus) {
+            const fresh: Record<string, unknown> = { ...record.status };
+            if (acStatus.power !== undefined) {
+              fresh.power = String(acStatus.power) === "1" || String(acStatus.power) === "true";
+            }
+            if (acStatus.mode !== undefined && Number.isFinite(Number(acStatus.mode))) {
+              fresh.mode = Number(acStatus.mode);
+            }
+            if (acStatus.temp !== undefined && Number.isFinite(Number(acStatus.temp))) {
+              fresh.temp = Number(acStatus.temp);
+            }
+            if (acStatus.wind !== undefined && Number.isFinite(Number(acStatus.wind))) {
+              fresh.wind = Number(acStatus.wind);
+            }
+            record.status = fresh;
+            return fresh;
+          }
+        } catch {
+          // fall back to generic getDeviceStatus below
+        }
+      }
       try {
         const items = await this._openApiClient.getDeviceStatus(hardwareId);
         const fresh = { ...(record?.status ?? {}), ...statusArrayToRecord(items) };
@@ -1115,7 +1448,9 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
   ): Promise<void> {
     const record = this._records.get(hardwareId);
     const localEntry = this._localEntryById(hardwareId);
+    const isVirtualIr = Boolean(record && (record.sub || isTuyaInfraredCategory(record.category)));
     const shouldTryLocal =
+      !isVirtualIr &&
       Boolean(localEntry && localEntry.ip && localEntry.localKey) &&
       (this._config.mode === "local" ||
         (this._config.mode === "hybrid" && this._config.preferLocal));
@@ -1194,26 +1529,51 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
     };
   }
 
+  private _readBindingValue(
+    profile: TuyaDeviceProfile,
+    binding: TuyaPropBinding,
+    status: Record<string, unknown>,
+  ): unknown {
+    if (binding.kind === "ir-power") {
+      if (binding.statusDpCode && status[binding.statusDpCode] !== undefined && status[binding.statusDpCode] !== null) {
+        return Boolean(status[binding.statusDpCode]);
+      }
+      return profile.irPower?.assumedState ?? null;
+    }
+    const readCode = binding.statusDpCode ?? binding.dpCode;
+    const raw = readCode in status ? status[readCode] : status[binding.dpCode];
+    return tuyaRawValueToMijiaProp(binding, raw);
+  }
+
+  private _hasReadableStatus(profile: TuyaDeviceProfile): boolean {
+    if (!profile.isInfraredRemote) return true;
+    return profile.detail.props.some((p) => p.readable);
+  }
+
   async readProp(nativeDid: string, name: string): Promise<unknown> {
     const profile = await this._ensureProfile(nativeDid);
     const binding =
       profile.bindingsByPropName.get(name) ?? profile.bindingsByDpCode.get(name);
-    const status = await this._fetchHardwareStatus(profile.hardwareId);
+    const status = this._hasReadableStatus(profile)
+      ? await this._fetchHardwareStatus(profile.hardwareId)
+      : { ...(this._records.get(profile.hardwareId)?.status ?? {}) };
     if (!binding) {
       return name in status ? status[name] : null;
     }
-    return tuyaRawValueToMijiaProp(binding, status[binding.dpCode]);
+    return this._readBindingValue(profile, binding, status);
   }
 
   async readProps(nativeDid: string, names: string[]): Promise<Record<string, unknown>> {
     const profile = await this._ensureProfile(nativeDid);
-    const status = await this._fetchHardwareStatus(profile.hardwareId);
+    const status = this._hasReadableStatus(profile)
+      ? await this._fetchHardwareStatus(profile.hardwareId)
+      : { ...(this._records.get(profile.hardwareId)?.status ?? {}) };
     const out: Record<string, unknown> = {};
     for (const name of names) {
       const binding =
         profile.bindingsByPropName.get(name) ?? profile.bindingsByDpCode.get(name);
       if (binding) {
-        out[name] = tuyaRawValueToMijiaProp(binding, status[binding.dpCode]);
+        out[name] = this._readBindingValue(profile, binding, status);
       } else {
         out[name] = name in status ? status[name] : null;
       }
@@ -1241,12 +1601,74 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
     } catch (err) {
       throw this._wrapError(err, `属性 ${name} 参数无效`);
     }
-    await this._sendHardwareCommand(profile.hardwareId, binding.dpCode, tuyaValue);
+
+    if (binding.kind === "ir-power") {
+      await this.setPowerState(nativeDid, Boolean(tuyaValue));
+      return;
+    }
+
+    const record = this._records.get(profile.hardwareId);
+    const isIrAc = record?.category.toLowerCase() === "infrared_ac";
+    if (
+      isIrAc &&
+      this._isOpenApiPrimaryChannel() &&
+      this._openApiClient &&
+      profile.irRemote?.hubId &&
+      profile.irRemote?.remoteId
+    ) {
+      const curMode = Number(record?.status.mode ?? record?.status.M ?? 0);
+      const curTemp = Number(record?.status.temp ?? record?.status.T ?? 24);
+      const curWind = Number(record?.status.wind ?? record?.status.F ?? 0);
+      const payload = {
+        power: 1,
+        mode: binding.dpCode === "M" ? Number(tuyaValue) : Number.isFinite(curMode) ? curMode : 0,
+        temp: binding.dpCode === "T" ? Number(tuyaValue) : Number.isFinite(curTemp) ? curTemp : 24,
+        wind: binding.dpCode === "F" ? Number(tuyaValue) : Number.isFinite(curWind) ? curWind : 0,
+      };
+      try {
+        const ok = await this._openApiClient.sendInfraredAcCommand(
+          profile.irRemote.hubId,
+          profile.irRemote.remoteId,
+          payload,
+        );
+        if (!ok) {
+          throw new ServiceError(`涂鸦 OpenAPI 拒绝了红外空调属性 ${name} 的控制指令`);
+        }
+      } catch (err) {
+        throw this._wrapError(err, `控制涂鸦红外空调 ${profile.info.name} 失败`);
+      }
+    } else {
+      await this._sendHardwareCommand(profile.hardwareId, binding.dpCode, tuyaValue);
+    }
+
+    if (record && binding.statusDpCode) {
+      record.status[binding.statusDpCode] = tuyaValue;
+    }
+    if (isIrAc && profile.irPower) {
+      // 涂鸦红外空调写入模式/温度/风速会携带开机状态发射完整红外帧
+      profile.irPower.assumedState = true;
+      if (record && profile.irPower.statusDpCode) {
+        record.status[profile.irPower.statusDpCode] = true;
+      }
+    }
   }
 
   async runAction(nativeDid: string, name: string, params?: unknown): Promise<void> {
     this._requireControlAccess();
     const profile = await this._ensureProfile(nativeDid);
+
+    const irAction = this._resolveIrActionBinding(profile, name);
+    if (irAction) {
+      const repeatCount = parseIrRepeatCount(params);
+      for (let i = 0; i < repeatCount; i += 1) {
+        if (i > 0) {
+          await new Promise((resolve) => setTimeout(resolve, IR_REPEAT_DELAY_MS));
+        }
+        await this._sendIrAction(profile, irAction);
+      }
+      return;
+    }
+
     const binding =
       profile.bindingsByPropName.get(name) ?? profile.bindingsByDpCode.get(name);
     if (binding && binding.writable) {
@@ -1270,6 +1692,62 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
     if (profile.isSplitParent) {
       throw new ServiceError("面板本体仅展示信息，请操作对应开关通道");
     }
+    if (profile.irPower) {
+      const record = this._records.get(profile.hardwareId);
+      const isIrAc = record?.category.toLowerCase() === "infrared_ac";
+      if (
+        isIrAc &&
+        this._isOpenApiPrimaryChannel() &&
+        this._openApiClient &&
+        profile.irRemote?.hubId &&
+        profile.irRemote?.remoteId
+      ) {
+        const payload = state
+          ? {
+              power: 1,
+              mode: Number.isFinite(Number(record?.status.mode ?? record?.status.M))
+                ? Number(record?.status.mode ?? record?.status.M)
+                : 0,
+              temp: Number.isFinite(Number(record?.status.temp ?? record?.status.T))
+                ? Number(record?.status.temp ?? record?.status.T)
+                : 24,
+              wind: Number.isFinite(Number(record?.status.wind ?? record?.status.F))
+                ? Number(record?.status.wind ?? record?.status.F)
+                : 0,
+            }
+          : { power: 0 };
+        try {
+          const ok = await this._openApiClient.sendInfraredAcCommand(
+            profile.irRemote.hubId,
+            profile.irRemote.remoteId,
+            payload,
+          );
+          if (!ok) {
+            throw new ServiceError(`涂鸦 OpenAPI 拒绝了红外空调开关指令`);
+          }
+          profile.irPower.assumedState = state;
+          if (record && profile.irPower.statusDpCode) {
+            record.status[profile.irPower.statusDpCode] = state;
+          }
+          return;
+        } catch (err) {
+          throw this._wrapError(err, `控制涂鸦红外空调 ${profile.info.name} 开关失败`);
+        }
+      }
+
+      const action = state
+        ? (profile.irPower.onAction ?? profile.irPower.toggleAction)
+        : (profile.irPower.offAction ?? profile.irPower.toggleAction);
+      if (!action) {
+        throw new ServiceError(`涂鸦红外设备「${profile.info.name}」缺少对应的${state ? "开机" : "关机"}按键`);
+      }
+      await this._sendIrAction(profile, action);
+      profile.irPower.assumedState = state;
+      if (record && profile.irPower.statusDpCode) {
+        record.status[profile.irPower.statusDpCode] = state;
+      }
+      return;
+    }
     if (!profile.powerDpCode) {
       throw new ServiceError("该涂鸦设备不支持快捷电源控制");
     }
@@ -1278,6 +1756,13 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
 
   async togglePower(nativeDid: string): Promise<boolean> {
     this._requireControlAccess();
+    const profile = await this._ensureProfile(nativeDid);
+    if (profile.irPower) {
+      const current = await this.powerState(nativeDid);
+      const next = current === true ? false : true;
+      await this.setPowerState(nativeDid, next);
+      return next;
+    }
     const current = await this.powerState(nativeDid);
     if (current === null) {
       throw new ServiceError("设备不支持开关控制或已离线");
@@ -1296,8 +1781,12 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
     const hwIds = new Set<string>();
     for (const did of nativeDids) {
       const profile = this._profiles.get(did);
-      if (profile && !profile.isSplitParent && profile.powerDpCode) {
-        hwIds.add(profile.hardwareId);
+      if (profile && !profile.isSplitParent) {
+        if (profile.powerDpCode) {
+          hwIds.add(profile.hardwareId);
+        } else if (profile.irPower?.statusDpCode) {
+          hwIds.add(profile.hardwareId);
+        }
       } else if (!profile) {
         hwIds.add(parseTuyaSplitDid(did).hardwareId);
       }
@@ -1318,7 +1807,21 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
     const out: Record<string, boolean | null> = {};
     for (const did of nativeDids) {
       const profile = this._profiles.get(did);
-      if (!profile || profile.isSplitParent || !profile.powerDpCode) {
+      if (!profile || profile.isSplitParent) {
+        out[did] = null;
+        continue;
+      }
+      if (profile.irPower) {
+        const statusCode = profile.irPower.statusDpCode;
+        const status = statusCode ? statusByHw.get(profile.hardwareId) : undefined;
+        if (status && statusCode && typeof status[statusCode] === "boolean") {
+          out[did] = status[statusCode] as boolean;
+        } else {
+          out[did] = profile.irPower.assumedState;
+        }
+        continue;
+      }
+      if (!profile.powerDpCode) {
         out[did] = null;
         continue;
       }
@@ -1525,6 +2028,10 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
         category: record?.category ?? "",
         source: record?.source ?? "",
         hasLocalMapping: Boolean(this._localEntryById(hardwareId)),
+        isInfraredRemote: Boolean(profile?.isInfraredRemote),
+        hasIrPower: Boolean(profile?.irPower),
+        irHubId: profile?.irRemote?.hubId ?? null,
+        irActionCodes: profile ? [...profile.irActionsByName.keys()] : [],
         dpCodes: Object.keys(record?.status ?? {}),
         propNames: profile?.detail.props.map((p) => p.name) ?? [],
       },

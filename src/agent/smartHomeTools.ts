@@ -90,6 +90,18 @@ function normalizeQuery(text: string): string {
     .replace(/[的\s\-_·.,，。！？!?“”"'`（）()]/g, "");
 }
 
+function isIrAudioDevice(device: Pick<DeviceInfo, "model" | "spec_type">): boolean {
+  if (isSpeaker(device)) return false;
+  const m = (device.model ?? "").toLowerCase();
+  const st = (device.spec_type ?? "").toLowerCase();
+  return (
+    m.includes("infrared_amplifier") ||
+    m.includes("infrared_audio") ||
+    m.includes("infrared_soundbar") ||
+    st.includes(":device:amplifier:")
+  );
+}
+
 function deviceMatchesCategory(device: DeviceInfo, category: string): boolean {
   const cat = category.trim().toLowerCase();
   if (!cat || cat === "all" || cat === "全部") {
@@ -113,8 +125,11 @@ function deviceMatchesCategory(device: DeviceInfo, category: string): boolean {
       device.spec_type.includes("sensor")
     );
   }
-  if (cat === "speaker" || cat === "音箱" || cat === "音响" || cat === "小爱") {
+  if (cat === "小爱") {
     return isSpeaker(device);
+  }
+  if (cat === "speaker" || cat === "音箱" || cat === "音响") {
+    return isSpeaker(device) || isIrAudioDevice(device);
   }
   if (cat === "camera" || cat === "摄像头" || cat === "摄像机") {
     return isCamera(device);
@@ -257,6 +272,8 @@ export function resolveDevices(
 
     if (combined === normTarget) {
       score = 100;
+    } else if (/(小米|小爱)/.test(normTarget) && isSpeaker(d) && /(音箱|音响|小爱)/.test(normTarget)) {
+      score = 92;
     } else if (dName.includes(normTarget)) {
       score = 85;
     } else if (normTarget.includes(dName) && dName.length >= 2) {
@@ -1352,11 +1369,11 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
     name: "run_device_action",
     label: "执行设备动作",
     description:
-      "执行智能设备的 MIoT 动作，例如宠物喂食器出粮（pet-food-out）、音箱播放/暂停/上一首/下一首/朗读文本、灯具延时关灯等。",
+      "执行智能设备的动作或红外遥控按键，例如涂鸦红外遥控按键（PowerOn、PowerOff、Volume+、Volume-、Play、Pause、Next、Previous 等）、宠物喂食器出粮（pet-food-out）、音箱播放/暂停/上一首/下一首/朗读文本等。",
     parameters: obj({
       target: str({ description: "设备 did 或名称" }),
-      action: str({ description: "动作名（如 pet-food-out、play、pause、next、previous、play-text）或中文描述（如 立即出粮、暂停、下一首）" }),
-      params: opt(arr(unknown(), { description: "可选动作参数数组，例如出粮份数 [2] 或朗读文本 [\"你好\"]" })),
+      action: str({ description: "动作名/红外按键名（如 PowerOn、Volume+、Play、pet-food-out）或中文描述（如 开机、音量+、播放、立即出粮、下一首）" }),
+      params: opt(arr(unknown(), { description: "可选动作参数数组，例如出粮份数 [2]、红外重复按键次数 [3] 或朗读文本 [\"你好\"]" })),
     }),
     execute: async (_toolCallId, params) => {
       const blocked = ensureAccessReady(deps);
@@ -1576,33 +1593,33 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
 
   const controlSpeakerTool: AgentTool<any> = {
     name: "control_speaker",
-    label: "控制小米/小爱音箱",
+    label: "控制音箱/红外音响",
     description:
-      "专用小米/小爱音箱综合控制工具：支持开关音箱（打开=取消静音并唤醒，关闭=暂停播放并静音待机）、播放指定音乐/歌曲/歌手、播放控制（播放/暂停/停止/上一首/下一首）、设置绝对音量（0-100）或相对增减音量（volume_delta）、扬声器静音/取消静音、麦克风静音以及朗读文本。",
+      "控制小米/小爱音箱或涂鸦红外遥控音响：支持开关机、调节或增减音量、静音、播放控制（播放/暂停/停止/上一首/下一首）；小爱音箱另支持点歌、绝对音量与文本播报。",
     parameters: obj({
-      target: opt(str({ description: "目标音箱名称或 did；留空自动选择默认在线小爱/小米音箱" })),
+      target: opt(str({ description: "目标音箱或红外音响名称/did；留空自动选择默认在线小爱/小米音箱" })),
       power: opt(
         oneOf(["on", "off", "toggle"] as const, {
-          description: "开关音箱：on 打开（取消静音并唤醒），off 关闭（暂停并静音待机），toggle 切换",
+          description: "开关音箱：on 打开，off 关闭，toggle 切换",
         }),
       ),
-      play_music: opt(str({ description: "播放指定音乐、歌曲、歌手或歌单，例如：周杰伦的晴天、轻音乐、林俊杰的江南" })),
+      play_music: opt(str({ description: "播放指定音乐、歌曲、歌手或歌单（仅小爱音箱），例如：周杰伦的晴天" })),
       playback: opt(
         oneOf(["play", "pause", "stop", "next", "previous"] as const, {
-          description: "播放控制：play 继续播放、pause 暂停、stop 停止、next 下一首、previous 上一首",
+          description: "播放控制：play 播放、pause 暂停、stop 停止、next 下一首、previous 上一首",
         }),
       ),
-      volume: opt(num({ description: "设置目标绝对音量（0-100）", minimum: 0, maximum: 100 })),
+      volume: opt(num({ description: "设置目标绝对音量（0-100，小爱音箱）", minimum: 0, maximum: 100 })),
       volume_delta: opt(
         num({
-          description: "相对调整音量增减值，例如 +10 表示调大 10%，-15 表示调小 15%",
+          description: "相对调整音量增减值，例如 +10 表示调大、-15 表示调小（红外音响会自动连发对应音量+/音量-按键）",
           minimum: -100,
           maximum: 100,
         }),
       ),
       mute: opt(bool({ description: "扬声器静音（true）或取消静音（false）" })),
-      mic_mute: opt(bool({ description: "麦克风静音（true）或开启麦克风（false）" })),
-      speak_text: opt(str({ description: "让音箱直接朗读指定文本内容" })),
+      mic_mute: opt(bool({ description: "麦克风静音（true）或开启麦克风（false，仅小爱音箱）" })),
+      speak_text: opt(str({ description: "让小爱音箱直接朗读指定文本内容" })),
     }),
     execute: async (_toolCallId, params) => {
       const blocked = ensureAccessReady(deps);
@@ -1610,9 +1627,21 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
 
       const devices = deps.mainWindow.activeDevices();
       const onlineSpeakers = devices.filter((d) => isSpeaker(d) && d.online);
+      const onlineIrAudio = devices.filter((d) => isIrAudioDevice(d) && d.online);
       let speaker: DeviceInfo | null = null;
       if (params.target) {
-        speaker = resolveSingleDevice(onlineSpeakers, params.target);
+        const wantsXiaoAi = /小米|小爱/i.test(params.target);
+        if (wantsXiaoAi) {
+          speaker = resolveSingleDevice(onlineSpeakers, params.target);
+        } else {
+          // 优先精确匹配 did / 精确设备名（让“音响”精准命中红外音响，而不误落到默认小爱）
+          const normT = normalizeQuery(params.target);
+          const pool = [...onlineIrAudio, ...onlineSpeakers];
+          speaker =
+            pool.find((d) => d.did === params.target.trim()) ??
+            pool.find((d) => normalizeQuery(d.name) === normT) ??
+            resolveSingleDevice(pool, params.target);
+        }
       }
       if (!speaker) {
         const prefDid = deps.settingsStore.getDefaultSpeakerDid();
@@ -1621,10 +1650,108 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         }
       }
       if (!speaker) {
-        speaker = onlineSpeakers[0] ?? null;
+        speaker = onlineSpeakers[0] ?? (params.target ? null : onlineIrAudio[0] ?? null);
       }
       if (!speaker) {
-        return textResult(speakerHint(devices) || "当前没有可用的在线小米/小爱音箱。", { ok: false }, true);
+        return textResult(speakerHint(devices) || "当前没有可用的在线音箱或红外音响。", { ok: false }, true);
+      }
+
+      // 涂鸦红外遥控音响（infrared_amplifier 等）：通过红外按键动作执行开关/音量增减/静音/播放控制
+      if (isIrAudioDevice(speaker)) {
+        const detail = await runJob(deps.jobs, () => deps.service.deviceDetail(speaker!.did), 2);
+        const findIrKey = (...candidates: string[]): ActionInfo | null => {
+          for (const c of candidates) {
+            const lower = c.toLowerCase();
+            const found = detail.actions.find((a) => a.name.trim().toLowerCase() === lower);
+            if (found) return found;
+          }
+          return null;
+        };
+        const changes: string[] = [];
+        const unsupported: string[] = [];
+
+        if (params.power) {
+          let nextState: boolean;
+          if (params.power === "toggle") {
+            nextState = await runJob(deps.jobs, () => deps.service.togglePower(speaker!.did), 1);
+          } else {
+            nextState = params.power === "on";
+            await runJob(deps.jobs, () => deps.service.setPowerState(speaker!.did, nextState), 1);
+          }
+          deps.mainWindow.applyPowerState(speaker.did, nextState);
+          deps.mainWindow.updateTrayDevices();
+          changes.push(nextState ? "已开机" : "已关机");
+        }
+
+        if (typeof params.mute === "boolean") {
+          const muteKey = findIrKey("mute");
+          if (muteKey) {
+            await runJob(deps.jobs, () => deps.service.runAction(speaker!.did, muteKey.name), 1);
+            changes.push("已发送静音键");
+          } else {
+            unsupported.push("静音按键");
+          }
+        }
+
+        if (params.volume_delta !== undefined && params.volume_delta !== 0) {
+          const up = Number(params.volume_delta) > 0;
+          const key = up
+            ? findIrKey("volume+", "vol+", "volumeup", "volume_up")
+            : findIrKey("volume-", "vol-", "volumedown", "volume_down");
+          if (key) {
+            const steps = Math.max(1, Math.min(5, Math.round(Math.abs(Number(params.volume_delta)) / 10) || 1));
+            await runJob(deps.jobs, () => deps.service.runAction(speaker!.did, key.name, [steps]), 1);
+            changes.push(up ? `音量调大（${steps}次）` : `音量调小（${steps}次）`);
+          } else {
+            unsupported.push(up ? "音量+按键" : "音量-按键");
+          }
+        } else if (params.volume !== undefined) {
+          unsupported.push("绝对音量设置（请使用调大/调小音量）");
+        }
+
+        if (params.playback) {
+          const pb = params.playback;
+          const map: Record<string, { keys: string[]; label: string }> = {
+            play: { keys: ["play", "playpause", "play/pause", "play_pause"], label: "播放" },
+            pause: { keys: ["pause", "playpause", "play/pause", "play_pause", "stop"], label: "暂停" },
+            stop: { keys: ["stop", "pause", "playpause"], label: "停止" },
+            next: { keys: ["next", "nexttrack", "next_track"], label: "下一首" },
+            previous: { keys: ["previous", "prev", "previoustrack", "previous_track"], label: "上一首" },
+          };
+          const spec = map[pb];
+          const key = spec ? findIrKey(...spec.keys) : null;
+          if (key) {
+            await runJob(deps.jobs, () => deps.service.runAction(speaker!.did, key.name), 1);
+            changes.push(spec!.label);
+          } else {
+            unsupported.push(spec?.label ?? pb);
+          }
+        }
+
+        if (params.play_music?.trim()) unsupported.push("语音点歌");
+        if (params.speak_text?.trim()) unsupported.push("文本播报");
+        if (typeof params.mic_mute === "boolean") unsupported.push("麦克风静音");
+
+        deps.broadcastState();
+
+        if (changes.length === 0) {
+          const msg =
+            unsupported.length > 0
+              ? `${speaker.name}为红外遥控音响，暂不支持${unsupported.join("、")}`
+              : `${speaker.name}未指定红外遥控操作`;
+          return textResult(msg, { ok: false, did: speaker.did, name: speaker.name, uiSummary: msg }, true);
+        }
+
+        const msg = `${speaker.name} ${changes.join("，")}${
+          unsupported.length > 0 ? `（不支持${unsupported.join("、")}）` : ""
+        }`;
+        return textResult(msg, {
+          ok: true,
+          did: speaker.did,
+          name: speaker.name,
+          changes,
+          uiSummary: msg,
+        });
       }
 
       const detail = await runJob(deps.jobs, () => deps.service.deviceDetail(speaker!.did), 2);

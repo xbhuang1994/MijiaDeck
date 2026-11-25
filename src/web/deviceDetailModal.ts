@@ -19,6 +19,7 @@ import {
   friendlyLabel,
   friendlyPropLabel,
   groupPropsByService,
+  isIrRemoteDevice,
   isPetFeederDevice,
   nextAvailableFeedPlanId,
   parseFeedPlans,
@@ -639,6 +640,13 @@ export class DeviceDetailModalController {
       }
     }
 
+    // 4b. Infrared Remote Control Panel Hero (Tuya IR amplifier / TV / AC / DIY remotes)
+    const irActions = data.actions.filter((a) => a.service === "ir-remote");
+    if (irActions.length > 0) {
+      container.appendChild(this.buildIrRemoteHero(data, irActions, heroConsumedActions));
+      renderedAnything = true;
+    }
+
     const hasAnyReportedValue = Object.values(data.values).some(
       (v) => v !== null && v !== undefined,
     );
@@ -673,22 +681,29 @@ export class DeviceDetailModalController {
       renderedAnything = true;
     }
 
-    // 7. Empty / Basic-only fallback (e.g. BLE-only device without MIoT spec or simple switch)
+    // 7. Empty / Basic-only fallback (e.g. BLE-only device, IR hub gateway, or simple switch)
     if (!renderedAnything) {
+      const isIrHub =
+        (data.device.spec_type ?? "").includes(":device:ir-hub:") ||
+        data.device.model.toLowerCase().includes(".wnykq.");
       const empty = document.createElement("div");
       empty.className = "dd-empty-card";
       const title = document.createElement("h3");
       title.className = "dd-empty-title";
-      title.textContent = data.powerProp
-        ? "基础开关设备"
-        : data.specError
-          ? "暂无公开控制能力"
-          : "暂无更多可展示属性";
+      title.textContent = isIrHub
+        ? "万能红外遥控网关"
+        : data.powerProp
+          ? "基础开关设备"
+          : data.specError
+            ? "暂无公开控制能力"
+            : "暂无更多可展示属性";
       const desc = document.createElement("p");
       desc.className = "dd-empty-desc";
-      desc.textContent = data.powerProp
-        ? "可使用右上角开关按钮直接控制电源，或切换至「设备信息」查看硬件详情。"
-        : "可切换至「设备信息」查看设备型号、固件与规格标识，或生成诊断报告排查能力支持情况。";
+      desc.textContent = isIrHub
+        ? "该设备为涂鸦红外发射主机，已绑定的红外遥控子设备（如音响、空调、电视等）会以独立卡片展示在设备列表中，请点击对应子设备卡片进入遥控面板。"
+        : data.powerProp
+          ? "可使用右上角开关按钮直接控制电源，或切换至「设备信息」查看硬件详情。"
+          : "可切换至「设备信息」查看设备型号、固件与规格标识，或生成诊断报告排查能力支持情况。";
       empty.append(title, desc);
       container.appendChild(empty);
     }
@@ -1072,6 +1087,284 @@ export class DeviceDetailModalController {
     }
 
     section.appendChild(card);
+    return section;
+  }
+
+  private irKeyIconSvg(code: string): string {
+    const k = code.trim().toLowerCase();
+    if (k === "poweron" || k === "power_on" || k === "poweroff" || k === "power_off" || k === "power" || k === "poweronoff") {
+      return `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path><line x1="12" y1="2" x2="12" y2="12"></line></svg>`;
+    }
+    if (k === "volume+" || k === "vol+" || k === "volumeup" || k === "volume_up") {
+      return `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><line x1="19" y1="9" x2="19" y2="15"></line><line x1="16" y1="12" x2="22" y2="12"></line></svg>`;
+    }
+    if (k === "volume-" || k === "vol-" || k === "volumedown" || k === "volume_down") {
+      return `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><line x1="16" y1="12" x2="22" y2="12"></line></svg>`;
+    }
+    if (k === "mute") {
+      return `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><line x1="23" y1="9" x2="17" y2="15"></line><line x1="17" y1="9" x2="23" y2="15"></line></svg>`;
+    }
+    if (k === "play") {
+      return `<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><polygon points="6 4 20 12 6 20 6 4"></polygon></svg>`;
+    }
+    if (k === "pause") {
+      return `<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><rect x="6" y="4" width="4" height="16" rx="1"></rect><rect x="14" y="4" width="4" height="16" rx="1"></rect></svg>`;
+    }
+    if (k === "playpause" || k === "play/pause" || k === "play_pause") {
+      return `<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><polygon points="4 5 13 12 4 19 4 5"></polygon><rect x="15" y="5" width="2.5" height="14" rx="0.8"></rect><rect x="19" y="5" width="2.5" height="14" rx="0.8"></rect></svg>`;
+    }
+    if (k === "stop") {
+      return `<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2"></rect></svg>`;
+    }
+    if (k === "previous" || k === "prev" || k === "previoustrack" || k === "previous_track") {
+      return `<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><rect x="4" y="5" width="2.5" height="14" rx="0.8"></rect><polygon points="20 5 9 12 20 19 20 5"></polygon></svg>`;
+    }
+    if (k === "next" || k === "nexttrack" || k === "next_track") {
+      return `<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><polygon points="4 5 15 12 4 19 4 5"></polygon><rect x="17.5" y="5" width="2.5" height="14" rx="0.8"></rect></svg>`;
+    }
+    if (k === "up") {
+      return `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="18 15 12 9 6 15"></polyline></svg>`;
+    }
+    if (k === "down") {
+      return `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>`;
+    }
+    if (k === "left") {
+      return `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"></polyline></svg>`;
+    }
+    if (k === "right") {
+      return `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"></polyline></svg>`;
+    }
+    return "";
+  }
+
+  private buildIrRemoteHero(
+    data: DeviceDetailApiResponse,
+    irActions: ActionInfo[],
+    consumedActions: Set<string>,
+  ): HTMLElement {
+    for (const a of irActions) {
+      consumedActions.add(a.name);
+    }
+
+    const hasWritableParams = data.props.some((p) => p.writable && p.name !== "on");
+    const section = this.createSection(
+      "红外遥控面板",
+      !data.online
+        ? "设备离线"
+        : hasWritableParams
+          ? `共 ${irActions.length} 个红外按键 · 支持下方参数精细调节`
+          : `共 ${irActions.length} 个红外按键 · 点击即刻发射红外信号`,
+    );
+
+    const panel = document.createElement("div");
+    panel.className = "dd-ir-panel";
+
+    const byLower = new Map<string, ActionInfo>();
+    for (const a of irActions) {
+      byLower.set(a.name.trim().toLowerCase(), a);
+    }
+    const used = new Set<string>();
+
+    const take = (...keys: string[]): ActionInfo | null => {
+      for (const key of keys) {
+        const found = byLower.get(key);
+        if (found && !used.has(found.name)) {
+          used.add(found.name);
+          return found;
+        }
+      }
+      return null;
+    };
+
+    const makeKeyBtn = (
+      action: ActionInfo,
+      extraClass = "",
+      compactIconOnly = false,
+    ): HTMLButtonElement => {
+      const label = friendlyLabel(action.desc, action.name);
+      const busy = this.busyActions.has(action.name);
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `dd-ir-key${extraClass ? ` ${extraClass}` : ""}${busy ? " is-busy" : ""}`;
+      btn.dataset.irKey = action.name;
+      btn.disabled = !data.online || busy;
+      btn.title = `${label} (${action.name})`;
+      btn.setAttribute("aria-label", label);
+
+      const iconSvg = this.irKeyIconSvg(action.name);
+      if (iconSvg) {
+        const ico = document.createElement("span");
+        ico.className = "dd-ir-key-ico";
+        ico.innerHTML = iconSvg;
+        btn.appendChild(ico);
+      }
+      if (!compactIconOnly || !iconSvg) {
+        const txt = document.createElement("span");
+        txt.className = "dd-ir-key-label";
+        txt.textContent = busy ? "发送中…" : label;
+        btn.appendChild(txt);
+      }
+
+      btn.addEventListener("click", () => {
+        void this.runAction(action.name, undefined, `已发送「${label}」红外指令`);
+      });
+      return btn;
+    };
+
+    // 1. 电源区（PowerOn / PowerOff / Power）
+    const pwrOn = take("poweron", "power_on");
+    const pwrOff = take("poweroff", "power_off");
+    const pwrToggle = take("power", "poweronoff", "standby");
+    if (pwrOn || pwrOff || pwrToggle) {
+      const group = document.createElement("div");
+      group.className = "dd-ir-group";
+      const row = document.createElement("div");
+      row.className = "dd-ir-row is-power";
+      if (pwrOn) row.appendChild(makeKeyBtn(pwrOn, "is-power-on"));
+      if (pwrOff) row.appendChild(makeKeyBtn(pwrOff, "is-power-off"));
+      if (pwrToggle) row.appendChild(makeKeyBtn(pwrToggle, "is-power-toggle"));
+      group.appendChild(row);
+      panel.appendChild(group);
+    }
+
+    // 2. 音量与静音区（Volume- / Mute / Volume+）
+    const volDown = take("volume-", "vol-", "volumedown", "volume_down");
+    const mute = take("mute");
+    const volUp = take("volume+", "vol+", "volumeup", "volume_up");
+    if (volDown || mute || volUp) {
+      const group = document.createElement("div");
+      group.className = "dd-ir-group";
+      const lbl = document.createElement("div");
+      lbl.className = "dd-ir-group-label";
+      lbl.textContent = "音量控制";
+      const row = document.createElement("div");
+      row.className = "dd-ir-row is-volume";
+      if (volDown) row.appendChild(makeKeyBtn(volDown, "is-rocker"));
+      if (mute) row.appendChild(makeKeyBtn(mute, "is-mute"));
+      if (volUp) row.appendChild(makeKeyBtn(volUp, "is-rocker"));
+      group.append(lbl, row);
+      panel.appendChild(group);
+    }
+
+    // 3. 播放控制区（上一首 / 快退 / 播放 / 暂停 / 停止 / 快进 / 下一首）
+    const mediaKeys = [
+      take("previous", "prev", "previoustrack", "previous_track"),
+      take("rewind", "rew"),
+      take("play"),
+      take("pause"),
+      take("playpause", "play/pause", "play_pause"),
+      take("stop"),
+      take("fastforward", "ff"),
+      take("next", "nexttrack", "next_track"),
+    ].filter((a): a is ActionInfo => a !== null);
+
+    if (mediaKeys.length > 0) {
+      const group = document.createElement("div");
+      group.className = "dd-ir-group";
+      const lbl = document.createElement("div");
+      lbl.className = "dd-ir-group-label";
+      lbl.textContent = "播放控制";
+      const row = document.createElement("div");
+      row.className = "dd-ir-row is-media";
+      for (const act of mediaKeys) {
+        const lower = act.name.trim().toLowerCase();
+        const isPrimary = lower === "play" || lower === "pause" || lower === "playpause" || lower === "play/pause";
+        row.appendChild(makeKeyBtn(act, isPrimary ? "is-accent-soft" : ""));
+      }
+      group.append(lbl, row);
+      panel.appendChild(group);
+    }
+
+    // 4. 方向键与菜单区（D-Pad + Menu/Home/Back/Exit）
+    const navUp = take("up");
+    const navDown = take("down");
+    const navLeft = take("left");
+    const navRight = take("right");
+    const navOk = take("ok", "enter", "select");
+    const navAux = [take("menu"), take("home"), take("back", "return"), take("exit")].filter(
+      (a): a is ActionInfo => a !== null,
+    );
+
+    if (navUp || navDown || navLeft || navRight || navOk || navAux.length > 0) {
+      const group = document.createElement("div");
+      group.className = "dd-ir-group";
+      const lbl = document.createElement("div");
+      lbl.className = "dd-ir-group-label";
+      lbl.textContent = "方向与导航";
+      group.appendChild(lbl);
+
+      if (navUp || navDown || navLeft || navRight || navOk) {
+        const dpad = document.createElement("div");
+        dpad.className = "dd-ir-dpad";
+        const cell = (act: ActionInfo | null, cls = ""): HTMLElement => {
+          if (!act) {
+            const sp = document.createElement("div");
+            sp.className = "dd-ir-dpad-empty";
+            return sp;
+          }
+          return makeKeyBtn(act, `is-dpad ${cls}`.trim());
+        };
+        dpad.append(
+          cell(null),
+          cell(navUp),
+          cell(null),
+          cell(navLeft),
+          cell(navOk, "is-accent-soft"),
+          cell(navRight),
+          cell(null),
+          cell(navDown),
+          cell(null),
+        );
+        group.appendChild(dpad);
+      }
+
+      if (navAux.length > 0) {
+        const auxRow = document.createElement("div");
+        auxRow.className = "dd-ir-row";
+        for (const act of navAux) {
+          auxRow.appendChild(makeKeyBtn(act));
+        }
+        group.appendChild(auxRow);
+      }
+      panel.appendChild(group);
+    }
+
+    // 5. 其余功能按键（频道、信号源、DIY 自定义按键等）与数字键区
+    const remaining = irActions.filter((a) => !used.has(a.name));
+    const digitActions = remaining.filter((a) => /^[0-9]$/.test(a.name.trim()) || a.name.trim() === "-/--");
+    const otherActions = remaining.filter((a) => !digitActions.includes(a));
+
+    if (otherActions.length > 0) {
+      const group = document.createElement("div");
+      group.className = "dd-ir-group";
+      const lbl = document.createElement("div");
+      lbl.className = "dd-ir-group-label";
+      lbl.textContent = "功能按键";
+      const grid = document.createElement("div");
+      grid.className = "dd-ir-key-grid";
+      for (const act of otherActions) {
+        grid.appendChild(makeKeyBtn(act));
+      }
+      group.append(lbl, grid);
+      panel.appendChild(group);
+    }
+
+    if (digitActions.length > 0) {
+      const group = document.createElement("div");
+      group.className = "dd-ir-group";
+      const lbl = document.createElement("div");
+      lbl.className = "dd-ir-group-label";
+      lbl.textContent = "数字按键";
+      const pad = document.createElement("div");
+      pad.className = "dd-ir-numpad";
+      for (const act of digitActions) {
+        pad.appendChild(makeKeyBtn(act, "is-numpad"));
+      }
+      group.append(lbl, pad);
+      panel.appendChild(group);
+    }
+
+    section.appendChild(panel);
     return section;
   }
 
@@ -1920,7 +2213,7 @@ export class DeviceDetailModalController {
         btn.disabled = disabled;
         btn.textContent = resolveEnumLabel(opt.value, [opt]) ?? String(opt.value);
         btn.addEventListener("click", () => {
-          if (selected) return;
+          if (selected && !isIrRemoteDevice(data.device, data.actions)) return;
           void this.writeProp(prop.name, opt.value);
         });
         seg.appendChild(btn);
@@ -2611,13 +2904,20 @@ export class DeviceDetailModalController {
       const res = await this.host.apiPost<{
         ok?: boolean;
         values?: Record<string, unknown>;
+        powerState?: boolean | null;
         message?: string;
       }>(`/api/devices/${encodeURIComponent(data.did)}/action`, body);
       if (gen !== this.generation || !this.data) return false;
       if (res?.values && typeof res.values === "object") {
         Object.assign(this.data.values, res.values);
       }
-      if (this.data.powerProp && typeof this.data.values[this.data.powerProp.name] === "boolean") {
+      if (typeof res?.powerState === "boolean") {
+        this.data.powerState = res.powerState;
+        this.host.onPowerSynced(this.data.did, res.powerState);
+      } else if (
+        this.data.powerProp &&
+        typeof this.data.values[this.data.powerProp.name] === "boolean"
+      ) {
         const pwr = this.data.values[this.data.powerProp.name] as boolean;
         this.data.powerState = pwr;
         this.host.onPowerSynced(this.data.did, pwr);

@@ -101,6 +101,18 @@ function isLightLike(device: DeviceInfo): boolean {
   return isLight(device) || (device.switch_channels.length === 0 && /灯/.test(device.name));
 }
 
+function isIrAudioDevice(device: Pick<DeviceInfo, "model" | "spec_type">): boolean {
+  if (isSpeaker(device)) return false;
+  const m = (device.model ?? "").toLowerCase();
+  const st = (device.spec_type ?? "").toLowerCase();
+  return (
+    m.includes("infrared_amplifier") ||
+    m.includes("infrared_audio") ||
+    m.includes("infrared_soundbar") ||
+    st.includes(":device:amplifier:")
+  );
+}
+
 function detectCommonRoom(clause: string): string | undefined {
   for (const room of COMMON_ROOM_NAMES) {
     if (clause.includes(room)) {
@@ -185,7 +197,7 @@ export function planDeterministicLocalCalls(
         return null;
       }
     }
-    if (call.name === "control_speaker" && !devices.some((d) => isSpeaker(d))) {
+    if (call.name === "control_speaker" && !devices.some((d) => isSpeaker(d) || isIrAudioDevice(d))) {
       return null;
     }
     if (call.name === "run_device_action" || call.name === "get_device_detail") {
@@ -569,8 +581,21 @@ function mapImplicitActionToToolCall(
 
 function resolveSpeakerArg(clause: string, devices: readonly DeviceInfo[]): DeviceInfo | undefined {
   const speakers = devices.filter((d) => isSpeaker(d));
-  if (speakers.length === 0) return undefined;
+  const irAudios = devices.filter((d) => isIrAudioDevice(d));
+  if (speakers.length === 0 && irAudios.length === 0) return undefined;
   const normClause = normalize(clause);
+
+  // 若用户明确点名非小爱的红外音响设备（例如“音响下一首”“调大音响音量”），优先匹配该设备
+  if (!/小米|小爱/i.test(clause) && irAudios.length > 0) {
+    const sortedIr = [...irAudios].sort((a, b) => b.name.length - a.name.length);
+    for (const ir of sortedIr) {
+      const normName = normalize(ir.name);
+      if (normName.length >= 2 && normClause.includes(normName)) {
+        return ir;
+      }
+    }
+  }
+
   const sorted = [...speakers].sort((a, b) => b.name.length - a.name.length);
   for (const s of sorted) {
     const normName = normalize(s.name);

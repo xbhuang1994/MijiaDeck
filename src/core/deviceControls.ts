@@ -17,6 +17,11 @@ const CAMERA_KINDS: ReadonlySet<string> = new Set(["camera", "ip-camera"]);
 const APPLIANCE_POWER_KINDS: ReadonlySet<string> = new Set([
   "television",
   "tv",
+  "amplifier",
+  "set-top-box",
+  "projector",
+  "dvd-player",
+  "ir-remote",
   "washer",
   "washing-machine",
   "dryer",
@@ -142,6 +147,21 @@ export function deviceKinds(device: DeviceInfo): Set<string> {
 
 export function isCamera(device: DeviceInfo): boolean {
   return hasAnyKind(deviceKinds(device), CAMERA_KINDS);
+}
+
+export function isIrRemote(device: Pick<DeviceInfo, "model" | "spec_type">): boolean {
+  const modelLower = (device.model ?? "").toLowerCase();
+  if (modelLower.includes(".infrared_")) {
+    return true;
+  }
+  const specType = (device.spec_type ?? "").toLowerCase();
+  return (
+    specType.includes(":device:ir-remote:") ||
+    specType.includes(":device:amplifier:") ||
+    specType.includes(":device:set-top-box:") ||
+    specType.includes(":device:projector:") ||
+    specType.includes(":device:dvd-player:")
+  );
 }
 
 /** Real appliance power, not router LEDs or sensor enable flags. */

@@ -225,6 +225,11 @@ const SPEAKER_KINDS = new Set(["speaker", "wifispeaker"]);
 const APPLIANCE_POWER_KINDS = new Set([
   "television",
   "tv",
+  "amplifier",
+  "set-top-box",
+  "projector",
+  "dvd-player",
+  "ir-remote",
   "washer",
   "washing-machine",
   "dryer",
@@ -450,8 +455,23 @@ function speakerHint(devices: DeviceInfo[]): string {
 
 function deviceIconSvg(model: string): string {
   const m = model.toLowerCase();
-  if (m.includes("wifispeaker") || m.includes("speaker")) {
+  if (
+    m.includes("wifispeaker") ||
+    m.includes("speaker") ||
+    m.includes("amplifier") ||
+    m.includes("soundbar") ||
+    m.includes("infrared_audio")
+  ) {
     return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="3" width="12" height="18" rx="2.5"></rect><circle cx="12" cy="14" r="3"></circle><circle cx="12" cy="7.5" r="1"></circle></svg>`;
+  }
+  if (m.includes("air-conditioner") || m.includes("aircondition") || m.includes("infrared_ac")) {
+    return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="9" rx="2"></rect><line x1="6" y1="10" x2="18" y2="10"></line><path d="M8 16c-.6 1.2-.6 2.3 0 3.5M12 16c-.6 1.2-.6 2.3 0 3.5M16 16c-.6 1.2-.6 2.3 0 3.5"></path></svg>`;
+  }
+  if (m.includes("infrared_tv") || m.includes(".television.") || m.includes(".tv.")) {
+    return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="5" width="19" height="12.5" rx="2"></rect><path d="M8 21h8M12 17.5V21"></path></svg>`;
+  }
+  if (m.includes("wnykq") || m.includes("ir-hub") || m.includes("ir-remote") || m.includes("infrared_")) {
+    return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="7" width="10" height="14" rx="3"></rect><circle cx="12" cy="11" r="1.1" fill="currentColor"></circle><line x1="10" y1="15" x2="14" y2="15"></line><line x1="10" y1="18" x2="14" y2="18"></line><path d="M9.5 4.8a4.2 4.2 0 0 1 5 0"></path><path d="M7.5 2.8a7 7 0 0 1 9 0"></path></svg>`;
   }
   if (m.includes("light") || m.includes("lamp") || m.includes("bulb")) {
     return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.87c.72.52 1.25 1.32 1.4 2.13h4.2c.15-.81.68-1.61 1.4-2.13A6 6 0 0 0 12 3z"></path></svg>`;
@@ -461,9 +481,6 @@ function deviceIconSvg(model: string): string {
   }
   if (m.includes("sensor") || m.includes("htv") || m.includes("thermometer")) {
     return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 14.76V5a2 2 0 1 0-4 0v9.76a4 4 0 1 0 4 0z"></path></svg>`;
-  }
-  if (m.includes("air-conditioner") || m.includes("aircondition")) {
-    return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="9" rx="2"></rect><line x1="6" y1="10" x2="18" y2="10"></line><path d="M8 16c-.6 1.2-.6 2.3 0 3.5M12 16c-.6 1.2-.6 2.3 0 3.5M16 16c-.6 1.2-.6 2.3 0 3.5"></path></svg>`;
   }
   if (m.includes("dehumidifier") || m.includes("humidifier")) {
     return `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"></path></svg>`;
