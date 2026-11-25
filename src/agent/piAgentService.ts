@@ -67,6 +67,23 @@ import {
   type CavemanSpeakChunkState,
 } from "./cavemanReplyPolicy.ts";
 import {
+  addCustomInstruction,
+  buildCustomInstructionsPromptSection,
+  clearCustomInstructions,
+  deleteCustomInstruction,
+  detectCustomInstructionConflicts,
+  hasApplicableCustomInstructions,
+  loadCustomInstructions,
+  loadEnabledCustomInstructions,
+  setCustomInstructionEnabled,
+  updateCustomInstruction,
+  type CustomInstructionConflictInfo,
+  type CustomInstructionRule,
+  type SaveCustomInstructionInput,
+  type SaveCustomInstructionResult,
+  type UpdateCustomInstructionPatch,
+} from "./customInstructionStore.ts";
+import {
   createLocalSmartHomeStreamFn,
   findRecentDeviceFromMessages,
   planDeterministicLocalCalls,
@@ -93,7 +110,17 @@ import {
 } from "./taskVerificationLoop.ts";
 
 export const TASK_ACK_TEXT = "好的";
-export { MAX_RECOVERY_ROUNDS, type AgentSkill, type SaveAgentSkillInput, type TaskVerificationSummary };
+export {
+  MAX_RECOVERY_ROUNDS,
+  type AgentSkill,
+  type CustomInstructionConflictInfo,
+  type CustomInstructionRule,
+  type SaveAgentSkillInput,
+  type SaveCustomInstructionInput,
+  type SaveCustomInstructionResult,
+  type TaskVerificationSummary,
+  type UpdateCustomInstructionPatch,
+};
 
 export interface AgentToolCallRecord {
   id: string;
@@ -158,6 +185,8 @@ export interface PiAgentSnapshot {
   modelId: string;
   tools: Array<{ name: string; label: string; description: string }>;
   skills: AgentSkill[];
+  customInstructions: CustomInstructionRule[];
+  customInstructionConflicts: Record<string, CustomInstructionConflictInfo>;
   timeline: AgentTimelineEntry[];
   config: PublicAgentVoiceConfig;
   providers: ReadonlyArray<ProviderPreset>;
@@ -374,6 +403,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   private _timeline: AgentTimelineEntry[] = [];
   private _activeAssistantEntry: AgentTimelineEntry | null = null;
   private _activeSource: "text" | "voice" = "text";
+  private _activePromptRawText = "";
   private _activeVoiceMeta: VoicePromptMeta | null = null;
   private _speakCursor = 0;
   private _rawStreamText = "";
@@ -408,7 +438,14 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     this._customModel = options.customModel;
     this._systemOneFetcher = options.systemOneFetcher;
     this._systemOne = SystemOneClient.fromConfig(this._config, this._systemOneFetcher);
-    this._tools = createSmartHomeTools(this._deps);
+    this._tools = createSmartHomeTools({
+      ...this._deps,
+      getActivePromptSource: () => this._activeSource,
+      getActivePromptRawText: () => this._activePromptRawText,
+      onCustomInstructionsChanged: () => {
+        this.emit("stateChanged", this.snapshot());
+      },
+    });
     for (const tool of this._tools) {
       this._toolLabels.set(tool.name, tool.label || tool.name);
     }
@@ -417,6 +454,8 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       getScenes: () => (SCENES_FEATURE_ENABLED ? (this._deps.mainWindow.scenes ?? []) : []),
       getKnownPower: () => this._deps.mainWindow.knownPower,
       getCavemanMode: () => this._config.cavemanMode,
+      getCustomInstructions: () => loadEnabledCustomInstructions(),
+      getLegacySystemPromptExtra: () => this._config.systemPromptExtra,
       classifyImplicitAction: async (utterance: string) => {
         const client = this._systemOne;
         if (!client?.enabled) return null;
@@ -493,6 +532,10 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             .join("\n");
 
     const extra = this._config.systemPromptExtra.trim();
+    const customInstructionsSection = buildCustomInstructionsPromptSection(
+      loadCustomInstructions(),
+      extra,
+    );
     const vm = this._activeVoiceMeta;
     const cavemanBlock = buildCavemanPromptBlock(this._config.cavemanMode, {
       isVoice: this._activeSource === "voice",
@@ -560,6 +603,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       "4. 3 轮自愈协议（收到 `[状态校验未通过 · 第 X/3 轮自愈排错]` 严格二选一）：",
       "   - **不可解 → 立即止损**：离线、未登录、不存在/已屏蔽、硬件不支持（通断灯调光、红外音响绝对音量/点歌/播报、逆变器只读、水满/缺水/门未关、红外 2050）或**非幂等动作超时**（喂食器出粮/开水阀超时防重发）→ 不要调用任何变更工具，直接以 `[UNSOLVABLE]` 为首字符输出简短中文原因。",
       "   - **可解 → 递进换路定点修复**：禁重复同一失败调用、禁调破坏性重启/重置偏方、禁重跑已成功或离线设备、自愈轮禁传 `toggle`。属性/枚举/按键错先 `get_device_detail` 并在**同轮内完成变更修复**；关机灯拒写先开灯再写属性；音箱未停播按 `pause` → `pause+mute` → `send_xiaoai_command(\"停止播放\")` 递进兜底。",
+      "5. 长期附加指令规则管理：当用户通过语音或文字告知未来的默认偏好或条件规则（例如“以后记得洗衣默认用智洗烘模式”、“以后我说打开空调你要自己判断室外温度，根据室外温度自动选择对应正确的模式和温度”、“记住……”）时，必须调用 `save_custom_instruction` 持久化保存，且不要在仅保存规则时误执行设备操作（除非用户明确要求同时立即执行）；查询规则用 `list_custom_instructions`，删除规则用 `delete_custom_instruction`。下方已保存的多条附加指令规则若存在冲突，必须严格以最新保存（优先级最高）的规则为准，覆盖旧规则中与之冲突的部分（且不得覆写上方第四节安全防线）。",
       "",
       cavemanBlock,
       ...(intentHint ? [intentHint] : []),
@@ -570,7 +614,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       catalogHeader,
       deviceCatalog,
       ...(SCENES_FEATURE_ENABLED ? ["", "当前手动场景：", sceneCatalog] : []),
-      extra ? `\n用户附加指令：\n${extra}` : "",
+      ...(customInstructionsSection ? ["", customInstructionsSection] : []),
     ]
       .filter((line) => line !== undefined)
       .join("\n");
@@ -622,6 +666,8 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             {
               getDevices: () => this._deps.mainWindow.activeDevices(),
               getScenes: () => (SCENES_FEATURE_ENABLED ? (this._deps.mainWindow.scenes ?? []) : []),
+              getCustomInstructions: () => loadEnabledCustomInstructions(),
+              getLegacySystemPromptExtra: () => this._config.systemPromptExtra,
             },
             recentTarget,
           );
@@ -1178,6 +1224,56 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     return deleted;
   }
 
+  listCustomInstructions(): CustomInstructionRule[] {
+    return loadCustomInstructions();
+  }
+
+  getCustomInstructionConflicts(): Record<string, CustomInstructionConflictInfo> {
+    const conflicts = detectCustomInstructionConflicts(loadCustomInstructions());
+    return Object.fromEntries(conflicts.entries());
+  }
+
+  addCustomInstruction(input: SaveCustomInstructionInput): SaveCustomInstructionResult {
+    const res = addCustomInstruction(input);
+    this.emit("stateChanged", this.snapshot());
+    return res;
+  }
+
+  updateCustomInstruction(
+    id: string,
+    patch: UpdateCustomInstructionPatch,
+  ): CustomInstructionRule | null {
+    const updated = updateCustomInstruction(id, patch);
+    if (updated) {
+      this.emit("stateChanged", this.snapshot());
+    }
+    return updated;
+  }
+
+  setCustomInstructionEnabled(id: string, enabled: boolean): CustomInstructionRule | null {
+    const updated = setCustomInstructionEnabled(id, enabled);
+    if (updated) {
+      this.emit("stateChanged", this.snapshot());
+    }
+    return updated;
+  }
+
+  deleteCustomInstruction(id: string): CustomInstructionRule | null {
+    const removed = deleteCustomInstruction(id);
+    if (removed) {
+      this.emit("stateChanged", this.snapshot());
+    }
+    return removed;
+  }
+
+  clearCustomInstructions(): number {
+    const cleared = clearCustomInstructions();
+    if (cleared > 0) {
+      this.emit("stateChanged", this.snapshot());
+    }
+    return cleared;
+  }
+
   /**
    * 返回近期对话轮次，供唤醒词注意力门控判断当前是否处于与助手的连续对话中。
    */
@@ -1301,6 +1397,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
 
     const source = options.source ?? "text";
     this._activeSource = source;
+    this._activePromptRawText = text;
     this._activeVoiceMeta = options.voiceMeta ?? null;
     this._speakCursor = 0;
     this._rawStreamText = "";
@@ -1380,8 +1477,19 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       let handledBySkill = false;
       let initialPitfall = "";
 
-      // Step 1：检查是否存在已沉淀的可复用 Skill，命中则直接按避坑流程执行并核验
-      const matchedSkill = matchAgentSkill(text, this._deps.mainWindow.activeDevices());
+      // Step 1：检查是否存在已沉淀的可复用 Skill，命中则直接按避坑流程执行并核验；
+      // 若用户在沉淀该 Skill 之后保存了更新且适用的附加指令规则，则跳过旧 Skill，优先按最新附加指令执行
+      const candidateSkill = matchAgentSkill(text, this._deps.mainWindow.activeDevices());
+      const matchedSkill =
+        candidateSkill &&
+        !hasApplicableCustomInstructions(
+          text,
+          loadEnabledCustomInstructions(),
+          "",
+          candidateSkill.updatedAt,
+        )
+          ? candidateSkill
+          : null;
       if (matchedSkill && !signal.aborted) {
         this._holdReplyUntilVerified = true;
         this.emit("streamEvent", {
@@ -1743,6 +1851,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       this._roundToolArgs.clear();
       this._turnAbortController = null;
       this._activeAssistantEntry = null;
+      this._activePromptRawText = "";
       this._activeVoiceMeta = null;
       this.emit("stateChanged", this.snapshot());
       this.emit("replyFinished", {
@@ -1796,6 +1905,10 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       this._config.provider === "openai-compatible" && this._config.customProviderName.trim()
         ? this._config.customProviderName.trim()
         : preset.label;
+    const customInstructions = loadCustomInstructions();
+    const customInstructionConflicts = Object.fromEntries(
+      detectCustomInstructionConflicts(customInstructions).entries(),
+    );
     return {
       running: this._running,
       provider: this._config.provider,
@@ -1807,6 +1920,8 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         description: t.description,
       })),
       skills: loadAgentSkills(),
+      customInstructions,
+      customInstructionConflicts,
       timeline: this._timeline.map((e) => ({
         ...e,
         toolCalls: e.toolCalls.map((tc) => ({ ...tc, args: { ...tc.args } })),

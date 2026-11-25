@@ -293,6 +293,18 @@
       <div id="pi-skills-list" class="pi-skills-list" hidden></div>
     </div>
 
+    <!-- Saved Custom Instruction Rules Bar (newest-first, latest wins on conflict) -->
+    <div id="pi-instructions-bar" class="pi-skills-bar pi-instructions-bar" hidden>
+      <button type="button" id="pi-instructions-toggle-btn" class="pi-skills-toggle-btn" aria-expanded="false">
+        <span class="pi-skills-toggle-left">
+          <span class="pi-skills-icon" aria-hidden="true">📌</span>
+          <span id="pi-instructions-count-label">附加指令规则 (0 · 最新优先)</span>
+        </span>
+        <span id="pi-instructions-chevron" class="pi-skills-chevron" aria-hidden="true">▸</span>
+      </button>
+      <div id="pi-instructions-list" class="pi-skills-list" hidden></div>
+    </div>
+
     <!-- Conversation & Tool Execution Timeline -->
     <div id="pi-agent-scroll" class="pi-agent-scroll">
       <div id="pi-agent-empty" class="pi-agent-empty">
@@ -712,12 +724,24 @@
             </select>
           </div>
 
-          <div class="setting-card setting-card-wrap">
+          <div class="setting-card setting-card-wrap" id="setting-row-agent-instructions">
             <div class="setting-info">
-              <div class="setting-label">附加指令（可选）</div>
-              <div class="setting-desc">告诉 Pi Agent 你的家庭习惯、房间别名或偏好（如“我说睡了就关客厅和餐厅所有灯”）</div>
+              <div class="setting-label">附加指令规则（支持语音保存多条 · 冲突时最新优先）</div>
+              <div class="setting-desc">直接对语音助手说“以后记得洗衣默认用智洗烘模式”或“以后我说打开空调你要自己判断室外温度，根据室外温度自动选择对应正确的模式和温度”即可自动保存；多条规则若存在冲突，始终以最新一条为准。</div>
             </div>
-            <textarea id="set-agent-system-prompt" class="agent-textarea" rows="2" placeholder="可选：补充个性化家居控制习惯…" aria-label="Pi Agent 附加指令"></textarea>
+            <div class="agent-inst-panel">
+              <div class="agent-inst-toolbar">
+                <input type="text" id="set-agent-instruction-input" class="md-text-input agent-inst-input" placeholder="输入一条附加指令规则，如“以后记得洗衣默认用智洗烘模式”…" autocomplete="off" spellcheck="false" aria-label="新增附加指令规则">
+                <button type="button" id="set-agent-instruction-add-btn" class="primary-button btn-compact">添加规则</button>
+                <button type="button" id="set-agent-instruction-voice-btn" class="secondary-button btn-compact" title="点击开始语音录入附加指令，说完再次点击保存">🎙 语音录入</button>
+              </div>
+              <div id="set-agent-instruction-voice-status" class="agent-inst-status" hidden></div>
+              <div id="set-agent-instructions-list" class="agent-inst-list"></div>
+              <div class="agent-inst-legacy-block">
+                <label for="set-agent-system-prompt" class="agent-inst-legacy-label">补充自由文本说明（可选，优先级低于上方规则）</label>
+                <textarea id="set-agent-system-prompt" class="agent-textarea" rows="2" placeholder="可选：补充个性化家居控制习惯…" aria-label="Pi Agent 附加指令"></textarea>
+              </div>
+            </div>
           </div>
 
           <div class="setting-section-title">语音监听、环境降噪、声纹与注意力设置</div>

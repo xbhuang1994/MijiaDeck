@@ -12,6 +12,7 @@
  * 只有确定是在与助手对话/叫助手操作时，才放行进入 Pi Agent 工具执行！
  */
 
+import { isCustomInstructionVoiceCommand } from "./customInstructionStore.ts";
 import type { WakeWordAcousticHit } from "./openWakeWordEngine.ts";
 import type { CommandIntentChoice, SystemOneClient } from "./systemOneClient.ts";
 import type { VoiceprintIdentifyResult } from "./voiceprintStore.ts";
@@ -277,7 +278,7 @@ const DIRECT_COMMAND_START_RE =
 
 // 真实智能家居设备与控制领域语义词表（用于区分设备指令与 "你好，帮我递杯水" 等日常家务聊天）
 const SMART_HOME_DOMAIN_RE =
-  /(?:灯|吸顶灯|台灯|照明|空调|温度|湿度|空气|净化器|加湿器|除湿|扫地|摄像头|摄像机|监控|传感|设备|风扇|窗帘|窗户|电视|音响|音箱|小爱|音量|声音|静音|闭麦|开麦|音乐|歌|播放|暂停|继续|停止|下一首|上一首|切歌|换歌|换一首|亮度|调亮|调暗|亮一点|暗一点|大一点|小一点|高一点|低一点|暖一点|冷一点|色温|暖光|冷光|白光|黄光|红光|蓝光|绿光|插座|开关|喂猫|喂狗|喂食|喂食器|出粮|投喂|场景|模式|观影|睡眠|回家|离家|全屋|客厅|卧室|书房|餐厅|厨房|阳台|走廊|浴室|主卧|次卧|玄关|卫生间|light|lamp|ac|air\s*conditioner|fan|curtain|tv|speaker|volume|music|pause|play|mute|bright|dim|temp|humidity)/i;
+  /(?:灯|吸顶灯|台灯|照明|空调|洗衣|洗衣机|洗烘|智洗烘|滚筒|波轮|烘干|温度|湿度|空气|净化器|加湿器|除湿|扫地|摄像头|摄像机|监控|传感|设备|风扇|窗帘|窗户|电视|音响|音箱|小爱|音量|声音|静音|闭麦|开麦|音乐|歌|播放|暂停|继续|停止|下一首|上一首|切歌|换歌|换一首|亮度|调亮|调暗|亮一点|暗一点|大一点|小一点|高一点|低一点|暖一点|冷一点|色温|暖光|冷光|白光|黄光|红光|蓝光|绿光|插座|开关|喂猫|喂狗|喂食|喂食器|出粮|投喂|场景|模式|观影|睡眠|回家|离家|全屋|客厅|卧室|书房|餐厅|厨房|阳台|走廊|浴室|主卧|次卧|玄关|卫生间|附加指令|自定义指令|指令规则|偏好规则|light|lamp|ac|air\s*conditioner|washer|laundry|fan|curtain|tv|speaker|volume|music|pause|play|mute|bright|dim|temp|humidity)/i;
 
 // 严防声学唤醒覆盖第三人称讨论或否定呼唤语境（含噪声下 SenseVoice 把 "别管Neo" 听成 "别管你用/别管你了"）
 const STRICT_THIRD_PERSON_NEO_RE =
@@ -295,7 +296,8 @@ export function isThirdPersonNeoMention(text: string): boolean {
 }
 
 export function looksLikeDirectDeviceCommand(text: string): boolean {
-  return DIRECT_COMMAND_START_RE.test(text.trim());
+  const trimmed = text.trim();
+  return DIRECT_COMMAND_START_RE.test(trimmed) || isCustomInstructionVoiceCommand(trimmed);
 }
 
 export function isWakeQueryText(text: string): boolean {
@@ -525,12 +527,17 @@ export function matchEnglishHeadWakeWord(
 export function trimTrailingMusicLyrics(command: string): string {
   const parts = command.split(/[，,。！？!?;；]/).map((s) => s.trim()).filter(Boolean);
   if (parts.length <= 1) return command.trim();
+  const isCustomRule = isCustomInstructionVoiceCommand(command);
   const kept: string[] = [parts[0]!];
   for (let i = 1; i < parts.length; i += 1) {
     const seg = parts[i]!;
     if (
       DIRECT_COMMAND_START_RE.test(seg) ||
-      /(?:亮度|色温|颜色|音量|声音|静音|暂停|停止|关闭|打开|调到|调成|调大|调小|温度|湿度|出粮|份|度|%)/.test(seg)
+      /(?:亮度|色温|颜色|音量|声音|静音|暂停|停止|关闭|打开|调到|调成|调大|调小|温度|湿度|出粮|份|度|%)/.test(seg) ||
+      (isCustomRule &&
+        /(?:默认|模式|自动|选择|判断|优先|记得|记住|规则|指令|洗衣|洗烘|智洗烘|空调|灯光|室外|室内|不要|超过|低于)/.test(
+          seg,
+        ))
     ) {
       kept.push(seg);
     } else {
@@ -580,7 +587,11 @@ const NON_COMMAND_CHAT_RE =
  */
 export function isClearConversationCommand(rawCmd: string): boolean {
   const cmd = rawCmd.replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
-  if (cmd.length < 2 || cmd.length > 36) return false;
+  if (cmd.length < 2) return false;
+  if (isCustomInstructionVoiceCommand(cmd) && cmd.length <= 160) {
+    return true;
+  }
+  if (cmd.length > 36) return false;
   if (NON_COMMAND_CHAT_RE.test(cmd)) return false;
   if (STANDALONE_CONVERSATION_CMD_RE.test(cmd)) return true;
   if (EXPLICIT_ASSISTANT_QUERY_RE.test(cmd)) return true;
@@ -768,7 +779,7 @@ export function findWakeWordSpan(
             continue;
           }
         }
-        if (!isWakeQuery && (!afterText || !DIRECT_COMMAND_START_RE.test(afterText))) {
+        if (!isWakeQuery && (!afterText || !looksLikeDirectDeviceCommand(afterText))) {
           continue;
         }
       }
@@ -923,7 +934,7 @@ function buildAttentionPrompt(params: {
     `最新听到的语音文本："""${params.text}"""`,
     "",
     "判定准则：",
-    "- 若用户直接呼唤你执行设备控制/查询/提问（如“小派，关灯”、“帮我把音量调大一点”、“那卧室灯也关掉”），addressed=true。",
+    "- 若用户直接呼唤你执行设备控制/查询/提问或保存/管理长期附加指令规则（如“小派，关灯”、“帮我把音量调大一点”、“那卧室灯也关掉”、“以后记得洗衣默认用智洗烘模式”、“以后我说打开空调你要自己判断室外温度”），addressed=true。",
     "- 注意背景音乐/电视干扰：如果环境中正在放歌，唤醒词前后可能混入无关歌词碎片（例如“也甘愿赴汤蹈火去走小派打开客厅吸顶灯，间走过这世间”）。只要唤醒词后紧跟明确的设备控制/查询指令，就判定 addressed=true，并在 command 字段中只提取干净的用户指令（去掉前后无关歌词）！",
     "- 若用户只是提到你的名字讨论/夸奖/抱怨/叫别人别管你（如“我刚跟朋友聊到小派挺好用的”、“你觉得小派怎么样”、“别管小派了吃饭吧”、“有人叫小派吗”），addressed=false！",
     "- 若处于连续对话窗口，但新句子明显是在和家人说话（如“晚饭吃什么”、“帮我拿双筷子”），或属于背景音乐歌词、电视广播对话、咖啡馆/环境杂音识别碎片，addressed=false, inConversation=false！",
@@ -1218,7 +1229,7 @@ export async function evaluateVoiceAttention(
     const hasReferentialAfter =
       cleanAfter.length > 0 && REFERENTIAL_AFTER_RE.test(cleanAfter);
     const looksDirectCommand =
-      cleanAfter.length > 0 && DIRECT_COMMAND_START_RE.test(cleanAfter);
+      cleanAfter.length > 0 && looksLikeDirectDeviceCommand(cleanAfter);
     const isBgmContext = Boolean(input.acousticEvent?.toUpperCase().includes("BGM"));
     const trimmedCmd = isBgmContext ? trimTrailingMusicLyrics(cleanAfter) : cleanAfter;
 
@@ -1564,16 +1575,15 @@ export async function evaluateVoiceAttention(
       });
     }
 
-    // B2.5. 连续对话中的明确直接智能家居控制指令（smart 模式、非 BGM、短句、含明确控制动词与智能家居域意图）：
+    // B2.5. 连续对话中的明确直接智能家居控制指令或语音附加指令规则（smart 模式、非 BGM）：
     // 借鉴 Home Assistant 本地确定性意图优先原则，0ms 直通免等待云端 SystemOne 往返；
     // 隐式/口语表达（如“有点刺眼”、“好冷啊”）与家庭闲聊仍交由 SystemOne 语义决策。
     const isClearDeviceCmd = isClearConversationCommand(cmd);
+    const isCustomRuleCmd = isCustomInstructionVoiceCommand(cmd) && cmd.length <= 160;
     if (
       input.attentionMode === "smart" &&
       !isBgmConv &&
-      cmd.length <= 18 &&
-      DIRECT_COMMAND_START_RE.test(cmd) &&
-      isClearDeviceCmd
+      ((cmd.length <= 18 && DIRECT_COMMAND_START_RE.test(cmd) && isClearDeviceCmd) || isCustomRuleCmd)
     ) {
       return wrap({
         accept: true,
@@ -1582,7 +1592,11 @@ export async function evaluateVoiceAttention(
         inConversation: true,
         confidence: 0.92,
         stage: "fast-followup",
-        reason: input.awakeActive ? "唤醒窗口内明确设备控制指令" : "连续对话中明确设备控制指令（本地快速直通）",
+        reason: isCustomRuleCmd
+          ? "识别到语音附加指令规则操作"
+          : input.awakeActive
+            ? "唤醒窗口内明确设备控制指令"
+            : "连续对话中明确设备控制指令（本地快速直通）",
         wakeWord: null,
         command: cmd,
         usedLlm: false,
@@ -1700,8 +1714,12 @@ export async function evaluateVoiceAttention(
       sysOneTransientFailure = fk === "timeout" || fk === "network";
     }
 
-    // B4. SystemOne 未启用或降级链：仅放行明确智能家居续聊/控制指令，防止泛化词/歌词/环境杂音在对话中误触发
-    if (input.attentionMode === "smart" && isClearDeviceCmd && (input.awakeActive || cmd.length <= 18)) {
+    // B4. SystemOne 未启用或降级链：仅放行明确智能家居续聊/控制指令或附加指令规则，防止泛化词/歌词/环境杂音在对话中误触发
+    if (
+      input.attentionMode === "smart" &&
+      isClearDeviceCmd &&
+      (input.awakeActive || cmd.length <= 18 || isCustomRuleCmd)
+    ) {
       return wrap({
         accept: true,
         wokeOnly: false,

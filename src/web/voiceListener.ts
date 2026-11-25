@@ -506,6 +506,7 @@ registerProcessor("mijia-voice-processor", MijiaVoiceProcessor);
 export async function recordShortWavSample(
   durationMs = 3000,
   onProgress?: (ratio: number, level: number) => void,
+  stopSignal?: AbortSignal,
 ): Promise<Blob> {
   if (!isMicrophoneAudioSupported()) {
     throw new Error("当前浏览器不支持麦克风录音");
@@ -539,7 +540,20 @@ export async function recordShortWavSample(
 
   try {
     await new Promise<void>((resolve) => {
+      let finished = false;
+      const done = () => {
+        if (finished) return;
+        finished = true;
+        stopSignal?.removeEventListener("abort", done);
+        resolve();
+      };
+      if (stopSignal?.aborted) {
+        done();
+        return;
+      }
+      stopSignal?.addEventListener("abort", done, { once: true });
       proc.onaudioprocess = (ev) => {
+        if (finished) return;
         const data = ev.inputBuffer.getChannelData(0);
         const copy = new Float32Array(data.length);
         let sum = 0;
@@ -553,7 +567,7 @@ export async function recordShortWavSample(
         const elapsed = Date.now() - startAt;
         onProgress?.(Math.min(1, elapsed / durationMs), Math.min(1, rms * 10));
         if (elapsed >= durationMs) {
-          resolve();
+          done();
         }
       };
       source.connect(proc);

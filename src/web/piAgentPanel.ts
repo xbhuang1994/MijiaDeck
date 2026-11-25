@@ -69,6 +69,27 @@ export interface UiAgentSkill {
   updatedAt: number;
 }
 
+export interface UiCustomInstructionRule {
+  id: string;
+  content: string;
+  rawText?: string;
+  topic: string;
+  source: "voice" | "text" | "manual";
+  enabled: boolean;
+  priority: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface UiCustomInstructionConflict {
+  ruleId: string;
+  overriddenById: string;
+  overriddenByPriority: number;
+  overriddenByContent: string;
+  topic: string;
+  reason: string;
+}
+
 export interface UiAgentTimelineEntry {
   id: string;
   role: "user" | "assistant";
@@ -166,6 +187,8 @@ export interface UiPiAgentSnapshot {
   modelId: string;
   tools: Array<{ name: string; label: string; description: string }>;
   skills?: UiAgentSkill[];
+  customInstructions?: UiCustomInstructionRule[];
+  customInstructionConflicts?: Record<string, UiCustomInstructionConflict>;
   timeline: UiAgentTimelineEntry[];
   config: UiPublicAgentConfig;
   providers: UiProviderPreset[];
@@ -367,6 +390,7 @@ function formatArgsPreview(args: Record<string, unknown>): string {
 export class PiAgentPanelController {
   private open = false;
   private skillsExpanded = false;
+  private instructionsExpanded = false;
   private agentState: UiPiAgentSnapshot | null = null;
   private voiceState: UiVoiceSnapshot | null = null;
   private localClientState: {
@@ -647,6 +671,13 @@ export class PiAgentPanelController {
       this.scrollTimelineToBottom();
     });
 
+    const instructionsToggleBtn = document.getElementById("pi-instructions-toggle-btn");
+    instructionsToggleBtn?.addEventListener("click", () => {
+      this.instructionsExpanded = !this.instructionsExpanded;
+      this.renderInstructionsBar();
+      this.scrollTimelineToBottom();
+    });
+
     const input = node<HTMLInputElement>("pi-agent-input");
     const submitInput = () => {
       const text = input.value.trim();
@@ -697,6 +728,14 @@ export class PiAgentPanelController {
 
   getProviders(): UiProviderPreset[] {
     return this.agentState?.providers ?? [];
+  }
+
+  getCustomInstructions(): UiCustomInstructionRule[] {
+    return this.agentState?.customInstructions ?? [];
+  }
+
+  getCustomInstructionConflicts(): Record<string, UiCustomInstructionConflict> {
+    return this.agentState?.customInstructionConflicts ?? {};
   }
 
   toggleDrawer(): void {
@@ -1226,6 +1265,7 @@ export class PiAgentPanelController {
     this.renderHeader();
     this.renderVoiceStrip();
     this.renderSkillsBar();
+    this.renderInstructionsBar();
     this.renderTimeline();
     this.renderComposer();
     this.renderLivePill();
@@ -1323,6 +1363,143 @@ export class PiAgentPanelController {
       del.textContent = "删除";
       del.addEventListener("click", () => {
         void this.deleteAgentSkill(skill.id);
+      });
+
+      actions.append(toggle, del);
+      row.append(main, actions);
+      list.appendChild(row);
+    }
+  }
+
+  private async toggleCustomInstruction(ruleId: string, enabled: boolean): Promise<void> {
+    try {
+      const res = await this.deps.apiPost<{ agent?: UiPiAgentSnapshot }>(
+        `/api/agent/instructions/${encodeURIComponent(ruleId)}/toggle`,
+        { enabled },
+      );
+      if (res.agent) this.applyAgentSnapshot(res.agent);
+      this.deps.showToast(enabled ? "已启用该附加指令" : "已停用该附加指令", 1800);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.deps.showToast(`更新附加指令失败：${msg}`, 3000);
+    }
+  }
+
+  private async deleteCustomInstruction(ruleId: string): Promise<void> {
+    try {
+      const res = await this.deps.apiPost<{ agent?: UiPiAgentSnapshot }>(
+        `/api/agent/instructions/${encodeURIComponent(ruleId)}/delete`,
+      );
+      if (res.agent) this.applyAgentSnapshot(res.agent);
+      this.deps.showToast("已删除该附加指令", 1800);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.deps.showToast(`删除附加指令失败：${msg}`, 3000);
+    }
+  }
+
+  private renderInstructionsBar(): void {
+    const bar = document.getElementById("pi-instructions-bar");
+    const countLabel = document.getElementById("pi-instructions-count-label");
+    const chevron = document.getElementById("pi-instructions-chevron");
+    const toggleBtn = document.getElementById("pi-instructions-toggle-btn");
+    const list = document.getElementById("pi-instructions-list");
+    if (!bar || !countLabel || !chevron || !toggleBtn || !list) return;
+
+    const rules = this.agentState?.customInstructions ?? [];
+    const conflicts = this.agentState?.customInstructionConflicts ?? {};
+    if (rules.length === 0) {
+      bar.hidden = true;
+      this.instructionsExpanded = false;
+      list.replaceChildren();
+      return;
+    }
+
+    bar.hidden = false;
+    const enabledCount = rules.filter((r) => r.enabled).length;
+    countLabel.textContent = `附加指令规则 (${enabledCount}/${rules.length} · 最新优先)`;
+    chevron.textContent = this.instructionsExpanded ? "▾" : "▸";
+    toggleBtn.setAttribute("aria-expanded", String(this.instructionsExpanded));
+    list.hidden = !this.instructionsExpanded;
+    list.replaceChildren();
+
+    if (!this.instructionsExpanded) return;
+
+    let enabledRank = 0;
+    for (const rule of rules) {
+      if (rule.enabled) enabledRank += 1;
+      const conflict = rule.enabled ? conflicts[rule.id] : undefined;
+
+      const row = document.createElement("div");
+      row.className = `pi-skill-item pi-inst-item${rule.enabled ? "" : " is-disabled"}${
+        conflict ? " is-overridden" : ""
+      }`;
+
+      const main = document.createElement("div");
+      main.className = "pi-skill-item-main";
+
+      const title = document.createElement("div");
+      title.className = "pi-inst-item-content";
+      title.textContent = rule.content;
+      title.title = rule.content;
+
+      const meta = document.createElement("div");
+      meta.className = "pi-inst-item-tags";
+
+      if (rule.enabled && enabledRank === 1) {
+        const latestTag = document.createElement("span");
+        latestTag.className = "inst-tag inst-tag-latest";
+        latestTag.textContent = "最新优先";
+        meta.appendChild(latestTag);
+      } else if (rule.enabled) {
+        const rankTag = document.createElement("span");
+        rankTag.className = "inst-tag";
+        rankTag.textContent = `#${enabledRank}`;
+        meta.appendChild(rankTag);
+      } else {
+        const offTag = document.createElement("span");
+        offTag.className = "inst-tag";
+        offTag.textContent = "已停用";
+        meta.appendChild(offTag);
+      }
+
+      const topicTag = document.createElement("span");
+      topicTag.className = "inst-tag inst-tag-topic";
+      topicTag.textContent = rule.topic || "通用";
+      meta.appendChild(topicTag);
+
+      const srcTag = document.createElement("span");
+      srcTag.className = `inst-tag${rule.source === "voice" ? " inst-tag-voice" : ""}`;
+      srcTag.textContent = rule.source === "voice" ? "语音" : rule.source === "text" ? "对话" : "手动";
+      meta.appendChild(srcTag);
+
+      if (conflict) {
+        const confTag = document.createElement("span");
+        confTag.className = "inst-tag inst-tag-conflict";
+        confTag.textContent = "冲突时以新规则为准";
+        confTag.title = conflict.reason;
+        meta.appendChild(confTag);
+      }
+
+      main.append(title, meta);
+
+      const actions = document.createElement("div");
+      actions.className = "pi-skill-item-actions";
+
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "pi-skill-mini-btn";
+      toggle.textContent = rule.enabled ? "停用" : "启用";
+      toggle.addEventListener("click", () => {
+        void this.toggleCustomInstruction(rule.id, !rule.enabled);
+      });
+
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "pi-skill-mini-btn is-danger";
+      del.textContent = "删除";
+      del.addEventListener("click", () => {
+        void this.deleteCustomInstruction(rule.id);
       });
 
       actions.append(toggle, del);

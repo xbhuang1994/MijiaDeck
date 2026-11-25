@@ -27,8 +27,17 @@ import {
 } from "@earendil-works/pi-ai";
 import type { DeviceInfo, PropInfo, SceneInfo } from "../core/models.ts";
 import { isLight } from "../core/deviceControls.ts";
+import { isWasherDevice } from "../core/deviceDetailModel.ts";
 import { SCENES_FEATURE_ENABLED } from "../core/featureFlags.ts";
 import { isSpeaker } from "../core/models.ts";
+import {
+  hasApplicableCustomInstructions,
+  isCustomInstructionVoiceCommand,
+  parseCustomInstructionVoiceIntent,
+  resolveLightDefaultPreferenceFromRules,
+  resolveWasherDefaultProgramFromRules,
+  type CustomInstructionRule,
+} from "./customInstructionStore.ts";
 import { resolveDevices } from "./smartHomeTools.ts";
 import {
   DEFAULT_CAVEMAN_MODE,
@@ -52,6 +61,8 @@ export interface LocalPlannerDeps {
   getScenes(): readonly SceneInfo[];
   getKnownPower(): Readonly<Record<string, boolean | null>>;
   getCavemanMode?: () => CavemanReplyMode;
+  getCustomInstructions?: () => readonly CustomInstructionRule[];
+  getLegacySystemPromptExtra?: () => string;
   classifyImplicitAction?: (utterance: string) => Promise<ImplicitActionLabel | null>;
 }
 
@@ -140,11 +151,28 @@ function roomMatchesDevice(device: DeviceInfo, room: string): boolean {
  */
 export function planDeterministicLocalCalls(
   userText: string,
-  deps: Pick<LocalPlannerDeps, "getDevices" | "getScenes">,
+  deps: Pick<LocalPlannerDeps, "getDevices" | "getScenes"> &
+    Partial<Pick<LocalPlannerDeps, "getCustomInstructions" | "getLegacySystemPromptExtra">>,
   recentTarget: string | null = null,
 ): PlannedCall[] | null {
   const trimmed = userText.trim();
-  if (!trimmed || trimmed.length > 48 || isGreetingOrHelp(trimmed) || RE_CONVERSATIONAL_CORRECTION.test(trimmed)) {
+  if (
+    !trimmed ||
+    trimmed.length > 48 ||
+    isGreetingOrHelp(trimmed) ||
+    RE_CONVERSATIONAL_CORRECTION.test(trimmed) ||
+    isCustomInstructionVoiceCommand(trimmed)
+  ) {
+    return null;
+  }
+
+  // 若当前指令命中用户已保存的附加指令规则，关闭本地快路径直通，交给云端大模型严格按最新规则执行
+  const customRules = deps.getCustomInstructions?.() ?? [];
+  const legacyExtra = deps.getLegacySystemPromptExtra?.() ?? "";
+  if (
+    (customRules.length > 0 || legacyExtra.trim().length > 0) &&
+    hasApplicableCustomInstructions(trimmed, customRules, legacyExtra)
+  ) {
     return null;
   }
 
@@ -1528,6 +1556,67 @@ function summarizeSingleToolResult(
         isError: false,
       };
     }
+
+    // 11. 保存 / 查看 / 删除附加指令规则
+    if (res.toolName === "save_custom_instruction") {
+      const ruleObj =
+        d.rule && typeof d.rule === "object" ? (d.rule as Record<string, unknown>) : null;
+      const content = typeof ruleObj?.content === "string" ? ruleObj.content : "";
+      const conflictCount = typeof d.conflictCount === "number" ? d.conflictCount : 0;
+      const bumped = d.bumped === true;
+      if (content) {
+        if (bumped) {
+          return {
+            text: isWarm
+              ? `已经把这条附加指令更新为最新优先了：${content}`
+              : `已更新为最新优先规则：${content}`,
+            isQuery: false,
+            isError: false,
+          };
+        }
+        if (conflictCount > 0) {
+          return {
+            text: isWarm
+              ? `已经记住了：${content}。如果和较早规则有冲突，会优先按这条最新的执行`
+              : `已记住最新规则（冲突覆盖旧规则）：${content}`,
+            isQuery: false,
+            isError: false,
+          };
+        }
+        return {
+          text: isWarm ? `已经记住这条附加指令了：${content}` : `已保存附加指令：${content}`,
+          isQuery: false,
+          isError: false,
+        };
+      }
+    }
+
+    if (res.toolName === "list_custom_instructions") {
+      const count = typeof d.count === "number" ? d.count : 0;
+      if (count === 0) {
+        return {
+          text: isWarm ? "目前还没有保存任何附加指令规则" : "暂无附加指令",
+          isQuery: true,
+          isError: false,
+        };
+      }
+      const items = Array.isArray(d.rules) ? (d.rules as Array<Record<string, unknown>>) : [];
+      const previews = items
+        .slice(0, 3)
+        .map((r, i) => `${i + 1}.${String(r.content ?? "")}`)
+        .join("；");
+      return {
+        text: `已保存${count}条附加指令（最新优先）：${previews}${items.length > 3 ? "等" : ""}`,
+        isQuery: true,
+        isError: false,
+      };
+    }
+
+    if (res.toolName === "delete_custom_instruction") {
+      if (typeof d.uiSummary === "string" && d.uiSummary.trim()) {
+        return { text: d.uiSummary.trim(), isQuery: false, isError: false };
+      }
+    }
   }
 
   if (d && typeof d.uiSummary === "string" && d.uiSummary.trim()) {
@@ -1731,11 +1820,74 @@ export function createLocalSmartHomeStreamFn(
         const devices = deps.getDevices();
         const scenes = deps.getScenes();
         const knownPower = deps.getKnownPower();
+        const customRules = deps.getCustomInstructions?.() ?? [];
         const recentTarget = findRecentDeviceFromTranscript(messages.slice(0, -1));
 
         if (isGreetingOrHelp(userText)) {
           const replyText = buildFinalReplyWithoutTools(userText, devices, cavemanMode, false);
           pushTextStreamReply(stream, model, now, replyText);
+          return;
+        }
+
+        // B0. 整句优先检测「保存 / 查看 / 删除附加指令规则」意图，避免长规则中的逗号触发子句拆分误控设备
+        const customRuleIntent = parseCustomInstructionVoiceIntent(userText);
+        if (customRuleIntent) {
+          const ruleCall: PlannedCall =
+            customRuleIntent.kind === "save"
+              ? {
+                  name: "save_custom_instruction",
+                  arguments: {
+                    content: customRuleIntent.content,
+                    topic: customRuleIntent.topic,
+                  },
+                }
+              : customRuleIntent.kind === "list"
+                ? {
+                    name: "list_custom_instructions",
+                    arguments: customRuleIntent.topic ? { topic: customRuleIntent.topic } : {},
+                  }
+                : customRuleIntent.kind === "delete_latest"
+                  ? {
+                      name: "delete_custom_instruction",
+                      arguments: { delete_latest: true },
+                    }
+                  : customRuleIntent.kind === "delete_match"
+                    ? {
+                        name: "delete_custom_instruction",
+                        arguments: { query: customRuleIntent.query },
+                      }
+                    : {
+                        name: "delete_custom_instruction",
+                        arguments: { clear_all: true },
+                      };
+          callCounter += 1;
+          const tc: ToolCall = {
+            type: "toolCall",
+            id: `local_call_${now}_${callCounter}`,
+            name: ruleCall.name,
+            arguments: ruleCall.arguments,
+          };
+          const partial: AssistantMessage = {
+            role: "assistant",
+            content: [tc],
+            api: model.api,
+            provider: model.provider,
+            model: model.id,
+            usage: ZERO_USAGE,
+            stopReason: "toolUse",
+            timestamp: now,
+          };
+          stream.push({ type: "start", partial });
+          stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+          stream.push({
+            type: "toolcall_delta",
+            contentIndex: 0,
+            delta: JSON.stringify(tc.arguments),
+            partial,
+          });
+          stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: tc, partial });
+          stream.push({ type: "done", reason: "toolUse", message: partial });
+          stream.end();
           return;
         }
 
@@ -1745,7 +1897,73 @@ export function createLocalSmartHomeStreamFn(
         let activeRecentTarget = recentTarget;
 
         for (const clause of clauses) {
-          const call = planSingleClause(clause, devices, scenes, activeRecentTarget);
+          // 洗衣机启动洗涤：自动按「最新规则优先」套用用户保存的默认洗衣模式（如智洗烘）
+          if (
+            /(?:开始洗|洗衣服|去洗衣|启动洗衣|帮我洗衣|洗衣机开始)/.test(clause) &&
+            !/(?:暂停|停止|关闭|关机|查看|状态)/.test(clause)
+          ) {
+            const washer =
+              devices.find((d) => isWasherDevice(d) && d.online) ??
+              devices.find((d) => isWasherDevice(d) || d.name.includes("洗衣") || d.name.includes("洗烘"));
+            if (washer) {
+              const washerPref = resolveWasherDefaultProgramFromRules(customRules);
+              if (washerPref) {
+                planned.push({
+                  name: "set_device_property",
+                  arguments: {
+                    target: washer.did,
+                    property: "program",
+                    value: washerPref.programKey,
+                  },
+                });
+              }
+              planned.push({
+                name: "run_device_action",
+                arguments: {
+                  target: washer.did,
+                  action: "start-wash",
+                },
+              });
+              activeRecentTarget = washer.did;
+              continue;
+            }
+          }
+
+          let call = planSingleClause(clause, devices, scenes, activeRecentTarget);
+          // 开灯指令：若用户未在本句指定亮度/色温/颜色，但已保存灯具默认规则，按最新规则优先自动套用
+          if (
+            call &&
+            call.name === "set_device_power" &&
+            call.arguments.state === "on" &&
+            typeof call.arguments.target === "string" &&
+            customRules.length > 0
+          ) {
+            const targetDev = devices.find(
+              (d) => d.did === call!.arguments.target || d.name === call!.arguments.target,
+            );
+            if (targetDev && isLight(targetDev)) {
+              const lightPref = resolveLightDefaultPreferenceFromRules(
+                targetDev.name,
+                targetDev.room_name,
+                customRules,
+              );
+              if (lightPref) {
+                call = {
+                  name: "control_light",
+                  arguments: {
+                    target: targetDev.did,
+                    on: true,
+                    ...(lightPref.brightness !== undefined ? { brightness: lightPref.brightness } : {}),
+                    ...(lightPref.temperaturePreset ? { temperature_preset: lightPref.temperaturePreset } : {}),
+                    ...(lightPref.colorTemperature !== undefined
+                      ? { color_temperature: lightPref.colorTemperature }
+                      : {}),
+                    ...(lightPref.color ? { color: lightPref.color } : {}),
+                  },
+                };
+              }
+            }
+          }
           if (call) {
             const callTarget = typeof call.arguments.target === "string" ? call.arguments.target : "";
             if (callTarget && devices.some((d) => d.did === callTarget)) {

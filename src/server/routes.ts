@@ -9,6 +9,17 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import {
+  addCustomInstruction,
+  clearCustomInstructions,
+  deleteCustomInstruction,
+  detectCustomInstructionConflicts,
+  loadCustomInstructions,
+  parseCustomInstructionVoiceIntent,
+  setCustomInstructionEnabled,
+  updateCustomInstruction,
+  type CustomInstructionSource,
+} from "../agent/customInstructionStore.ts";
+import {
   normalizeTtsSpeed,
   normalizeTtsVoice,
   TTS_VOICE_PRESETS,
@@ -2048,6 +2059,188 @@ export function createRequestHandler(
           skills: runtime.piAgent.listSkills(),
           agent: runtime.piAgent.snapshot(),
         });
+      }
+
+      // ---------- 多条附加指令规则（支持语音/手动保存、冲突最新优先） ----------
+
+      if (method === "GET" && pathname === "/api/agent/instructions") {
+        const instructions = runtime.piAgent
+          ? runtime.piAgent.listCustomInstructions()
+          : loadCustomInstructions();
+        const conflicts = Object.fromEntries(
+          detectCustomInstructionConflicts(instructions).entries(),
+        );
+        return jsonResponse({
+          ok: true,
+          instructions,
+          conflicts,
+          agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
+        });
+      }
+
+      if (method === "POST" && pathname === "/api/agent/instructions") {
+        const body = await readJsonBody(req);
+        const rawContent = typeof body.content === "string" ? body.content.trim() : "";
+        if (!rawContent) {
+          throw new HttpError(400, "请输入要保存的附加指令内容");
+        }
+        const sourceRaw = typeof body.source === "string" ? body.source.trim() : "manual";
+        const source: CustomInstructionSource =
+          sourceRaw === "voice" || sourceRaw === "text" || sourceRaw === "manual"
+            ? sourceRaw
+            : "manual";
+        const parsedVoice = source === "voice" ? parseCustomInstructionVoiceIntent(rawContent) : null;
+        const content =
+          parsedVoice && parsedVoice.kind === "save" ? parsedVoice.content : rawContent;
+        const rawText =
+          typeof body.rawText === "string" && body.rawText.trim()
+            ? body.rawText.trim()
+            : rawContent !== content
+              ? rawContent
+              : undefined;
+        const topic = typeof body.topic === "string" ? body.topic.trim() : undefined;
+        const enabled = body.enabled !== undefined ? body.enabled !== false : true;
+
+        try {
+          const result = runtime.piAgent
+            ? runtime.piAgent.addCustomInstruction({ content, rawText, topic, source, enabled })
+            : addCustomInstruction({ content, rawText, topic, source, enabled });
+          const instructions = runtime.piAgent
+            ? runtime.piAgent.listCustomInstructions()
+            : loadCustomInstructions();
+          const conflicts = Object.fromEntries(
+            detectCustomInstructionConflicts(instructions).entries(),
+          );
+          emitBroadcast(runtime);
+          return jsonResponse({
+            ok: true,
+            rule: result.rule,
+            created: result.created,
+            bumped: result.bumped,
+            conflictingRules: result.conflictingRules,
+            instructions,
+            conflicts,
+            agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
+          });
+        } catch (err) {
+          throw new HttpError(400, sanitizeErrorMessage(err));
+        }
+      }
+
+      if (method === "POST" && pathname === "/api/agent/instructions/clear") {
+        const cleared = runtime.piAgent
+          ? runtime.piAgent.clearCustomInstructions()
+          : clearCustomInstructions();
+        emitBroadcast(runtime);
+        return jsonResponse({
+          ok: true,
+          cleared,
+          instructions: [],
+          conflicts: {},
+          agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
+        });
+      }
+
+      const instToggleMatch = /^\/api\/agent\/instructions\/([^/]+)\/toggle$/.exec(pathname);
+      if (method === "POST" && instToggleMatch) {
+        const id = decodeSegment(instToggleMatch[1]!);
+        const body = await readJsonBody(req);
+        const enabled = body.enabled !== false;
+        const updated = runtime.piAgent
+          ? runtime.piAgent.setCustomInstructionEnabled(id, enabled)
+          : setCustomInstructionEnabled(id, enabled);
+        if (!updated) {
+          throw new HttpError(404, "未找到指定的附加指令规则");
+        }
+        const instructions = runtime.piAgent
+          ? runtime.piAgent.listCustomInstructions()
+          : loadCustomInstructions();
+        const conflicts = Object.fromEntries(
+          detectCustomInstructionConflicts(instructions).entries(),
+        );
+        emitBroadcast(runtime);
+        return jsonResponse({
+          ok: true,
+          rule: updated,
+          instructions,
+          conflicts,
+          agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
+        });
+      }
+
+      const instDeletePostMatch = /^\/api\/agent\/instructions\/([^/]+)\/delete$/.exec(pathname);
+      const instDeleteMatch = /^\/api\/agent\/instructions\/([^/]+)$/.exec(pathname);
+      if (
+        (method === "DELETE" && instDeleteMatch) ||
+        (method === "POST" && instDeletePostMatch)
+      ) {
+        const id = decodeSegment((instDeletePostMatch ?? instDeleteMatch)![1]!);
+        const removed = runtime.piAgent
+          ? runtime.piAgent.deleteCustomInstruction(id)
+          : deleteCustomInstruction(id);
+        if (!removed) {
+          throw new HttpError(404, "未找到指定的附加指令规则");
+        }
+        const instructions = runtime.piAgent
+          ? runtime.piAgent.listCustomInstructions()
+          : loadCustomInstructions();
+        const conflicts = Object.fromEntries(
+          detectCustomInstructionConflicts(instructions).entries(),
+        );
+        emitBroadcast(runtime);
+        return jsonResponse({
+          ok: true,
+          deleted: true,
+          rule: removed,
+          instructions,
+          conflicts,
+          agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
+        });
+      }
+
+      const instUpdateMatch = /^\/api\/agent\/instructions\/([^/]+)$/.exec(pathname);
+      if (method === "POST" && instUpdateMatch) {
+        const id = decodeSegment(instUpdateMatch[1]!);
+        const body = await readJsonBody(req);
+        try {
+          const updated = runtime.piAgent
+            ? runtime.piAgent.updateCustomInstruction(id, {
+                ...(typeof body.content === "string" ? { content: body.content } : {}),
+                ...(typeof body.topic === "string" ? { topic: body.topic } : {}),
+                ...(typeof body.enabled === "boolean" ? { enabled: body.enabled } : {}),
+                ...(typeof body.bumpPriority === "boolean"
+                  ? { bumpPriority: body.bumpPriority }
+                  : {}),
+              })
+            : updateCustomInstruction(id, {
+                ...(typeof body.content === "string" ? { content: body.content } : {}),
+                ...(typeof body.topic === "string" ? { topic: body.topic } : {}),
+                ...(typeof body.enabled === "boolean" ? { enabled: body.enabled } : {}),
+                ...(typeof body.bumpPriority === "boolean"
+                  ? { bumpPriority: body.bumpPriority }
+                  : {}),
+              });
+          if (!updated) {
+            throw new HttpError(404, "未找到指定的附加指令规则");
+          }
+          const instructions = runtime.piAgent
+            ? runtime.piAgent.listCustomInstructions()
+            : loadCustomInstructions();
+          const conflicts = Object.fromEntries(
+            detectCustomInstructionConflicts(instructions).entries(),
+          );
+          emitBroadcast(runtime);
+          return jsonResponse({
+            ok: true,
+            rule: updated,
+            instructions,
+            conflicts,
+            agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
+          });
+        } catch (err) {
+          if (err instanceof HttpError) throw err;
+          throw new HttpError(400, sanitizeErrorMessage(err));
+        }
       }
 
       if (method === "POST" && pathname === "/api/agent/abort") {
