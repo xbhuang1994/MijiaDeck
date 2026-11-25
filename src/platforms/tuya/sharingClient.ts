@@ -49,6 +49,11 @@ export interface TuyaSharingHome {
   geoName?: string;
 }
 
+export interface TuyaSharingRoom {
+  id: string;
+  name: string;
+}
+
 export interface TuyaSharingDevice {
   id: string;
   name: string;
@@ -62,6 +67,8 @@ export interface TuyaSharingDevice {
   local_key?: string;
   localKey?: string;
   ip?: string;
+  room_id?: string | number;
+  roomId?: string | number;
   room_name?: string;
   roomName?: string;
   home_id?: string;
@@ -537,8 +544,11 @@ export class TuyaSharingClient {
       }
 
       const rawResult = resp.result;
-      if (typeof rawResult === "string" && rawResult.length > 0) {
+      if (typeof rawResult === "string" && rawResult.trim().length > 0) {
         const decryptedText = tuyaSharingAesGcmDecrypt(rawResult, secret);
+        if (!decryptedText.trim()) {
+          return "" as unknown as T;
+        }
         try {
           return JSON.parse(decryptedText) as T;
         } catch {
@@ -628,6 +638,28 @@ export class TuyaSharingClient {
     });
     if (!Array.isArray(res)) return [];
     return res.filter(isRecord) as unknown as TuyaSharingDevice[];
+  }
+
+  /**
+   * 查询设备所属房间（对齐 tuya-device-sharing-sdk `HomeRepository.query_room_by_device`）：
+   * `GET /v1.0/m/thing/ha/{deviceId}/room`
+   * 未分配房间的设备会返回空字符串或空对象，此时返回 `null`。
+   */
+  async queryRoomByDevice(deviceId: string): Promise<TuyaSharingRoom | null> {
+    const trimmedId = deviceId.trim();
+    if (!trimmedId) return null;
+    const res = await this._signedRequest<unknown>(
+      "GET",
+      `/v1.0/m/thing/ha/${encodeURIComponent(trimmedId)}/room`,
+    );
+    if (!isRecord(res)) return null;
+    const rawName = res.name ?? res.roomName ?? res.room_name;
+    const name = typeof rawName === "string" ? rawName.trim() : "";
+    if (!name) return null;
+    const rawId = res.id ?? res.roomId ?? res.room_id;
+    const id =
+      typeof rawId === "string" || typeof rawId === "number" ? String(rawId).trim() : "";
+    return { id, name };
   }
 
   async queryDeviceDetail(deviceIds: string[]): Promise<TuyaSharingDevice[]> {

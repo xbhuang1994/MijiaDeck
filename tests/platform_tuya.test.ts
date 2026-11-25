@@ -1230,4 +1230,255 @@ describe("TuyaPlatformProvider — QR Auth, Encrypted Cloud Sync, Control, Hybri
     expect(tok.accessToken).toBe("eu_tok");
     await expect(client.getDeviceStatus("bad_dev")).rejects.toThrow(/param is illegal/);
   });
+
+  test("HA Device Sharing resolves rooms via /v1.0/m/thing/ha/{deviceId}/room (including empty/unassigned, split switches, errors & room move refresh)", async () => {
+    const refreshToken = "refresh_room_test_999";
+    const accessToken = "access_room_test_111";
+    const mem = makeMemoryConfigStore({
+      enabled: true,
+      mode: "sharing",
+      userCode: "UCROOM01",
+      tokenSession: {
+        accessToken,
+        refreshToken,
+        expireTime: 1_730_010_000_000,
+        uid: "uid_room_test",
+        endpoint: "https://apigw.tuyacn.com",
+      },
+      localDevices: [
+        {
+          id: "dev_local_room_fallback",
+          name: "局域网兜底设备",
+          ip: "192.168.1.99",
+          port: 6668,
+          localKey: "0123456789abcdef",
+          version: "3.3",
+          category: "cz",
+          room: "阳台",
+        },
+      ],
+    });
+
+    let livingLightRoom = { id: 80190840, name: "客厅" };
+    const roomRequests: string[] = [];
+
+    const mockFetch: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const urlStr = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const parsedUrl = new URL(urlStr);
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const rid = headers["X-requestId"]!;
+      const sid = headers["X-sid"] ?? "";
+      const hashKey = tuyaSharingHashKey(rid, refreshToken);
+      const secret = tuyaSharingSecret(rid, sid, hashKey);
+
+      const replyEncrypted = (resultObj: unknown): Response =>
+        jsonResponse({
+          success: true,
+          result: tuyaSharingAesGcmEncrypt(JSON.stringify(resultObj), secret),
+        });
+
+      if (parsedUrl.pathname === "/v1.0/m/life/users/homes") {
+        return replyEncrypted([{ ownerId: "244347141", name: "我的家" }]);
+      }
+      if (parsedUrl.pathname === "/v1.0/m/life/ha/home/devices") {
+        // Real Tuya Sharing API omits roomName / room_name from /ha/home/devices
+        return replyEncrypted([
+          {
+            id: "dev_living_light",
+            name: "客厅灯",
+            category: "tdq",
+            product_id: "p_sw1",
+            online: true,
+            status: [{ code: "switch_1", value: true }],
+          },
+          {
+            id: "dev_bedroom_2g",
+            name: "卧室双开",
+            category: "kg",
+            product_id: "p_sw2",
+            online: true,
+            status: [
+              { code: "switch_1", value: false },
+              { code: "switch_2", value: true },
+            ],
+          },
+          {
+            id: "dev_unassigned_empty",
+            name: "大空调",
+            category: "infrared_ac",
+            product_id: "p_ac",
+            online: true,
+          },
+          {
+            id: "dev_local_room_fallback",
+            name: "局域网兜底设备",
+            category: "cz",
+            product_id: "p_plug",
+            online: true,
+            status: [{ code: "switch_1", value: false }],
+          },
+          {
+            id: "dev_room_api_error",
+            name: "故障房间接口设备",
+            category: "tdq",
+            product_id: "p_err",
+            online: true,
+            status: [{ code: "switch_1", value: false }],
+          },
+        ]);
+      }
+      if (parsedUrl.pathname.endsWith("/specifications")) {
+        if (parsedUrl.pathname.includes("dev_bedroom_2g")) {
+          return replyEncrypted({
+            category: "kg",
+            functions: [
+              { code: "switch_1", type: "Boolean", values: "{}" },
+              { code: "switch_2", type: "Boolean", values: "{}" },
+            ],
+            status: [
+              { code: "switch_1", type: "Boolean", values: "{}" },
+              { code: "switch_2", type: "Boolean", values: "{}" },
+            ],
+          });
+        }
+        return replyEncrypted({ functions: [], status: [] });
+      }
+      if (parsedUrl.pathname.startsWith("/v1.0/m/thing/ha/") && parsedUrl.pathname.endsWith("/room")) {
+        const deviceId = parsedUrl.pathname.split("/")[5]!;
+        roomRequests.push(deviceId);
+        if (deviceId === "dev_living_light") {
+          return replyEncrypted(livingLightRoom);
+        }
+        if (deviceId === "dev_bedroom_2g") {
+          return replyEncrypted({ id: 80193049, name: "卧室" });
+        }
+        if (deviceId === "dev_unassigned_empty") {
+          // Real Tuya gateway returns empty string `result: ""` (unencrypted) when unassigned
+          return jsonResponse({ success: true, result: "" });
+        }
+        if (deviceId === "dev_local_room_fallback") {
+          // Encrypted empty object also means unassigned -> falls back to localEntry.room ("阳台")
+          return replyEncrypted({});
+        }
+        if (deviceId === "dev_room_api_error") {
+          return jsonResponse({ success: false, code: "1108", msg: "uri path invalid" });
+        }
+      }
+      throw new Error(`Unhandled path: ${parsedUrl.pathname}`);
+    }) as typeof fetch;
+
+    const provider = new TuyaPlatformProvider({
+      httpFetch: mockFetch,
+      configStore: mem.store,
+      now: () => 1_730_000_000_000,
+    });
+
+    const first = await provider.listDevices();
+    const byDid = new Map(first.map((d) => [d.did, d]));
+    expect(byDid.get("dev_living_light")?.room_name).toBe("客厅");
+    expect(byDid.get("dev_bedroom_2g")?.room_name).toBe("卧室");
+    expect(byDid.get("dev_bedroom_2g.s1")?.room_name).toBe("卧室");
+    expect(byDid.get("dev_bedroom_2g.s2")?.room_name).toBe("卧室");
+    expect(byDid.get("dev_unassigned_empty")?.room_name).toBe("默认房间");
+    expect(byDid.get("dev_local_room_fallback")?.room_name).toBe("阳台");
+    expect(byDid.get("dev_room_api_error")?.room_name).toBe("默认房间");
+    expect(roomRequests).toHaveLength(5);
+
+    // Moving a device to another room in Tuya App must reflect on the next sync (no stale room cache)
+    livingLightRoom = { id: 80199999, name: "书房" };
+    const second = await provider.listDevices();
+    const secondByDid = new Map(second.map((d) => [d.did, d]));
+    expect(secondByDid.get("dev_living_light")?.room_name).toBe("书房");
+  });
+
+  test("Tuya OpenAPI v2.0 resolves home and room names via /v1.0/homes/{homeId}/rooms and room devices", async () => {
+    const mem = makeMemoryConfigStore({
+      enabled: true,
+      mode: "openapi",
+      region: "cn",
+      accessId: "aid_room",
+      accessSecret: "sec_room",
+      uid: "uid_room_openapi",
+    });
+
+    const mockFetch: typeof fetch = (async (input: RequestInfo | URL) => {
+      const url = new URL(
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url,
+      );
+      if (url.pathname === "/v1.0/token") {
+        return jsonResponse({
+          success: true,
+          result: {
+            access_token: "oa_tok",
+            refresh_token: "oa_rt",
+            expire_time: 7200,
+            uid: "uid_room_openapi",
+          },
+        });
+      }
+      if (url.pathname === "/v1.0/users/uid_room_openapi/devices") {
+        return jsonResponse({
+          success: true,
+          result: [
+            { id: "oa_dev_1", name: "客厅灯", category: "dj", online: true },
+            { id: "oa_dev_2", name: "书房台灯", category: "dj", online: true },
+            { id: "oa_dev_3", name: "未分组插座", category: "cz", online: true },
+          ],
+        });
+      }
+      if (url.pathname === "/v1.0/users/uid_room_openapi/homes") {
+        return jsonResponse({
+          success: true,
+          result: [
+            { home_id: "h_home", name: "我的家" },
+            { home_id: "h_studio", name: "工作室" },
+          ],
+        });
+      }
+      if (url.pathname === "/v1.0/homes/h_home/rooms") {
+        return jsonResponse({
+          success: true,
+          result: {
+            home_id: "h_home",
+            name: "我的家",
+            rooms: [{ room_id: 101, name: "客厅" }],
+          },
+        });
+      }
+      if (url.pathname === "/v1.0/homes/h_studio/rooms") {
+        return jsonResponse({
+          success: true,
+          result: {
+            home_id: "h_studio",
+            name: "工作室",
+            rooms: [{ room_id: 202, name: "书房" }],
+          },
+        });
+      }
+      if (url.pathname === "/v1.0/homes/h_home/rooms/101/devices") {
+        return jsonResponse({ success: true, result: [{ id: "oa_dev_1" }] });
+      }
+      if (url.pathname === "/v1.0/homes/h_studio/rooms/202/devices") {
+        return jsonResponse({ success: true, result: [{ id: "oa_dev_2" }] });
+      }
+      if (url.pathname.endsWith("/specifications")) {
+        return jsonResponse({ success: true, result: { functions: [], status: [] } });
+      }
+      throw new Error(`Unexpected OpenAPI path: ${url.pathname}`);
+    }) as typeof fetch;
+
+    const provider = new TuyaPlatformProvider({
+      httpFetch: mockFetch,
+      configStore: mem.store,
+    });
+
+    const devices = await provider.listDevices();
+    const byDid = new Map(devices.map((d) => [d.did, d]));
+    expect(byDid.get("oa_dev_1")?.home_name).toBe("我的家");
+    expect(byDid.get("oa_dev_1")?.room_name).toBe("客厅");
+    expect(byDid.get("oa_dev_2")?.home_name).toBe("工作室");
+    expect(byDid.get("oa_dev_2")?.room_name).toBe("书房");
+    expect(byDid.get("oa_dev_3")?.home_name).toBe("我的家");
+    expect(byDid.get("oa_dev_3")?.room_name).toBe("默认房间");
+  });
 });

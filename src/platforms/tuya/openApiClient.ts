@@ -30,6 +30,8 @@ export interface TuyaOpenApiDevice {
   ip?: string;
   uid?: string;
   icon?: string;
+  room_name?: string;
+  roomName?: string;
   status?: TuyaStatusItem[];
 }
 
@@ -37,6 +39,11 @@ export interface TuyaOpenApiHome {
   home_id: string;
   name: string;
   geo_name?: string;
+}
+
+export interface TuyaOpenApiRoom {
+  room_id: string;
+  name: string;
 }
 
 export interface TuyaOpenApiScene {
@@ -346,6 +353,39 @@ export class TuyaOpenApiClient {
         ...(typeof item.geo_name === "string" ? { geo_name: item.geo_name } : {}),
       }))
       .filter((h) => h.home_id.length > 0);
+  }
+
+  async listHomeRooms(homeId: string): Promise<TuyaOpenApiRoom[]> {
+    const trimmedHomeId = homeId.trim();
+    if (!trimmedHomeId) return [];
+    const res = await this._authorizedRequest<unknown>(
+      "GET",
+      `/v1.0/homes/${encodeURIComponent(trimmedHomeId)}/rooms`,
+    );
+    const rawRooms = Array.isArray(res)
+      ? res
+      : isRecord(res) && Array.isArray(res.rooms)
+        ? res.rooms
+        : [];
+    return rawRooms
+      .filter(isRecord)
+      .map((item) => ({
+        room_id: String(item.room_id ?? item.id ?? "").trim(),
+        name: String(item.name ?? item.room_name ?? "").trim(),
+      }))
+      .filter((r) => r.room_id.length > 0 && r.name.length > 0);
+  }
+
+  async listRoomDevices(homeId: string, roomId: string): Promise<TuyaOpenApiDevice[]> {
+    const trimmedHomeId = homeId.trim();
+    const trimmedRoomId = roomId.trim();
+    if (!trimmedHomeId || !trimmedRoomId) return [];
+    const res = await this._authorizedRequest<unknown>(
+      "GET",
+      `/v1.0/homes/${encodeURIComponent(trimmedHomeId)}/rooms/${encodeURIComponent(trimmedRoomId)}/devices`,
+    );
+    if (!Array.isArray(res)) return [];
+    return res.filter(isRecord) as unknown as TuyaOpenApiDevice[];
   }
 
   async listHomeScenes(homeId: string): Promise<TuyaOpenApiScene[]> {

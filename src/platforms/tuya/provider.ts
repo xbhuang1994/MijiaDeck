@@ -805,22 +805,37 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
           }
         }
 
-        progress?.(45, `正在同步 ${rawDevices.length} 台涂鸦设备规格…`);
-        const specs = await runWithConcurrency(rawDevices, SPEC_CONCURRENCY, async ({ dev }) => {
-          const cached = this._specCache.get(dev.id);
-          if (cached) return cached;
-          try {
-            const spec = await this._sharingClient.queryDeviceSpec(dev.id);
-            this._specCache.set(dev.id, spec);
-            return spec;
-          } catch {
-            return null;
-          }
+        progress?.(45, `正在同步 ${rawDevices.length} 台涂鸦设备规格与房间…`);
+        const deviceMeta = await runWithConcurrency(rawDevices, SPEC_CONCURRENCY, async ({ dev }) => {
+          const inlineRoom = (dev.roomName || dev.room_name || "").trim();
+          const [spec, roomName] = await Promise.all([
+            (async (): Promise<TuyaDeviceSpecification | null> => {
+              const cached = this._specCache.get(dev.id);
+              if (cached) return cached;
+              try {
+                const s = await this._sharingClient.queryDeviceSpec(dev.id);
+                this._specCache.set(dev.id, s);
+                return s;
+              } catch {
+                return null;
+              }
+            })(),
+            (async (): Promise<string> => {
+              if (inlineRoom) return inlineRoom;
+              try {
+                const room = await this._sharingClient.queryRoomByDevice(dev.id);
+                return room?.name?.trim() || "";
+              } catch {
+                return "";
+              }
+            })(),
+          ]);
+          return { spec, roomName };
         });
 
         for (let i = 0; i < rawDevices.length; i += 1) {
           const { homeName, dev } = rawDevices[i]!;
-          const spec = specs[i] ?? null;
+          const { spec, roomName: resolvedRoom } = deviceMeta[i] ?? { spec: null, roomName: "" };
           const localEntry = this._localEntryById(dev.id);
           const category = dev.category || spec?.category || "";
           const { codeToDpId, dpIdToCode } = buildDpIdMaps(
@@ -836,7 +851,7 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
             productId: dev.productId || dev.product_id,
             model: dev.model,
             homeName,
-            roomName: dev.roomName || dev.room_name || localEntry?.room || "默认房间",
+            roomName: resolvedRoom || localEntry?.room?.trim() || "默认房间",
             online: Boolean(dev.online),
             localKey: localEntry?.localKey || dev.localKey || dev.local_key,
             ip: localEntry?.ip || dev.ip,
@@ -856,10 +871,38 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
           throw new ServiceError("涂鸦 OpenAPI 模式缺少用户 UID，请在平台配置中填写 UID");
         }
         const rawDevices: TuyaOpenApiDevice[] = await this._openApiClient.listUserDevices(uid);
+        const deviceLocationById = new Map<string, { homeName: string; roomName: string }>();
         let defaultHomeName = "涂鸦家庭";
         try {
           const homes = await this._openApiClient.listHomes(uid);
           if (homes[0]?.name) defaultHomeName = homes[0].name;
+          await Promise.all(
+            homes.map(async (home) => {
+              try {
+                const rooms = await this._openApiClient!.listHomeRooms(home.home_id);
+                await runWithConcurrency(rooms, SPEC_CONCURRENCY, async (room) => {
+                  try {
+                    const roomDevs = await this._openApiClient!.listRoomDevices(
+                      home.home_id,
+                      room.room_id,
+                    );
+                    for (const rd of roomDevs) {
+                      if (rd.id && room.name) {
+                        deviceLocationById.set(rd.id, {
+                          homeName: home.name || defaultHomeName,
+                          roomName: room.name,
+                        });
+                      }
+                    }
+                  } catch {
+                    // individual room device lookup is best-effort
+                  }
+                });
+              } catch {
+                // rooms endpoint is optional in some OpenAPI project scopes
+              }
+            }),
+          );
         } catch {
           // homes endpoint is optional in some OpenAPI project scopes
         }
@@ -881,6 +924,7 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
           const dev = rawDevices[i]!;
           const spec = specs[i] ?? null;
           const localEntry = this._localEntryById(dev.id);
+          const loc = deviceLocationById.get(dev.id);
           const category = dev.category || spec?.category || "";
           const { codeToDpId, dpIdToCode } = buildDpIdMaps(category, spec, localEntry);
           recordsById.set(dev.id, {
@@ -889,8 +933,13 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
             category,
             productId: dev.product_id,
             model: dev.model,
-            homeName: defaultHomeName,
-            roomName: localEntry?.room || "默认房间",
+            homeName: loc?.homeName || defaultHomeName,
+            roomName:
+              dev.roomName?.trim() ||
+              dev.room_name?.trim() ||
+              loc?.roomName ||
+              localEntry?.room?.trim() ||
+              "默认房间",
             online: Boolean(dev.online),
             localKey: localEntry?.localKey || dev.local_key,
             ip: localEntry?.ip || dev.ip,
@@ -1464,6 +1513,8 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
         did: device.did,
         name: device.name,
         model: device.model,
+        home_name: device.home_name,
+        room_name: device.room_name,
         spec_type: device.spec_type,
         online: device.online,
         light_features: device.light_features,
