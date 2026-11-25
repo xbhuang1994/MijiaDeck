@@ -6735,9 +6735,9 @@ body.pi-drawer-open .voice-fab {
 .pi-voice-tracks-panel {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  margin-top: 8px;
-  padding-top: 8px;
+  gap: 4px;
+  margin-top: 6px;
+  padding-top: 6px;
   border-top: 1px dashed var(--c-line);
 }
 
@@ -6745,40 +6745,43 @@ body.pi-drawer-open .voice-fab {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 6px;
+  gap: 5px;
 }
 
 .pi-tracks-header-left {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 5px;
+  flex-wrap: nowrap;
+  gap: 4px;
   min-width: 0;
+  overflow: hidden;
 }
 
 .pi-tracks-title {
-  font-size: 11.5px;
+  font-size: 11px;
   font-weight: 700;
   color: var(--c-text-primary);
   letter-spacing: 0.01em;
+  white-space: nowrap;
 }
 
 .pi-tracks-count-badge {
   display: inline-flex;
   align-items: center;
-  padding: 1px 7px;
+  padding: 1px 6px;
   border-radius: 999px;
-  font-size: 10.5px;
+  font-size: 10px;
   font-weight: 600;
   color: var(--c-theme-dim);
   background: var(--c-accent-surface);
   border: 1px solid var(--c-accent-border);
+  white-space: nowrap;
 }
 
 .pi-tracks-count-badge.is-multi {
-  color: #0284c7;
-  background: rgba(14, 165, 233, 0.14);
-  border-color: rgba(14, 165, 233, 0.36);
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.14);
+  border-color: rgba(56, 189, 248, 0.38);
 }
 
 .pi-tracks-count-badge.is-live {
@@ -6788,12 +6791,15 @@ body.pi-drawer-open .voice-fab {
 }
 
 .pi-tracks-engine-badge {
-  font-size: 10px;
+  font-size: 9.5px;
   color: var(--c-text-secondary);
-  padding: 1px 6px;
+  padding: 1px 5px;
   border-radius: 999px;
   background: var(--c-surface);
   border: 1px solid var(--c-line);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .pi-tracks-toggle-btn {
@@ -6801,9 +6807,9 @@ body.pi-drawer-open .voice-fab {
   border: 1px solid var(--c-line);
   background: var(--c-surface);
   color: var(--c-text-secondary);
-  font-size: 10.5px;
+  font-size: 10px;
   line-height: 1;
-  padding: 3px 8px;
+  padding: 3px 7px;
   border-radius: 999px;
   cursor: pointer;
   flex-shrink: 0;
@@ -6818,8 +6824,8 @@ body.pi-drawer-open .voice-fab {
 .pi-tracks-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  max-height: 210px;
+  gap: 4px;
+  max-height: 158px;
   overflow-y: auto;
   padding-right: 2px;
 }
@@ -6827,9 +6833,9 @@ body.pi-drawer-open .voice-fab {
 .pi-track-card {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 7px 9px;
-  border-radius: 9px;
+  gap: 2px;
+  padding: 5px 8px;
+  border-radius: 8px;
   background: var(--c-surface);
   border: 1px solid var(--c-line);
   border-left-width: 3px;
@@ -6955,24 +6961,26 @@ body.pi-drawer-open .voice-fab {
 }
 
 .pi-track-text {
-  font-size: 12.5px;
+  font-size: 12px;
   font-weight: 500;
-  line-height: 1.45;
+  line-height: 1.35;
   color: var(--c-text-primary);
   word-break: break-word;
 }
 
 .pi-track-text.is-empty {
-  font-size: 11.5px;
+  font-size: 11px;
   font-style: italic;
   color: var(--c-text-secondary);
 }
 
 .pi-track-foot {
-  font-size: 10.5px;
-  line-height: 1.35;
+  font-size: 10px;
+  line-height: 1.28;
   color: var(--c-text-secondary);
-  word-break: break-word;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .pi-msg-track-badge {

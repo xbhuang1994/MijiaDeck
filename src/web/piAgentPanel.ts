@@ -2814,7 +2814,7 @@ export class PiAgentPanelController {
     countBadge.classList.toggle("is-multi", tracks.length > 1);
     countBadge.textContent =
       tracks.length > 1
-        ? `${tracks.length} 轨独立处理 · ${batch.acceptedCount} 轨命中`
+        ? `${tracks.length} 轨独立 · ${batch.acceptedCount} 命中`
         : batch.acceptedCount > 0
           ? "1 轨 · 已命中"
           : "1 轨";
@@ -2822,7 +2822,7 @@ export class PiAgentPanelController {
     engineBadge.hidden = false;
     const engineLabel = batch.bssUsed ? "BSS+SE" : "SE";
     engineBadge.textContent =
-      batch.totalMs > 0 ? `${engineLabel} · ${Math.round(batch.totalMs)}ms` : engineLabel;
+      batch.totalMs > 0 ? `${engineLabel} ${Math.round(batch.totalMs)}ms` : engineLabel;
 
     if (!this.tracksExpanded) return;
 
