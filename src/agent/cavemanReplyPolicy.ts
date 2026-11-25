@@ -70,19 +70,28 @@ const RE_CJK_CORNER_BRACKETS = /[「」『』]/g;
 const RE_ARROWS = /\s*(?:->|=>|→|➜|➔)\s*/g;
 const RE_DECORATIVE_EMOJI = /[\p{Extended_Pictographic}\uFE0E\uFE0F\u200D\u20E3]/gu;
 
-// 客套开场白（ZH / EN）
-const ZH_OPENER_PATTERNS: readonly RegExp[] = [
-  /^(?:好的|好哒|好嘞|好的呢|好呀|没问题|当然|当然可以|明白|收到|了解|太好了|太棒了|非常乐意|很乐意|很高兴为您服务|不客气|客气了|您好|你好|嗨|哈喽|嘿)[，,！!。.\s~～]+/,
+// 官腔/客套开场白（ZH / EN）
+// - BUREAUCRATIC: 在 lite / full / ultra 均剥离（避免 AI 腔与冗长前缀）
+// - CASUAL: 仅在 full / ultra 剥离（lite 保留自然友好的“好的/没问题”等口语连接）
+const ZH_BUREAUCRATIC_OPENER_PATTERNS: readonly RegExp[] = [
+  /^(?:非常乐意|很乐意|很高兴为您服务|不客气|客气了)[，,！!。.\s~～]+/,
   /^(?:根据|按照)(?:您的|你的)?(?:要求|指令|指示|需求|查询(?:结果)?)[，,：:\s]+/,
   /^(?:为您|为你)?(?:查询|查看|执行|操作)结果(?:如下)?[：:，,\s]+/,
   /^(?:我)?(?:已经|已)?(?:为您|为你|帮您|帮你)(?:查询到|查到|查询了|查看了|获取到|读取到|确认到|检查到)[：:，,\s]*/,
 ];
 
-const EN_OPENER_PATTERNS: readonly RegExp[] = [
-  /^(?:sure|of course|certainly|absolutely|got it|no problem|alright|all right|okay|ok|great|awesome|hello|hi|hey)[!.,:\s]+/i,
+const ZH_CASUAL_OPENER_PATTERNS: readonly RegExp[] = [
+  /^(?:好的|好哒|好嘞|好的呢|好呀|没问题|当然|当然可以|明白|收到|了解|太好了|太棒了|您好|你好|嗨|哈喽|嘿)[，,！!。.\s~～]+/,
+];
+
+const EN_BUREAUCRATIC_OPENER_PATTERNS: readonly RegExp[] = [
   /^(?:i(?:'d| would) be (?:happy|glad|delighted) to(?:\s+help(?:\s+you)?(?:\s+with\s+that)?)?|happy to help|glad to help)[!.,:\s]*/i,
   /^(?:i(?:'ve| have) gone ahead and|i went ahead and|i(?:'ve| have) just|i have successfully|i've successfully)\s+/i,
   /^(?:here(?:'s| is) (?:what i found|the (?:status|result|update|info)))[:—–\-\s]+/i,
+];
+
+const EN_CASUAL_OPENER_PATTERNS: readonly RegExp[] = [
+  /^(?:sure|of course|certainly|absolutely|got it|no problem|alright|all right|okay|ok|great|awesome|hello|hi|hey)[!.,:\s]+/i,
 ];
 
 // 客套收尾语（ZH / EN）
@@ -101,6 +110,10 @@ const EN_CLOSER_PATTERNS: readonly RegExp[] = [
 ];
 
 // 流式纯客套分句判定
+const RE_PURE_BUREAUCRATIC_OPENER_ZH =
+  /^(?:非常乐意|很乐意|很高兴为您服务|不客气|客气了)[，,！!。.\s~～]*$/;
+const RE_PURE_BUREAUCRATIC_OPENER_EN =
+  /^(?:happy to help|glad to help|i(?:'d| would) be (?:happy|glad|delighted) to help(?:\s+you)?)[!.,\s]*$/i;
 const RE_PURE_OPENER_ZH =
   /^(?:好的|好哒|好嘞|好的呢|好呀|没问题|当然|当然可以|明白|收到|了解|太好了|太棒了|非常乐意|很乐意|很高兴为您服务|不客气|客气了)[，,！!。.\s~～]*$/;
 const RE_PURE_OPENER_EN =
@@ -170,23 +183,23 @@ export function buildCavemanPromptBlock(
       break;
     case "full":
       lines.push(
-        "Reply Style [caveman:full]: Match user language (ZH/EN). Answer first; zero ceremony, closers, or tool chatter. <=20 ZH chars / <=15 EN words.",
+        "Reply Style [caveman:full]: Match user language (ZH/EN). Direct, natural complete spoken sentence; no filler, flattery, or closers. <=28 ZH chars / <=18 EN words.",
       );
       lines.push(
-        "Ex: 客厅吸顶灯已开，亮度80%。 / 卧室灯离线，无法打开。 / Bedroom: 23.6°C, humidity 54%.",
+        "Ex: 客厅吸顶灯已打开，亮度调到80%。 / 抱歉，卧室灯离线了，暂时无法打开。 / Living room light is on at 80%.",
       );
       break;
     case "lite":
       lines.push(
-        "Reply Style [caveman:lite]: Match user language (ZH/EN). Complete natural sentences; zero filler, flattery, or closers.",
+        "Reply Style [natural:lite]: Match user language (ZH/EN). Warm, natural, concise spoken reply (1 sentence); drop bureaucratic filler and customer-service closers.",
       );
       lines.push(
-        "Ex: 已打开客厅吸顶灯，亮度调至80%。 / Turned on living room light at 80%.",
+        "Ex: 好的，客厅吸顶灯已经打开，亮度调到80%了。 / Sure, I turned on the living room light to 80%.",
       );
       break;
     case "off":
       lines.push(
-        "Reply Style [normal]: Match user language (ZH/EN). Concise, natural baseline (1-2 sentences).",
+        "Reply Style [normal]: Match user language (ZH/EN). Warm, natural conversational reply (1-2 sentences).",
       );
       break;
   }
@@ -335,14 +348,14 @@ export function compressCavemanReply(
         return `\uE000CF${idx}\uE001`;
       });
 
-  // 1. 剥离客套开场白与收尾语（lite / full / ultra 均执行）
-  working = stripOpeners(working);
+  // 1. 剥离官腔开场白与客服收尾语（lite 保留自然友好的“好的/没问题”，full/ultra 剥离客套开场）
+  working = stripOpeners(working, effectiveMode);
   working = stripClosers(working);
 
   // 2. 处理常见中文客套动词前缀（“我已经为您打开了...” / “已为你把...”）
   working = tightenPoliteVerbPrefixes(working, effectiveMode);
 
-  // 3. full / ultra 模式进一步精简冗余表达
+  // 3. full / ultra 模式进一步精简冗余表达（full 保留完整自然句式与“抱歉”，ultra 极致电报压缩）
   if (effectiveMode === "full" || effectiveMode === "ultra") {
     working = tightenFullPhrasing(working);
   }
@@ -397,7 +410,7 @@ export function compressCavemanSpeakChunk(
     return cleaned;
   }
 
-  if (!state.emittedAny && isPureOpenerChunk(cleaned)) {
+  if (!state.emittedAny && isPureOpenerChunk(cleaned, effectiveMode)) {
     return "";
   }
 
@@ -454,11 +467,20 @@ export function formatWakeAck(mode: CavemanReplyMode, speakerName?: string | nul
 }
 
 /**
- * 生成退出连续对话 / 回到待机的极简提示语。
+ * 生成退出连续对话 / 回到待机的自然提示语。
  */
 export function formatExitConversationAck(mode: CavemanReplyMode): string {
   const effectiveMode = normalizeCavemanMode(mode, DEFAULT_CAVEMAN_MODE);
-  return effectiveMode === "off" ? "好的，已回到待机" : "已待机";
+  switch (effectiveMode) {
+    case "ultra":
+      return "已待机";
+    case "full":
+      return "好的，已待机";
+    case "lite":
+      return "好的，有需要再叫我";
+    case "off":
+      return "好的，已回到待机，有需要再叫我";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -469,8 +491,11 @@ function isAutoClarityText(text: string): boolean {
   return RE_AUTO_CLARITY_ZH.test(text) || RE_AUTO_CLARITY_EN.test(text);
 }
 
-function isPureOpenerChunk(text: string): boolean {
+function isPureOpenerChunk(text: string, mode: CavemanReplyMode): boolean {
   const trimmed = text.trim();
+  if (mode === "lite") {
+    return RE_PURE_BUREAUCRATIC_OPENER_ZH.test(trimmed) || RE_PURE_BUREAUCRATIC_OPENER_EN.test(trimmed);
+  }
   return RE_PURE_OPENER_ZH.test(trimmed) || RE_PURE_OPENER_EN.test(trimmed);
 }
 
@@ -479,14 +504,55 @@ function isPureCloserChunk(text: string): boolean {
   return RE_PURE_CLOSER_ZH.test(trimmed) || RE_PURE_CLOSER_EN.test(trimmed);
 }
 
-function stripOpeners(input: string): string {
+function stripOpeners(input: string, mode: CavemanReplyMode): string {
   let out = input.trim();
+
+  if (mode === "lite") {
+    // 若以“好的！抱歉，...”开头，去掉前面突兀的“好的！”保留自然致歉
+    out = out.replace(
+      /^(?:好的|好哒|好嘞|没问题|当然|明白|收到)[，,！!。\s]+(?=(?:抱歉|不好意思|对不起))/,
+      "",
+    );
+    // 合并叠床架屋的双重客套（“好的，没问题！” -> “好的，”）
+    out = out.replace(
+      /^(好的|好哒|好嘞|好呀|没问题)[，,！!。\s]+(?:没问题|当然可以|当然|明白|收到|非常乐意|很乐意)[，,！!。\s]+/,
+      "$1，",
+    );
+    // 剥离官腔开场白（含紧跟在“好的，”之后的官腔）
+    const leadMatch = /^(好的|好哒|好嘞|好呀|没问题|Sure|Okay|OK)[，,！!.\s]+/i.exec(out);
+    const savedLead = leadMatch ? leadMatch[0] : "";
+    let body = savedLead ? out.slice(savedLead.length).trim() : out;
+    for (let pass = 0; pass < 4; pass += 1) {
+      const before = body;
+      for (const re of ZH_BUREAUCRATIC_OPENER_PATTERNS) {
+        body = body.replace(re, "").trim();
+      }
+      for (const re of EN_BUREAUCRATIC_OPENER_PATTERNS) {
+        body = body.replace(re, "").trim();
+      }
+      if (body === before) break;
+    }
+    if (savedLead && body) {
+      const leadNorm = /^(好的|好哒|好嘞|好呀|没问题)/.test(savedLead)
+        ? `${leadMatch![1]}，`
+        : `${leadMatch![1]}, `;
+      return `${leadNorm}${body}`;
+    }
+    return body || out;
+  }
+
   for (let pass = 0; pass < 4; pass += 1) {
     const before = out;
-    for (const re of ZH_OPENER_PATTERNS) {
+    for (const re of ZH_CASUAL_OPENER_PATTERNS) {
       out = out.replace(re, "").trim();
     }
-    for (const re of EN_OPENER_PATTERNS) {
+    for (const re of ZH_BUREAUCRATIC_OPENER_PATTERNS) {
+      out = out.replace(re, "").trim();
+    }
+    for (const re of EN_CASUAL_OPENER_PATTERNS) {
+      out = out.replace(re, "").trim();
+    }
+    for (const re of EN_BUREAUCRATIC_OPENER_PATTERNS) {
       out = out.replace(re, "").trim();
     }
     if (out === before) break;
@@ -512,17 +578,34 @@ function stripClosers(input: string): string {
 function tightenPoliteVerbPrefixes(input: string, mode: CavemanReplyMode): string {
   let out = input;
 
-  // “我已经为您把...” / “已为你将...”
   if (mode === "lite") {
-    out = out.replace(/^(?:我)?(?:已经|已)(?:为您|为你|帮您|帮你)(把|将)/, "已$1");
-    out = out.replace(/^(?:我)?(?:已经|已)(?:为您|为你|帮您|帮你)(?!把|将)/, "已");
-  } else {
-    out = out.replace(/^(?:我)?(?:已经|已)?(?:为您|为你|帮您|帮你)(?:把|将)/, "");
-    out = out.replace(/^(?:我)?(?:已经|已)(?:为您|为你|帮您|帮你)(?!把|将)/, "已");
-    out = out.replace(/^已(?:经)?(?:把|将)/, "");
+    // lite 仅温和去除过重的客服官腔“我已经为您”，保留自然口语“已经”“把/将”和“了”
+    out = out.replace(/^(好的，)?(?:我)?已经(?:为您|为你|帮您|帮你)/, "$1已经");
+    out = out.replace(/^(好的，)?(?:我)?已(?:为您|为你|帮您|帮你)/, "$1已");
+    out = out.replace(/，并且?(?:为您|为你|帮您|帮你)?将/g, "，把");
+    out = out.replace(/，并将/g, "，把");
+    if (/^[a-z]/.test(out)) {
+      out = out[0]!.toUpperCase() + out.slice(1);
+    }
+    return out;
   }
 
-  // 去除“已打开了”中的冗余“了”
+  if (mode === "full") {
+    // full 保持完整自然动词结构（绝不删光“把/将”造成无动词电报残句）
+    out = out.replace(/^(?:我)?(?:已经|已)(?:为您|为你|帮您|帮你)(把|将)/, "已$1");
+    out = out.replace(/^(?:我)?(?:已经|已)(?:为您|为你|帮您|帮你)(?!把|将)/, "已");
+    out = out.replace(/已(打开|关闭|开启|调[整节至到暗亮高低]|设[置定]|执行|切换|静音|暂停|停止|播放|播报|出粮|发送)了/g, "已$1");
+    out = out.replace(/已已/g, "已");
+    if (/^[a-z]/.test(out)) {
+      out = out[0]!.toUpperCase() + out.slice(1);
+    }
+    return out;
+  }
+
+  // ultra：极致电报体
+  out = out.replace(/^(?:我)?(?:已经|已)?(?:为您|为你|帮您|帮你)(?:把|将)/, "");
+  out = out.replace(/^(?:我)?(?:已经|已)(?:为您|为你|帮您|帮你)(?!把|将)/, "已");
+  out = out.replace(/^已(?:经)?(?:把|将)/, "");
   out = out.replace(/已(打开|关闭|开启|调[整节至到暗亮高低]|设[置定]|执行|切换|静音|暂停|停止|播放|播报|出粮|发送)了/g, "已$1");
   out = out.replace(/已已/g, "已");
 
@@ -537,23 +620,15 @@ function tightenPoliteVerbPrefixes(input: string, mode: CavemanReplyMode): strin
 function tightenFullPhrasing(input: string): string {
   let out = input;
 
-  // 中文常见冗长表述精简（不触碰任何否定词）
+  // 适度精简书面官腔，但保留“抱歉”、自然动宾与完整句式（不再把回复砍成冰冷电报残句）
   out = out
     .replace(RE_CJK_CORNER_BRACKETS, "")
-    .replace(/^(?:抱歉|不好意思|对不起)[，,！!\s]+/, "")
     .replace(/(?<!无法|不能|未能|没能|不可)(?:为您|为你|帮您|帮你)/g, "")
     .replace(/(?:已经)?成功(?:地)?/g, "已")
     .replace(/已已/g, "已")
     .replace(/，并将/g, "，")
     .replace(/，并且将/g, "，")
-    .replace(/，并把/g, "，")
-    .replace(/([^，,。；;\n]{1,22}?)(打开|开启|关闭)了(?=[，,。；;\n]|$)/g, "$1已$2")
-    .replace(/已已/g, "已")
-    .replace(/当前离线/g, "离线")
-    .replace(/当前(温度|湿度|亮度|色温|音量|电量)(?:为|是)\s*/g, "$1 ")
-    .replace(/(温度|湿度|亮度|色温|音量|电量)(?:为|是)\s*(?=-?\d)/g, "$1 ")
-    .replace(/已将/g, "")
-    .replace(/已把/g, "");
+    .replace(/，并把/g, "，");
 
   // 英文精简
   out = out
@@ -561,9 +636,7 @@ function tightenFullPhrasing(input: string): string {
       /^(?:I(?:'ve| have)\s+)?(?:successfully\s+)?(?=(?:turned|switched|set|adjusted|dimmed|brightened|muted|unmuted|paused|resumed|started|stopped|executed|ran|sent|checked|found|opened|closed|dispensed)\b)/i,
       "",
     )
-    .replace(/\bsuccessfully\s+/gi, "")
-    .replace(/\bhas been\s+(?=[a-z]+)/gi, "")
-    .replace(/\bhave been\s+(?=[a-z]+)/gi, "");
+    .replace(/\bsuccessfully\s+/gi, "");
 
   if (/^[a-z]/.test(out)) {
     out = out[0]!.toUpperCase() + out.slice(1);
@@ -575,15 +648,24 @@ function tightenFullPhrasing(input: string): string {
 function tightenUltraPhrasing(input: string): string {
   let out = input;
 
-  // 中文极简（保留“关闭”等所有否定词原样不动）
+  // 中文极致电报体（仅在用户主动选择 ultra 时启用；保留所有否定词原样不动）
   out = out
+    .replace(/^(?:抱歉|不好意思|对不起)[，,！!\s]+/, "")
+    .replace(/([^，,。；;\n]{1,22}?)(打开|开启|关闭)了(?=[，,。；;\n]|$)/g, "$1已$2")
+    .replace(/已已/g, "已")
     .replace(/已打开/g, "已开")
     .replace(/已开启/g, "已开")
+    .replace(/当前(温度|湿度|亮度|色温|音量|电量)(?:为|是)\s*/g, "$1 ")
+    .replace(/(温度|湿度|亮度|色温|音量|电量)(?:为|是)\s*(?=-?\d)/g, "$1 ")
+    .replace(/已将/g, "")
+    .replace(/已把/g, "")
     .replace(/([\u4e00-\u9fffA-Za-z0-9])的(亮度|色温|音量|温度|湿度|电量|颜色)/g, "$1$2")
     .replace(/当前离线/g, "离线");
 
   // 英文电报体精简
   out = out
+    .replace(/\bhas been\s+(?=[a-z]+)/gi, "")
+    .replace(/\bhave been\s+(?=[a-z]+)/gi, "")
     .replace(/^(?:The|A|An)\s+/i, "")
     .replace(/\bis\s+now\s+/gi, "");
 

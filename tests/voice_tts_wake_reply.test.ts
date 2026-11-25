@@ -165,6 +165,9 @@ describe("Local Gentle Female TTS Engine & HTTP Endpoint", () => {
     );
     expect(normalizeTextForLocalTts("Neo已就绪，OK", "gentle-zh-en")).toBe("尼奥已就绪，ok");
     expect(normalizeTextForLocalTts("Neo已就绪，OK", "warm-zh-baker")).toBe("尼奥已就绪，好的");
+    expect(normalizeTextForLocalTts("小爱音箱 Pro 音量已调到65%", "warm-zh-baker")).toBe(
+      "小爱音箱 专业版 音量已调到百分之65",
+    );
     expect(normalizeTtsVoice("warm-zh-baker")).toBe("warm-zh-baker");
     expect(normalizeTtsVoice("invalid")).toBe("gentle-zh-en");
     expect(normalizeTtsSpeed(0.5)).toBe(0.7);

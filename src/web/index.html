@@ -258,7 +258,7 @@
         <button type="button" id="pi-voice-start-btn" class="primary-button btn-compact">开启持续监听</button>
         <button type="button" id="pi-voice-oneshot-btn" class="secondary-button btn-compact" title="免唤醒单次语音输入（快捷键 Alt+V）">单次说话</button>
         <button type="button" id="pi-voice-wake-toggle-btn" class="pi-wake-pill active" title="点击切换唤醒词模式或免唤醒直达模式">唤醒词：小派</button>
-        <button type="button" id="pi-caveman-toggle-btn" class="pi-caveman-pill active" title="点击切换 Caveman 极简回复风格">极简 · Full</button>
+        <button type="button" id="pi-caveman-toggle-btn" class="pi-caveman-pill active" title="点击切换语音与文字回复风格">自然 · Lite</button>
       </div>
       <div id="pi-voice-telemetry" class="pi-voice-telemetry" hidden></div>
     </div>
@@ -659,14 +659,14 @@
 
           <div class="setting-card setting-card-wrap">
             <div class="setting-info">
-              <div class="setting-label">Caveman 极简回复风格</div>
-              <div class="setting-desc" id="set-agent-caveman-desc">极简直给，去寒暄废话、保留关键数值与结果 · 例：“客厅灯已开，亮度 85%。”</div>
+              <div class="setting-label">语音与文字回复风格</div>
+              <div class="setting-desc" id="set-agent-caveman-desc">自然口语且简洁，保留基本礼貌与完整句式 · 例：“好的，客厅吸顶灯已经打开，亮度调到85%了。”</div>
             </div>
-            <select id="set-agent-caveman-mode" class="md-select" aria-label="Caveman 极简回复风格">
-              <option value="full">极简洞穴人 Full · 推荐</option>
+            <select id="set-agent-caveman-mode" class="md-select" aria-label="语音与文字回复风格">
+              <option value="lite">自然精炼 Lite · 推荐</option>
+              <option value="full">简短直接 Full</option>
               <option value="ultra">电报极简 Ultra · 最快语音</option>
-              <option value="lite">精炼自然 Lite</option>
-              <option value="off">标准自然</option>
+              <option value="off">温暖对话（不压缩）</option>
             </select>
           </div>
 

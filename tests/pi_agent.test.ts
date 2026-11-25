@@ -296,7 +296,7 @@ describe("PiAgentService with Local Smart-Home Stream Engine", () => {
         expect(res.toolCalls[0]?.args.playback).toBe("stop");
         expect(res.toolCalls[0]?.args.play_music).toBeUndefined();
         expect(res.reply).not.toContain("继续播放");
-        expect(res.reply).toContain("已停止");
+        expect(res.reply).toMatch(/已经?停止/);
         // VirtualDemoService speaker only exposes pause (no stop action), so stop falls back to pause
         expect(await h.service.readProp("demo-speaker-xiaoai", "playing-state")).toBe(2);
       }
@@ -317,7 +317,7 @@ describe("PiAgentService with Local Smart-Home Stream Engine", () => {
         expect(res.ok).toBe(true);
         expect(res.toolCalls[0]?.name).toBe("control_speaker");
         expect(res.toolCalls[0]?.args.playback).toBe("pause");
-        expect(res.reply).toContain("已暂停");
+        expect(res.reply).toMatch(/已经?暂停/);
         expect(await h.service.readProp("demo-speaker-xiaoai", "playing-state")).toBe(2);
       }
 
@@ -516,7 +516,7 @@ describe("PiAgentService with Local Smart-Home Stream Engine", () => {
       expect(res.ok).toBe(true);
       expect(res.toolCalls[0]?.name).toBe("control_speaker");
       expect(res.toolCalls[0]?.args.playback).toBe("stop");
-      expect(res.reply).toContain("已停止");
+      expect(res.reply).toMatch(/已经?停止/);
       expect(res.reply).not.toContain("继续播放");
       // Tried stop (s3a4) -> -704220008 -> transparently fell back to pause (s3a3); NEVER called play (s3a2) or stop-alarm (s6a1)
       expect(actionPayloads).toEqual([

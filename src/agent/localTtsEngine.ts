@@ -234,6 +234,12 @@ export function normalizeTextForLocalTts(
       .replace(/\bPi\s*Agent\b/gi, "小派助手")
       .replace(/\bMijiaDeck\b/gi, "米家桌面端")
       .replace(/\bNeo\b/gi, "尼奥")
+      .replace(/\bPro\b/gi, "专业版")
+      .replace(/\bMax\b/gi, "增强版")
+      .replace(/\bMini\b/gi, "迷你")
+      .replace(/\bLite\b/gi, "青春版")
+      .replace(/\bPlus\b/gi, "加强版")
+      .replace(/\bAir\b/gi, "轻享版")
       .replace(/\bOK\b/gi, "好的")
       .replace(/\bhello\b/gi, "你好")
       .replace(/\bhi\b/gi, "嗨");

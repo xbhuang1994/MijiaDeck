@@ -99,6 +99,7 @@ export class VoiceCommandSegmenter {
   // 自适应背景音乐/底噪能量追踪（用于区分持续背景音乐 vs 前景近场说话人）
   private _ambientRmsFloor = 0.008;
   private _commandPeakRms = 0;
+  private _idleRmsWindow: number[] = [];
 
   constructor(options: VoiceCommandSegmenterOptions = {}) {
     this.speechSeconds = Math.max(0.06, options.speechSeconds ?? 0.20);
@@ -123,6 +124,7 @@ export class VoiceCommandSegmenter {
     this._resetSecondsLeft = this.resetSeconds;
     this.inCommand = false;
     this._commandPeakRms = 0;
+    this._idleRmsWindow.length = 0;
   }
 
   /**
@@ -137,11 +139,12 @@ export class VoiceCommandSegmenter {
     this._timeoutSecondsLeft = Math.min(this.timeoutSeconds, 4.0);
     this._resetSecondsLeft = this.resetSeconds;
     this._commandPeakRms = Math.max(initialPeakRms, this._ambientRmsFloor * 1.4);
+    this._idleRmsWindow.length = 0;
   }
 
   /**
    * 喂入一帧语音概率与帧 RMS，返回滞回分段状态。
-   * 当 `rawRms` 存在持续背景音乐底噪（例如 `ambientRmsFloor >= 0.018`）时，
+   * 当 `rawRms` 存在持续背景音乐底噪（例如 `ambientRmsFloor >= 0.015`）时，
    * 若前景语音能量显著抬升后又回落至音乐底噪附近，即便 Silero VAD 因歌声维持中等概率，
    * 也会识别为“前景人声已停顿”并平稳推进尾静音倒计时。
    */
@@ -161,13 +164,39 @@ export class VoiceCommandSegmenter {
 
     const rms = typeof frameRms === "number" && Number.isFinite(frameRms) ? frameRms : undefined;
 
-    // 未在指令内时跟踪环境底噪（允许追踪持续背景音乐电平，上限 0.14；~1.5s 内收敛）
+    // 未在指令内时采用最小统计窗口跟踪持续背景底噪：
+    // - 能量低于当前底噪时立即向下衰减；
+    // - 向上抬升仅在非语音帧连续满 20 帧（~640ms）后取窗口最小值缓慢收敛，
+    //   彻底杜绝安静房间起音阶段（Silero VAD 0.2~0.5s 触发延迟期间）将人声起音误算为音乐底噪！
     if (!this.inCommand && rms !== undefined) {
-      const alpha = rms < this._ambientRmsFloor ? 0.08 : 0.05;
-      this._ambientRmsFloor = Math.max(
-        0.003,
-        Math.min(0.14, this._ambientRmsFloor * (1 - alpha) + rms * alpha),
-      );
+      if (rms < this._ambientRmsFloor) {
+        this._ambientRmsFloor = Math.max(
+          0.003,
+          Math.min(0.14, this._ambientRmsFloor * 0.92 + rms * 0.08),
+        );
+      }
+      if (prob <= this.beforeCommandSpeechThreshold) {
+        this._idleRmsWindow.push(rms);
+        if (this._idleRmsWindow.length > 20) {
+          this._idleRmsWindow.shift();
+        }
+        if (this._idleRmsWindow.length >= 20) {
+          let windowMin = this._idleRmsWindow[0]!;
+          for (let i = 1; i < this._idleRmsWindow.length; i += 1) {
+            if (this._idleRmsWindow[i]! < windowMin) {
+              windowMin = this._idleRmsWindow[i]!;
+            }
+          }
+          if (windowMin > this._ambientRmsFloor) {
+            this._ambientRmsFloor = Math.max(
+              0.003,
+              Math.min(0.14, this._ambientRmsFloor * 0.92 + windowMin * 0.08),
+            );
+          }
+        }
+      } else {
+        this._idleRmsWindow.length = 0;
+      }
     }
 
     if (this.inCommand) {
@@ -190,6 +219,7 @@ export class VoiceCommandSegmenter {
           this._silenceSecondsLeft = this.silenceSeconds;
           this._timeoutSecondsLeft = this.timeoutSeconds;
           this._commandPeakRms = rms ?? 0;
+          this._idleRmsWindow.length = 0;
           return { continuing: true, inCommand: true, justStarted: true, timedOut: false };
         }
       } else {
@@ -207,14 +237,15 @@ export class VoiceCommandSegmenter {
       this._commandPeakRms = rms;
     }
 
-    // 在高背景音乐环境下，若前景人声峰值显著高于底噪且当前帧能量回落到底噪附近，
-    // 提高判定仍处于前景讲话的概率要求，使命令结束后无需等到 4.2s 超时！
+    // 在高背景音乐环境下，仅当当前帧能量同时回落至环境底噪附近（<= floor * 1.32）
+    // 且明显低于前景语音峰值（<= peak * 0.65）时，才判定前景人声已停顿，避免正常轻音节被误切。
     let effectiveInThreshold = this.inCommandSpeechThreshold;
     if (
       rms !== undefined &&
       this._ambientRmsFloor >= 0.015 &&
       this._commandPeakRms >= this._ambientRmsFloor * 1.45 &&
-      rms <= Math.max(this._ambientRmsFloor * 1.28, this._commandPeakRms * 0.58)
+      rms <= this._ambientRmsFloor * 1.32 &&
+      rms <= this._commandPeakRms * 0.65
     ) {
       effectiveInThreshold = Math.max(effectiveInThreshold, 0.78);
     }

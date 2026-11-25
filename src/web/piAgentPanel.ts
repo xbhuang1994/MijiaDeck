@@ -244,16 +244,16 @@ const QUICK_SUGGESTIONS: ReadonlyArray<string> = [
   "小爱音箱音量调到 55",
 ];
 
-const CAVEMAN_CYCLE_ORDER: ReadonlyArray<UiCavemanMode> = ["full", "ultra", "lite", "off"];
+const CAVEMAN_CYCLE_ORDER: ReadonlyArray<UiCavemanMode> = ["lite", "full", "ultra", "off"];
 const CAVEMAN_LABELS: Readonly<Record<UiCavemanMode, string>> = {
-  full: "极简 · Full",
-  ultra: "电报 · Ultra",
-  lite: "精炼 · Lite",
-  off: "标准回复",
+  lite: "自然 · Lite",
+  full: "简短 · Full",
+  ultra: "极简 · Ultra",
+  off: "温暖对话",
 };
 
 function normalizeUiCavemanMode(raw: unknown): UiCavemanMode {
-  return raw === "ultra" || raw === "full" || raw === "lite" || raw === "off" ? raw : "full";
+  return raw === "ultra" || raw === "full" || raw === "lite" || raw === "off" ? raw : "lite";
 }
 
 function node<T extends HTMLElement = HTMLElement>(id: string): T {
@@ -674,7 +674,7 @@ export class PiAgentPanelController {
   async cycleCavemanMode(): Promise<void> {
     const current = this.currentCavemanMode();
     const idx = CAVEMAN_CYCLE_ORDER.indexOf(current);
-    const next = CAVEMAN_CYCLE_ORDER[(idx + 1) % CAVEMAN_CYCLE_ORDER.length] ?? "full";
+    const next = CAVEMAN_CYCLE_ORDER[(idx + 1) % CAVEMAN_CYCLE_ORDER.length] ?? "lite";
     try {
       const res = await this.deps.apiPost<{
         agent?: UiPiAgentSnapshot;
@@ -1191,7 +1191,7 @@ export class PiAgentPanelController {
       const cm = this.currentCavemanMode();
       cavemanBtn.textContent = CAVEMAN_LABELS[cm];
       cavemanBtn.classList.toggle("active", cm !== "off");
-      cavemanBtn.title = `当前回复风格：${CAVEMAN_LABELS[cm]}（点击循环切换 Full / Ultra / Lite / 标准）`;
+      cavemanBtn.title = `当前回复风格：${CAVEMAN_LABELS[cm]}（点击循环切换 自然 / 简短 / 极简 / 温暖）`;
     }
 
     const interim = this.localClientState.interimTranscript || this.voiceState?.interimTranscript || "";
@@ -1291,8 +1291,16 @@ export class PiAgentPanelController {
     }
 
     const cavemanMode = this.currentCavemanMode();
-    if (cavemanMode !== "off") {
-      tags.push({ label: "Caveman", title: `回复风格：${CAVEMAN_LABELS[cavemanMode]}` });
+    if (cavemanMode === "ultra" || cavemanMode === "full") {
+      tags.push({
+        label: cavemanMode === "ultra" ? "电报极简" : "简短回复",
+        title: `回复风格：${CAVEMAN_LABELS[cavemanMode]}`,
+      });
+    } else if (cavemanMode === "lite") {
+      tags.push({
+        label: "自然回复",
+        title: `回复风格：${CAVEMAN_LABELS[cavemanMode]}`,
+      });
     }
 
     const vpCount = vs?.voiceprints?.length ?? 0;

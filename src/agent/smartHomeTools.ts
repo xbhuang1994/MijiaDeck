@@ -902,7 +902,14 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
 
       return textResult(
         summary,
-        { ok: succeeded.length > 0, succeeded, failed, uiSummary: summary },
+        {
+          ok: succeeded.length > 0,
+          succeeded,
+          failed,
+          ...(params.room ? { room: params.room } : {}),
+          ...(params.category ? { category: params.category } : {}),
+          uiSummary: summary,
+        },
         succeeded.length === 0,
       );
     },
@@ -973,6 +980,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         turnedOn = true;
       }
 
+      let appliedBrightness: number | undefined;
       if (params.brightness !== undefined) {
         const bProp = controls.brightness;
         if (!bProp) {
@@ -983,9 +991,11 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         const scaled = high === 100 ? params.brightness : (params.brightness / 100) * high;
         const val = clampToPropRange(bProp, scaled);
         await runJob(deps.jobs, () => deps.service.writeProp(device.did, bProp.name, val), 1);
-        changes.push(`亮度 ${Math.round(params.brightness)}%`);
+        appliedBrightness = Math.round(params.brightness);
+        changes.push(`亮度 ${appliedBrightness}%`);
       }
 
+      let appliedColorTemp: number | undefined;
       if (params.color_temperature !== undefined || params.temperature_preset !== undefined) {
         const tProp = controls.temperature;
         if (!tProp) {
@@ -1002,9 +1012,11 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         }
         const val = clampToPropRange(tProp, targetK);
         await runJob(deps.jobs, () => deps.service.writeProp(device.did, tProp.name, val), 1);
+        appliedColorTemp = val;
         changes.push(`色温 ${val}K`);
       }
 
+      let appliedColor: string | undefined;
       if (params.color !== undefined) {
         const cProp = controls.color;
         if (!cProp) {
@@ -1017,9 +1029,11 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
           return textResult(msg, { ok: false, uiSummary: msg }, true);
         }
         await runJob(deps.jobs, () => deps.service.writeProp(device.did, cProp.name, rgb), 1);
+        appliedColor = params.color;
         changes.push(`颜色 ${params.color}`);
       }
 
+      let appliedModeLabel: string | undefined;
       if (params.mode !== undefined) {
         const modeProp = detail.props.find((p) => p.name === "mode" && p.writable);
         if (modeProp) {
@@ -1037,7 +1051,9 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
           const coerced = coercePropWriteValue(modeProp, modeVal);
           if (coerced.ok) {
             await runJob(deps.jobs, () => deps.service.writeProp(device.did, modeProp.name, coerced.value), 1);
-            changes.push(params.mode.endsWith("模式") ? params.mode : `${params.mode}模式`);
+            const modeLabel = params.mode.endsWith("模式") ? params.mode : `${params.mode}模式`;
+            appliedModeLabel = modeLabel;
+            changes.push(modeLabel);
           }
         }
       }
@@ -1073,6 +1089,12 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         ok: true,
         did: device.did,
         name: device.name,
+        turnedOn,
+        ...(appliedBrightness !== undefined ? { brightness: appliedBrightness } : {}),
+        ...(params.temperature_preset !== undefined ? { temperaturePreset: params.temperature_preset } : {}),
+        ...(appliedColorTemp !== undefined ? { colorTemperature: appliedColorTemp } : {}),
+        ...(appliedColor !== undefined ? { color: appliedColor } : {}),
+        ...(appliedModeLabel !== undefined ? { mode: appliedModeLabel } : {}),
         changes: allChanges,
         values: readback,
         uiSummary: msg,
@@ -1176,7 +1198,9 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         did: device.did,
         name: device.name,
         property: prop.name,
+        propLabel: prop.desc || prop.name,
         value: coerced.value,
+        displayVal,
         uiSummary: msg,
       });
     },
@@ -1227,8 +1251,9 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       }
       deps.broadcastState();
 
+      const isFeederAction = actionName === "pet-food-out" || normAct.includes("出粮");
       let msg: string;
-      if (actionName === "pet-food-out" || normAct.includes("出粮")) {
+      if (isFeederAction) {
         const portions = params.params?.[0];
         msg =
           portions !== undefined && portions !== null
@@ -1244,6 +1269,8 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         did: device.did,
         name: device.name,
         action: actionName,
+        actionLabel,
+        isFeederAction,
         params: params.params ?? [],
         uiSummary: msg,
       });
@@ -1461,9 +1488,13 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
       const detail = await runJob(deps.jobs, () => deps.service.deviceDetail(speaker!.did), 2);
       const { volumeProp, speakerMuteProp, micMuteProp } = findSpeakerAudioProps(detail.props);
       const changes: string[] = [];
+      let powerNote: string | undefined;
+      let appliedVolume: number | undefined;
+      let appliedSong: string | undefined;
 
       if (params.power) {
         const pwRes = await applySpeakerPower(deps, speaker, params.power);
+        powerNote = pwRes.note;
         changes.push(pwRes.note);
       }
 
@@ -1507,6 +1538,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         }
         const clamped = clampToPropRange(volumeProp, targetVol);
         await runJob(deps.jobs, () => deps.service.writeProp(speaker!.did, volumeProp.name, clamped), 1);
+        appliedVolume = clamped;
         changes.push(`音量 ${clamped}%`);
       }
 
@@ -1530,6 +1562,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
           () => deps.service.runAction(speaker!.did, "execute-text-directive", [directive, 0]),
           1,
         );
+        appliedSong = songClean;
         changes.push(`播放${songClean}`);
       }
 
@@ -1581,6 +1614,12 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
         name: speaker.name,
         changes,
         values: readback,
+        ...(powerNote ? { powerNote } : {}),
+        ...(typeof params.mute === "boolean" ? { mute: params.mute } : {}),
+        ...(typeof params.mic_mute === "boolean" ? { micMute: params.mic_mute } : {}),
+        ...(appliedVolume !== undefined ? { volume: appliedVolume } : {}),
+        ...(appliedSong ? { playMusic: appliedSong } : {}),
+        ...(params.playback ? { playback: params.playback } : {}),
         ...(params.speak_text?.trim() ? { speak_text: params.speak_text.trim() } : {}),
         uiSummary: summary,
       });

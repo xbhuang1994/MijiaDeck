@@ -110,6 +110,9 @@ export class VoiceStreamSession {
   private readonly _denRing = new Float32Array(RAW_RING_CAPACITY);
   private _rawTotalSamples = 0;
   private _denTotalSamples = 0;
+  private _vadSamplesFed = 0;
+  private _vadSampleBase = 0;
+  private _lastEmittedEndSample = -1;
   private _denoisedPending = new Float32Array(0);
   private _vadDetected = false;
   private _lastFrameRms = 0;
@@ -118,6 +121,7 @@ export class VoiceStreamSession {
   private _wakeAnchorHit: WakeWordAcousticHit | null = null;
   private _lastRawOverlap = new Float32Array(0);
   private _lastDenOverlap = new Float32Array(0);
+  private _lastMatchedStartSec = -1;
   private _lastMatchedEndSec = -1;
 
   // 无 Silero VAD 时的纯 TS 兜底窗口缓冲
@@ -187,8 +191,63 @@ export class VoiceStreamSession {
       this._wakeAnchorHit = hit;
       this._lastRawOverlap = new Float32Array(0);
       this._lastDenOverlap = new Float32Array(0);
+      if (this._vad) {
+        try {
+          while (!this._vad.isEmpty()) {
+            this._vad.pop();
+          }
+        } catch {
+          // ignore
+        }
+      }
       this._segmenter.forceStartCommand(Math.max(this._lastFrameRms, 0.05));
     }
+  }
+
+  /**
+   * 完整重置 Silero VAD 内部语音状态与残余队列，并记录采样原点偏移 `_vadSampleBase`，
+   * 彻底杜绝 `vad.clear()` 仅清空已出队段却保留正在进行中的语音缓冲导致“一句话二次识别”！
+   */
+  private _resetVadState(): void {
+    if (!this._vad) return;
+    try {
+      while (!this._vad.isEmpty()) {
+        this._vad.pop();
+      }
+      if (typeof this._vad.reset === "function") {
+        this._vad.reset();
+        this._vadSampleBase = this._vadSamplesFed;
+      } else {
+        this._vad.clear();
+      }
+    } catch {
+      try {
+        this._vad.clear();
+      } catch {
+        // ignore
+      }
+    }
+    if (this._vadDetected) {
+      this._vadDetected = false;
+      this._opts.onSpeechActivity?.(false);
+    }
+  }
+
+  /**
+   * TTS 播报开始/结束切换时清理挂起状态与残余 VAD 缓冲，防止播报前后残留帧拼接触发误识别。
+   */
+  resetAfterTts(): void {
+    if (this._disposed) return;
+    this._wakeAnchorSample = null;
+    this._wakeAnchorHit = null;
+    this._activeSegmentStartSample = null;
+    this._denoisedPending = new Float32Array(0);
+    this._lastRawOverlap = new Float32Array(0);
+    this._lastDenOverlap = new Float32Array(0);
+    this._segmenter.reset();
+    this._resetVadState();
+    this._oww?.resetSegmentTracking();
+    this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, this._rawTotalSamples);
   }
 
   /**
@@ -308,11 +367,26 @@ export class VoiceStreamSession {
         const frameRms = computeRms(frame);
         this._lastFrameRms = frameRms;
         this._vad.acceptWaveform(frame);
+        this._vadSamplesFed += 512;
         const nowDetected = this._vad.isDetected();
 
         if (nowDetected !== this._vadDetected) {
           this._vadDetected = nowDetected;
           this._opts.onSpeechActivity?.(nowDetected);
+        }
+
+        // 安静房间唤醒锚定快路径：Silero VAD 已完成整句尾静音判定并产段时立即收尾发包并 reset VAD，
+        // 避免滞回分段器重复再等一遍 minSilenceSec 且彻底杜绝二次重复出段。
+        if (
+          this._wakeAnchorSample !== null &&
+          !nowDetected &&
+          !this._vad.isEmpty() &&
+          this._segmenter.ambientRmsFloor < 0.015 &&
+          this._rawTotalSamples - this._wakeAnchorSample >= TARGET_SR * 0.65
+        ) {
+          this._emitWakeAnchoredSegment(false);
+          offset += 512;
+          continue;
         }
 
         // 0.72 既高于常规 inCommandThreshold(0.48)，又低于高音乐底噪回落门限(0.78)，
@@ -381,14 +455,11 @@ export class VoiceStreamSession {
     const rawSlice = this._readRingRange(this._rawRing, this._rawTotalSamples, rawStart, rawEnd);
     const denSlice = this._readRingTail(this._denRing, this._denTotalSamples, rawSlice.length);
 
-    try {
-      this._vad?.clear();
-    } catch {
-      // ignore
-    }
+    this._resetVadState();
     this._oww?.resetSegmentTracking();
     this._lastRawOverlap = new Float32Array(0);
     this._lastDenOverlap = new Float32Array(0);
+    this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, rawEnd);
 
     const inputSnrDb = estimateSnrDb(rawSlice, TARGET_SR);
     const outputSnrDb = estimateSnrDb(denSlice, TARGET_SR);
@@ -422,11 +493,7 @@ export class VoiceStreamSession {
     let rawSlice = this._readRingRange(this._rawRing, this._rawTotalSamples, rawStart, rawEnd);
     let denSlice = this._readRingTail(this._denRing, this._denTotalSamples, rawSlice.length);
 
-    try {
-      this._vad?.clear();
-    } catch {
-      // ignore
-    }
+    this._resetVadState();
 
     if (this._lastRawOverlap.length > 0) {
       const joinedRaw = new Float32Array(this._lastRawOverlap.length + rawSlice.length);
@@ -458,6 +525,8 @@ export class VoiceStreamSession {
       this._droppedPureMusicCount += 1;
       return;
     }
+
+    this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, rawEnd);
 
     const inputSnrDb = estimateSnrDb(rawSlice, TARGET_SR);
     const outputSnrDb = estimateSnrDb(denSlice, TARGET_SR);
@@ -503,6 +572,7 @@ export class VoiceStreamSession {
             let off = 0;
             while (off + 512 <= merged.length) {
               this._vad.acceptWaveform(merged.subarray(off, off + 512));
+              this._vadSamplesFed += 512;
               off += 512;
             }
             this._denoisedPending = new Float32Array(0);
@@ -604,11 +674,27 @@ export class VoiceStreamSession {
       if (!seg || !seg.samples || seg.samples.length < TARGET_SR * 0.16) {
         continue;
       }
+      const absStart = this._vadSampleBase + seg.start;
+      const absEnd = absStart + seg.samples.length;
+
+      // 去重：若该 Silero 段与刚发出的唤醒锚定段/分段器窗口高度重叠，直接丢弃防一句话识别两次
+      if (!isManualFlush && this._lastEmittedEndSample > 0) {
+        const overlapSamples = Math.min(absEnd, this._lastEmittedEndSample) - absStart;
+        const segLen = Math.max(1, absEnd - absStart);
+        if (
+          absEnd <= this._lastEmittedEndSample + Math.round(TARGET_SR * 0.25) ||
+          (overlapSamples > 0 && overlapSamples / segLen >= 0.6)
+        ) {
+          this._droppedStaleCount += 1;
+          continue;
+        }
+      }
+
       this._activeSegmentStartSample = null;
       this._segmenter.reset();
 
-      const rawStart = Math.max(0, seg.start - PRE_ROLL_SAMPLES);
-      const rawEnd = Math.min(this._rawTotalSamples, seg.start + seg.samples.length + POST_ROLL_SAMPLES);
+      const rawStart = Math.max(0, absStart - PRE_ROLL_SAMPLES);
+      const rawEnd = Math.min(this._rawTotalSamples, absEnd + POST_ROLL_SAMPLES);
       let rawSlice = this._readRingRange(this._rawRing, this._rawTotalSamples, rawStart, rawEnd);
       let denSlice = new Float32Array(seg.samples);
 
@@ -648,6 +734,8 @@ export class VoiceStreamSession {
         continue;
       }
 
+      this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, absEnd);
+
       const inputSnrDb = estimateSnrDb(rawSlice, TARGET_SR);
       const outputSnrDb = estimateSnrDb(denSlice, TARGET_SR);
       const payload: VoiceStreamSegmentPayload = {
@@ -657,7 +745,7 @@ export class VoiceStreamSession {
         inputSnrDb,
         outputSnrDb,
         snrGainDb: Number((outputSnrDb - inputSnrDb).toFixed(2)),
-        startSec: Number((seg.start / TARGET_SR).toFixed(2)),
+        startSec: Number((absStart / TARGET_SR).toFixed(2)),
         durationSec,
         forcedRoll,
         acousticWake,
@@ -738,18 +826,26 @@ export class VoiceStreamSession {
     void Promise.resolve()
       .then(async () => {
         if (this._disposed) return;
-        // 若上一条刚成功命中并执行指令，跳过紧随其后的纯重叠残尾滚窗防止重复触发残缺指令
-        if (
-          !next.wakeAnchored &&
-          next.forcedRoll &&
-          this._lastMatchedEndSec >= 0 &&
-          next.startSec < this._lastMatchedEndSec
-        ) {
-          this._droppedStaleCount += 1;
-          return;
+        // 若上一条刚成功命中并执行指令，跳过紧随其后的重叠残尾段/滚窗，彻底防止同一句话触发二次执行
+        if (!next.wakeAnchored && this._lastMatchedEndSec >= 0) {
+          const nextStart = next.startSec;
+          const nextEnd = next.startSec + next.durationSec;
+          const overlapStart = Math.max(nextStart, Math.max(0, this._lastMatchedStartSec));
+          const overlapEnd = Math.min(nextEnd, this._lastMatchedEndSec);
+          const overlapSec = Math.max(0, overlapEnd - overlapStart);
+          const overlapRatio = next.durationSec > 0 ? overlapSec / next.durationSec : 0;
+          if (
+            (next.forcedRoll && nextStart < this._lastMatchedEndSec) ||
+            overlapRatio >= 0.5 ||
+            (nextStart < this._lastMatchedEndSec && nextEnd <= this._lastMatchedEndSec + 0.35)
+          ) {
+            this._droppedStaleCount += 1;
+            return;
+          }
         }
         const res = await this._opts.onSegmentReady(next);
         if (res?.matched) {
+          this._lastMatchedStartSec = next.startSec;
           this._lastMatchedEndSec = next.startSec + next.durationSec;
           this._lastRawOverlap = new Float32Array(0);
           this._lastDenOverlap = new Float32Array(0);
@@ -780,11 +876,7 @@ export class VoiceStreamSession {
     this._wakeAnchorSample = null;
     this._wakeAnchorHit = null;
     this._activeSegmentStartSample = null;
-    try {
-      this._vad?.clear();
-    } catch {
-      // ignore
-    }
+    this._resetVadState();
     try {
       this._oww?.reset();
     } catch {

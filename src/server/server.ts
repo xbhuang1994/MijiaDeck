@@ -283,6 +283,7 @@ function handleWsMessage(
       if (!vl) return;
       if (typeof parsed.speaking === "boolean") {
         vl.setTtsSpeaking(parsed.speaking);
+        ws.data.voiceStream?.resetAfterTts();
       }
     }
   } catch {

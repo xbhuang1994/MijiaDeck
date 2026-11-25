@@ -19,6 +19,7 @@ import {
   WakeWordCooldownGuard,
 } from "../src/agent/voiceCommandSegmenter.ts";
 import { VoiceStreamSession, type VoiceStreamSegmentPayload } from "../src/agent/voiceStreamSession.ts";
+import { VoiceListenerController } from "../src/agent/voiceListenerController.ts";
 import {
   defaultAgentVoiceConfig,
   loadAgentVoiceConfig,
@@ -542,6 +543,326 @@ describe("Real ONNX Latency & Negative-SNR Pop-Music Separation Verification", (
       });
       expect(rNeg3.attention.accept).toBe(true);
       expect(rNeg3.attention.command).toContain("灯");
+
+      engine.dispose();
+    },
+    60_000,
+  );
+});
+
+describe("Single-Sentence Anti-Duplicate Voice Recognition Regression", () => {
+  test("VoiceCommandSegmenter does not inflate ambientRmsFloor on quiet-room speech onset and avoids premature chops", () => {
+    const seg = new VoiceCommandSegmenter({ silenceSeconds: 0.55 });
+    const frameSec = 512 / 16000;
+
+    // 1. Quiet room baseline (10 frames at RMS 0.003)
+    for (let i = 0; i < 10; i += 1) {
+      seg.process(frameSec, 0.05, 0.003);
+    }
+    expect(seg.ambientRmsFloor).toBeLessThan(0.008);
+
+    // 2. Simulate Silero VAD 0.45s onset lag: loud speech starts (RMS 0.12) while prob is still 0.05
+    for (let i = 0; i < 14; i += 1) {
+      seg.process(frameSec, 0.05, 0.12);
+    }
+    // Minimum-statistics window must keep ambientRmsFloor quiet (NOT spiked >= 0.015!)
+    expect(seg.ambientRmsFloor).toBeLessThan(0.01);
+
+    // 3. Speech detected -> ongoing syllables with soft consonant dips (0.045 vs 0.18 peak) must stay continuing
+    for (let i = 0; i < 8; i += 1) {
+      seg.process(frameSec, 0.72, 0.18);
+    }
+    expect(seg.inCommand).toBe(true);
+    let cutEarly = false;
+    for (let i = 0; i < 25; i += 1) {
+      const rms = i % 3 === 0 ? 0.04 : 0.12;
+      const step = seg.process(frameSec, 0.72, rms);
+      if (!step.continuing) cutEarly = true;
+    }
+    expect(cutEarly).toBe(false);
+  });
+
+  test("VoiceStreamSession resets Silero VAD & tracks _vadSampleBase so 2 consecutive utterances emit 1 segment each without overlap duplication", async () => {
+    let spotCallback: ((hit: any) => void) | undefined;
+    let fakeVadQueue: Array<{ start: number; samples: Float32Array }> = [];
+    let fakeVadDetected = false;
+    let vadCounterSinceReset = 0;
+    let resetCalls = 0;
+
+    const fakeEngine = {
+      createOnlineDenoiser: () => null,
+      createStreamingVad: () => ({
+        acceptWaveform(chunk: Float32Array) {
+          vadCounterSinceReset += chunk.length;
+        },
+        isDetected: () => fakeVadDetected,
+        isEmpty: () => fakeVadQueue.length === 0,
+        front: () => fakeVadQueue[0],
+        pop: () => {
+          fakeVadQueue.shift();
+        },
+        flush: () => {},
+        reset: () => {
+          resetCalls += 1;
+          vadCounterSinceReset = 0;
+          fakeVadQueue = [];
+          fakeVadDetected = false;
+        },
+        clear: () => {
+          fakeVadQueue = [];
+        },
+      }),
+      createWakeWordStream: (_words: readonly string[], opts: { onSpot?: (hit: any) => void }) => {
+        spotCallback = opts.onSpot;
+        return {
+          pushSamples: () => {},
+          getHeadPeakHit: () => null,
+          getPeakHit: () => null,
+          resetSegmentTracking: () => {},
+          reloadPrototypes: () => {},
+          reset: () => {},
+        };
+      },
+      sourceSeparator: {
+        analyzeAudioScene: () => ({
+          tags: [],
+          speechProb: 0.5,
+          musicProb: 0,
+          singingProb: 0,
+          noiseProb: 0,
+          crowdTvProb: 0,
+          detectedSoundTypes: ["speech"],
+          durationMs: 1,
+        }),
+      },
+    } as unknown as LocalVoiceEngine;
+
+    const received: VoiceStreamSegmentPayload[] = [];
+    const session = new VoiceStreamSession({
+      localEngine: fakeEngine,
+      noiseMode: "off",
+      vadSensitivity: "default",
+      wakeWords: ["Neo"],
+      onSegmentReady: async (seg) => {
+        received.push(seg);
+        return {
+          ok: true,
+          matched: true,
+          wokeOnly: false,
+          command: "test",
+          text: "test",
+          speechDetected: true,
+          denoiseEngine: "off",
+          vadEngine: "silero",
+          asrEngine: "sensevoice-local",
+          voiceState: {} as any,
+        };
+      },
+    });
+
+    const quiet = new Float32Array(1024).fill(0.002);
+    // 0.5s quiet lead-in
+    for (let i = 0; i < 8; i += 1) session.pushFloat32Samples(quiet);
+
+    // Utterance 1: wake-anchored at ~1.0s..2.2s
+    const utt1Speech = new Float32Array(1024).fill(0.11);
+    fakeVadDetected = true;
+    spotCallback?.({
+      wakeWord: "Neo",
+      matched: true,
+      score: 0.85,
+      rawScore: 0.85,
+      threshold: 0.6,
+      source: "enrolled",
+      sampleOffset: 16000,
+      latencyMs: 3,
+    });
+    for (let i = 0; i < 20; i += 1) session.pushFloat32Samples(utt1Speech);
+    // Silero finalizes Utterance 1 -> quiet-room fast-completion emits ONCE and calls vad.reset()
+    fakeVadDetected = false;
+    fakeVadQueue.push({ start: 8192, samples: new Float32Array(20480).fill(0.11) });
+    session.pushFloat32Samples(quiet);
+    for (let i = 0; i < 16; i += 1) session.pushFloat32Samples(quiet);
+    await session.waitForIdle();
+
+    expect(resetCalls).toBeGreaterThanOrEqual(1);
+    expect(received.length).toBe(1);
+    expect(received[0]!.wakeAnchored).toBe(true);
+
+    // Utterance 2 (non-wake follow-up at ~3.5s..5.0s, marked with distinct amplitude 0.22):
+    // Since vad.reset() reset Silero's local `seg.start` back to ~16384 (1.0s post-reset),
+    // `_vadSampleBase` MUST offset `seg.start` so rawSamples slices Utterance 2 (0.22), NOT Utterance 1 (0.11)!
+    const utt2StartLocal = vadCounterSinceReset;
+    const utt2Speech = new Float32Array(1024).fill(0.22);
+    fakeVadDetected = true;
+    for (let i = 0; i < 20; i += 1) session.pushFloat32Samples(utt2Speech);
+    fakeVadDetected = false;
+    fakeVadQueue.push({ start: utt2StartLocal, samples: new Float32Array(20480).fill(0.22) });
+    session.pushFloat32Samples(quiet);
+    await session.waitForIdle();
+
+    expect(received.length).toBe(2);
+    expect(received[1]!.wakeAnchored).toBe(false);
+    // Utterance 2 startSec must be well after Utterance 1 (around ~3.3s+), NOT near 1.0s!
+    expect(received[1]!.startSec).toBeGreaterThan(2.5);
+    // Verify rawSamples captured Utterance 2's actual audio (~0.22) rather than Utterance 1 (~0.11)
+    const peakUtt2 = Math.max(...Array.from(received[1]!.rawSamples, (v) => Math.abs(v)));
+    expect(peakUtt2).toBeGreaterThan(0.18);
+
+    // Also verify resetAfterTts clears pending VAD state cleanly
+    fakeVadDetected = true;
+    fakeVadQueue.push({ start: vadCounterSinceReset, samples: new Float32Array(8000).fill(0.05) });
+    session.resetAfterTts();
+    expect(fakeVadQueue.length).toBe(0);
+    session.dispose();
+  });
+
+  test("VoiceListenerController deduplicates normalized & post-completion duplicate transcripts", async () => {
+    useTempDataDir();
+    applyTheme("dark", "green");
+    const demo = new VirtualDemoService();
+    const jobs = new JobExecutor();
+    const networkMonitor = new NetworkMonitor({ initialReachability: "online", autoStart: false });
+    const themeCtrl = new ThemeController("dark");
+    const mw = new MainWindowController({
+      service: demo,
+      jobs,
+      themeCtrl,
+      networkMonitor,
+      autoStartTimers: false,
+      cacheLoader: () => null,
+      cacheSaver: () => {},
+    });
+    mw.start();
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && mw.allDevices.length === 0) {
+      await Bun.sleep(10);
+    }
+
+    const agent = new PiAgentService({
+      deps: { mainWindow: mw, service: demo, jobs, settingsStore, broadcastState: () => {} },
+      initialConfig: normalizeAgentVoiceConfig({
+        ...defaultAgentVoiceConfig(),
+        wakeWords: ["Neo"],
+        attentionMode: "off",
+      }),
+    });
+    const vl = new VoiceListenerController(agent);
+
+    try {
+      const first = await vl.handleTranscript("Neo，关闭客厅吸顶灯。", { now: 10_000 });
+      expect(first.matched).toBe(true);
+
+      // Same utterance arriving 400ms later with slightly different punctuation/casing -> MUST be deduped!
+      const dup = await vl.handleTranscript("neo 关闭客厅吸顶灯", { now: 10_400 });
+      expect(dup.matched).toBe(false);
+
+      // Distinct repeat after dedup window (>2s later) -> MUST still execute
+      const again = await vl.handleTranscript("Neo，打开客厅吸顶灯。", { now: 13_000 });
+      expect(again.matched).toBe(true);
+    } finally {
+      vl.dispose();
+      agent.dispose();
+      networkMonitor.stop();
+      mw.dispose();
+      await jobs.shutdown();
+    }
+  });
+
+  test.if(HAS_BENCH_WAVS)(
+    "streams real single-sentence benchmark clips through VoiceStreamSession and emits exactly 1 full segment per sentence",
+    async () => {
+      const engine = new LocalVoiceEngine();
+      const status = engine.getStatus();
+      if (!status.readyForLocalAsr || !status.readyForVad || !status.readyForDenoise) {
+        return;
+      }
+
+      const wakeWords = ["Neo", "尼奥", "鸟"];
+      await engine.warmup({ preloadEnglish: true });
+      if (status.readyForWakeWord) {
+        await engine.openWakeWord.bootstrapWakeWords(wakeWords);
+      }
+
+      // 1. Verify each single-sentence clip emits EXACTLY 1 segment (zero double triggers)
+      const singleClips = [
+        { file: "clip_001.wav", expectSub: "客厅吸顶灯" },
+        { file: "clip_002.wav", expectSub: "关灯" },
+        { file: "clip_006.wav", expectSub: "living room light" },
+        { file: "clip_007.wav", expectSub: "温度" },
+      ];
+
+      for (const item of singleClips) {
+        const decoded = decodeWavPcm(new Uint8Array(readFileSync(path.join(BENCH_AUDIO_DIR, item.file))));
+        const segs: VoiceStreamSegmentPayload[] = [];
+        const session = new VoiceStreamSession({
+          localEngine: engine,
+          noiseMode: "auto",
+          vadSensitivity: "default",
+          vadSilenceMs: 1200,
+          sampleRate: 16000,
+          wakeWords,
+          owwEnabled: true,
+          owwThreshold: 0.6,
+          onSegmentReady: async (seg) => {
+            segs.push(seg);
+            return null;
+          },
+        });
+
+        const padded = new Float32Array(16000 * 0.6 + decoded.samples.length + 16000 * 1.6);
+        padded.set(decoded.samples, Math.round(16000 * 0.6));
+        for (let off = 0; off < padded.length; off += 1024) {
+          session.pushFloat32Samples(padded.subarray(off, Math.min(padded.length, off + 1024)));
+        }
+        await session.waitForIdle();
+        session.dispose();
+
+        expect(segs.length).toBe(1);
+        const asrRaw = await engine.transcribeLocal(segs[0]!.rawSamples, 16000, "zh-CN");
+        const asrDen = await engine.transcribeLocal(segs[0]!.denoisedSamples, 16000, "zh-CN");
+        const combined = `${asrRaw.text} ${asrDen.text}`.toLowerCase();
+        expect(combined).toContain(item.expectSub.toLowerCase());
+      }
+
+      // 2. Back-to-back 2 sentences in ONE continuous session (clip_001 + silence + clip_006) -> exactly 2 complete segments
+      const c1 = decodeWavPcm(new Uint8Array(readFileSync(path.join(BENCH_AUDIO_DIR, "clip_001.wav"))));
+      const c6 = decodeWavPcm(new Uint8Array(readFileSync(path.join(BENCH_AUDIO_DIR, "clip_006.wav"))));
+      const multiSegs: VoiceStreamSegmentPayload[] = [];
+      const multiSession = new VoiceStreamSession({
+        localEngine: engine,
+        noiseMode: "auto",
+        vadSensitivity: "default",
+        vadSilenceMs: 1200,
+        sampleRate: 16000,
+        wakeWords,
+        owwEnabled: true,
+        owwThreshold: 0.6,
+        onSegmentReady: async (seg) => {
+          multiSegs.push(seg);
+          return null;
+        },
+      });
+
+      const lead = Math.round(16000 * 0.5);
+      const gap = Math.round(16000 * 1.8);
+      const tail = Math.round(16000 * 1.6);
+      const merged = new Float32Array(lead + c1.samples.length + gap + c6.samples.length + tail);
+      merged.set(c1.samples, lead);
+      merged.set(c6.samples, lead + c1.samples.length + gap);
+      for (let off = 0; off < merged.length; off += 1024) {
+        multiSession.pushFloat32Samples(merged.subarray(off, Math.min(merged.length, off + 1024)));
+      }
+      await multiSession.waitForIdle();
+      multiSession.dispose();
+
+      expect(multiSegs.length).toBe(2);
+      const asr1Raw = await engine.transcribeLocal(multiSegs[0]!.rawSamples, 16000, "zh-CN");
+      const asr1Den = await engine.transcribeLocal(multiSegs[0]!.denoisedSamples, 16000, "zh-CN");
+      const asr2Raw = await engine.transcribeLocal(multiSegs[1]!.rawSamples, 16000, "zh-CN");
+      const asr2Den = await engine.transcribeLocal(multiSegs[1]!.denoisedSamples, 16000, "zh-CN");
+      expect(`${asr1Raw.text} ${asr1Den.text}`).toContain("客厅吸顶灯");
+      expect(`${asr2Raw.text} ${asr2Den.text}`.toLowerCase()).toContain("living room light");
 
       engine.dispose();
     },

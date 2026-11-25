@@ -765,96 +765,242 @@ function planSingleClause(
   return null;
 }
 
-function summarizeSingleToolResult(res: ToolResultMessage, userText: string): string {
+function formatNaturalNameList(names: readonly string[]): string {
+  if (names.length === 0) return "";
+  if (names.length === 1) return names[0]!;
+  if (names.length === 2) return `${names[0]}和${names[1]}`;
+  return `${names.slice(0, -1).join("、")}和${names[names.length - 1]}`;
+}
+
+function formatLightTempPresetZh(preset: unknown): string | null {
+  if (preset === "warm") return "暖光";
+  if (preset === "cool") return "冷白光";
+  if (preset === "neutral") return "自然光";
+  return null;
+}
+
+function formatSpeakerPowerNoteNatural(note: string, warm: boolean): string {
+  if (note === "已静音暂停") return warm ? "已经暂停并静音了" : "已暂停并静音";
+  if (note === "已唤醒") return warm ? "已经唤醒了" : "已唤醒";
+  if (note === "已静音") return warm ? "已经静音了" : "已静音";
+  if (note === "已暂停") return warm ? "已经暂停了" : "已暂停";
+  return warm ? `${note.replace(/^已/, "已经")}了` : note;
+}
+
+interface SummarizedClause {
+  text: string;
+  isQuery: boolean;
+  isError: boolean;
+}
+
+function summarizeSingleToolResult(
+  res: ToolResultMessage,
+  userText: string,
+  mode: CavemanReplyMode,
+): SummarizedClause {
   const raw = extractToolResultText(res);
   const d =
     res.details && typeof res.details === "object"
       ? (res.details as Record<string, unknown>)
       : null;
 
+  const isUltra = mode === "ultra";
+  const isWarm = mode === "lite" || mode === "off";
+
   if (res.isError) {
-    return sanitizeForVoiceTts(raw) || "执行失败";
+    const cleanErr = sanitizeForVoiceTts(raw) || "执行失败";
+    if (isUltra) return { text: cleanErr, isQuery: false, isError: true };
+    if (/^(抱歉|不好意思|对不起)/.test(cleanErr)) {
+      return { text: cleanErr, isQuery: false, isError: true };
+    }
+    return {
+      text: isWarm ? `抱歉，${cleanErr}` : cleanErr,
+      isQuery: false,
+      isError: true,
+    };
   }
 
+  // 1. 设备列表查询
   if (res.toolName === "list_devices" && d) {
     const items = Array.isArray(d.devices) ? (d.devices as Array<Record<string, unknown>>) : null;
     if (items) {
-      if (items.length === 0) return "未找到设备";
+      if (items.length === 0) {
+        return { text: isUltra ? "未找到设备" : "暂时没找到符合条件的设备", isQuery: true, isError: false };
+      }
       const names = items.map((it) => String(it.name ?? "").trim()).filter(Boolean);
-      if (names.length === 0) return `共 ${items.length} 台设备`;
-      return names.length <= 4
-        ? `共 ${items.length} 台：${names.join("、")}`
-        : `共 ${items.length} 台：${names.slice(0, 3).join("、")}等`;
+      if (isUltra) {
+        if (names.length === 0) return { text: `共 ${items.length} 台设备`, isQuery: true, isError: false };
+        const txt =
+          names.length <= 4
+            ? `共 ${items.length} 台：${names.join("、")}`
+            : `共 ${items.length} 台：${names.slice(0, 3).join("、")}等`;
+        return { text: txt, isQuery: true, isError: false };
+      }
+      if (names.length === 0) {
+        return { text: `一共有${items.length}台设备`, isQuery: true, isError: false };
+      }
+      const listTxt =
+        names.length <= 4
+          ? formatNaturalNameList(names)
+          : `${names.slice(0, 3).join("、")}等`;
+      return {
+        text: isWarm
+          ? `一共找到${items.length}台设备，有${listTxt}`
+          : `共有${items.length}台设备，包括${listTxt}`,
+        isQuery: true,
+        isError: false,
+      };
     }
   }
 
+  // 2. 场景列表查询
   if (res.toolName === "list_scenes" && d) {
     const items = Array.isArray(d.scenes) ? (d.scenes as Array<Record<string, unknown>>) : null;
     if (items) {
-      if (items.length === 0) return "暂无手动场景";
+      if (items.length === 0) {
+        return { text: isUltra ? "暂无手动场景" : "目前还没有可用的手动场景", isQuery: true, isError: false };
+      }
       const names = items.map((it) => String(it.name ?? "").trim()).filter(Boolean);
-      if (names.length === 0) return `共 ${items.length} 个场景`;
-      return names.length <= 4
-        ? `共 ${items.length} 个场景：${names.join("、")}`
-        : `共 ${items.length} 个场景：${names.slice(0, 3).join("、")}等`;
+      if (isUltra) {
+        if (names.length === 0) return { text: `共 ${items.length} 个场景`, isQuery: true, isError: false };
+        const txt =
+          names.length <= 4
+            ? `共 ${items.length} 个场景：${names.join("、")}`
+            : `共 ${items.length} 个场景：${names.slice(0, 3).join("、")}等`;
+        return { text: txt, isQuery: true, isError: false };
+      }
+      if (names.length === 0) {
+        return { text: `共有${items.length}个手动场景`, isQuery: true, isError: false };
+      }
+      const listTxt =
+        names.length <= 4
+          ? formatNaturalNameList(names)
+          : `${names.slice(0, 3).join("、")}等`;
+      return {
+        text: isWarm
+          ? `现在有${items.length}个手动场景，分别是${listTxt}`
+          : `共有${items.length}个场景，包括${listTxt}`,
+        isQuery: true,
+        isError: false,
+      };
     }
   }
 
+  // 3. 设备状态 / 传感器详情查询
   if (res.toolName === "get_device_detail" && d) {
     const name = typeof d.name === "string" && d.name.trim() ? d.name.trim() : "设备";
+    const room = typeof d.room === "string" && d.room.trim() ? d.room.trim() : "";
     if (d.online === false) {
-      return joinDeviceLabel(name, "离线");
+      return {
+        text: isUltra ? joinDeviceLabel(name, "离线") : `${name}目前离线了`,
+        isQuery: true,
+        isError: false,
+      };
     }
     const vals = (d.values && typeof d.values === "object" ? d.values : {}) as Record<string, unknown>;
     const props = Array.isArray(d.props) ? (d.props as PropInfo[]) : [];
 
-    // 1. 传感器温湿度摘要（仅当电量 < 20% 或用户明确询问电量时附带电量）
+    // 3.1 传感器温湿度摘要（仅当电量 < 20% 或用户明确询问电量时附带电量）
     const temp = vals["temperature"];
     const hum = vals["relative-humidity"] ?? vals["humidity"];
     const bat = vals["battery-level"] ?? vals["battery"];
     if (typeof temp === "number" || typeof hum === "number") {
-      const sensorParts: string[] = [];
-      if (typeof temp === "number") sensorParts.push(`${temp}°C`);
-      if (typeof hum === "number") sensorParts.push(`湿度 ${hum}%`);
       const askedBattery = /(电量|电池|还有多少电|剩多少电)/.test(userText);
-      if (typeof bat === "number" && (bat < 20 || askedBattery)) {
-        sensorParts.push(`电量 ${bat}%`);
+      if (isUltra) {
+        const sensorParts: string[] = [];
+        if (typeof temp === "number") sensorParts.push(`${temp}°C`);
+        if (typeof hum === "number") sensorParts.push(`湿度 ${hum}%`);
+        if (typeof bat === "number" && (bat < 20 || askedBattery)) {
+          sensorParts.push(`电量 ${bat}%`);
+        }
+        return { text: `${name} ${sensorParts.join("，")}`, isQuery: true, isError: false };
       }
-      return `${name} ${sensorParts.join("，")}`;
+      const subject = room && !askedBattery ? room : name;
+      const sensorParts: string[] = [];
+      if (typeof temp === "number") sensorParts.push(`温度${temp}°C`);
+      if (typeof hum === "number") sensorParts.push(`湿度${hum}%`);
+      if (typeof bat === "number" && (bat < 20 || askedBattery)) {
+        sensorParts.push(bat < 20 && !askedBattery ? `另外电量偏低，只剩${bat}%了` : `电量${bat}%`);
+      }
+      const intro = isWarm ? `${subject}现在` : `${subject}当前`;
+      return { text: `${intro}${sensorParts.join("，")}`, isQuery: true, isError: false };
     }
 
-    // 2. 灯具状态摘要
+    // 3.2 灯具状态摘要
     const hasLightVals =
       typeof vals["brightness"] === "number" || typeof vals["color-temperature"] === "number";
     if (hasLightVals && typeof vals["on"] === "boolean") {
+      if (isUltra) {
+        if (!vals["on"]) return { text: joinDeviceLabel(name, "已关"), isQuery: true, isError: false };
+        const lightParts: string[] = [];
+        if (typeof vals["brightness"] === "number") lightParts.push(`亮度 ${vals["brightness"]}%`);
+        if (typeof vals["color-temperature"] === "number") lightParts.push(`${vals["color-temperature"]}K`);
+        return {
+          text:
+            lightParts.length > 0
+              ? joinDeviceLabel(name, `已开，${lightParts.join("，")}`)
+              : joinDeviceLabel(name, "已开"),
+          isQuery: true,
+          isError: false,
+        };
+      }
       if (!vals["on"]) {
-        return joinDeviceLabel(name, "已关");
+        return { text: isWarm ? `${name}现在是关着的` : `${name}当前已关闭`, isQuery: true, isError: false };
       }
       const lightParts: string[] = [];
-      if (typeof vals["brightness"] === "number") lightParts.push(`亮度 ${vals["brightness"]}%`);
-      if (typeof vals["color-temperature"] === "number") lightParts.push(`${vals["color-temperature"]}K`);
-      return lightParts.length > 0
-        ? joinDeviceLabel(name, `已开，${lightParts.join("，")}`)
-        : joinDeviceLabel(name, "已开");
+      if (typeof vals["brightness"] === "number") lightParts.push(`亮度${vals["brightness"]}%`);
+      if (typeof vals["color-temperature"] === "number") lightParts.push(`色温${vals["color-temperature"]}K`);
+      const onStr = isWarm ? `${name}现在是开着的` : `${name}当前已开启`;
+      return {
+        text: lightParts.length > 0 ? `${onStr}，${lightParts.join("，")}` : onStr,
+        isQuery: true,
+        isError: false,
+      };
     }
 
-    // 3. 优先使用工具返回的干净 uiSummary（永不泄露 [did=...]）
-    if (typeof d.uiSummary === "string" && d.uiSummary.trim()) {
-      return sanitizeForVoiceTts(d.uiSummary);
-    }
-
-    // 4. 音箱 / 开关 / 其他非传感器设备摘要
+    // 3.3 音箱 / 开关 / 通用设备摘要
     const speakerParts: string[] = [];
-    if (typeof vals["volume"] === "number") speakerParts.push(`音量 ${vals["volume"]}%`);
-    if (vals["mute"] === true || vals["mute-2"] === true) speakerParts.push("已静音");
+    if (typeof vals["volume"] === "number") {
+      speakerParts.push(isUltra ? `音量 ${vals["volume"]}%` : `音量${vals["volume"]}%`);
+    }
+    if (vals["mute"] === true || vals["mute-2"] === true) {
+      speakerParts.push(isWarm ? "目前处于静音状态" : "已静音");
+    }
     if (speakerParts.length > 0) {
-      return `${name} ${speakerParts.join("，")}`;
+      return {
+        text: isUltra
+          ? `${name} ${speakerParts.join("，")}`
+          : `${joinDeviceLabel(name, isWarm ? "现在" : "当前")}${speakerParts.join("，")}`,
+        isQuery: true,
+        isError: false,
+      };
     }
+
     if (typeof vals["on"] === "boolean") {
-      return joinDeviceLabel(name, vals["on"] ? "已开" : "已关");
+      if (isUltra) return { text: joinDeviceLabel(name, vals["on"] ? "已开" : "已关"), isQuery: true, isError: false };
+      return {
+        text: vals["on"]
+          ? isWarm
+            ? `${name}现在是开着的`
+            : `${name}当前已开启`
+          : isWarm
+            ? `${name}现在是关着的`
+            : `${name}当前已关闭`,
+        isQuery: true,
+        isError: false,
+      };
     }
+
     if (typeof bat === "number") {
-      return `${name} 电量 ${bat}%`;
+      return {
+        text: isUltra ? `${name} 电量 ${bat}%` : `${name}当前电量${bat}%`,
+        isQuery: true,
+        isError: false,
+      };
+    }
+
+    if (typeof d.uiSummary === "string" && d.uiSummary.trim()) {
+      return { text: sanitizeForVoiceTts(d.uiSummary), isQuery: true, isError: false };
     }
 
     const genericParts: string[] = [];
@@ -870,61 +1016,383 @@ function summarizeSingleToolResult(res: ToolResultMessage, userText: string): st
       } else {
         formatted = `${String(val)}${formatPropUnit(p.unit)}`;
       }
-      genericParts.push(`${p.desc || p.name} ${formatted}`);
+      genericParts.push(isUltra ? `${p.desc || p.name} ${formatted}` : `${p.desc || p.name}${formatted}`);
       if (genericParts.length >= 2) break;
     }
     if (genericParts.length > 0) {
-      return `${name} ${genericParts.join("，")}`;
+      return {
+        text: isUltra
+          ? `${name} ${genericParts.join("，")}`
+          : `${name}当前${genericParts.join("，")}`,
+        isQuery: true,
+        isError: false,
+      };
     }
-    return joinDeviceLabel(name, "在线");
+    return {
+      text: isUltra ? joinDeviceLabel(name, "在线") : `${name}目前在线`,
+      isQuery: true,
+      isError: false,
+    };
+  }
+
+  // 非 ultra 模式下，对控制类工具优先基于结构化 details 生成自然顺口的中文回复
+  if (!isUltra && d) {
+    // 4. 开关设备（单台 / 批量 / 音箱软开关）
+    if (res.toolName === "set_device_power") {
+      const succeeded = Array.isArray(d.succeeded)
+        ? (d.succeeded as Array<{ name?: string; state?: boolean; note?: string }>)
+        : [];
+      const failed = Array.isArray(d.failed)
+        ? (d.failed as Array<{ name?: string; reason?: string }>)
+        : [];
+      let okText = "";
+      if (succeeded.length === 1) {
+        const s = succeeded[0]!;
+        const devName = s.name?.trim() || "设备";
+        if (s.note) {
+          okText = joinDeviceLabel(devName, formatSpeakerPowerNoteNatural(s.note, isWarm));
+        } else if (s.state) {
+          okText = isWarm ? `${devName}已经打开了` : `${devName}已打开`;
+        } else {
+          okText = isWarm ? `${devName}已经关掉了` : `${devName}已关闭`;
+        }
+      } else if (succeeded.length > 1) {
+        const allPlain = succeeded.every((s) => !s.note);
+        const allSameState = succeeded.every((s) => s.state === succeeded[0]!.state);
+        const names = succeeded.map((s) => s.name?.trim() || "设备");
+        if (allPlain && allSameState) {
+          const isOn = Boolean(succeeded[0]!.state);
+          const listStr =
+            names.length <= 3
+              ? formatNaturalNameList(names)
+              : `${names.slice(0, 3).join("、")}等${names.length}台设备`;
+          if (isWarm) {
+            okText = isOn ? `已经打开${listStr}了` : `已经关掉${listStr}了`;
+          } else {
+            okText = isOn ? `已打开${listStr}` : `已关闭${listStr}`;
+          }
+        } else {
+          const itemLabels = succeeded.slice(0, 3).map((s) => {
+            const devName = s.name?.trim() || "设备";
+            if (s.note) return joinDeviceLabel(devName, formatSpeakerPowerNoteNatural(s.note, false));
+            return `${devName}${s.state ? "已打开" : "已关闭"}`;
+          });
+          okText =
+            succeeded.length <= 3
+              ? itemLabels.join("，")
+              : `${itemLabels.join("，")}等${succeeded.length}台设备`;
+        }
+      }
+      const failText =
+        failed.length > 0
+          ? failed
+              .map((f) => {
+                const devName = f.name?.trim() || "设备";
+                if (f.reason === "离线" || f.reason === "设备已离线") {
+                  return `${devName}当前离线`;
+                }
+                return `${devName}控制失败（${f.reason || "未知原因"}）`;
+              })
+              .join("，")
+          : "";
+      if (okText && failText) {
+        return { text: `${okText}，不过${failText}`, isQuery: false, isError: false };
+      }
+      if (okText) {
+        return { text: okText, isQuery: false, isError: false };
+      }
+      if (failText) {
+        return { text: isWarm ? `抱歉，${failText}` : failText, isQuery: false, isError: true };
+      }
+    }
+
+    // 5. 灯光精细控制（开关 / 亮度 / 色温预设或开尔文 / 颜色 / 模式）
+    if (res.toolName === "control_light") {
+      const name = typeof d.name === "string" && d.name.trim() ? d.name.trim() : "灯";
+      if (d.on === false) {
+        return {
+          text: isWarm ? `${name}已经关掉了` : `${name}已关闭`,
+          isQuery: false,
+          isError: false,
+        };
+      }
+      const turnedOn = d.turnedOn === true;
+      const brightness = typeof d.brightness === "number" ? d.brightness : undefined;
+      const presetLabel = formatLightTempPresetZh(d.temperaturePreset);
+      const colorTemp = typeof d.colorTemperature === "number" ? d.colorTemperature : undefined;
+      const color = typeof d.color === "string" && d.color.trim() ? d.color.trim() : undefined;
+      const modeLabel = typeof d.mode === "string" && d.mode.trim() ? d.mode.trim() : undefined;
+
+      const adjustClauses: string[] = [];
+      if (brightness !== undefined) {
+        adjustClauses.push(`亮度调到${brightness}%`);
+      }
+      if (presetLabel) {
+        adjustClauses.push(`调成${presetLabel}`);
+      } else if (colorTemp !== undefined) {
+        adjustClauses.push(`色温调到${colorTemp}K`);
+      }
+      if (color) {
+        adjustClauses.push(`调成${color}`);
+      }
+      if (modeLabel) {
+        adjustClauses.push(`切到${modeLabel}`);
+      }
+
+      if (turnedOn && adjustClauses.length > 0) {
+        const joined = adjustClauses.join("，");
+        return {
+          text: isWarm ? `已经打开${name}，并把${joined}了`.replace("并把调成", "并调成").replace("并把切到", "并切到") : `${name}已打开，${joined}`,
+          isQuery: false,
+          isError: false,
+        };
+      }
+      if (turnedOn) {
+        return {
+          text: isWarm ? `${name}已经打开了` : `${name}已打开`,
+          isQuery: false,
+          isError: false,
+        };
+      }
+      if (adjustClauses.length === 1) {
+        const single = adjustClauses[0]!;
+        if (brightness !== undefined) {
+          return {
+            text: isWarm ? `${name}亮度已经调到${brightness}%了` : `${name}亮度已调到${brightness}%`,
+            isQuery: false,
+            isError: false,
+          };
+        }
+        if (presetLabel) {
+          return {
+            text: isWarm ? `${name}已经调成${presetLabel}了` : `${name}已调成${presetLabel}`,
+            isQuery: false,
+            isError: false,
+          };
+        }
+        if (colorTemp !== undefined) {
+          return {
+            text: isWarm ? `${name}色温已经调到${colorTemp}K了` : `${name}色温已调到${colorTemp}K`,
+            isQuery: false,
+            isError: false,
+          };
+        }
+        if (color) {
+          return {
+            text: isWarm ? `${name}已经调成${color}了` : `${name}已调成${color}`,
+            isQuery: false,
+            isError: false,
+          };
+        }
+        if (modeLabel) {
+          return {
+            text: isWarm ? `${name}已经切到${modeLabel}了` : `${name}已切到${modeLabel}`,
+            isQuery: false,
+            isError: false,
+          };
+        }
+        return {
+          text: isWarm ? `${name}已经${single}了` : `${name}已${single}`,
+          isQuery: false,
+          isError: false,
+        };
+      }
+      if (adjustClauses.length > 1) {
+        const first = adjustClauses[0]!;
+        const rest = adjustClauses.slice(1).join("，");
+        if (isWarm) {
+          const head = first.startsWith("亮度") || first.startsWith("色温")
+            ? `${name}已经把${first}`
+            : `${name}已经${first}`;
+          return { text: `${head}，${rest}了`, isQuery: false, isError: false };
+        }
+        const head = first.startsWith("亮度") || first.startsWith("色温")
+          ? `${name}${first.replace("调到", "已调到")}`
+          : `${name}已${first}`;
+        return { text: `${head}，${rest}`, isQuery: false, isError: false };
+      }
+    }
+
+    // 6. 音箱控制
+    if (res.toolName === "control_speaker") {
+      const name = typeof d.name === "string" && d.name.trim() ? d.name.trim() : "音箱";
+      const spkClauses: string[] = [];
+      if (typeof d.powerNote === "string" && d.powerNote.trim()) {
+        spkClauses.push(formatSpeakerPowerNoteNatural(d.powerNote.trim(), false));
+      }
+      if (typeof d.mute === "boolean") {
+        spkClauses.push(d.mute ? "已静音" : "已取消静音");
+      }
+      if (typeof d.micMute === "boolean") {
+        spkClauses.push(d.micMute ? "麦克风已静音" : "麦克风已开启");
+      }
+      if (typeof d.volume === "number") {
+        spkClauses.push(`音量已调到${d.volume}%`);
+      }
+      if (typeof d.playMusic === "string" && d.playMusic.trim()) {
+        spkClauses.push(isWarm ? `开始播放${d.playMusic.trim()}` : `正在播放${d.playMusic.trim()}`);
+      }
+      if (typeof d.playback === "string") {
+        const pbMap: Record<string, string> = {
+          play: "已继续播放",
+          pause: "已暂停播放",
+          stop: "已停止播放",
+          next: "已切到下一首",
+          previous: "已切到上一首",
+        };
+        spkClauses.push(pbMap[d.playback] ?? d.playback);
+      }
+      if (typeof d.speak_text === "string" && d.speak_text.trim()) {
+        spkClauses.push("已完成播报");
+      }
+      if (spkClauses.length > 0) {
+        const joined = spkClauses.join("，");
+        if (!isWarm) {
+          return { text: joinDeviceLabel(name, joined), isQuery: false, isError: false };
+        }
+        const warmJoined = joined
+          .replace(/^已/, "已经")
+          .replace(/^音量已/, "音量已经")
+          .replace(/^麦克风已/, "麦克风已经");
+        const suffix = warmJoined.endsWith("了") ? "" : "了";
+        return { text: `${joinDeviceLabel(name, warmJoined)}${suffix}`, isQuery: false, isError: false };
+      }
+    }
+
+    // 7. 场景执行
+    if (res.toolName === "run_scene" && typeof d.name === "string" && d.name.trim()) {
+      const sceneName = d.name.trim();
+      return {
+        text: isWarm ? `已经执行${sceneName}了` : `已执行${sceneName}`,
+        isQuery: false,
+        isError: false,
+      };
+    }
+
+    // 8. 喂食器等设备动作
+    if (res.toolName === "run_device_action") {
+      const name = typeof d.name === "string" && d.name.trim() ? d.name.trim() : "设备";
+      const paramsArr = Array.isArray(d.params) ? d.params : [];
+      if (d.isFeederAction) {
+        const portions = paramsArr[0];
+        if (portions !== undefined && portions !== null) {
+          return {
+            text: isWarm ? `${name}已经出粮${portions}份了` : `${name}已出粮${portions}份`,
+            isQuery: false,
+            isError: false,
+          };
+        }
+        return {
+          text: isWarm ? `${name}已经出粮了` : `${name}已出粮`,
+          isQuery: false,
+          isError: false,
+        };
+      }
+      if (typeof d.actionLabel === "string" && d.actionLabel.trim()) {
+        return {
+          text: isWarm
+            ? `${name}已经执行${d.actionLabel.trim()}了`
+            : `${name}已执行${d.actionLabel.trim()}`,
+          isQuery: false,
+          isError: false,
+        };
+      }
+    }
+
+    // 9. 转发小爱
+    if (res.toolName === "send_xiaoai_command" && typeof d.text === "string" && d.text.trim()) {
+      const directive = d.text.trim();
+      return {
+        text: isWarm ? `已经转告小爱${directive}了` : `已转告小爱${directive}`,
+        isQuery: false,
+        isError: false,
+      };
+    }
+
+    // 10. 通用属性设置
+    if (
+      res.toolName === "set_device_property" &&
+      typeof d.name === "string" &&
+      typeof d.propLabel === "string" &&
+      typeof d.displayVal === "string"
+    ) {
+      return {
+        text: isWarm
+          ? `${d.name}的${d.propLabel}已经设为${d.displayVal}了`
+          : `${d.name}${d.propLabel}已设为${d.displayVal}`,
+        isQuery: false,
+        isError: false,
+      };
+    }
   }
 
   if (d && typeof d.uiSummary === "string" && d.uiSummary.trim()) {
-    return sanitizeForVoiceTts(d.uiSummary);
+    return { text: sanitizeForVoiceTts(d.uiSummary), isQuery: false, isError: false };
   }
 
-  if (!raw) return "";
+  if (!raw) return { text: "", isQuery: false, isError: false };
   const cleaned = sanitizeForVoiceTts(raw);
-  if (cleaned.length <= 160) return cleaned;
+  if (cleaned.length <= 160) return { text: cleaned, isQuery: false, isError: false };
   const firstClause = cleaned.split(/[。！？!?\n]/)[0]?.trim() ?? cleaned.slice(0, 140);
-  return firstClause.replace(/[:：]$/, "");
+  return { text: firstClause.replace(/[:：]$/, ""), isQuery: false, isError: false };
 }
 
 export function summarizeToolResults(
   results: readonly ToolResultMessage[],
   userText = "",
-  _mode: CavemanReplyMode = DEFAULT_CAVEMAN_MODE,
+  mode: CavemanReplyMode = DEFAULT_CAVEMAN_MODE,
 ): string {
+  const effectiveMode = normalizeCavemanMode(mode, DEFAULT_CAVEMAN_MODE);
+  const isUltra = effectiveMode === "ultra";
+  const isWarm = effectiveMode === "lite" || effectiveMode === "off";
+
   if (results.length === 0) {
-    return "已完成";
-  }
-  const parts: string[] = [];
-  for (const res of results) {
-    const piece = summarizeSingleToolResult(res, userText).trim();
-    if (piece) {
-      parts.push(piece);
-    }
-  }
-  if (parts.length === 0) {
-    return "已完成";
-  }
-  if (parts.length === 1) {
-    return parts[0]!;
+    return isWarm ? "好的，已经处理好了" : "已完成";
   }
 
-  const trimmedParts = parts.map((p) => p.replace(/。+$/, ""));
-  if (
-    trimmedParts.length === 2 &&
-    trimmedParts[0]!.length <= 18 &&
-    trimmedParts[1]!.length <= 18 &&
-    !trimmedParts[0]!.includes("；") &&
-    !trimmedParts[1]!.includes("；") &&
-    !trimmedParts[0]!.includes("，") &&
-    !trimmedParts[1]!.includes("，")
-  ) {
-    return `${trimmedParts[0]}，${trimmedParts[1]}`;
+  const clauses: SummarizedClause[] = [];
+  for (const res of results) {
+    const clause = summarizeSingleToolResult(res, userText, effectiveMode);
+    if (clause.text.trim()) {
+      clauses.push({ ...clause, text: clause.text.trim() });
+    }
   }
-  return trimmedParts.join("；");
+  if (clauses.length === 0) {
+    return isWarm ? "好的，已经处理好了" : "已完成";
+  }
+
+  const allNonQueryOk = clauses.every((c) => !c.isQuery && !c.isError);
+  const lead = isWarm && allNonQueryOk ? "好的，" : "";
+
+  if (clauses.length === 1) {
+    const single = clauses[0]!.text;
+    if (lead && !/^(好的|抱歉)/.test(single)) {
+      return `${lead}${single}`;
+    }
+    return single;
+  }
+
+  const trimmedParts = clauses.map((c) => c.text.replace(/。+$/, ""));
+  if (isUltra) {
+    if (
+      trimmedParts.length === 2 &&
+      trimmedParts[0]!.length <= 18 &&
+      trimmedParts[1]!.length <= 18 &&
+      !trimmedParts[0]!.includes("；") &&
+      !trimmedParts[1]!.includes("；") &&
+      !trimmedParts[0]!.includes("，") &&
+      !trimmedParts[1]!.includes("，")
+    ) {
+      return `${trimmedParts[0]}，${trimmedParts[1]}`;
+    }
+    return trimmedParts.join("；");
+  }
+
+  const joined =
+    trimmedParts.length === 2 && !trimmedParts[0]!.includes("；") && !trimmedParts[1]!.includes("；")
+      ? `${trimmedParts[0]}，${trimmedParts[1]}`
+      : trimmedParts.join("；");
+  return lead && !/^(好的|抱歉)/.test(joined) ? `${lead}${joined}` : joined;
 }
 
 function buildFinalReplyWithoutTools(
@@ -935,31 +1403,40 @@ function buildFinalReplyWithoutTools(
 ): string {
   const effectiveMode = normalizeCavemanMode(mode, DEFAULT_CAVEMAN_MODE);
   if (needsLlmHint) {
-    if (effectiveMode === "ultra" || effectiveMode === "full") {
+    if (effectiveMode === "ultra") {
       return "本地引擎暂不支持，可切大模型处理";
     }
-    return "本地引擎暂不支持该指令，可在设置中接入大模型处理。";
+    if (effectiveMode === "full") {
+      return "这条指令本地引擎暂时还处理不了，可以在设置里接入大模型试试。";
+    }
+    return "抱歉，这条指令本地引擎暂时还处理不了，你可以在设置里接入云端大模型后再试试。";
   }
 
   const trimmed = userText.trim();
   if (/^(你好|您好|hi|hello|在吗|小派)/i.test(trimmed)) {
     const onlineCount = devices.filter((d) => d.online).length;
-    if (effectiveMode === "ultra" || effectiveMode === "full") {
+    if (effectiveMode === "ultra") {
       return `在呢，${onlineCount}/${devices.length} 台设备在线，请说`;
     }
-    if (effectiveMode === "lite") {
-      return `在呢，当前 ${onlineCount}/${devices.length} 台设备在线，请说指令。`;
+    if (effectiveMode === "full") {
+      return `在呢，家里有${onlineCount}台设备在线，请说需要控制什么。`;
     }
-    return `你好！当前共 ${devices.length} 台设备（${onlineCount} 台在线），直接说指令即可控制。`;
+    if (effectiveMode === "lite") {
+      return `在呢，家里现在有${onlineCount}台设备在线，想控制什么直接告诉我。`;
+    }
+    return `你好呀！家里现在有${onlineCount}台设备在线（共${devices.length}台），直接说出想控制的设备就可以。`;
   }
 
-  if (effectiveMode === "ultra" || effectiveMode === "full") {
+  if (effectiveMode === "ultra") {
     return "支持开关、调光、音箱、喂食、场景和温湿度查询，请说指令";
   }
-  if (effectiveMode === "lite") {
-    return "支持控制开关、调光、音箱、喂食、场景和温湿度查询，请直接说指令。";
+  if (effectiveMode === "full") {
+    return "我可以帮你控制开关、调光调色、音箱、喂食器、场景和查温湿度，直接说指令就行。";
   }
-  return "我是 MijiaDeck 助手，支持开关、调光调色、温湿度查询、小爱音箱、喂食和场景控制；复杂推理可在设置中接入大模型。";
+  if (effectiveMode === "lite") {
+    return "我可以帮你开关设备、调光调色、控制音箱、执行场景和查温湿度，直接告诉我你想做什么就行。";
+  }
+  return "我是 MijiaDeck 助手，可以帮你控制开关、调光调色、查温湿度、控制小爱音箱、喂食和执行场景；需要更复杂的对话也可以在设置里接入云端大模型。";
 }
 
 function pushTextStreamReply(

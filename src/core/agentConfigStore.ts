@@ -166,7 +166,7 @@ const CAVEMAN_MODE_ALIASES: Readonly<Record<string, CavemanReplyMode>> = {
   normal: "off",
 };
 export const DEFAULT_SYSTEMONE_MODEL = "karpo/karpo-decision-31b";
-export const DEFAULT_CAVEMAN_MODE: CavemanReplyMode = "full";
+export const DEFAULT_CAVEMAN_MODE: CavemanReplyMode = "lite";
 const VALID_CUSTOM_APIS = new Set<string>([
   "openai-completions",
   "openai-responses",

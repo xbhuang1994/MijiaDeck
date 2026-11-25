@@ -246,10 +246,10 @@ const PTZ_LABELS: Record<number, { arrow: string; label: string; dx: number; dy:
 };
 
 const CAVEMAN_PREVIEW_DESCS: Readonly<Record<UiCavemanMode, string>> = {
-  full: "极简直给，去寒暄废话、保留关键数值与结果 · 例：“客厅灯已开，亮度 85%。”",
-  ultra: "电报体极致压缩，语音首字播报最快 · 例：“客厅灯开 85%。”",
-  lite: "精炼自然口语，保留基本礼貌与清晰表述 · 例：“好的，客厅吸顶灯已打开，亮度 85%。”",
-  off: "标准自然对话回复，不做字数压缩 · 例：“好的，已经为您打开了客厅吸顶灯，并将亮度调整到了 85%。”",
+  lite: "自然口语且简洁，保留基本礼貌与完整句式 · 例：“好的，客厅吸顶灯已经打开，亮度调到85%了。”",
+  full: "简短直给，去掉开场客套与收尾寒暄但保持自然句式 · 例：“客厅吸顶灯已打开，亮度调到85%。”",
+  ultra: "电报体极致压缩，语音首字播报最快 · 例：“客厅吸顶灯已开，亮度 85%”",
+  off: "温暖自然的完整对话回复，不做压缩 · 例：“好的，已经帮你打开客厅吸顶灯，亮度调到85%了。”",
 };
 
 function safeUrlHost(rawUrl: string): string {
@@ -3418,7 +3418,7 @@ export class MijiaDeckWebApp {
         ? "已检测到环境变量密钥，也可在此覆盖"
         : "输入新的 API Key（留空保持不变）";
     el("set-agent-clear-key-btn").hidden = !cfg?.hasApiKey;
-    el<HTMLSelectElement>("set-agent-caveman-mode").value = cfg?.cavemanMode || "full";
+    el<HTMLSelectElement>("set-agent-caveman-mode").value = cfg?.cavemanMode || "lite";
     this.syncCavemanDesc();
     el<HTMLTextAreaElement>("set-agent-system-prompt").value = cfg?.systemPromptExtra || "";
 
@@ -3526,7 +3526,7 @@ export class MijiaDeckWebApp {
     if (!sel || !desc) return;
     const raw = sel.value;
     const mode: UiCavemanMode =
-      raw === "ultra" || raw === "full" || raw === "lite" || raw === "off" ? raw : "full";
+      raw === "ultra" || raw === "full" || raw === "lite" || raw === "off" ? raw : "lite";
     desc.textContent = CAVEMAN_PREVIEW_DESCS[mode];
   }
 

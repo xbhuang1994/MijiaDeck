@@ -137,7 +137,7 @@ afterEach(() => {
 
 describe("CavemanReplyPolicy — Prompt & Normalization", () => {
   test("re-exports default mode and normalizes mode aliases", () => {
-    expect(DEFAULT_CAVEMAN_MODE).toBe("full");
+    expect(DEFAULT_CAVEMAN_MODE).toBe("lite");
     expect(normalizeCavemanMode("ultra")).toBe("ultra");
     expect(normalizeCavemanMode("caveman-ultra")).toBe("ultra");
     expect(normalizeCavemanMode("caveman")).toBe("full");
@@ -176,9 +176,9 @@ describe("CavemanReplyPolicy — Prompt & Normalization", () => {
 
     expect(buildCavemanPromptBlock("ultra")).toContain("客厅灯已开，亮度80%");
     expect(buildCavemanPromptBlock("ultra")).toContain("卧室 23.6°C，湿度 54%");
-    expect(buildCavemanPromptBlock("full")).toContain("客厅吸顶灯已开，亮度80%。");
-    expect(buildCavemanPromptBlock("full")).toContain("卧室灯离线，无法打开。");
-    expect(buildCavemanPromptBlock("lite")).toContain("已打开客厅吸顶灯，亮度调至80%。");
+    expect(buildCavemanPromptBlock("full")).toContain("客厅吸顶灯已打开，亮度调到80%。");
+    expect(buildCavemanPromptBlock("full")).toContain("抱歉，卧室灯离线了，暂时无法打开。");
+    expect(buildCavemanPromptBlock("lite")).toContain("好的，客厅吸顶灯已经打开，亮度调到80%了。");
     expect(buildCavemanPromptBlock("off")).toContain("1-2 sentences");
   });
 
@@ -221,26 +221,35 @@ describe("CavemanReplyPolicy — Voice TTS Sanitization & Compression", () => {
     expect(clean).not.toContain("\n");
   });
 
-  test("compressCavemanReply strips ZH and EN openers/closers cleanly across lite/full/ultra/off", () => {
+  test("compressCavemanReply keeps natural warmth in lite, tightens cleanly in full, and compresses telegraphically in ultra", () => {
     const zhVerbose =
       "好的，没问题！我已经为您打开了客厅吸顶灯，并将亮度调至 80%。请问还有什么可以帮您的吗？";
 
     const offText = compressCavemanReply(zhVerbose, "off", false);
     expect(offText).toBe(zhVerbose);
 
+    // lite keeps friendly "好的，" while removing stacked filler ("没问题"), bureaucratic "为您", and customer-service closers
     const liteOut = compressCavemanReply(zhVerbose, "lite", true);
-    expect(liteOut).not.toContain("好的");
+    expect(liteOut).toStartWith("好的，");
     expect(liteOut).not.toContain("没问题");
+    expect(liteOut).not.toContain("为您");
     expect(liteOut).not.toContain("请问还有什么");
     expect(liteOut).toContain("客厅吸顶灯");
     expect(liteOut).toContain("80%");
 
+    // full removes openers/closers but preserves complete natural verbs & apology
     const fullOut = compressCavemanReply(zhVerbose, "full", true);
+    expect(fullOut).not.toContain("好的");
     expect(fullOut).not.toContain("我已经为您");
     expect(fullOut).not.toContain("请问还有什么");
     expect(fullOut).toContain("客厅吸顶灯");
     expect(fullOut).toContain("80%");
     expect(fullOut.length).toBeLessThanOrEqual(liteOut.length);
+
+    const fullApology = compressCavemanReply("好的！抱歉，卧室灯当前离线，无法打开。请问还有什么可以帮您的吗？", "full", true);
+    expect(fullApology).toContain("抱歉");
+    expect(fullApology).toContain("离线");
+    expect(fullApology).not.toContain("请问还有什么");
 
     const ultraOut = compressCavemanReply(zhVerbose, "ultra", true);
     expect(ultraOut).toContain("客厅吸顶灯");
@@ -399,15 +408,115 @@ describe("CavemanReplyPolicy — Voice TTS Sanitization & Compression", () => {
     expect(formatWakeAck("full", "   ")).toBe("在呢");
 
     expect(formatExitConversationAck("ultra")).toBe("已待机");
-    expect(formatExitConversationAck("full")).toBe("已待机");
-    expect(formatExitConversationAck("lite")).toBe("已待机");
-    expect(formatExitConversationAck("off")).toBe("好的，已回到待机");
+    expect(formatExitConversationAck("full")).toBe("好的，已待机");
+    expect(formatExitConversationAck("lite")).toBe("好的，有需要再叫我");
+    expect(formatExitConversationAck("off")).toBe("好的，已回到待机，有需要再叫我");
   });
 });
 
-describe("SmartHomeTools & LocalPlannerStream — Crisp Outputs, Bug Fixes & Implicit Action Hook", () => {
-  test("fixes speaker power grammar and produces crisp Caveman-ready tool outputs + clean uiSummary", async () => {
+describe("SmartHomeTools & LocalPlannerStream — Natural Replies (lite/full) & Crisp Telegraphic (ultra)", () => {
+  test("produces natural spoken replies in default lite mode and direct natural sentences in full mode", async () => {
     const h = createHarness();
+    try {
+      await h.ready();
+
+      // 1. Default lite mode: warm, grammatical, natural spoken Chinese (never stiff fragments!)
+      const spkOff = await h.agent.prompt("关闭小米音响");
+      expect(spkOff.ok).toBe(true);
+      expect(spkOff.reply).toBe("好的，小爱音箱 Pro 已经暂停并静音了");
+      expect(spkOff.reply).not.toContain("已「");
+
+      const spkOn = await h.agent.prompt("打开小米音响");
+      expect(spkOn.ok).toBe(true);
+      expect(spkOn.reply).toBe("好的，小爱音箱 Pro 已经唤醒了");
+
+      const lightOff = await h.agent.prompt("关闭客厅吸顶灯");
+      expect(lightOff.reply).toBe("好的，客厅吸顶灯已经关掉了");
+
+      const lightOnBright = await h.agent.prompt("把客厅吸顶灯亮度调到85%");
+      expect(lightOnBright.reply).toBe("好的，已经打开客厅吸顶灯，并把亮度调到85%了");
+
+      const lightBrightOnly = await h.agent.prompt("把客厅吸顶灯亮度调到60%");
+      expect(lightBrightOnly.reply).toBe("好的，客厅吸顶灯亮度已经调到60%了");
+
+      const lightWarm = await h.agent.prompt("把客厅吸顶灯调成暖光");
+      expect(lightWarm.reply).toBe("好的，客厅吸顶灯已经调成暖光了");
+      expect(lightWarm.reply).not.toContain("K");
+
+      // Batch 3 devices off -> uses natural "和" instead of machine colon
+      await h.service.setPowerState("demo-switch-bar.s2", true);
+      await h.service.setPowerState("demo-switch-bar.s3", true);
+      await h.service.setPowerState("demo-switch-bar.s4", true);
+      const batch3 = await h.agent.prompt("关闭餐厅所有灯");
+      expect(batch3.reply).toContain("餐厅主灯");
+      expect(batch3.reply).toContain("吧台射灯");
+      expect(batch3.reply).toContain("餐边灯带");
+      expect(batch3.reply).toContain("和");
+      expect(batch3.reply).not.toContain("已关：");
+
+      // Sensor summary in lite mode sounds natural & omits battery >= 20% unless requested
+      const sensorReply = await h.agent.prompt("卧室现在温度和湿度多少？");
+      expect(sensorReply.reply).toBe("卧室现在温度23.6°C，湿度54%");
+      expect(sensorReply.reply).not.toContain("电量");
+
+      const sensorBatReply = await h.agent.prompt("卧室温度计电量多少？");
+      expect(sensorBatReply.reply).toContain("23.6°C");
+      expect(sensorBatReply.reply).toContain("54%");
+      expect(sensorBatReply.reply).toContain("电量");
+
+      // Scene, feeder, speaker volume & music
+      const sceneRes = await h.agent.prompt("执行回家模式");
+      expect(sceneRes.reply).toBe("好的，已经执行回家模式了");
+
+      const feedRes = await h.agent.prompt("给宠物喂食器出粮2份");
+      expect(feedRes.reply).toBe("好的，智能宠物喂食器已经出粮2份了");
+
+      const volRes = await h.agent.prompt("小爱音箱音量调到65");
+      expect(volRes.reply).toBe("好的，小爱音箱 Pro 音量已经调到65%了");
+
+      const musicRes = await h.agent.prompt("用小米音响播放晴天");
+      expect(musicRes.reply).toBe("好的，小爱音箱 Pro 开始播放晴天了");
+
+      // Compound action in lite mode prefixes "好的，" only ONCE
+      await h.service.setPowerState("demo-light-living", true);
+      h.mainWindow.applyPowerState("demo-light-living", true);
+      await h.service.setPowerState("demo-switch-bar.s2", true);
+      h.mainWindow.applyPowerState("demo-switch-bar.s2", true);
+      const compound = await h.agent.prompt("把客厅吸顶灯亮度调到85%，并关闭餐厅主灯");
+      expect(compound.reply).toBe("好的，客厅吸顶灯亮度已经调到85%了，餐厅主灯已经关掉了");
+      expect(compound.reply.split("好的").length - 1).toBe(1);
+
+      // Greeting in lite mode is warm & concise
+      const greet = await h.agent.prompt("你好");
+      expect(greet.reply).toContain("在线");
+      expect(greet.reply).toContain("在呢");
+    } finally {
+      await h.cleanup();
+    }
+
+    // 2. Full mode: direct, no "好的，" filler, still natural complete sentences
+    const hFull = createHarness({ getCavemanMode: () => "full" });
+    try {
+      await hFull.ready();
+      const rBright = await hFull.agent.prompt("把客厅吸顶灯亮度调到60%");
+      expect(rBright.reply).toBe("客厅吸顶灯亮度已调到60%");
+      expect(rBright.reply).not.toContain("好的");
+
+      const rWarm = await hFull.agent.prompt("把客厅吸顶灯调成暖光");
+      expect(rWarm.reply).toBe("客厅吸顶灯已调成暖光");
+
+      const rVol = await hFull.agent.prompt("小爱音箱音量调到65");
+      expect(rVol.reply).toBe("小爱音箱 Pro 音量已调到65%");
+
+      const rSensor = await hFull.agent.prompt("卧室现在温度和湿度多少？");
+      expect(rSensor.reply).toBe("卧室当前温度23.6°C，湿度54%");
+    } finally {
+      await hFull.cleanup();
+    }
+  });
+
+  test("preserves crisp telegraphic Caveman outputs in ultra mode + clean uiSummary on tools", async () => {
+    const h = createHarness({ getCavemanMode: () => "ultra" });
     try {
       await h.ready();
 
@@ -516,11 +625,11 @@ describe("SmartHomeTools & LocalPlannerStream — Crisp Outputs, Bug Fixes & Imp
   });
 
   test("localPlannerStream summarizes devices, scenes, sensors, lights, greetings, and compound actions without [did=...] leaks", async () => {
-    const h = createHarness();
+    const h = createHarness({ getCavemanMode: () => "ultra" });
     try {
       await h.ready();
 
-      // Greeting concise in full mode
+      // Greeting concise in ultra mode
       const greet = await h.agent.prompt("你好");
       expect(greet.reply).toMatch(/^在呢，\d+\/\d+ 台设备在线，请说$/);
       expect(greet.reply.length).toBeLessThan(30);
@@ -568,7 +677,7 @@ describe("SmartHomeTools & LocalPlannerStream — Crisp Outputs, Bug Fixes & Imp
       const compound = await h.agent.prompt("把客厅吸顶灯亮度调到85%，并关闭餐厅主灯");
       expect(compound.reply).toBe("客厅吸顶灯亮度 85%，餐厅主灯已关");
 
-      // Compound join of longer / 3+ clauses uses "；"
+      // Compound join of longer / 3+ clauses uses "；" in ultra mode
       const threeToolMsgs: ToolResultMessage[] = [
         {
           role: "toolResult",
@@ -598,7 +707,9 @@ describe("SmartHomeTools & LocalPlannerStream — Crisp Outputs, Bug Fixes & Imp
           timestamp: Date.now(),
         },
       ];
-      expect(summarizeToolResults(threeToolMsgs)).toBe("客厅吸顶灯已开；餐厅主灯已关；已执行：回家模式");
+      expect(summarizeToolResults(threeToolMsgs, "", "ultra")).toBe(
+        "客厅吸顶灯已开；餐厅主灯已关；已执行：回家模式",
+      );
 
       // Low battery (<20%) sensor summary via direct summarizeToolResults
       const lowBatMsg: ToolResultMessage = {
@@ -609,13 +720,17 @@ describe("SmartHomeTools & LocalPlannerStream — Crisp Outputs, Bug Fixes & Imp
         details: {
           ok: true,
           name: "卧室米家温湿度计",
+          room: "卧室",
           online: true,
           values: { temperature: 23.6, "relative-humidity": 54, "battery-level": 12 },
         },
         isError: false,
         timestamp: Date.now(),
       };
-      expect(summarizeToolResults([lowBatMsg], "卧室几度")).toBe("卧室米家温湿度计 23.6°C，湿度 54%，电量 12%");
+      expect(summarizeToolResults([lowBatMsg], "卧室几度", "ultra")).toBe(
+        "卧室米家温湿度计 23.6°C，湿度 54%，电量 12%",
+      );
+      expect(summarizeToolResults([lowBatMsg], "卧室几度", "lite")).toContain("12%");
     } finally {
       await h.cleanup();
     }

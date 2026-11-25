@@ -292,7 +292,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   private _history: VoiceTranscriptEntry[] = [];
   private _lastMetrics: VoiceLastMetrics | null = null;
   private _lastDispatchedText = "";
+  private _lastDispatchedNormText = "";
   private _lastDispatchedAt = 0;
+  private _lastDispatchedCompletedAt = 0;
   private _seq = 0;
 
   constructor(
@@ -419,6 +421,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._timerPaused = false;
     this._consecutiveSidetalkCount = 0;
     this._lastTransitionReason = reason;
+    this._resetDedupState();
     if (this._mode !== "processing" && this._mode !== "error") {
       this._mode = this._active ? "listening" : "idle";
     }
@@ -507,6 +510,20 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._lastSpokenAt = now;
   }
 
+  private _normalizeDedupText(raw: string): string {
+    return raw
+      .trim()
+      .toLowerCase()
+      .replace(/[\s,，。．.、!！?？:：;；"'`“”‘’~～]+/g, "");
+  }
+
+  private _resetDedupState(): void {
+    this._lastDispatchedText = "";
+    this._lastDispatchedNormText = "";
+    this._lastDispatchedAt = 0;
+    this._lastDispatchedCompletedAt = 0;
+  }
+
   /**
    * 后台预热本地温柔女声神经 TTS 并缓存当前唤醒词回复短语（让“嗯?”几乎零延迟播放）。
    */
@@ -514,7 +531,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const cfg = this.config;
     if (cfg.ttsEngine === "browser" || !cfg.autoSpeakReply) return;
     const ack = resolveWakeAckReply(cfg.wakeAckPhrase);
-    const prewarmTexts = ack ? [ack, "已待机"] : ["已待机"];
+    const exitAck = formatExitConversationAck(cfg.cavemanMode);
+    const prewarmTexts = ack ? [ack, exitAck] : [exitAck];
     await this._localEngine.tts.warmup({
       voice: cfg.ttsVoice,
       speed: cfg.ttsSpeed,
@@ -544,6 +562,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         this._speechInProgress = false;
         this._consecutiveSidetalkCount = 0;
         this._lastTransitionReason = "stopped";
+        this._resetDedupState();
       } else if (this._mode === "idle" || this._mode === "error") {
         this._mode = "listening";
         this._error = null;
@@ -625,8 +644,18 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._lastTranscript = text;
     this._error = null;
 
-    // 1.5s 内相同最终识别结果去重（避免浏览器重复回调）
-    if (text === this._lastDispatchedText && now - this._lastDispatchedAt < 1500) {
+    // 1.8s（或上条刚执行完毕 1.5s）内相同最终识别结果去重（归一化标点与空格，防止浏览器/VAD 重复回调）
+    const normText = this._normalizeDedupText(text);
+    const sameAsLast =
+      text === this._lastDispatchedText ||
+      (normText.length >= 2 && normText === this._lastDispatchedNormText);
+    const withinStartWindow =
+      this._lastDispatchedAt > 0 && now >= this._lastDispatchedAt && now - this._lastDispatchedAt < 1800;
+    const withinCompletedWindow =
+      this._lastDispatchedCompletedAt > 0 &&
+      now >= this._lastDispatchedCompletedAt &&
+      now - this._lastDispatchedCompletedAt < 1500;
+    if (sameAsLast && (withinStartWindow || withinCompletedWindow)) {
       return {
         ok: true,
         matched: false,
@@ -845,7 +874,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._consecutiveSidetalkCount = 0;
     this._awakeUntil = null;
     this._lastDispatchedText = text;
+    this._lastDispatchedNormText = normText;
     this._lastDispatchedAt = now;
+    this._lastDispatchedCompletedAt = 0;
     this._lastCommand = decision.command;
     this._mode = "processing";
     this.emit("stateChanged", this.snapshot());
@@ -863,6 +894,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       },
     });
     const agentMs = Math.round(performance.now() - agentStart);
+    this._lastDispatchedCompletedAt =
+      options.now !== undefined ? Math.max(now, now + agentMs) : Date.now();
 
     timings.agentMs = agentMs;
     timings.totalMs = Math.round(
