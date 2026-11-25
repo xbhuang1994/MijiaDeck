@@ -126,9 +126,19 @@ export type ImplicitActionChoice =
   | "query_status"
   | "needs_llm_agent";
 
+export interface WakeAttentionAliasHint {
+  matchedSurface: string;
+  targetWakeWord: string;
+  substitutedUtterance: string;
+}
+
 export interface WakeAttentionInput {
   utterance: string;
   wakeWords: readonly string[];
+  /** 可选：句首疑似被 ASR 谐音/近音误听的触发词候选（仅用于原句字面语义 vs 替换回触发词后的语义对比） */
+  suspectedWakeAlias?: WakeAttentionAliasHint | null;
+  /** 可选：本地声学唤醒命中信号（仅在声学唤醒已命中且伴随近音候选时提供） */
+  acousticWake?: { wakeWord: string; score: number; matched?: boolean } | null;
 }
 
 export interface WakeAttentionOptions {
@@ -378,12 +388,12 @@ const HISTORY_MAX_CHARS = 80;
 const WAKE_DECISION_QUESTION: SystemOneChoiceQuestion<WakeAttentionDecision> = {
   type: "choice",
   instructions:
-    "唤醒词检测已触发，仅判断语音转写文本 utterance 是不是误听有人在叫触发词（wake_words，支持中英文及语音识别常见同音/近音/音译误差），不需要做上下文、背景环境、设备能力或后续意图等其它判断。注意：中文语音识别常将句首英文或短触发词误听为发音相近的孤立单字/双字并紧跟逗号或停顿（例如把 Neo 听成“六，/流，/牛，/纽，/钮，/尼，/你，/你哦，/尼奥，/里奥，/呢，/那，”等），这类句首近音呼唤仍属于有人在叫触发词（valid_wake）。",
+    "唤醒词检测已触发，仅判断语音转写文本 utterance 是不是误听有人在叫触发词（wake_words，支持中英文及语音识别常见同音/近音/音译误差），不需要做上下文、背景环境、设备能力或后续意图等其它判断。重要判别法（同音/近音语义替换检验）：中英混说时语音识别常将句首触发词误听为谐音中文词且连读时可能无逗号（如把 Neo 听成“你有/你又/你好/你给/六，/牛/钮/纽/尼奥/里奥/你哦”等）。请对比原句 utterance 字面语义与替换回触发词后的语义（若 state 提供 suspected_wake_alias.if_replaced 请直接参考）：若原句按字面语义生硬/不通顺/语法别扭，而替换回触发词后语义自然通顺（例如“你有播放点音乐吧”字面不通顺、替换为“Neo，播放点音乐吧”完全自然，“六，我觉得客厅有点暗呢”替换为“Neo，我觉得客厅有点暗呢”完全自然），尤其配合 acoustic_wake 声学唤醒命中时，判定为 valid_wake；反之，即使声学唤醒命中，若原句按字面本身就是自然通顺的日常问句/陈述句（如“你有打开窗户吗？”“你有时间吗？”“你好，晚饭吃什么”“六个苹果多少钱”），或只是聊天/转述/评价/否定中顺带提及触发词而非呼叫（如“我刚才聊到Neo挺好用的”），判定为 false_wake。",
   criteria: {
     valid_wake:
-      "确实有人在呼唤触发词（不是误听）：包括纯呼唤触发词、触发词后接任意说话内容，或句首出现因语音识别同音/近音/音译误差转写出的孤立触发词谐音（如“六，我觉得客厅有点暗呢”句首的“六，”对应 Neo）。",
+      "确实有人在呼唤触发词（不是误听）：直接叫出触发词（单独叫或后接任意内容），或句首近音/同音词按原字面语义不通顺/语法别扭、替换回触发词（if_replaced）后语义自然通顺（如“你有播放点音乐吧”->“Neo，播放点音乐吧”，“六，我觉得客厅有点暗呢”->“Neo，我觉得客厅有点暗呢”）。",
     false_wake:
-      "误听或误唤醒：并没有人在叫触发词，包括仅因发音相近把普通日常词句/外语词/杂音碎片误听成触发词，或在与他人聊天、转述、评价、否定中顺带提及该词而并非在呼叫触发词。",
+      "误听或误唤醒：并没有人在叫触发词，包括原句按字面本就是自然通顺的日常问句/陈述句（如“你有打开窗户吗？”“你有时间吗？”“六个苹果多少钱”）、纯杂音碎片，或在与他人聊天、转述、评价、否定中顺带提及该词而并非在呼叫触发词。",
   },
 };
 
@@ -1120,11 +1130,32 @@ export class SystemOneClient {
 
     const wakeWords = input.wakeWords.map((w) => w.trim()).filter(Boolean);
     const strict = Boolean(opts?.strict);
+    const aliasHeard = input.suspectedWakeAlias?.matchedSurface
+      ? collapseWhitespace(input.suspectedWakeAlias.matchedSurface)
+      : "";
+    const aliasTarget = input.suspectedWakeAlias?.targetWakeWord
+      ? collapseWhitespace(input.suspectedWakeAlias.targetWakeWord)
+      : "";
+    const aliasReplaced = input.suspectedWakeAlias?.substitutedUtterance
+      ? collapseWhitespace(input.suspectedWakeAlias.substitutedUtterance)
+      : "";
+    const hasAliasHint = Boolean(aliasHeard && aliasTarget && aliasReplaced);
+    const matchedAcousticWake =
+      hasAliasHint && input.acousticWake && input.acousticWake.matched !== false
+        ? {
+            wake_word: input.acousticWake.wakeWord.trim(),
+            score: Number(input.acousticWake.score.toFixed(3)),
+          }
+        : null;
 
     const cacheKey = JSON.stringify([
       "wake",
       cleanUtterance.toLowerCase(),
       wakeWords.map((w) => w.toLowerCase()),
+      hasAliasHint ? `${aliasHeard.toLowerCase()}->${aliasTarget.toLowerCase()}` : "",
+      matchedAcousticWake
+        ? `${matchedAcousticWake.wake_word.toLowerCase()}:${matchedAcousticWake.score.toFixed(2)}`
+        : "",
       strict,
     ]);
 
@@ -1138,6 +1169,16 @@ export class SystemOneClient {
       utterance: cleanUtterance,
       wake_words: wakeWords,
     };
+    if (hasAliasHint) {
+      state.suspected_wake_alias = {
+        heard: aliasHeard,
+        target_wake_word: aliasTarget,
+        if_replaced: aliasReplaced,
+      };
+    }
+    if (matchedAcousticWake && matchedAcousticWake.wake_word) {
+      state.acoustic_wake = matchedAcousticWake;
+    }
 
     const questions = {
       decision: WAKE_DECISION_QUESTION,
