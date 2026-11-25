@@ -96,6 +96,8 @@ export interface VoiceTranscriptEntry {
   speakerScore?: number;
   attentionStage?: AttentionDecision["stage"];
   attentionReason?: string;
+  passSource?: AttentionDecision["passSource"];
+  matchedCapability?: string;
   intent?: CommandIntentChoice;
   acousticWakeScore?: number;
   snrGainDb?: number;
@@ -344,6 +346,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   private readonly _localEngine: LocalVoiceEngine;
   private readonly _echoGuard = new TtsEchoGuard();
   private readonly _unsubAgentSpeak: () => void;
+  private readonly _unsubConfirmationPending: () => void;
+  private _lastDedupPendingId: string | null = null;
 
   private _active = false;
   private _mode: VoiceListenMode = "idle";
@@ -391,17 +395,47 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._localEngine.setQwen3ComputeDevice?.(this.config.qwen3ComputeDevice);
     this._engine = this._localEngine.getStatus().readyForLocalAsr ? "local" : "browser";
 
-    // 转发 Pi Agent 流式分句语音播报事件，并登记到多语段回声账本（带唯一 utteranceId 供前后端精准对齐）
-    this._unsubAgentSpeak = this._agent.on("speakChunk", ({ text, final, taskId, priority }) => {
-      if (!this.config.autoSpeakReply) return;
-      const rec = this._recordSpoken(text, Date.now(), { priority, taskId });
-      this.emit("speakChunkRequested", {
-        text,
-        final,
-        utteranceId: rec?.id,
-        priority,
-        taskId,
-      });
+    // 转发 Pi Agent 流式分句语音播报事件，并登记到多语段回声账本（带唯一 utteranceId 与确认提问标记）
+    this._unsubAgentSpeak = this._agent.on(
+      "speakChunk",
+      ({ text, final, taskId, priority, isConfirmationPrompt }) => {
+        if (!this.config.autoSpeakReply) return;
+        const rec = this._recordSpoken(text, Date.now(), {
+          priority,
+          taskId,
+          isConfirmationPrompt,
+        });
+        this.emit("speakChunkRequested", {
+          text,
+          final,
+          utteranceId: rec?.id,
+          priority,
+          taskId,
+        });
+      },
+    );
+
+    // 当 Pi Agent 抛出结构化待确认提问时，强制保持至少 20s 连续对话窗口（即使 conversationWindowSec === 0）
+    this._unsubConfirmationPending = this._agent.on("confirmationPending", () => {
+      const keepMs = Math.max(20_000, this.config.conversationWindowSec * 1000);
+      const nowMs = Date.now();
+      this._dialogState = "conversation";
+      this._consecutiveSidetalkCount = 0;
+      this._consecutiveAmbientNoiseCount = 0;
+      this._speechGraceSuppressed = false;
+      this._lastTransitionReason = "confirmation_pending";
+      const nextUntil = nowMs + keepMs;
+      this._conversationUntil = nextUntil;
+      this._awakeUntil = nextUntil;
+      this._remainingConversationMs = keepMs;
+      this._setConversationDeadlines(nextUntil, true);
+      if (!this._timerPaused) {
+        this._armConversationTimer(keepMs, this._dialogEpoch);
+      }
+      if (this._active) {
+        this._mode = "awake";
+      }
+      this.emit("stateChanged", this.snapshot());
     });
   }
 
@@ -778,6 +812,20 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const prevDt = this._echoGuard.doubleTalkActive;
 
     this._echoGuard.updateClientPlaybackState(patch);
+    if (patch.phase === "end" || patch.speaking === false) {
+      this._agent.markConfirmationPromptTtsEnded();
+      if (this._agent.getActivePendingConfirmationGateContext()) {
+        const keepMs = Math.max(20_000, this.config.conversationWindowSec * 1000);
+        const nowMs = Date.now();
+        this._dialogState = "conversation";
+        const nextUntil = nowMs + keepMs;
+        this._conversationUntil = nextUntil;
+        this._awakeUntil = nextUntil;
+        this._remainingConversationMs = keepMs;
+        this._setConversationDeadlines(nextUntil, true);
+        this._armConversationTimer(keepMs, this._dialogEpoch);
+      }
+    }
     if (typeof patch.speaking === "boolean") {
       this.setTtsSpeaking(patch.speaking);
     }
@@ -796,7 +844,11 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   private _recordSpoken(
     text: string,
     now = Date.now(),
-    meta?: { priority?: "ack" | "normal" | "result" | "system"; taskId?: string },
+    meta?: {
+      priority?: "ack" | "normal" | "result" | "system";
+      taskId?: string;
+      isConfirmationPrompt?: boolean;
+    },
   ) {
     const t = text.trim();
     if (!t) return null;
@@ -810,6 +862,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       now,
       priority: meta?.priority,
       taskId: meta?.taskId,
+      isConfirmationPrompt: meta?.isConfirmationPrompt,
     });
   }
 
@@ -960,10 +1013,15 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._error = null;
 
     // 1.8s（或上条刚执行完毕 1.5s）内相同最终识别结果去重（归一化标点与空格，防止浏览器/VAD 重复回调）
+    // 若挂起确认槽 ID 已切换（连续两个不同确认都答复“好/嗯”），跳过旧去重拦截
+    const activePendingCtx = this._agent.getActivePendingConfirmationGateContext();
+    const activePendingId = activePendingCtx?.id ?? null;
     const normText = this._normalizeDedupText(text);
+    const samePendingEpoch = activePendingId === this._lastDedupPendingId;
     const sameAsLast =
-      text === this._lastDispatchedText ||
-      (normText.length >= 2 && normText === this._lastDispatchedNormText);
+      samePendingEpoch &&
+      (text === this._lastDispatchedText ||
+        (normText.length >= 2 && normText === this._lastDispatchedNormText));
     const withinStartWindow =
       this._lastDispatchedAt > 0 && now >= this._lastDispatchedAt && now - this._lastDispatchedAt < 1800;
     const withinCompletedWindow =
@@ -1074,6 +1132,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         voiceprint: options.voiceprint,
         voiceprintMode: cfg.voiceprintMode,
         llmEvaluator,
+        capabilityDigest: this._agent.getCapabilityDigest(),
+        learnedTriggers: this._agent.getLearnedTriggerSamples(),
+        pendingConfirmation: activePendingCtx,
       }));
 
     if (decision.stage === "echo") {
@@ -1104,6 +1165,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       speakerScore: options.voiceprint?.evaluated ? options.voiceprint.score : undefined,
       attentionStage: decision.stage,
       attentionReason: decision.reason,
+      ...(decision.passSource ? { passSource: decision.passSource } : {}),
+      ...(decision.matchedCapability ? { matchedCapability: decision.matchedCapability } : {}),
       ...(decision.intent ? { intent: decision.intent } : {}),
       ...(options.acousticWake ? { acousticWakeScore: options.acousticWake.score } : {}),
       snrGainDb: options.snrGainDb,
@@ -1245,6 +1308,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       .trim();
     if (this._agent.activeTaskCount > 0 && CANCEL_RUNNING_TASK_RE.test(normalizedCancelCmd)) {
       this._agent.abort();
+      this._agent.taintRecentAutoExecutedMemoryIfWithin(120_000);
       const cancelReply = "已取消正在执行的任务";
       entry.reply = cancelReply;
       const cancelSnap = this.snapshot();
@@ -1280,6 +1344,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._awakeUntil = null;
     this._lastDispatchedText = text;
     this._lastDispatchedNormText = normText;
+    this._lastDedupPendingId = activePendingId;
     this._lastDispatchedAt = now;
     this._lastDispatchedCompletedAt = 0;
     this._lastCommand = decision.command;
@@ -1307,9 +1372,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const submission = this._agent.submitPrompt(decision.command, {
       source: "voice",
       voiceMeta: {
+        speakerId: options.voiceprint?.speakerId ?? null,
         speakerName: options.voiceprint?.speakerName ?? null,
         speakerRole: options.voiceprint?.role ?? null,
         speakerScore: options.voiceprint?.score,
+        speakerMatched: options.voiceprint?.evaluated ? options.voiceprint.matched : undefined,
+        enrolledCount: options.voiceprint?.enrolledCount,
         wakeWord: decision.wakeWord,
         attentionReason: decision.reason,
         ...(decision.intent ? { intent: decision.intent } : {}),
@@ -1351,7 +1419,11 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           this._remainingConversationMs = convMs;
           this._setConversationDeadlines(nextUntil, true);
           this._armConversationTimer(convMs, this._dialogEpoch);
-        } else if (cfg.conversationWindowSec <= 0 && this._agent.activeTaskCount === 0) {
+        } else if (
+          cfg.conversationWindowSec <= 0 &&
+          this._agent.activeTaskCount === 0 &&
+          !this._agent.getActivePendingConfirmationGateContext()
+        ) {
           this._dialogState = "standby";
           this._conversationUntil = null;
           this._conversationBaseUntil = null;
@@ -1598,6 +1670,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         systemOneClient: this._agent.systemOneClient,
         llmEvaluator,
         preDenoisedGtcrn: preDenoisedForSep,
+        capabilityDigest: this._agent.getCapabilityDigest(),
+        learnedTriggers: this._agent.getLearnedTriggerSamples(),
+        pendingConfirmation: this._agent.getActivePendingConfirmationGateContext(),
       });
 
       // tag 模式在分离命中有效人声后直接复用 sep.bestSpeechPcm 执行 50ms 声纹打标
@@ -2095,6 +2170,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
             preDenoisedGtcrn:
               segment.denoiseEngine.startsWith("gtcrn") ? segment.denoisedSamples : undefined,
             precomputedAcousticWake: acousticWake,
+            capabilityDigest: this._agent.getCapabilityDigest(),
+            learnedTriggers: this._agent.getLearnedTriggerSamples(),
+            pendingConfirmation: this._agent.getActivePendingConfirmationGateContext(),
           },
         );
 
@@ -2718,6 +2796,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._clearConversationTimer();
     this._clearTtsPauseWatchdog();
     this._unsubAgentSpeak();
+    this._unsubConfirmationPending();
     this._localEngine.dispose();
     this._active = false;
     this._dialogState = "standby";

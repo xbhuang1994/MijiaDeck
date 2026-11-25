@@ -45,7 +45,7 @@ const RE_SILENT_WRAPPER = /^[\s"'`“”‘’「」()（）【】]*\[SILENT\][\
 
 // Auto-Clarity 安全 / 确认 / 风险警告短语检测
 const RE_AUTO_CLARITY_ZH =
-  /(?:请先?确认|二次确认|确定要|是否继续|危险|警告|不可逆|安全提示|高风险|风险提示|注意安全|API\s*Key|尚未登录|扫码登录|网络不可用|权限不足)/i;
+  /(?:请先?确认|二次确认|确定要|是否继续|确认一下|是否使用|要不要|是用.+吗|暂未执行|过热告警|舱门未关|危险|警告|不可逆|安全提示|高风险|风险提示|注意安全|API\s*Key|尚未登录|扫码登录|网络不可用|权限不足)/i;
 const RE_AUTO_CLARITY_EN =
   /\b(?:please\s+confirm|confirmation\s+required|are\s+you\s+sure|warning|caution|danger|irreversible|destructive|safety\s+warning|proceed\?)\b/i;
 

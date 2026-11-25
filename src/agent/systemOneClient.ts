@@ -123,6 +123,12 @@ export interface WakeAttentionInput {
   acousticEvent?: string;
   speakerName?: string | null;
   acousticWake?: { wakeWord: string; score: number } | null;
+  /** 当前家庭设备的特殊能力清单（例如三筒洗衣机的袜子筒/内裤筒、扫地机、浇花水阀、喂食器等） */
+  homeCapabilities?: readonly string[];
+  /** 已学习的强化决策记忆触发短语示例 */
+  learnedTriggers?: readonly string[];
+  /** 设备能力拓扑哈希（隔离缓存，避免设备变化后复用陈旧负向结果） */
+  capabilityDigestHash?: string;
 }
 
 export interface WakeAttentionOptions {
@@ -161,6 +167,15 @@ export interface ConversationTurnInput {
   lastSpokenReply?: string;
   acousticEvent?: string;
   speakerName?: string | null;
+  acousticWake?: { wakeWord: string; score: number } | null;
+  /** 当前家庭设备的特殊能力清单 */
+  homeCapabilities?: readonly string[];
+  /** 已学习的强化决策记忆触发短语示例 */
+  learnedTriggers?: readonly string[];
+  /** 当前正在等待用户回复的待确认槽位 */
+  pendingConfirmation?: { questionText: string; summary: string } | null;
+  /** 设备能力拓扑哈希（隔离缓存） */
+  capabilityDigestHash?: string;
 }
 
 export interface ConversationTurnOptions {
@@ -310,28 +325,28 @@ const HISTORY_MAX_CHARS = 80;
 const WAKE_DECISION_QUESTION: SystemOneChoiceQuestion<WakeAttentionDecision> = {
   type: "choice",
   instructions:
-    "你是智能家居语音控制助手（唤醒词见 wake_words，支持中英文及常见同音误差）。判断用户最新话语是在直接向你下达指令/查询/抱怨、仅呼唤确认你在场，还是与你无关。注意：播放背景音乐(BGM)或电视时，唤醒词前后可能夹杂无关歌词或电视台词碎片，只要包含对助手的直接命令或提问即视为 direct_command。",
+    "你是智能家居语音控制助手（唤醒词见 wake_words，支持中英文及常见同音误差）。请结合 home_capabilities、learned_triggers 与 acoustic_wake 判断用户最新话语是在直接向你下达指令/查询/隐式控制需求、仅呼唤确认你在场，还是与你无关。注意：若 home_capabilities 显示家中有对应专能家电（例如三筒洗衣机的袜子筒/内裤筒、扫地机器人、智能浇花灌溉、宠物喂食器、独立干衣机），像“帮我洗一下袜子”“帮我洗内衣”“浇一下花”“扫一下地”“喂一下猫”均属于合法的设备控制请求 direct_command，绝不可误判为真人跑腿家务。播放背景音乐(BGM)或电视时，唤醒词前后可能夹杂无关歌词或电视台词碎片，只要含对助手的直接命令或提问即视为 direct_command。",
   criteria: {
     direct_command:
-      "说话人直接呼唤助手并下达设备控制、状态查询、保存/查看/删除长期附加指令规则（如“以后记得洗衣默认用智洗烘模式”“记住以后开空调先判断室外温度”）、知识提问或环境抱怨/调节需求（如开关灯、调亮调暗、太暗了、太吵了、查温度、英文控制指令等），即使唤醒词前后混有背景歌词碎片也属此类。",
+      "说话人直接呼唤助手（或声学唤醒命中）并下达显式/隐式设备控制（包括命中 home_capabilities 或 learned_triggers 的洗袜子/洗内衣/烘干/扫地/浇花/喂宠物等需求）、状态查询、保存/查看/删除长期附加指令规则、知识提问或环境抱怨调节需求（如太暗、太吵、太潮、查温度、英文控制指令等）。",
     wake_only:
       "说话人仅在呼唤助手名字或询问是否在线，没有具体操作指令或问题（如“小派”、“嘿小派”、“小派在吗”、“Hey Neo”）。",
     ignore:
-      "第三人称提及、讨论、评价、转述或否定呼叫助手（如“我刚聊到小派很好用”、“你觉得小派怎么样”、“别管小派了”），或对旁人说话、自言自语、纯背景音乐歌词/噪声/电视声。",
+      "第三人称提及、讨论、评价、转述或否定呼叫助手（如“我刚聊到小派很好用”、“你觉得小派怎么样”、“别管小派了”），或对旁人说话、明显无任何对应联网设备的纯手工跑腿家务（如洗碗、做饭、拿快递、倒水）、自言自语、纯背景音乐歌词/噪声/电视声。",
   },
 };
 
 const CONVERSATION_ACTION_QUESTION: SystemOneChoiceQuestion<ConversationActionChoice> = {
   type: "choice",
   instructions:
-    "你是运行在电脑上的智能家居控制助手，只能控制米家设备与问答，不能跑腿做家务。当前处于连续对话模式（用户可省略唤醒词，支持中英文）。请结合 history 判断最新 utterance 的性质。",
+    "你是运行在电脑上的多平台智能家居控制助手，可控制家中各类智能设备（见 home_capabilities，含多筒洗衣机袜子筒/内裤筒、干衣机、扫地机、喂食器、智能灌溉等）与回答问题。当前处于连续对话模式（用户可省略唤醒词，若 acoustic_wake 非空表示刚刚检测到唤醒词，若 pending_confirmation 非空表示正在等用户确认）。请结合 home_capabilities、learned_triggers、pending_confirmation、acoustic_wake 与 history 判断最新 utterance 的性质。",
   criteria: {
     followup:
-      "用户在继续与智能家居助手对话：下达后续设备控制/调节指令、保存或管理长期偏好与附加指令规则（如“以后记得……”“记住……”）、补充参数、纠正或撤销操作、查询设备或环境状态、隐式控制反馈（如太暗了、太吵了、再亮一点），或面向助手的自然追问（中英文均可）。",
+      "用户在继续与智能家居助手对话：下达显式或隐式设备控制/调节指令（凡命中 home_capabilities 或 learned_triggers 的请求如“帮我洗一下袜子”“洗内裤”“浇花”“扫地”“喂猫”均属此类）、回复 pending_confirmation 的肯定/否定/改选/消歧答复（如“嗯”“好”“对”“用下筒”“方寸别院那台”“不用了”）、保存或管理长期偏好规则、补充参数、纠正撤销、查询设备状态、环境抱怨反馈，或面向助手的自然追问。",
     side_talk:
-      "用户在与旁边家人/朋友说话、自言自语、聊日常琐事或要求真人跑腿做家务（如晚饭吃什么、帮我倒水、拿双筷子、去取快递），或纯背景歌词/环境噪声，未面向智能家居助手说话。",
+      "用户在与旁边家人/朋友说话、自言自语、聊日常琐事或要求真人完成家中无任何联网设备支持的跑腿家务（如晚饭吃什么、帮我倒水、拿双筷子、洗碗做饭、去取快递），或纯背景歌词/环境噪声，未面向智能家居助手说话。",
     goodbye:
-      "用户明确示意结束本次对话、道谢收尾或让助手退下/停止聆听（如“谢谢不用了”、“没事了”、“好了退下吧”、“再见”、“that's all thanks”、“goodbye”）。",
+      "用户明确示意结束本次对话、道谢收尾或让助手退下/停止聆听（如“谢谢不用了”、“没事了”、“好了退下吧”、“再见”、“that's all thanks”、“goodbye”）。注意：当 pending_confirmation 存在时，用户回复“算了/取消/不用了”优先视作对确认请求的拒绝 followup 而非直接退出。",
   },
 };
 
@@ -1042,6 +1057,7 @@ export class SystemOneClient {
       input.acousticWake
         ? `${input.acousticWake.wakeWord.toLowerCase()}:${input.acousticWake.score.toFixed(2)}`
         : "",
+      input.capabilityDigestHash ?? "",
       includeIntent,
       strict,
     ]);
@@ -1067,6 +1083,12 @@ export class SystemOneClient {
         wake_word: input.acousticWake.wakeWord,
         score: Number(input.acousticWake.score.toFixed(3)),
       };
+    }
+    if (input.homeCapabilities && input.homeCapabilities.length > 0) {
+      state.home_capabilities = input.homeCapabilities.slice(0, 12);
+    }
+    if (input.learnedTriggers && input.learnedTriggers.length > 0) {
+      state.learned_triggers = input.learnedTriggers.slice(0, 12);
     }
 
     const questions: Record<string, SystemOneQuestion> = {
@@ -1163,6 +1185,7 @@ export class SystemOneClient {
     const includeIntent = Boolean(opts?.includeIntent);
     const strict = Boolean(opts?.strict);
 
+    const hasPendingConfirm = Boolean(input.pendingConfirmation?.questionText);
     const cacheKey = JSON.stringify([
       "conv",
       primaryText.toLowerCase(),
@@ -1172,14 +1195,20 @@ export class SystemOneClient {
       lastSpoken.toLowerCase(),
       input.acousticEvent ?? "",
       input.speakerName ?? "",
+      input.acousticWake
+        ? `${input.acousticWake.wakeWord.toLowerCase()}:${input.acousticWake.score.toFixed(2)}`
+        : "",
+      input.capabilityDigestHash ?? "",
       includeIntent,
       strict,
     ]);
 
-    const cached = this._cache.get(cacheKey) as ConversationTurnResult | undefined;
-    if (cached) {
-      this._cacheHits += 1;
-      return { ...cached, latencyMs: 0, cached: true };
+    if (!hasPendingConfirm) {
+      const cached = this._cache.get(cacheKey) as ConversationTurnResult | undefined;
+      if (cached) {
+        this._cacheHits += 1;
+        return { ...cached, latencyMs: 0, cached: true };
+      }
     }
 
     const state: Record<string, unknown> = {
@@ -1198,6 +1227,24 @@ export class SystemOneClient {
     }
     if (input.acousticEvent) state.acoustic_event = input.acousticEvent;
     if (input.speakerName) state.speaker = input.speakerName;
+    if (input.acousticWake) {
+      state.acoustic_wake = {
+        wake_word: input.acousticWake.wakeWord,
+        score: Number(input.acousticWake.score.toFixed(3)),
+      };
+    }
+    if (input.homeCapabilities && input.homeCapabilities.length > 0) {
+      state.home_capabilities = input.homeCapabilities.slice(0, 12);
+    }
+    if (input.learnedTriggers && input.learnedTriggers.length > 0) {
+      state.learned_triggers = input.learnedTriggers.slice(0, 12);
+    }
+    if (hasPendingConfirm && input.pendingConfirmation) {
+      state.pending_confirmation = {
+        question: truncateText(input.pendingConfirmation.questionText, 120),
+        summary: truncateText(input.pendingConfirmation.summary, 100),
+      };
+    }
 
     const questions: Record<string, SystemOneQuestion> = {
       conv_action: CONVERSATION_ACTION_QUESTION,
@@ -1258,8 +1305,8 @@ export class SystemOneClient {
       };
     }
 
-    // 仅缓存非执行判定，绝不缓存 followup
-    if (action === "side_talk" || action === "goodbye") {
+    // 仅缓存非执行判定，绝不缓存 followup，且待确认状态下不写入负向缓存
+    if (!hasPendingConfirm && (action === "side_talk" || action === "goodbye")) {
       this._cache.set(cacheKey, result);
     }
 

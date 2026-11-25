@@ -26,6 +26,13 @@ import {
 } from "../agent/localTtsEngine.ts";
 import { fetchProviderModels } from "../agent/modelDiscovery.ts";
 import type { PiAgentService } from "../agent/piAgentService.ts";
+import {
+  clearReinforcementMemories,
+  deleteReinforcementMemory,
+  listReinforcementMemories,
+  resetReinforcementMemory,
+  toggleReinforcementMemory,
+} from "../agent/reinforcementMemoryStore.ts";
 import type {
   VoiceListenerController,
   VoiceListenMode,
@@ -2017,6 +2024,13 @@ export function createRequestHandler(
           reply: result.reply,
           ...(result.thinking ? { thinking: result.thinking } : {}),
           ...(result.thinkingLevel ? { thinkingLevel: result.thinkingLevel } : {}),
+          ...(result.memoryEvent ? { memoryEvent: result.memoryEvent } : {}),
+          ...(result.pendingConfirmation
+            ? {
+                pendingConfirmation: result.pendingConfirmation,
+                awaitingConfirmation: true,
+              }
+            : {}),
           toolCalls: result.toolCalls,
           retriesUsed: result.retriesUsed ?? 0,
           ...(result.retryNotices ? { retryNotices: result.retryNotices } : {}),
@@ -2272,6 +2286,127 @@ export function createRequestHandler(
           if (err instanceof HttpError) throw err;
           throw new HttpError(400, sanitizeErrorMessage(err));
         }
+      }
+
+      // ---------- 强化决策记忆与渐进确认 API ----------
+
+      if (method === "GET" && pathname === "/api/agent/memories") {
+        const memories = runtime.piAgent
+          ? runtime.piAgent.listDecisionMemories(true)
+          : listReinforcementMemories({ includeDisabled: true });
+        const snap = runtime.piAgent ? runtime.piAgent.snapshot() : null;
+        return jsonResponse({
+          ok: true,
+          memories,
+          pendingConfirmation: snap?.pendingConfirmation ?? null,
+          agent: snap,
+        });
+      }
+
+      if (method === "POST" && pathname === "/api/agent/memories/clear") {
+        const cleared = runtime.piAgent
+          ? runtime.piAgent.clearDecisionMemories()
+          : clearReinforcementMemories();
+        emitBroadcast(runtime);
+        return jsonResponse({
+          ok: true,
+          cleared,
+          memories: [],
+          agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
+        });
+      }
+
+      const memToggleMatch = /^\/api\/agent\/memories\/([^/]+)\/toggle$/.exec(pathname);
+      if (method === "POST" && memToggleMatch) {
+        const id = decodeSegment(memToggleMatch[1]!);
+        const body = await readJsonBody(req);
+        const enabled = typeof body.enabled === "boolean" ? body.enabled : undefined;
+        const updated = runtime.piAgent
+          ? runtime.piAgent.toggleDecisionMemory(id, enabled)
+          : toggleReinforcementMemory(id, enabled);
+        if (!updated) {
+          throw new HttpError(404, "未找到指定的强化决策记忆");
+        }
+        const memories = runtime.piAgent
+          ? runtime.piAgent.listDecisionMemories(true)
+          : listReinforcementMemories({ includeDisabled: true });
+        emitBroadcast(runtime);
+        return jsonResponse({
+          ok: true,
+          memory: updated,
+          memories,
+          agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
+        });
+      }
+
+      const memResetMatch = /^\/api\/agent\/memories\/([^/]+)\/reset$/.exec(pathname);
+      if (method === "POST" && memResetMatch) {
+        const id = decodeSegment(memResetMatch[1]!);
+        const updated = runtime.piAgent
+          ? runtime.piAgent.resetDecisionMemory(id)
+          : resetReinforcementMemory(id);
+        if (!updated) {
+          throw new HttpError(404, "未找到指定的强化决策记忆");
+        }
+        const memories = runtime.piAgent
+          ? runtime.piAgent.listDecisionMemories(true)
+          : listReinforcementMemories({ includeDisabled: true });
+        emitBroadcast(runtime);
+        return jsonResponse({
+          ok: true,
+          memory: updated,
+          memories,
+          agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
+        });
+      }
+
+      const memDeletePostMatch = /^\/api\/agent\/memories\/([^/]+)\/delete$/.exec(pathname);
+      const memDeleteMatch = /^\/api\/agent\/memories\/([^/]+)$/.exec(pathname);
+      if (
+        (method === "DELETE" && memDeleteMatch) ||
+        (method === "POST" && memDeletePostMatch)
+      ) {
+        const id = decodeSegment((memDeletePostMatch ?? memDeleteMatch)![1]!);
+        const deleted = runtime.piAgent
+          ? runtime.piAgent.deleteDecisionMemory(id)
+          : deleteReinforcementMemory(id);
+        if (!deleted) {
+          throw new HttpError(404, "未找到指定的强化决策记忆");
+        }
+        const memories = runtime.piAgent
+          ? runtime.piAgent.listDecisionMemories(true)
+          : listReinforcementMemories({ includeDisabled: true });
+        emitBroadcast(runtime);
+        return jsonResponse({
+          ok: true,
+          deleted: true,
+          memories,
+          agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
+        });
+      }
+
+      const confirmResolveMatch = /^\/api\/agent\/confirmations\/([^/]+)\/resolve$/.exec(pathname);
+      if (method === "POST" && confirmResolveMatch) {
+        if (!runtime.piAgent) {
+          throw new HttpError(503, "Pi Agent 服务未就绪");
+        }
+        const id = decodeSegment(confirmResolveMatch[1]!);
+        const body = await readJsonBody(req);
+        const action = body.action === "cancel" ? "cancel" : "confirm";
+        const selectedCandidateIndex =
+          typeof body.selectedCandidateIndex === "number" && Number.isFinite(body.selectedCandidateIndex)
+            ? Math.trunc(body.selectedCandidateIndex)
+            : undefined;
+        const result = await runtime.piAgent.resolvePendingConfirmationById(id, action, {
+          selectedCandidateIndex,
+        });
+        emitBroadcast(runtime);
+        return jsonResponse({
+          ok: result.ok,
+          result,
+          memories: runtime.piAgent.listDecisionMemories(true),
+          agent: runtime.piAgent.snapshot(),
+        });
       }
 
       if (method === "POST" && pathname === "/api/agent/abort") {

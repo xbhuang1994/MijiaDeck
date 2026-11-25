@@ -510,9 +510,9 @@ describe("SystemOneClient wire protocol & 6 domain methods", () => {
       "A: 已调至 40%",
       "U: 卧室灯也开一下",
     ]);
-    expect(String(questions.conv_action!.instructions)).toContain(
-      "你是运行在电脑上的智能家居控制助手，只能控制米家设备与问答，不能跑腿做家务。当前处于连续对话模式（用户可省略唤醒词，支持中英文）。",
-    );
+    expect(String(questions.conv_action!.instructions)).toContain("多平台智能家居控制助手");
+    expect(String(questions.conv_action!.instructions)).toContain("home_capabilities");
+    expect(String(questions.conv_action!.instructions)).toContain("连续对话模式");
     expect(Object.keys(questions).sort()).toEqual(["asr_best", "conv_action", "intent"]);
 
     expect(res1!.action).toBe("followup");

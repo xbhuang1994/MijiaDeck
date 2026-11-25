@@ -29,6 +29,8 @@ export interface EchoUtteranceRecord {
   active: boolean;
   priority?: "ack" | "normal" | "result" | "system";
   taskId?: string;
+  /** 标记该播报属于向用户发出的确认提问，触发严格反回声自确认保护 */
+  isConfirmationPrompt?: boolean;
 }
 
 export interface EchoEvaluateOptions {
@@ -46,6 +48,10 @@ export interface EchoEvaluateOptions {
   recentUtterances?: ReadonlyArray<EchoUtteranceRecord>;
   /** 外部告知当前是否有活跃播报 */
   ttsActive?: boolean;
+  /** 处于待确认提问播报或刚播完状态：锁定严格回声阈值，防止 TTS 复述触发自确认 */
+  strictConfirmationGuard?: boolean;
+  /** 当前待确认提问入队时间：早于此时间的短 ACK（如“好的”）不再误杀用户的真实确认回复 */
+  confirmationPromptEnqueuedAt?: number;
 }
 
 export interface EchoEvaluationResult {
@@ -427,6 +433,7 @@ export class TtsEchoGuard {
       now?: number;
       priority?: "ack" | "normal" | "result" | "system";
       taskId?: string;
+      isConfirmationPrompt?: boolean;
     } = {},
   ): EchoUtteranceRecord {
     const now = options.now ?? Date.now();
@@ -444,6 +451,7 @@ export class TtsEchoGuard {
       active: false,
       priority: options.priority,
       taskId: options.taskId,
+      isConfirmationPrompt: options.isConfirmationPrompt,
     };
     this._ledger.push(rec);
     if (this._ledger.length > MAX_LEDGER_ENTRIES) {
@@ -558,14 +566,16 @@ export class TtsEchoGuard {
         continue;
       }
       if (u.endedAt !== null) {
-        if (now >= u.endedAt && now - u.endedAt <= tailWindowMs) {
+        const effTail = u.isConfirmationPrompt ? Math.max(tailWindowMs, 8500) : tailWindowMs;
+        if (now >= u.endedAt && now - u.endedAt <= effTail) {
           out.push({ ...u });
         }
         continue;
       }
       // 尚未收到前端播放完毕回执时，以 enqueuedAt + estimatedDurationMs + tailWindowMs 作为兜底有效窗
       const approxEnd = (u.startedAt ?? u.enqueuedAt) + u.estimatedDurationMs;
-      if (now >= u.enqueuedAt && now <= approxEnd + tailWindowMs) {
+      const effTail = u.isConfirmationPrompt ? Math.max(tailWindowMs, 8500) : tailWindowMs;
+      if (now >= u.enqueuedAt && now <= approxEnd + effTail) {
         out.push({ ...u });
       }
     }
@@ -649,12 +659,24 @@ export function evaluateTtsEcho(options: EchoEvaluateOptions): EchoEvaluationRes
   if (options.recentUtterances && options.recentUtterances.length > 0) {
     for (const u of options.recentUtterances) {
       if (!u.text) continue;
+      // 确认提问发出后，忽略早于提问的短 ACK（如“好的”），避免误杀用户针对该提问的真实“好的/嗯”肯定答复
+      if (
+        options.confirmationPromptEnqueuedAt &&
+        u.priority === "ack" &&
+        u.enqueuedAt < options.confirmationPromptEnqueuedAt
+      ) {
+        continue;
+      }
       if (u.active) {
         candidates.push(u);
         continue;
       }
       const refEnd = u.endedAt ?? (u.startedAt ?? u.enqueuedAt) + u.estimatedDurationMs;
-      if (now >= u.enqueuedAt - 200 && now <= refEnd + tailWindowMs) {
+      const effectiveTail =
+        options.strictConfirmationGuard || u.isConfirmationPrompt
+          ? Math.max(tailWindowMs, 8500)
+          : tailWindowMs;
+      if (now >= u.enqueuedAt - 200 && now <= refEnd + effectiveTail) {
         candidates.push(u);
       }
     }
@@ -666,7 +688,7 @@ export function evaluateTtsEcho(options: EchoEvaluateOptions): EchoEvaluationRes
     options.legacyLastSpokenReply &&
     options.legacyLastSpokenAt &&
     now >= options.legacyLastSpokenAt &&
-    now - options.legacyLastSpokenAt <= tailWindowMs
+    now - options.legacyLastSpokenAt <= (options.strictConfirmationGuard ? Math.max(tailWindowMs, 8500) : tailWindowMs)
   ) {
     candidates.push({
       id: "legacy",
@@ -712,8 +734,20 @@ export function evaluateTtsEcho(options: EchoEvaluateOptions): EchoEvaluationRes
     }
   }
 
+  const strictConfirmationActive = Boolean(
+    options.strictConfirmationGuard || candidates.some((c) => c.isConfirmationPrompt),
+  );
+
   // 1. 极短应答回声保护（如播报“嗯?”、“好的”、“在呢”、“已待机”后 3.2s 内回收到 1~2 字残片）
+  // 特例：若提问已发出且早前的“好的”短 ACK 早于该确认提问，则绝不误杀用户针对该提问说出的真实“好的/嗯”！
   const shortAckMatched = candidates.some((c) => {
+    if (
+      options.confirmationPromptEnqueuedAt &&
+      c.priority === "ack" &&
+      c.enqueuedAt < options.confirmationPromptEnqueuedAt
+    ) {
+      return false;
+    }
     const elapsed = c.active ? 0 : Math.max(0, now - (c.endedAt ?? c.enqueuedAt));
     if (elapsed > SHORT_ACK_TAIL_WINDOW_MS) return false;
     if (heardNorm.length < 1 || heardNorm.length > 2) return false;
@@ -738,7 +772,7 @@ export function evaluateTtsEcho(options: EchoEvaluateOptions): EchoEvaluationRes
   // 2. 反向祈使指令保护（如刚播报“已关闭客厅吸顶灯”，用户紧接着说“打开客厅吸顶灯”）
   const looksDirect = Boolean(options.looksDirectCommand || IMPERATIVE_PREFIX_RE.test(cleaned));
   const oppositePolarity = hasOppositeActionPolarity(heardNorm, bestTargetNorm);
-  if (oppositePolarity && (looksDirect || options.hasWakeWord)) {
+  if (!strictConfirmationActive && oppositePolarity && (looksDirect || options.hasWakeWord)) {
     return {
       isEcho: false,
       grayZone: false,
@@ -761,20 +795,37 @@ export function evaluateTtsEcho(options: EchoEvaluateOptions): EchoEvaluationRes
   );
 
   let echoThreshold = options.hasWakeWord || looksDirect ? 0.86 : 0.58;
-  if (duringActiveTts && !options.hasWakeWord) {
-    echoThreshold -= 0.06;
+  if (strictConfirmationActive && !options.hasWakeWord) {
+    // 确认提问播报完毕后，用户说出 1~2 字极短回复（如“好的/是的/对的/嗯/好”）不应因含助词“的”
+    // 与长确认问句（如“要用洗衣机的袜子筒吗”）产生 50% 单字重合而被误杀！
+    if (!duringActiveTts && heardNorm.length <= 2 && bestTargetNorm.length >= 8) {
+      return {
+        isEcho: false,
+        grayZone: false,
+        score: bestScore,
+        matchedUtterance: bestTarget,
+        duringActiveTts,
+        reason: "",
+      };
+    }
+    // 确认提问播报与尾窗期间锁定严格回声阈值，禁止 looksDirect/声纹加分抬高门槛导致 TTS 自确认
+    echoThreshold = 0.42;
+  } else {
+    if (duringActiveTts && !options.hasWakeWord) {
+      echoThreshold -= 0.06;
+    }
+    if (mode === "aggressive") {
+      echoThreshold -= 0.08;
+    } else if (mode === "standard") {
+      echoThreshold += 0.04;
+    }
+    if (ownerVoiceMatched) {
+      echoThreshold += 0.1;
+    } else if (nonOwnerDuringTts) {
+      echoThreshold -= 0.08;
+    }
+    echoThreshold = Math.max(0.42, Math.min(0.95, echoThreshold));
   }
-  if (mode === "aggressive") {
-    echoThreshold -= 0.08;
-  } else if (mode === "standard") {
-    echoThreshold += 0.04;
-  }
-  if (ownerVoiceMatched) {
-    echoThreshold += 0.1;
-  } else if (nonOwnerDuringTts) {
-    echoThreshold -= 0.08;
-  }
-  echoThreshold = Math.max(0.42, Math.min(0.95, echoThreshold));
 
   if (bestScore >= echoThreshold) {
     return {
@@ -783,14 +834,17 @@ export function evaluateTtsEcho(options: EchoEvaluateOptions): EchoEvaluationRes
       score: bestScore,
       matchedUtterance: bestTarget,
       duringActiveTts,
-      reason: duringActiveTts
-        ? "全双工播报期间检测到扬声器回声，已自动抑制"
-        : "检测到系统语音播报回声，已自动抑制",
+      reason: strictConfirmationActive
+        ? "确认提问播报期间检测到疑似扬声器回声，已拦截防自确认"
+        : duringActiveTts
+          ? "全双工播报期间检测到扬声器回声，已自动抑制"
+          : "检测到系统语音播报回声，已自动抑制",
     };
   }
 
   // 4. 双讲回声残片剥离：用户说话与播报重叠导致 ASR 拼接“<播报尾音><真实指令>”
-  if (bestScore >= 0.22 || duringActiveTts) {
+  // 确认提问防护期间禁止残片剥离放行，防止确认问句尾部残片被当作新命令或肯定确认
+  if (!strictConfirmationActive && (bestScore >= 0.22 || duringActiveTts)) {
     const stripped = stripEchoContamination(cleaned, spokenTexts);
     if (stripped) {
       const strippedScore = Math.max(

@@ -13,6 +13,7 @@ import {
   type UiLocalVoiceStatus,
   type UiProviderPreset,
   type UiPublicAgentConfig,
+  type UiReinforcementMemory,
   type UiThinkingLevel,
   type UiVoiceprintProfile,
   type UiWakeWordHit,
@@ -1184,6 +1185,7 @@ export class MijiaDeckWebApp {
   private owwPrototypesCache: UiWakeWordPrototypeSummary[] = [];
   private customInstructionsCache: UiCustomInstructionRule[] = [];
   private customInstructionConflictsCache: Record<string, UiCustomInstructionConflict> = {};
+  private memoriesCache: UiReinforcementMemory[] = [];
   private vpRecordingBusy = false;
   private owwRecordingBusy = false;
   private instRecordingAbort: AbortController | null = null;
@@ -1782,8 +1784,10 @@ export class MijiaDeckWebApp {
       if (provs.length > 0) this.agentProvidersCache = provs;
       this.customInstructionsCache = this.piAgentPanel.getCustomInstructions();
       this.customInstructionConflictsCache = this.piAgentPanel.getCustomInstructionConflicts();
+      this.memoriesCache = this.piAgentPanel.getMemories();
       if (this.activeModal === "settings" && this.settingsDraft.tab === "voice-agent") {
         this.renderCustomInstructions();
+        this.renderReinforcementMemories();
       }
     }
     if ("voiceListen" in rec && rec.voiceListen) {
@@ -2064,8 +2068,10 @@ export class MijiaDeckWebApp {
           if (provs.length > 0) this.agentProvidersCache = provs;
           this.customInstructionsCache = this.piAgentPanel.getCustomInstructions();
           this.customInstructionConflictsCache = this.piAgentPanel.getCustomInstructionConflicts();
+          this.memoriesCache = this.piAgentPanel.getMemories();
           if (this.activeModal === "settings" && this.settingsDraft.tab === "voice-agent") {
             this.renderCustomInstructions();
+            this.renderReinforcementMemories();
           }
         }
         break;
@@ -3639,6 +3645,15 @@ export class MijiaDeckWebApp {
       this.customInstructionConflictsCache = this.piAgentPanel.getCustomInstructionConflicts();
     }
 
+    try {
+      const rawMem = await apiGet<{ memories?: UiReinforcementMemory[] }>("/api/agent/memories");
+      if (Array.isArray(rawMem?.memories)) {
+        this.memoriesCache = rawMem.memories;
+      }
+    } catch {
+      this.memoriesCache = this.piAgentPanel.getMemories();
+    }
+
     const s = this.state.settings;
     this.settingsOriginal = { mode: s.theme, color: s.theme_color };
     this.settingsDraft = {
@@ -3782,6 +3797,7 @@ export class MijiaDeckWebApp {
     this.syncCavemanDesc();
     el<HTMLTextAreaElement>("set-agent-system-prompt").value = cfg?.systemPromptExtra || "";
     this.renderCustomInstructions();
+    this.renderReinforcementMemories();
 
     el<HTMLSelectElement>("set-voice-engine").value = cfg?.voiceEngine || "auto";
     el<HTMLSelectElement>("set-voice-local-asr-engine").value = cfg?.localAsrEngine || "auto";
@@ -4502,6 +4518,178 @@ export class MijiaDeckWebApp {
       actions.append(toggleBtn, delBtn);
       row.append(main, actions);
       list.appendChild(row);
+    }
+  }
+
+  private renderReinforcementMemories(): void {
+    const list = document.getElementById("set-agent-memories-list");
+    const summaryEl = document.getElementById("set-agent-memories-summary");
+    const clearBtn = document.getElementById("set-agent-memories-clear-btn");
+    if (!list) return;
+    list.replaceChildren();
+
+    const memories = this.memoriesCache;
+    if (clearBtn) clearBtn.hidden = !memories || memories.length === 0;
+    if (!memories || memories.length === 0) {
+      if (summaryEl) summaryEl.textContent = "当前暂无自动学习的强化决策记忆";
+      const empty = document.createElement("div");
+      empty.className = "agent-inst-empty";
+      empty.textContent =
+        "当你说出“帮我洗一下袜子”等隐式指令并确认后，系统会自动总结并记录在此；连续确认 2 次后第 3 次自动免确认执行。";
+      list.appendChild(empty);
+      return;
+    }
+
+    const autoCount = memories.filter((m) => m.uiStage === "autonomous").length;
+    if (summaryEl) {
+      summaryEl.textContent = `共 ${memories.length} 条记忆 · ${autoCount} 条已达成免确认自主执行`;
+    }
+
+    for (const mem of memories) {
+      const row = document.createElement("div");
+      row.className = `agent-inst-item${mem.enabled ? "" : " is-disabled"}`;
+
+      const main = document.createElement("div");
+      main.className = "agent-inst-item-main";
+
+      const content = document.createElement("div");
+      content.className = "agent-inst-item-text";
+      content.textContent = mem.summary;
+
+      const meta = document.createElement("div");
+      meta.className = "agent-inst-item-meta";
+
+      const stageTag = document.createElement("span");
+      if (mem.uiStage === "autonomous") {
+        stageTag.className = "inst-tag mem-tag-autonomous";
+        stageTag.textContent = `已信任 · 免确认 (${mem.confirmCount}/${mem.confirmThreshold})`;
+      } else if (mem.uiStage === "safety_locked") {
+        stageTag.className = "inst-tag mem-tag-safety";
+        stageTag.textContent = "安全锁 · 每次必确认";
+      } else if (mem.uiStage === "stale") {
+        stageTag.className = "inst-tag mem-tag-stale";
+        stageTag.textContent = "休眠/变化 · 需重确认";
+      } else if (mem.uiStage === "disabled") {
+        stageTag.className = "inst-tag";
+        stageTag.textContent = "已停用";
+      } else {
+        stageTag.className = "inst-tag mem-tag-learning";
+        stageTag.textContent = `学习中 ${mem.confirmCount}/${mem.confirmThreshold}`;
+      }
+      stageTag.title = mem.gateReason || mem.summary;
+      meta.appendChild(stageTag);
+
+      const retTag = document.createElement("span");
+      retTag.className = "inst-tag";
+      retTag.textContent = `保留率 ${Math.round((mem.retention ?? 1) * 100)}%`;
+      meta.appendChild(retTag);
+
+      if (mem.autoExecCount > 0) {
+        const autoTag = document.createElement("span");
+        autoTag.className = "inst-tag";
+        autoTag.textContent = `免确认执行 ${mem.autoExecCount} 次`;
+        meta.appendChild(autoTag);
+      }
+
+      const dt = new Date(mem.updatedAt);
+      const timeEl = document.createElement("span");
+      timeEl.className = "agent-inst-item-time";
+      timeEl.textContent = `${String(dt.getMonth() + 1).padStart(2, "0")}-${String(
+        dt.getDate(),
+      ).padStart(2, "0")} ${String(dt.getHours()).padStart(2, "0")}:${String(
+        dt.getMinutes(),
+      ).padStart(2, "0")}`;
+      meta.appendChild(timeEl);
+
+      main.append(content, meta);
+
+      const actions = document.createElement("div");
+      actions.className = "agent-inst-item-actions";
+
+      const resetBtn = document.createElement("button");
+      resetBtn.type = "button";
+      resetBtn.className = "pi-skill-mini-btn";
+      resetBtn.textContent = "重置";
+      resetBtn.addEventListener("click", () => {
+        void this.handleResetMemory(mem.id);
+      });
+
+      const toggleBtn = document.createElement("button");
+      toggleBtn.type = "button";
+      toggleBtn.className = "pi-skill-mini-btn";
+      toggleBtn.textContent = mem.enabled ? "停用" : "启用";
+      toggleBtn.addEventListener("click", () => {
+        void this.handleToggleMemory(mem.id, !mem.enabled);
+      });
+
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "pi-skill-mini-btn is-danger";
+      delBtn.textContent = "删除";
+      delBtn.addEventListener("click", () => {
+        void this.handleDeleteMemory(mem.id);
+      });
+
+      actions.append(resetBtn, toggleBtn, delBtn);
+      row.append(main, actions);
+      list.appendChild(row);
+    }
+  }
+
+  private async handleToggleMemory(id: string, enabled: boolean): Promise<void> {
+    try {
+      const res = await apiPost<{ memories?: UiReinforcementMemory[]; agent?: unknown }>(
+        `/api/agent/memories/${encodeURIComponent(id)}/toggle`,
+        { enabled },
+      );
+      if (Array.isArray(res?.memories)) this.memoriesCache = res.memories;
+      if (res?.agent) this.piAgentPanel.applyAgentSnapshot(res.agent);
+      this.renderReinforcementMemories();
+      this.showToast(enabled ? "已启用该强化记忆" : "已停用该强化记忆", 1800);
+    } catch (err) {
+      this.showToast(`更新强化记忆失败：${err instanceof Error ? err.message : String(err)}`, 2800);
+    }
+  }
+
+  private async handleResetMemory(id: string): Promise<void> {
+    try {
+      const res = await apiPost<{ memories?: UiReinforcementMemory[]; agent?: unknown }>(
+        `/api/agent/memories/${encodeURIComponent(id)}/reset`,
+      );
+      if (Array.isArray(res?.memories)) this.memoriesCache = res.memories;
+      if (res?.agent) this.piAgentPanel.applyAgentSnapshot(res.agent);
+      this.renderReinforcementMemories();
+      this.showToast("已重置该记忆进度，下次触发将重新确认", 2000);
+    } catch (err) {
+      this.showToast(`重置强化记忆失败：${err instanceof Error ? err.message : String(err)}`, 2800);
+    }
+  }
+
+  private async handleDeleteMemory(id: string): Promise<void> {
+    try {
+      const res = await apiPost<{ memories?: UiReinforcementMemory[]; agent?: unknown }>(
+        `/api/agent/memories/${encodeURIComponent(id)}/delete`,
+      );
+      if (Array.isArray(res?.memories)) this.memoriesCache = res.memories;
+      if (res?.agent) this.piAgentPanel.applyAgentSnapshot(res.agent);
+      this.renderReinforcementMemories();
+      this.showToast("已删除该强化决策记忆", 1800);
+    } catch (err) {
+      this.showToast(`删除强化记忆失败：${err instanceof Error ? err.message : String(err)}`, 2800);
+    }
+  }
+
+  private async handleClearMemories(): Promise<void> {
+    try {
+      const res = await apiPost<{ memories?: UiReinforcementMemory[]; agent?: unknown }>(
+        "/api/agent/memories/clear",
+      );
+      this.memoriesCache = Array.isArray(res?.memories) ? res.memories : [];
+      if (res?.agent) this.piAgentPanel.applyAgentSnapshot(res.agent);
+      this.renderReinforcementMemories();
+      this.showToast("已清空全部强化决策记忆", 1800);
+    } catch (err) {
+      this.showToast(`清空强化记忆失败：${err instanceof Error ? err.message : String(err)}`, 2800);
     }
   }
 
@@ -6633,6 +6821,9 @@ export class MijiaDeckWebApp {
     });
     el("set-agent-instruction-voice-btn").addEventListener("click", () => {
       void this.handleVoiceRecordCustomInstruction();
+    });
+    document.getElementById("set-agent-memories-clear-btn")?.addEventListener("click", () => {
+      void this.handleClearMemories();
     });
 
     el("set-stt-clear-key-btn").addEventListener("click", () => {
