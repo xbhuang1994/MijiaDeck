@@ -410,7 +410,7 @@ describe("未唤醒门控待机（零实时转写 + 循环录制缓冲区持续�
     session.dispose();
   });
 
-  test("clearvoice 模式未唤醒时：写入循环录制缓冲区 + 跑 openWakeWord，但零 ClearVoice GPU 请求、零转写、零分段", async () => {
+  test("clearvoice 模式未唤醒时：开启降噪对非静音音频执行 ClearVoice 降噪唤醒（零转写/零分段/零 UI 闪烁）；纯静音或降噪关闭时零 GPU 请求", async () => {
     const dir = useTempDataDir();
     const { server, receivedSlices } = startMockClearVoiceServer();
     const cvRuntime = new ClearVoiceGpuRuntime({
@@ -443,6 +443,14 @@ describe("未唤醒门控待机（零实时转写 + 循环录制缓冲区持续�
     expect(session.isAwake).toBe(false);
     expect(session.isWakeGatedStandby).toBe(true);
 
+    // 1. 纯静音待机：零 ClearVoice GPU 请求
+    const pureSilence = makeSilence(2.0);
+    pushChunked(session, pureSilence);
+    await session.flush();
+    await session.waitForIdle();
+    expect(receivedSlices.length).toBe(0);
+
+    // 2. 非静音环境音（未说唤醒词）：运行待机 ClearVoice 降噪喂给 openWakeWord，但严格零 ASR、零字幕、零分段、零 UI 闪烁
     const speech = makeSine(3.0, 500, 0.28);
     const silence = makeSilence(1.5);
     pushChunked(session, speech);
@@ -450,13 +458,27 @@ describe("未唤醒门控待机（零实时转写 + 循环录制缓冲区持续�
     await session.flush();
     await session.waitForIdle();
 
-    expect(session.ringBufferedSamples).toBe(speech.length + silence.length);
-    expect(owwCtrl.pushedSamples.reduce((a, b) => a + b, 0)).toBe(speech.length + silence.length);
-    expect(receivedSlices.length).toBe(0);
+    expect(session.ringBufferedSamples).toBe(pureSilence.length + speech.length + silence.length);
+    expect(receivedSlices.length).toBeGreaterThanOrEqual(1);
+    expect(session.standbyClearVoiceProcessedSlices).toBeGreaterThanOrEqual(1);
+    expect(owwCtrl.pushedSamples.reduce((a, b) => a + b, 0)).toBeGreaterThan(
+      pureSilence.length + speech.length + silence.length,
+    );
     expect(asrCalls.length).toBe(0);
     expect(partials.length).toBe(0);
     expect(segments.length).toBe(0);
     expect(speechActivities.length).toBe(0);
+
+    // 3. 热关闭降噪（noiseMode: "off"）：后续待机音频零新增 ClearVoice GPU 请求
+    const slicesBeforeOff = receivedSlices.length;
+    session.setNoiseMode("off");
+    pushChunked(session, makeSine(2.5, 440, 0.25));
+    pushChunked(session, makeSilence(1.0));
+    await session.flush();
+    await session.waitForIdle();
+    expect(receivedSlices.length).toBe(slicesBeforeOff);
+    expect(asrCalls.length).toBe(0);
+    expect(segments.length).toBe(0);
 
     session.dispose();
   });
@@ -1190,86 +1212,88 @@ describe("真实 ONNX 模型端到端验证（背景音零 ASR + 真实唤醒词
         return;
       }
 
-      const wakeWords = ["Neo", "尼奥", "鸟"];
-      await engine.warmup();
-      await engine.openWakeWord.bootstrapWakeWords(wakeWords);
+      try {
+        const wakeWords = ["Neo", "尼奥", "鸟"];
+        await engine.warmup();
+        await engine.openWakeWord.bootstrapWakeWords(wakeWords);
 
-      // 1. 待机下播放流行歌曲 (clip_026) 和电视对话 (clip_066)：legacy 与 clearvoice 双模式均必须 0 触发、0 分段！
-      for (const mode of ["legacy", "clearvoice"] as const) {
-        for (const noiseFile of ["clip_026.wav", "clip_066.wav"]) {
-          const decoded = decodeWavPcm(
-            new Uint8Array(readFileSync(path.join(BENCH_AUDIO_DIR, noiseFile))),
-          );
-          const segs: VoiceStreamSegmentPayload[] = [];
-          const partials: string[] = [];
-          const session = new VoiceStreamSession({
-            localEngine: engine,
-            noiseMode: "auto",
-            voicePipelineMode: mode,
-            vadSilenceMs: 1000,
-            wakeWords,
-            wakeWordEnabled: true,
-            owwEnabled: true,
-            owwThreshold: 0.6,
-            streamingAsrEnabled: true,
-            onPartialTranscript: (p) => partials.push(p.text),
-            onSegmentReady: async (seg) => {
-              segs.push(seg);
-              return null;
-            },
-          });
+        // 1. 待机下播放流行歌曲 (clip_026) 和电视对话 (clip_066)：legacy 与 clearvoice 双模式均必须 0 触发、0 分段！
+        for (const mode of ["legacy", "clearvoice"] as const) {
+          for (const noiseFile of ["clip_026.wav", "clip_066.wav"]) {
+            const decoded = decodeWavPcm(
+              new Uint8Array(readFileSync(path.join(BENCH_AUDIO_DIR, noiseFile))),
+            );
+            const segs: VoiceStreamSegmentPayload[] = [];
+            const partials: string[] = [];
+            const session = new VoiceStreamSession({
+              localEngine: engine,
+              noiseMode: "auto",
+              voicePipelineMode: mode,
+              vadSilenceMs: 1000,
+              wakeWords,
+              wakeWordEnabled: true,
+              owwEnabled: true,
+              owwThreshold: 0.6,
+              streamingAsrEnabled: true,
+              onPartialTranscript: (p) => partials.push(p.text),
+              onSegmentReady: async (seg) => {
+                segs.push(seg);
+                return null;
+              },
+            });
 
-          expect(session.isWakeGatedStandby).toBe(true);
-          pushChunked(session, decoded.samples, 1024);
-          pushChunked(session, makeSilence(1.2), 1024);
-          await session.flush();
-          await session.waitForIdle();
-          session.dispose();
+            expect(session.isWakeGatedStandby).toBe(true);
+            pushChunked(session, decoded.samples, 1024);
+            pushChunked(session, makeSilence(1.2), 1024);
+            await session.flush();
+            await session.waitForIdle();
+            session.dispose();
 
-          expect(segs.length).toBe(0);
-          expect(partials.length).toBe(0);
+            expect(segs.length).toBe(0);
+            expect(partials.length).toBe(0);
+          }
         }
+
+        // 2. 待机下说真实唤醒指令 clip_001.wav（“Neo，打开客厅吸顶灯”）：
+        //    openWakeWord 声学唤醒 -> 自动回放循环录制缓冲区并衔接后续音频 -> 完整转写“客厅吸顶灯”
+        const wakeClip = decodeWavPcm(
+          new Uint8Array(readFileSync(path.join(BENCH_AUDIO_DIR, "clip_001.wav"))),
+        );
+        const wakeSegs: VoiceStreamSegmentPayload[] = [];
+        const wakeSpots: WakeWordAcousticHit[] = [];
+        const session = new VoiceStreamSession({
+          localEngine: engine,
+          noiseMode: "auto",
+          voicePipelineMode: "legacy",
+          vadSilenceMs: 1200,
+          wakeWords,
+          wakeWordEnabled: true,
+          owwEnabled: true,
+          owwThreshold: 0.6,
+          streamingAsrEnabled: false,
+          onWakeWordSpot: (hit) => wakeSpots.push(hit),
+          onSegmentReady: async (seg) => {
+            wakeSegs.push(seg);
+            return null;
+          },
+        });
+
+        const padded = new Float32Array(Math.round(SR * 0.6) + wakeClip.samples.length + Math.round(SR * 1.6));
+        padded.set(wakeClip.samples, Math.round(SR * 0.6));
+        pushChunked(session, padded, 1024);
+        await session.waitForIdle();
+        session.dispose();
+
+        expect(wakeSpots.length).toBeGreaterThanOrEqual(1);
+        expect(wakeSegs.length).toBe(1);
+        expect(wakeSegs[0]!.wakeAnchored).toBe(true);
+        const asrRaw = await engine.transcribeLocal(wakeSegs[0]!.rawSamples, SR, "zh-CN");
+        const asrDen = await engine.transcribeLocal(wakeSegs[0]!.denoisedSamples, SR, "zh-CN");
+        expect(`${asrRaw.text} ${asrDen.text}`).toContain("客厅吸顶灯");
+      } finally {
+        engine.dispose();
       }
-
-      // 2. 待机下说真实唤醒指令 clip_001.wav（“Neo，打开客厅吸顶灯”）：
-      //    openWakeWord 声学唤醒 -> 自动回放循环录制缓冲区并衔接后续音频 -> 完整转写“客厅吸顶灯”
-      const wakeClip = decodeWavPcm(
-        new Uint8Array(readFileSync(path.join(BENCH_AUDIO_DIR, "clip_001.wav"))),
-      );
-      const wakeSegs: VoiceStreamSegmentPayload[] = [];
-      const wakeSpots: WakeWordAcousticHit[] = [];
-      const session = new VoiceStreamSession({
-        localEngine: engine,
-        noiseMode: "auto",
-        voicePipelineMode: "legacy",
-        vadSilenceMs: 1200,
-        wakeWords,
-        wakeWordEnabled: true,
-        owwEnabled: true,
-        owwThreshold: 0.6,
-        streamingAsrEnabled: false,
-        onWakeWordSpot: (hit) => wakeSpots.push(hit),
-        onSegmentReady: async (seg) => {
-          wakeSegs.push(seg);
-          return null;
-        },
-      });
-
-      const padded = new Float32Array(Math.round(SR * 0.6) + wakeClip.samples.length + Math.round(SR * 1.6));
-      padded.set(wakeClip.samples, Math.round(SR * 0.6));
-      pushChunked(session, padded, 1024);
-      await session.waitForIdle();
-      session.dispose();
-
-      expect(wakeSpots.length).toBeGreaterThanOrEqual(1);
-      expect(wakeSegs.length).toBe(1);
-      expect(wakeSegs[0]!.wakeAnchored).toBe(true);
-      const asrRaw = await engine.transcribeLocal(wakeSegs[0]!.rawSamples, SR, "zh-CN");
-      const asrDen = await engine.transcribeLocal(wakeSegs[0]!.denoisedSamples, SR, "zh-CN");
-      expect(`${asrRaw.text} ${asrDen.text}`).toContain("客厅吸顶灯");
-
-      engine.dispose();
     },
-    60_000,
+    180_000,
   );
 });

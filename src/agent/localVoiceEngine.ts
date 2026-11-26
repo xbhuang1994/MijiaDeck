@@ -35,6 +35,7 @@ import {
   l2Normalize,
   resampleLinear,
   spectralSubtractDenoise,
+  StreamingDspDenoiser,
 } from "./audioPcm.ts";
 import {
   LocalTtsEngine,
@@ -932,65 +933,75 @@ export class LocalVoiceEngine {
   }
 
   /**
-   * 为连续 WebSocket 音频流创建独立的实时流式神经降噪器（GTCRN / DPDFNet4 / VoxLock）。
+   * 为连续 WebSocket 音频流创建独立的实时流式降噪器（GTCRN / DPDFNet4 / VoxLock / 纯 TS 频谱维纳 DSP 降级）。
    */
   createOnlineDenoiser(
     mode: NoiseSuppressionMode = "auto",
-  ): { denoiser: OnlineDenoiserHandleLike; engine: "gtcrn" | "dpdfnet4" | "voxlock" } | null {
-    if (mode === "off" || mode === "dsp") return null;
+  ): { denoiser: OnlineDenoiserHandleLike; engine: "gtcrn" | "dpdfnet4" | "voxlock" | "dsp" } | null {
+    if (mode === "off") return null;
+    if (mode === "dsp") {
+      return {
+        engine: "dsp",
+        denoiser: new StreamingDspDenoiser(16000),
+      };
+    }
     const sherpa = loadSherpaModule();
     const p = this.paths;
-    if (!sherpa || typeof sherpa.OnlineSpeechDenoiser !== "function") return null;
-
-    try {
-      if (mode === "voxlock" && existsSync(p.voxlockEnroll) && existsSync(p.voxlockChunk)) {
-        const refPath = getPrimaryOwnerRefWavPath();
-        return {
-          engine: "voxlock",
-          denoiser: new sherpa.OnlineSpeechDenoiser({
-            model: {
-              voxlock: {
-                enrollModel: p.voxlockEnroll,
-                chunkModel: p.voxlockChunk,
-                ...(refPath && existsSync(refPath) ? { voiceSample: refPath } : {}),
+    if (sherpa && typeof sherpa.OnlineSpeechDenoiser === "function") {
+      try {
+        if (mode === "voxlock" && existsSync(p.voxlockEnroll) && existsSync(p.voxlockChunk)) {
+          const refPath = getPrimaryOwnerRefWavPath();
+          return {
+            engine: "voxlock",
+            denoiser: new sherpa.OnlineSpeechDenoiser({
+              model: {
+                voxlock: {
+                  enrollModel: p.voxlockEnroll,
+                  chunkModel: p.voxlockChunk,
+                  ...(refPath && existsSync(refPath) ? { voiceSample: refPath } : {}),
+                },
+                numThreads: this._numThreads(),
+                debug: false,
+                provider: "cpu",
               },
-              numThreads: this._numThreads(),
-              debug: false,
-              provider: "cpu",
-            },
-          }),
-        };
+            }),
+          };
+        }
+        if (mode === "dpdfnet" && existsSync(p.dpdfnet4)) {
+          return {
+            engine: "dpdfnet4",
+            denoiser: new sherpa.OnlineSpeechDenoiser({
+              model: {
+                dpdfnet: { model: p.dpdfnet4 },
+                numThreads: this._denoiserThreads(),
+                debug: false,
+                provider: "cpu",
+              },
+            }),
+          };
+        }
+        if (existsSync(p.gtcrn)) {
+          return {
+            engine: "gtcrn",
+            denoiser: new sherpa.OnlineSpeechDenoiser({
+              model: {
+                gtcrn: { model: p.gtcrn },
+                numThreads: this._denoiserThreads(),
+                debug: false,
+                provider: "cpu",
+              },
+            }),
+          };
+        }
+      } catch (err) {
+        this._lastError = err instanceof Error ? err.message : String(err);
       }
-      if (mode === "dpdfnet" && existsSync(p.dpdfnet4)) {
-        return {
-          engine: "dpdfnet4",
-          denoiser: new sherpa.OnlineSpeechDenoiser({
-            model: {
-              dpdfnet: { model: p.dpdfnet4 },
-              numThreads: this._denoiserThreads(),
-              debug: false,
-              provider: "cpu",
-            },
-          }),
-        };
-      }
-      if (existsSync(p.gtcrn)) {
-        return {
-          engine: "gtcrn",
-          denoiser: new sherpa.OnlineSpeechDenoiser({
-            model: {
-              gtcrn: { model: p.gtcrn },
-              numThreads: this._denoiserThreads(),
-              debug: false,
-              provider: "cpu",
-            },
-          }),
-        };
-      }
-    } catch (err) {
-      this._lastError = err instanceof Error ? err.message : String(err);
     }
-    return null;
+    // 无原生 ONNX 降噪模型时自动降级到连续流式 DSP 频谱维纳降噪，确保待机/对话永不退化为零降噪
+    return {
+      engine: "dsp",
+      denoiser: new StreamingDspDenoiser(16000),
+    };
   }
 
   /**
