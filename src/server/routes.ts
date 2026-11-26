@@ -16,6 +16,7 @@ import {
   Qwen3AsrGpuRuntime,
   resolveQwen3AsrGatewayEndpoints,
 } from "../agent/qwen3AsrGpuRuntime.ts";
+import { XfyunIatV2Runtime } from "../agent/xfyunIatV2Runtime.ts";
 import {
   addCustomInstruction,
   clearCustomInstructions,
@@ -202,7 +203,7 @@ export class HttpError extends Error {
 }
 
 const SECRET_PATTERNS: ReadonlyArray<RegExp> = [
-  /(serviceToken|ssecurity|passToken|cUserId|userId|p2p_id|init_string|authorization|cookie|api[_-]?key|sttApiKey|systemOneApiKey|clearVoiceApiKey|qwen3AsrApiKey|x-auth-code|accessSecret|localKey|refreshToken|authToken|accessToken|password)\s*[:=]\s*[^\s,;'"&}]+/gi,
+  /(serviceToken|ssecurity|passToken|cUserId|userId|p2p_id|init_string|authorization|cookie|api[_-]?key|api[_-]?secret|sttApiKey|systemOneApiKey|clearVoiceApiKey|qwen3AsrApiKey|xfyunApiKey|xfyunApiSecret|x-auth-code|accessSecret|localKey|refreshToken|authToken|accessToken|password)\s*[:=]\s*[^\s,;'"&}]+/gi,
   /Bearer\s+[A-Za-z0-9._~+/=-]+/gi,
   /JWT\s+[A-Za-z0-9._~+/=-]+/gi,
   /sk-[A-Za-z0-9_\-]{8,}/g,
@@ -2877,6 +2878,54 @@ export function createRequestHandler(
                 endpoints: resolveQwen3AsrGatewayEndpoints(qwenAuth.serviceUrl),
               }
             : null,
+        });
+      }
+
+      if (method === "POST" && pathname === "/api/voice/xfyun/test") {
+        const cfgStore = runtime.agentConfigStore ?? agentConfigStoreModule;
+        const saved = runtime.piAgent ? runtime.piAgent.config : cfgStore.loadAgentVoiceConfig();
+        const body = await readJsonBody(req);
+        const tempCfg = cfgStore.normalizeAgentVoiceConfig({
+          ...saved,
+          xfyunEndpointUrl:
+            typeof body.xfyunEndpointUrl === "string" && body.xfyunEndpointUrl.trim()
+              ? body.xfyunEndpointUrl.trim()
+              : saved.xfyunEndpointUrl,
+          xfyunAppId:
+            typeof body.xfyunAppId === "string"
+              ? body.xfyunAppId.trim()
+              : saved.xfyunAppId,
+          xfyunApiKey:
+            body.clearXfyunApiKey === true
+              ? ""
+              : typeof body.xfyunApiKey === "string" && body.xfyunApiKey.trim()
+                ? body.xfyunApiKey.trim()
+                : saved.xfyunApiKey,
+          xfyunApiSecret:
+            body.clearXfyunApiSecret === true
+              ? ""
+              : typeof body.xfyunApiSecret === "string" && body.xfyunApiSecret.trim()
+                ? body.xfyunApiSecret.trim()
+                : saved.xfyunApiSecret,
+        });
+        const xfyunAuth = cfgStore.resolveEffectiveXfyunAuth(tempCfg);
+        if (!xfyunAuth.configured) {
+          throw new HttpError(400, "请先完整填写讯飞 APPID、APIKey 与 APISecret");
+        }
+        const probe = new XfyunIatV2Runtime({
+          endpointUrl: xfyunAuth.endpointUrl,
+          appId: xfyunAuth.appId,
+          apiKey: xfyunAuth.apiKey,
+          apiSecret: xfyunAuth.apiSecret,
+        });
+        const result = await probe.testConnection({ timeoutMs: 8000 });
+        probe.dispose();
+        return jsonResponse({
+          ok: result.ok,
+          latencyMs: result.latencyMs,
+          sid: result.sid,
+          endpointUrl: result.endpointUrl,
+          ...(result.error ? { error: sanitizeErrorMessage(result.error) } : {}),
         });
       }
 

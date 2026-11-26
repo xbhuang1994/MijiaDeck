@@ -293,7 +293,7 @@
         <button type="button" id="pi-voice-oneshot-btn" class="secondary-button btn-compact" title="免唤醒单次语音输入（快捷键 Alt+V）">单次说话</button>
         <button type="button" id="pi-voice-wake-toggle-btn" class="pi-wake-pill active" title="点击切换唤醒词模式或免唤醒直达模式">唤醒词：小派</button>
         <button type="button" id="pi-streaming-toggle-btn" class="pi-wake-pill active" title="点击快速开启或关闭实时流式转写与智能断句">流式：开</button>
-        <button type="button" id="pi-voice-pipeline-toggle-btn" class="pi-wake-pill" title="点击切换原方案与在线 ClearVoice 多轨切片 + 在线 Qwen3-ASR 新方案">方案：原方案</button>
+        <button type="button" id="pi-voice-pipeline-toggle-btn" class="pi-wake-pill" title="点击循环切换语音方案：原方案 / ClearVoice 多轨方案 / 讯飞听写大模型 2.0">方案：原方案</button>
         <button type="button" id="pi-caveman-toggle-btn" class="pi-caveman-pill active" title="点击切换语音与文字回复风格">自然 · Lite</button>
         <select id="pi-thinking-level-select" class="pi-thinking-select" aria-label="AI 思考等级" title="设置 AI 思考等级（思考过程显示在对话框，不语音播报）">
           <option value="off">思考：关</option>
@@ -837,6 +837,7 @@
                 <span class="voice-badge-pill" id="badge-model-qwen3-asr">Qwen3-ASR 0.6B (在线)</span>
                 <span class="voice-badge-pill" id="badge-model-clearvoice">ClearVoice SE (在线)</span>
                 <span class="voice-badge-pill" id="badge-model-clearvoice-ss">ClearVoice BSS (在线)</span>
+                <span class="voice-badge-pill" id="badge-model-xfyun-iat">讯飞听写 2.0 (在线)</span>
                 <span class="voice-badge-pill" id="badge-model-asr">SenseVoice (备用)</span>
                 <span class="voice-badge-pill" id="badge-model-gtcrn">GTCRN 降噪</span>
                 <span class="voice-badge-pill" id="badge-model-dpdfnet">DPDFNet4 强噪</span>
@@ -888,13 +889,38 @@
 
           <div class="setting-card" id="setting-row-clearvoice-pipeline">
             <div class="setting-info">
-              <div class="setting-label">在线 ClearVoice 多轨盲源分离与降噪方案（MossFormer2 BSS+SE → 分轨独立处理）</div>
-              <div class="setting-desc" id="set-voice-clearvoice-desc">开启后调用在线 ClearVoice（MossFormer2_SS_16K 盲源分离 + 分轨 MossFormer2_SE_48K 降噪与剔除背景音）产出独立多轨音频，每条音轨独立执行声纹识别、在线 Qwen3-ASR 转文字、逻辑判定与后续流程，并在界面分轨展示（严禁混杂成单轨）；未配置在线网关或关闭则使用原方案</div>
+              <div class="setting-label">语音前端与识别方案</div>
+              <div class="setting-desc" id="set-voice-clearvoice-desc">可在原方案（GTCRN/声源分离）、在线 ClearVoice 多轨方案（MossFormer2 BSS+SE → 分轨独立处理）与讯飞语音听写大模型 2.0 方案（openWakeWord 唤醒后直接推送原始音频至讯飞 WebSocket，不做额外处理）间自由切换</div>
             </div>
-            <label class="md-switch">
-              <input type="checkbox" id="set-voice-clearvoice-enabled" aria-label="切换在线 ClearVoice 新方案或原方案">
-              <span class="md-switch-track"></span>
-            </label>
+            <select id="set-voice-pipeline-mode" class="md-select" aria-label="语音前端与识别方案">
+              <option value="legacy">原方案（GTCRN / 声源分离 + Qwen3-ASR / SenseVoice）</option>
+              <option value="clearvoice">ClearVoice 多轨方案（MossFormer2 BSS+SE → 分轨独立处理）</option>
+              <option value="xfyun">讯飞语音听写大模型 2.0（openWakeWord 唤醒后直推原始音频）</option>
+            </select>
+            <input type="checkbox" id="set-voice-clearvoice-enabled" hidden aria-hidden="true" tabindex="-1">
+          </div>
+
+          <div class="setting-card setting-card-wrap" id="setting-row-xfyun-iat">
+            <div class="setting-info">
+              <div class="setting-label">讯飞语音听写大模型 2.0 配置（Spark ASR V2 WebSocket）</div>
+              <div class="setting-desc" id="set-voice-xfyun-desc">切换至「讯飞语音听写大模型 2.0」方案后，openWakeWord 命中唤醒词即刻直推 16kHz 原始音频至讯飞 WebSocket（无需降噪或额外处理），支持动态修正实时出字与服务端自动判停；密钥仅保存于本机配置文件</div>
+            </div>
+            <div class="systemone-grid">
+              <div class="systemone-row">
+                <input type="text" id="set-xfyun-endpoint-url" class="md-text-input" placeholder="WebSocket 服务地址（默认 wss://iat.cn-huabei-1.xf-yun.com/v1）" spellcheck="false" aria-label="讯飞听写 WebSocket 服务地址">
+                <input type="text" id="set-xfyun-appid" class="md-text-input" placeholder="讯飞 APPID" autocomplete="off" spellcheck="false" aria-label="讯飞 APPID">
+              </div>
+              <div class="agent-key-row">
+                <input type="password" id="set-xfyun-api-key" class="md-text-input" placeholder="讯飞 APIKey（留空保持不变）" autocomplete="off" aria-label="讯飞 APIKey">
+                <button type="button" id="set-xfyun-clear-key-btn" class="secondary-button btn-compact" hidden>清除</button>
+              </div>
+              <div class="agent-key-row">
+                <input type="password" id="set-xfyun-api-secret" class="md-text-input" placeholder="讯飞 APISecret（留空保持不变）" autocomplete="off" aria-label="讯飞 APISecret">
+                <button type="button" id="set-xfyun-clear-secret-btn" class="secondary-button btn-compact" hidden>清除</button>
+                <button type="button" id="set-xfyun-test-btn" class="secondary-button btn-compact" title="测试讯飞语音听写大模型 2.0 WebSocket 鉴权与连通性">测试连接</button>
+              </div>
+              <div id="set-xfyun-test-result" class="agent-inst-status" hidden></div>
+            </div>
           </div>
 
           <div class="setting-card setting-card-wrap" id="setting-row-voice-gateway">
