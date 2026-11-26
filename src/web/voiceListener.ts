@@ -17,7 +17,7 @@ export type ClientVoiceMode = "idle" | "listening" | "awake" | "processing" | "s
 export interface ClientVoiceConfig {
   voiceEnabled: boolean;
   voiceEngine: "auto" | "local" | "browser" | "whisper";
-  voicePipelineMode?: "legacy" | "clearvoice" | "xfyun";
+  voicePipelineMode?: "legacy" | "clearvoice" | "xfyun" | "voice-ws";
   clearVoiceServiceUrl?: string;
   clearVoiceModel?: string;
   qwen3AsrServiceUrl?: string;
@@ -25,6 +25,10 @@ export interface ClientVoiceConfig {
   xfyunEndpointUrl?: string;
   xfyunAppId?: string;
   effectiveXfyunConfigured?: boolean;
+  voiceWsAsrEndpointUrl?: string;
+  voiceWsAsrDenoise?: boolean;
+  voiceWsAsrLanguage?: string;
+  effectiveVoiceWsAsrConfigured?: boolean;
   localAsrEngine?: "auto" | "qwen3-asr" | "sensevoice";
   qwen3StreamingEnabled?: boolean;
   voiceLang: string;
@@ -61,6 +65,7 @@ export interface ClientVoiceConfig {
   effectiveSttConfigured: boolean;
   localAsrReady?: boolean;
   xfyunIatReady?: boolean;
+  voiceWsAsrReady?: boolean;
   localTtsReady?: boolean;
 }
 
@@ -1891,9 +1896,13 @@ export class VoiceListenerClient {
     const hasMic = isMicrophoneAudioSupported();
     const hasSpeech = isBrowserSpeechSupported();
     const xfyunReady = Boolean(this.config.xfyunIatReady || this.config.effectiveXfyunConfigured);
+    const voiceWsReady = Boolean(
+      this.config.voiceWsAsrReady || this.config.effectiveVoiceWsAsrConfigured,
+    );
     const localReady =
       Boolean(this.config.localAsrReady) ||
-      (this.config.voicePipelineMode === "xfyun" && xfyunReady);
+      (this.config.voicePipelineMode === "xfyun" && xfyunReady) ||
+      (this.config.voicePipelineMode === "voice-ws" && voiceWsReady);
 
     if (pref === "local") {
       return hasMic ? "local" : hasSpeech ? "browser" : null;
