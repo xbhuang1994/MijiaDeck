@@ -493,7 +493,8 @@ export async function startMijiaDeckServer(
         }
         if (
           streamOpts?.voicePipelineMode === "legacy" ||
-          streamOpts?.voicePipelineMode === "clearvoice"
+          streamOpts?.voicePipelineMode === "clearvoice" ||
+          streamOpts?.voicePipelineMode === "xfyun"
         ) {
           stream.setVoicePipelineMode(streamOpts.voicePipelineMode);
         }
