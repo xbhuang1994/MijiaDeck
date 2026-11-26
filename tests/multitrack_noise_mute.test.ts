@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { decodeWavPcm, encodeWavPcm16 } from "../src/agent/audioPcm.ts";
 import { ClearVoiceGpuRuntime } from "../src/agent/clearVoiceGpuRuntime.ts";
 import {
   ConversationTrackMuteManager,
@@ -487,19 +488,18 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
     const vadCalls: number[] = [];
     const asrCalls: number[] = [];
     const fakeEngine = {
-      clearVoiceGpu: new ClearVoiceGpuRuntime({ modelsDir: tmpDir }),
+      clearVoiceGpu: new ClearVoiceGpuRuntime(),
       openWakeWord: { isReady: false, getStatus: () => ({ ready: false, prototypeCount: 0 }) },
       sourceSeparator: { warmupAsync: async () => {} },
       tts: { getStatus: () => ({ ready: false, addonAvailable: false, readyVoices: [], activeVoice: null }) },
       setPreferredAsrEngine: () => {},
-      setQwen3ComputeDevice: () => {},
       setClearVoiceServiceUrl: () => {},
       getStatus: () => ({
         readyForLocalAsr: true,
         readyForClearVoiceGpu: true,
         readyForClearVoiceBss: true,
         readyForVoiceprint: false,
-        clearVoice: new ClearVoiceGpuRuntime({ modelsDir: tmpDir }).getStatus(),
+        clearVoice: new ClearVoiceGpuRuntime().getStatus(),
       }),
       detectSpeechSegments: (samples: Float32Array) => {
         const hz = estimateDominantZeroCrossingHz(samples, 16000);
@@ -532,7 +532,7 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
           lang: "zh",
           emotion: "",
           event: "",
-          engine: "qwen3-asr-gpu",
+          engine: "qwen3-asr-remote",
           durationMs: 35,
         };
       },
@@ -551,7 +551,7 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
           { trackId: "cv_track_2", trackIndex: 2, sourceSlot: 1, samples: track2Audio, energyRatio: 0.45 },
         ],
         {
-          denoiseEngine: "clearvoice-mossformer2-bss-se-gpu",
+          denoiseEngine: "clearvoice-mossformer2-bss-se-remote",
           bssUsed: true,
           inputSnrDb: 8,
           denoiseMs: 40,
@@ -595,7 +595,7 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
           { trackId: "cv_track_2", trackIndex: 2, sourceSlot: 1, samples: track2Audio, energyRatio: 0.45 },
         ],
         {
-          denoiseEngine: "clearvoice-mossformer2-bss-se-gpu",
+          denoiseEngine: "clearvoice-mossformer2-bss-se-remote",
           bssUsed: true,
           inputSnrDb: 8,
           denoiseMs: 40,
@@ -628,7 +628,7 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
           { trackId: "cv_track_2", trackIndex: 2, sourceSlot: 1, samples: track2Audio, energyRatio: 0.45 },
         ],
         {
-          denoiseEngine: "clearvoice-mossformer2-bss-se-gpu",
+          denoiseEngine: "clearvoice-mossformer2-bss-se-remote",
           bssUsed: true,
           inputSnrDb: 8,
           denoiseMs: 40,
@@ -681,19 +681,18 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
     let turn = 1;
     const asrCalls: number[] = [];
     const fakeEngine = {
-      clearVoiceGpu: new ClearVoiceGpuRuntime({ modelsDir: tmpDir }),
+      clearVoiceGpu: new ClearVoiceGpuRuntime(),
       openWakeWord: { isReady: false, getStatus: () => ({ ready: false, prototypeCount: 0 }) },
       sourceSeparator: { warmupAsync: async () => {} },
       tts: { getStatus: () => ({ ready: false, addonAvailable: false, readyVoices: [], activeVoice: null }) },
       setPreferredAsrEngine: () => {},
-      setQwen3ComputeDevice: () => {},
       setClearVoiceServiceUrl: () => {},
       getStatus: () => ({
         readyForLocalAsr: true,
         readyForClearVoiceGpu: true,
         readyForClearVoiceBss: true,
         readyForVoiceprint: false,
-        clearVoice: new ClearVoiceGpuRuntime({ modelsDir: tmpDir }).getStatus(),
+        clearVoice: new ClearVoiceGpuRuntime().getStatus(),
       }),
       detectSpeechSegments: (samples: Float32Array) => ({
         hasSpeech: true,
@@ -719,7 +718,7 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
           lang: "zh",
           emotion: "",
           event: "",
-          engine: "qwen3-asr-gpu",
+          engine: "qwen3-asr-remote",
           durationMs: 25,
         };
       },
@@ -738,7 +737,7 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
           { trackId: "cv_track_2", trackIndex: 2, sourceSlot: 1, samples: track2Audio },
         ],
         {
-          denoiseEngine: "clearvoice-mossformer2-bss-se-gpu",
+          denoiseEngine: "clearvoice-mossformer2-bss-se-remote",
           bssUsed: true,
           inputSnrDb: 8,
           denoiseMs: 30,
@@ -761,7 +760,7 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
           { trackId: "cv_track_2", trackIndex: 2, sourceSlot: 1, samples: track2Audio },
         ],
         {
-          denoiseEngine: "clearvoice-mossformer2-bss-se-gpu",
+          denoiseEngine: "clearvoice-mossformer2-bss-se-remote",
           bssUsed: true,
           inputSnrDb: 8,
           denoiseMs: 30,
@@ -814,19 +813,18 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
     let turn = 1;
     const asrCalls: number[] = [];
     const fakeEngine = {
-      clearVoiceGpu: new ClearVoiceGpuRuntime({ modelsDir: tmpDir }),
+      clearVoiceGpu: new ClearVoiceGpuRuntime(),
       openWakeWord: { isReady: false, getStatus: () => ({ ready: false, prototypeCount: 0 }) },
       sourceSeparator: { warmupAsync: async () => {} },
       tts: { getStatus: () => ({ ready: false, addonAvailable: false, readyVoices: [], activeVoice: null }) },
       setPreferredAsrEngine: () => {},
-      setQwen3ComputeDevice: () => {},
       setClearVoiceServiceUrl: () => {},
       getStatus: () => ({
         readyForLocalAsr: true,
         readyForClearVoiceGpu: true,
         readyForClearVoiceBss: true,
         readyForVoiceprint: false,
-        clearVoice: new ClearVoiceGpuRuntime({ modelsDir: tmpDir }).getStatus(),
+        clearVoice: new ClearVoiceGpuRuntime().getStatus(),
       }),
       detectSpeechSegments: (samples: Float32Array) => ({
         hasSpeech: true,
@@ -854,7 +852,7 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
           lang: "zh",
           emotion: "",
           event: "",
-          engine: "qwen3-asr-gpu",
+          engine: "qwen3-asr-remote",
           durationMs: 20,
         };
       },
@@ -874,7 +872,7 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
           { trackId: "cv_track_2", trackIndex: 2, sourceSlot: 1, samples: track2Audio },
         ],
         {
-          denoiseEngine: "clearvoice-mossformer2-bss-se-gpu",
+          denoiseEngine: "clearvoice-mossformer2-bss-se-remote",
           bssUsed: true,
           inputSnrDb: 8,
           denoiseMs: 25,
@@ -894,7 +892,7 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
           { trackId: "cv_track_2", trackIndex: 2, sourceSlot: 1, samples: track2Audio },
         ],
         {
-          denoiseEngine: "clearvoice-mossformer2-bss-se-gpu",
+          denoiseEngine: "clearvoice-mossformer2-bss-se-remote",
           bssUsed: true,
           inputSnrDb: 8,
           denoiseMs: 25,
@@ -916,7 +914,7 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
           { trackId: "cv_track_2", trackIndex: 2, sourceSlot: 1, samples: track2Audio },
         ],
         {
-          denoiseEngine: "clearvoice-mossformer2-bss-se-gpu",
+          denoiseEngine: "clearvoice-mossformer2-bss-se-remote",
           bssUsed: true,
           inputSnrDb: 8,
           denoiseMs: 25,
@@ -966,19 +964,18 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
     });
 
     const fakeEngine = {
-      clearVoiceGpu: new ClearVoiceGpuRuntime({ modelsDir: tmpDir }),
+      clearVoiceGpu: new ClearVoiceGpuRuntime(),
       openWakeWord: { isReady: false, getStatus: () => ({ ready: false, prototypeCount: 0 }) },
       sourceSeparator: { warmupAsync: async () => {} },
       tts: { getStatus: () => ({ ready: false, addonAvailable: false, readyVoices: [], activeVoice: null }) },
       setPreferredAsrEngine: () => {},
-      setQwen3ComputeDevice: () => {},
       setClearVoiceServiceUrl: () => {},
       getStatus: () => ({
         readyForLocalAsr: true,
         readyForClearVoiceGpu: true,
         readyForClearVoiceBss: true,
         readyForVoiceprint: false,
-        clearVoice: new ClearVoiceGpuRuntime({ modelsDir: tmpDir }).getStatus(),
+        clearVoice: new ClearVoiceGpuRuntime().getStatus(),
       }),
       detectSpeechSegments: (samples: Float32Array) => ({
         hasSpeech: true,
@@ -1000,7 +997,7 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
           lang: "zh",
           emotion: "",
           event: "",
-          engine: "qwen3-asr-gpu",
+          engine: "qwen3-asr-remote",
           durationMs: 20,
         };
       },
@@ -1017,7 +1014,7 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
       await controller.processClearVoiceSeparatedTracks(
         [{ trackId: "cv_track_1", trackIndex: 1, sourceSlot: 0, samples: track2Audio }],
         {
-          denoiseEngine: "clearvoice-mossformer2-gpu",
+          denoiseEngine: "clearvoice-mossformer2-remote",
           bssUsed: false,
           inputSnrDb: 10,
           denoiseMs: 20,
@@ -1037,7 +1034,7 @@ describe("VoiceListenerController 多轨屏蔽集成测试", () => {
           { trackId: "cv_track_2", trackIndex: 2, sourceSlot: 1, samples: track2Audio },
         ],
         {
-          denoiseEngine: "clearvoice-mossformer2-bss-se-gpu",
+          denoiseEngine: "clearvoice-mossformer2-bss-se-remote",
           bssUsed: true,
           inputSnrDb: 8,
           denoiseMs: 25,
@@ -1091,7 +1088,7 @@ describe("VoiceStreamSession 实时多轨流式预览超 20 字即时屏蔽与�
       systemOneApiKey: "mock-key",
     });
 
-    // Mock ClearVoice GPU 多轨服务：2 轨（320Hz 用户 + 880Hz 电视）
+    // Mock 在线 ClearVoice 多轨网关：2 轨（320Hz 用户 + 880Hz 电视）
     let sepCount = 0;
     let totalSamples = 0;
     mockCvServer = Bun.serve({
@@ -1101,37 +1098,56 @@ describe("VoiceStreamSession 实时多轨流式预览超 20 字即时屏蔽与�
         const u = new URL(req.url);
         if (u.pathname === "/health") {
           return Response.json({
-            ok: true,
-            model: "MossFormer2_SE_48K",
-            ssReady: true,
-            ssModel: "MossFormer2_SS_16K",
-            provider: "CUDAExecutionProvider",
-            ssProvider: "CUDAExecutionProvider",
-            device: "gpu",
-            ssDevice: "gpu",
-            warmedUp: true,
+            status: "ok",
+            upstreams: {
+              clearvoice: {
+                status: "ok",
+                details: {
+                  status: "ok",
+                  gpu_name: "Mock Online GPU",
+                  loaded_models: [
+                    { name: "MossFormer2_SE_48K", task: "speech_enhancement" },
+                    { name: "MossFormer2_SS_16K", task: "speech_separation" },
+                  ],
+                },
+              },
+            },
           });
         }
-        if (u.pathname === "/separate") {
-          const buf = await req.arrayBuffer();
-          const n = new Float32Array(buf).length;
+        if (u.pathname === "/clearvoice/v1/enhance") {
+          const form = await req.formData();
+          const file = form.get("file") as Blob;
+          const decoded = decodeWavPcm(new Uint8Array(await file.arrayBuffer()));
+          const outWav = encodeWavPcm16(decoded.samples, decoded.sampleRate);
+          return new Response(new Uint8Array(outWav), {
+            status: 200,
+            headers: {
+              "Content-Type": "audio/wav",
+              "X-ClearVoice-Model": "MossFormer2_SE_48K",
+              "X-Elapsed-Ms": "12.0",
+            },
+          });
+        }
+        if (u.pathname === "/clearvoice/v1/separate") {
+          const form = await req.formData();
+          const file = form.get("file") as Blob;
+          const decoded = decodeWavPcm(new Uint8Array(await file.arrayBuffer()));
+          const n = decoded.samples.length;
+          const sr = decoded.sampleRate;
           const idx = sepCount++;
           const startPos = idx === 0 ? 0 : Math.max(0, totalSamples - 4800);
           totalSamples = startPos + n;
-          const tUser = makeSineSlice(startPos, n, 16000, 320, 0.26);
-          const tTv = makeSineSlice(startPos, n, 16000, 880, 0.22);
-          const packed = new Float32Array(n * 2);
-          packed.set(tUser, 0);
-          packed.set(tTv, n);
-          return new Response(new Uint8Array(packed.buffer), {
-            status: 200,
-            headers: {
-              "Content-Type": "application/octet-stream",
-              "X-ClearVoice-Track-Count": "2",
-              "X-ClearVoice-Samples-Per-Track": String(n),
-              "X-ClearVoice-SS-Available": "1",
-              "X-ClearVoice-Device": "gpu",
-            },
+          const tUser = makeSineSlice(startPos, n, sr, 320, 0.26);
+          const tTv = makeSineSlice(startPos, n, sr, 880, 0.22);
+          return Response.json({
+            task: "speech_separation",
+            model: "MossFormer2_SS_16K",
+            elapsed_ms: 25.0,
+            speakers: [tUser, tTv].map((tr, spIdx) => ({
+              speaker: spIdx + 1,
+              sample_rate: sr,
+              audio_base64: Buffer.from(encodeWavPcm16(tr, sr)).toString("base64"),
+            })),
           });
         }
         return new Response("not found", { status: 404 });
@@ -1139,7 +1155,6 @@ describe("VoiceStreamSession 实时多轨流式预览超 20 字即时屏蔽与�
     });
 
     const cvRuntime = new ClearVoiceGpuRuntime({
-      modelsDir: tmpDir,
       serviceUrl: `http://127.0.0.1:${mockCvServer.port}`,
     });
 
@@ -1150,14 +1165,13 @@ describe("VoiceStreamSession 实时多轨流式预览超 20 字即时屏蔽与�
       sourceSeparator: { warmupAsync: async () => {} },
       tts: { getStatus: () => ({ ready: false, addonAvailable: false, readyVoices: [], activeVoice: null }) },
       setPreferredAsrEngine: () => {},
-      setQwen3ComputeDevice: () => {},
       setClearVoiceServiceUrl: () => {},
       createOnlineDenoiser: () => null,
       createStreamingVad: () => createEnergyMockVad(0.02),
       createWakeWordStream: () => null,
       getStatus: () => ({
         readyForLocalAsr: true,
-        activeQwen3Device: "gpu",
+        activeQwen3Device: "remote",
         readyForClearVoiceGpu: true,
         readyForClearVoiceBss: true,
         readyForVoiceprint: false,
@@ -1185,9 +1199,9 @@ describe("VoiceStreamSession 实时多轨流式预览超 20 字即时屏蔽与�
           lang: "zh",
           emotion: "",
           event: "",
-          engine: "qwen3-asr-gpu",
+          engine: "qwen3-asr-remote",
           durationMs: 30,
-          computeDevice: "gpu",
+          computeDevice: "remote",
         };
       },
       denoise: (s: Float32Array) => ({
@@ -1233,8 +1247,14 @@ describe("VoiceStreamSession 实时多轨流式预览超 20 字即时屏蔽与�
         },
       });
 
-      // 连续推入 4.5s 语音（在 2.0s 与 4.0s 分别触发 2 次流式预览切片）+ 静音收尾
-      session.pushFloat32Samples(makeSine(4.5, 16000, 500, 0.25));
+      // 连续推入 4.5s 双人叠加语音（320Hz 用户 + 880Hz 电视，在 2.0s 与 4.0s 分别触发 2 次流式预览切片）+ 静音收尾
+      const mixUser = makeSine(4.5, 16000, 320, 0.26);
+      const mixTv = makeSine(4.5, 16000, 880, 0.22);
+      const mixed45 = new Float32Array(mixUser.length);
+      for (let i = 0; i < mixed45.length; i += 1) {
+        mixed45[i] = mixUser[i]! + mixTv[i]!;
+      }
+      session.pushFloat32Samples(mixed45);
       session.pushFloat32Samples(new Float32Array(Math.round(16000 * 0.4)));
       await session.flush();
       await session.waitForIdle();

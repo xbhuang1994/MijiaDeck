@@ -572,7 +572,6 @@ describe("PiAgentService Smart Immediate Ack via SystemOne", () => {
       },
       getStatus: () => ({ readyForLocalAsr: false, readyForSourceSeparation: false }),
       setPreferredAsrEngine: () => {},
-      setQwen3ComputeDevice: () => {},
       dispose: () => {},
     } as any;
 

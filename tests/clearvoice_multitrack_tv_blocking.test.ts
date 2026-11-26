@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { decodeWavPcm, l2Normalize } from "../src/agent/audioPcm.ts";
+import { decodeWavPcm, encodeWavPcm16, l2Normalize } from "../src/agent/audioPcm.ts";
 import {
   alignSeparatedTracksWithPrevTails,
   ClearVoiceMultiTrackEndpointTracker,
@@ -80,7 +80,7 @@ function makeAsrOut(text: string, durationMs = 5): LocalAsrOutput {
     lang: "zh",
     emotion: "",
     event: "",
-    engine: "qwen3-asr-local",
+    engine: "qwen3-asr-remote",
     durationMs,
   };
 }
@@ -230,21 +230,42 @@ function startTimelineMockBssServer(options: {
       const u = new URL(req.url);
       if (u.pathname === "/health") {
         return Response.json({
-          ok: true,
-          model: "MossFormer2_SE_48K",
-          ssReady: true,
-          ssModel: "MossFormer2_SS_16K",
-          provider: "CUDAExecutionProvider",
-          ssProvider: "CUDAExecutionProvider",
-          device: "gpu",
-          ssDevice: "gpu",
-          gpuName: "Mock RTX 3060",
-          warmedUp: true,
+          status: "ok",
+          upstreams: {
+            clearvoice: {
+              status: "ok",
+              details: {
+                status: "ok",
+                gpu_name: "Mock Online GPU",
+                loaded_models: [
+                  { name: "MossFormer2_SE_48K", task: "speech_enhancement" },
+                  { name: "MossFormer2_SS_16K", task: "speech_separation" },
+                ],
+              },
+            },
+          },
         });
       }
-      if (u.pathname === "/separate") {
-        const buf = await req.arrayBuffer();
-        const input = new Float32Array(buf);
+      if (u.pathname === "/clearvoice/v1/enhance") {
+        const form = await req.formData();
+        const file = form.get("file") as Blob;
+        const decoded = decodeWavPcm(new Uint8Array(await file.arrayBuffer()));
+        const outWav = encodeWavPcm16(decoded.samples, decoded.sampleRate);
+        return new Response(new Uint8Array(outWav), {
+          status: 200,
+          headers: {
+            "Content-Type": "audio/wav",
+            "X-ClearVoice-Model": "MossFormer2_SE_48K",
+            "X-Elapsed-Ms": "8.0",
+          },
+        });
+      }
+      if (u.pathname === "/clearvoice/v1/separate") {
+        const form = await req.formData();
+        const file = form.get("file") as Blob;
+        const decoded = decodeWavPcm(new Uint8Array(await file.arrayBuffer()));
+        const input = decoded.samples;
+        const sr = decoded.sampleRate;
         const n = input.length;
         const callIdx = callCount++;
         const startPos = findBestStart(input);
@@ -258,24 +279,15 @@ function startTimelineMockBssServer(options: {
         }
         const shouldSwap = swapOnCall ? swapOnCall(callIdx) : callIdx % 2 === 1;
         const outTracks = shouldSwap ? [t1, t0] : [t0, t1];
-        const packed = new Float32Array(n * 2);
-        packed.set(outTracks[0]!, 0);
-        packed.set(outTracks[1]!, n);
-        return new Response(new Uint8Array(packed.buffer), {
-          status: 200,
-          headers: {
-            "Content-Type": "application/octet-stream",
-            "X-ClearVoice-Track-Count": "2",
-            "X-ClearVoice-Samples-Per-Track": String(n),
-            "X-ClearVoice-SS-Available": "1",
-            "X-ClearVoice-Model": "MossFormer2_SS_16K+MossFormer2_SE_48K",
-            "X-ClearVoice-Provider": "CUDAExecutionProvider",
-            "X-ClearVoice-Device": "gpu",
-            "X-ClearVoice-SS-Ms": "12.0",
-            "X-ClearVoice-SE-Ms": "8.0",
-            "X-ClearVoice-Infer-Ms": "20.0",
-            "X-ClearVoice-Gpu-Name": "Mock RTX 3060",
-          },
+        return Response.json({
+          task: "speech_separation",
+          model: "MossFormer2_SS_16K",
+          elapsed_ms: 12.0,
+          speakers: outTracks.map((tr, idx) => ({
+            speaker: idx + 1,
+            sample_rate: sr,
+            audio_base64: Buffer.from(encodeWavPcm16(tr, sr)).toString("base64"),
+          })),
         });
       }
       return new Response("not found", { status: 404 });
@@ -467,7 +479,6 @@ describe("流式端到端：音轨 1 真实命令 + 音轨 2 电视持续发声�
     mockCvServer = mock.server;
 
     const cvRuntime = new ClearVoiceGpuRuntime({
-      modelsDir: tmpDir,
       serviceUrl: `http://127.0.0.1:${mockCvServer.port}`,
     });
 
@@ -480,7 +491,7 @@ describe("流式端到端：音轨 1 真实命令 + 音轨 2 电视持续发声�
         readyForVoiceprint: true,
         readyForClearVoiceGpu: true,
         readyForClearVoiceBss: true,
-        activeQwen3Device: "gpu",
+        activeQwen3Device: "remote",
       }),
       createOnlineDenoiser: () => null,
       dispose: () => {},
@@ -627,7 +638,6 @@ describe("流式端到端：音轨 1 真实命令 + 音轨 2 电视持续发声�
     mockCvServer = mock.server;
 
     const cvRuntime = new ClearVoiceGpuRuntime({
-      modelsDir: tmpDir,
       serviceUrl: `http://127.0.0.1:${mockCvServer.port}`,
     });
 
@@ -640,7 +650,7 @@ describe("流式端到端：音轨 1 真实命令 + 音轨 2 电视持续发声�
         readyForVoiceprint: false,
         readyForClearVoiceGpu: true,
         readyForClearVoiceBss: true,
-        activeQwen3Device: "gpu",
+        activeQwen3Device: "remote",
       }),
       createOnlineDenoiser: () => null,
       dispose: () => {},
@@ -764,7 +774,6 @@ describe("流式端到端：音轨 1 真实命令 + 音轨 2 电视持续发声�
     mockCvServer = mock.server;
 
     const cvRuntime = new ClearVoiceGpuRuntime({
-      modelsDir: tmpDir,
       serviceUrl: `http://127.0.0.1:${mockCvServer.port}`,
     });
 
@@ -781,7 +790,7 @@ describe("流式端到端：音轨 1 真实命令 + 音轨 2 电视持续发声�
         readyForVoiceprint: false,
         readyForClearVoiceGpu: true,
         readyForClearVoiceBss: true,
-        activeQwen3Device: "gpu",
+        activeQwen3Device: "remote",
       }),
       createOnlineDenoiser: () => null,
       dispose: () => {},
@@ -947,7 +956,6 @@ describe("流式端到端：音轨 1 真实命令 + 音轨 2 电视持续发声�
     mockCvServer = mock.server;
 
     const cvRuntime = new ClearVoiceGpuRuntime({
-      modelsDir: tmpDir,
       serviceUrl: `http://127.0.0.1:${mockCvServer.port}`,
     });
 
@@ -960,7 +968,7 @@ describe("流式端到端：音轨 1 真实命令 + 音轨 2 电视持续发声�
         readyForVoiceprint: false,
         readyForClearVoiceGpu: true,
         readyForClearVoiceBss: true,
-        activeQwen3Device: "gpu",
+        activeQwen3Device: "remote",
       }),
       createOnlineDenoiser: () => null,
       dispose: () => {},
@@ -1088,7 +1096,7 @@ describe("流式端到端：音轨 1 真实命令 + 音轨 2 电视持续发声�
           { trackId: "cv_track_2", trackIndex: 2, samples: t2 },
         ],
         {
-          denoiseEngine: "clearvoice-mossformer2-bss-se-gpu",
+          denoiseEngine: "clearvoice-mossformer2-bss-se-remote",
           bssUsed: true,
           inputSnrDb: 10,
           denoiseMs: 25,
@@ -1117,7 +1125,7 @@ describe("流式端到端：音轨 1 真实命令 + 音轨 2 电视持续发声�
 });
 
 // ---------------------------------------------------------------------------
-// 真实 RTX GPU 端到端实测：真实用户命令录音 clip_001.wav + 真实持续电视/旁白录音循环 8.5s
+// 在线 ClearVoice 端到端实测（配置了在线网关且本地录音样本存在时运行）
 // ---------------------------------------------------------------------------
 
 const REAL_MODELS_DIR = process.env.MIJIADECK_VOICE_MODELS_DIR || "";
@@ -1125,13 +1133,12 @@ const REAL_CMD_WAV = path.resolve(import.meta.dir, "../benchmarks/voice_sep_100/
 const REAL_TV_WAV = path.resolve(import.meta.dir, "../benchmarks/voice_sep_100/family_ref.wav");
 const REAL_OWNER_REF = path.resolve(import.meta.dir, "../benchmarks/voice_sep_100/owner_ref.wav");
 
-describe("真实 GPU ClearVoice (MossFormer2_SS_16K + SE_48K) 持续电视不阻塞用户命令端到端实测", () => {
+describe("在线 ClearVoice (MossFormer2_SS_16K + SE_48K) 持续电视不阻塞用户命令端到端实测", () => {
   test(
     "真实录音混合：用户说 clip_001（0..2.86s）+ 电视持续循环 family_ref（0..8.5s 不停），未 flush 前即独立出段执行用户命令",
     async () => {
       const engine = new LocalVoiceEngine({
         ...(REAL_MODELS_DIR ? { modelsDir: REAL_MODELS_DIR } : {}),
-        qwen3ComputeDevice: "cpu",
       });
       const st = engine.getStatus();
       if (

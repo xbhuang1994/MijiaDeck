@@ -120,7 +120,7 @@ function createEnergyMockVad(threshold = 0.02): StreamingVadHandleLike {
 }
 
 /**
- * 模拟支持 /separate 的 ClearVoice GPU 盲源分离服务：
+ * 模拟支持 /clearvoice/v1/separate 的在线 ClearVoice 盲源分离网关：
  * - 将混合信号分离为 2 条独立音轨：
  *   - 轨 A：电视背景音（低频 180Hz）
  *   - 轨 B：干净用户人声唤醒信号（高频 920Hz，仅当混音中含高频成分时非零）
@@ -137,32 +137,31 @@ function startMockMultiTrackClearVoiceServer(options: { swapEveryOtherSlice?: bo
       const u = new URL(req.url);
       if (u.pathname === "/health") {
         return Response.json({
-          ok: true,
-          model: "MossFormer2_SE_48K",
-          provider: "CUDAExecutionProvider",
-          device: "gpu",
-          ssReady: true,
-          ssModel: "MossFormer2_SS_16K",
-          ssProvider: "CUDAExecutionProvider",
-          ssDevice: "gpu",
-          gpuName: "Mock RTX 3060",
-          warmedUp: true,
+          status: "ok",
+          ready: true,
+          device: "cuda",
+          gpu_name: "Mock Online ClearVoice Gateway",
+          models: {
+            enhance: ["MossFormer2_SE_48K"],
+            separate: ["MossFormer2_SS_16K"],
+          },
         });
       }
-      if (u.pathname === "/separate") {
+      if (u.pathname === "/clearvoice/v1/separate") {
         separateCalls += 1;
-        const buf = await req.arrayBuffer();
-        const mix = new Float32Array(buf);
+        const form = await req.formData();
+        const file = form.get("file") as Blob;
+        const decoded = decodeWavPcm(new Uint8Array(await file.arrayBuffer()));
+        const mix = decoded.samples;
         const n = mix.length;
         receivedLengths.push(n);
 
-        // 简单正交解调分离：用 1 阶差分能量检测高频 920Hz 用户人声成分，还原纯净双轨
+        // 简单正交解调分离：用离散匹配滤波检测 180Hz 电视与 920Hz 用户人声成分，还原纯净双轨
         const tvTrack = new Float32Array(n);
         const userTrack = new Float32Array(n);
         const win = 160;
         for (let off = 0; off < n; off += win) {
           const end = Math.min(n, off + win);
-          // 分别计算 180Hz 与 920Hz 离散匹配幅度
           let c180 = 0, s180 = 0, c920 = 0, s920 = 0;
           const m = end - off;
           for (let i = off; i < end; i += 1) {
@@ -190,26 +189,24 @@ function startMockMultiTrackClearVoiceServer(options: { swapEveryOtherSlice?: bo
 
         const shouldSwap = Boolean(options.swapEveryOtherSlice && separateCalls % 2 === 0);
         const tracks = shouldSwap ? [userTrack, tvTrack] : [tvTrack, userTrack];
-        const packed = new Float32Array(n * 2);
-        packed.set(tracks[0]!, 0);
-        packed.set(tracks[1]!, n);
 
-        return new Response(new Uint8Array(packed.buffer), {
+        return Response.json({
+          model: "MossFormer2_SS_16K",
+          elapsed_ms: 15,
+          speakers: tracks.map((t, idx) => ({
+            speaker: idx + 1,
+            sample_rate: SR,
+            audio_base64: Buffer.from(encodeWavPcm16(t, SR)).toString("base64"),
+          })),
+        });
+      }
+      if (u.pathname === "/clearvoice/v1/enhance") {
+        const form = await req.formData();
+        const file = form.get("file") as Blob;
+        const decoded = decodeWavPcm(new Uint8Array(await file.arrayBuffer()));
+        return new Response(new Uint8Array(encodeWavPcm16(decoded.samples, decoded.sampleRate)), {
           status: 200,
-          headers: {
-            "Content-Type": "application/octet-stream",
-            "X-Sample-Rate": String(SR),
-            "X-ClearVoice-Track-Count": "2",
-            "X-ClearVoice-Samples-Per-Track": String(n),
-            "X-ClearVoice-SS-Available": "1",
-            "X-ClearVoice-Model": "MossFormer2_SS_16K+MossFormer2_SE_48K",
-            "X-ClearVoice-Provider": "CUDAExecutionProvider",
-            "X-ClearVoice-Device": "gpu",
-            "X-ClearVoice-SS-Ms": "15.0",
-            "X-ClearVoice-SE-Ms": "6.0",
-            "X-ClearVoice-Infer-Ms": "21.0",
-            "X-ClearVoice-Gpu-Name": "Mock RTX 3060",
-          },
+          headers: { "Content-Type": "audio/wav" },
         });
       }
       return new Response("not found", { status: 404 });
@@ -334,10 +331,9 @@ describe("StreamingDspDenoiser 连续流式纯 TS 降噪器", () => {
 
 describe("待机 ClearVoice 多轨盲源分离唤醒（抗电视背景音 + 零待机 ASR）", () => {
   test("连续播放电视时混合轨无法触发 OWW，待机 ClearVoice BSS+SE 分离出纯净用户轨后精准唤醒并回放环形缓冲", async () => {
-    const dir = useTempDataDir();
+    useTempDataDir();
     const cvMock = startMockMultiTrackClearVoiceServer({ swapEveryOtherSlice: true });
     const cvRuntime = new ClearVoiceGpuRuntime({
-      modelsDir: dir,
       serviceUrl: `http://127.0.0.1:${cvMock.server.port}`,
     });
     const owwFactory = createCleanUserTrackOwwFactory();
@@ -350,7 +346,7 @@ describe("待机 ClearVoice 多轨盲源分离唤醒（抗电视背景音 + 零�
       clearVoiceGpu: cvRuntime,
       getStatus: () => ({
         readyForLocalAsr: true,
-        activeQwen3Device: "gpu",
+        activeQwen3Device: "remote",
         readyForClearVoiceGpu: true,
         readyForClearVoiceBss: true,
         readyForDpdfnet: false,
@@ -373,7 +369,7 @@ describe("待机 ClearVoice 多轨盲源分离唤醒（抗电视背景音 + 零�
           lang: "zh",
           emotion: "",
           event: "",
-          engine: "qwen3-asr-gpu",
+          engine: "qwen3-asr-remote",
           durationMs: 20,
         };
       },
@@ -485,7 +481,7 @@ describe("待机 ClearVoice 多轨盲源分离唤醒（抗电视背景音 + 零�
       },
       getStatus: () => ({
         readyForLocalAsr: true,
-        activeQwen3Device: "cpu",
+        activeQwen3Device: null,
         readyForClearVoiceGpu: false,
         readyForDpdfnet: true,
       }),
@@ -557,7 +553,7 @@ describe("待机 ClearVoice 多轨盲源分离唤醒（抗电视背景音 + 零�
       createWakeWordStream: owwFactory.factory,
       getStatus: () => ({
         readyForLocalAsr: true,
-        activeQwen3Device: "cpu",
+        activeQwen3Device: null,
         readyForClearVoiceGpu: false,
         readyForDpdfnet: true,
       }),
@@ -693,7 +689,7 @@ describe("HTTP /api/voice/audio 待机门控 ClearVoice 降噪唤醒与热配置
         lang: "zh",
         emotion: "",
         event: "",
-        engine: "qwen3-asr-gpu",
+        engine: "qwen3-asr-remote",
         durationMs: 15,
       };
     };
@@ -795,7 +791,7 @@ describe("HTTP /api/voice/audio 待机门控 ClearVoice 降噪唤醒与热配置
   });
 });
 
-describe("真实 ONNX + ClearVoice GPU 连续电视播放下待机唤醒端到端验证", () => {
+describe("真实 ONNX + 在线 ClearVoice 连续电视播放下待机唤醒端到端验证", () => {
   test.if(HAS_BENCH_WAVS)(
     "持续播放真实电视广播（0dB SNR 压过用户声）：待机纯电视零误触发/零 ASR，叠加真实「Neo，打开客厅吸顶灯」后通过待机 ClearVoice BSS+SE 成功唤醒并完整转写",
     async () => {
@@ -807,7 +803,7 @@ describe("真实 ONNX + ClearVoice GPU 连续电视播放下待机唤醒端到�
         !status.readyForWakeWord ||
         !status.readyForClearVoiceGpu ||
         !status.readyForClearVoiceBss ||
-        status.clearVoice.provider !== "cuda"
+        status.clearVoice.provider !== "remote"
       ) {
         engine.dispose();
         return;
