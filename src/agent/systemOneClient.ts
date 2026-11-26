@@ -20,6 +20,7 @@ import {
 } from "../core/agentConfigStore.ts";
 import { createBoundedFetch, type BoundedFetch, type FetchLike } from "../core/httpTimeout.ts";
 import {
+  isSelfContainedTaskAckUtterance,
   TASK_ACK_MIN_CONFIDENCE,
   TASK_ACK_QUESTION,
   resolveTaskAckPhrase,
@@ -101,6 +102,8 @@ export interface SystemOneDecideOptions {
   signal?: AbortSignal;
   cacheKey?: string;
   cacheable?: boolean;
+  /** 为 true 时，本次超时仅静默降级而不计入熔断器连续失败（适用于即时应答词等非门禁弱依赖） */
+  softTimeout?: boolean;
 }
 
 // ==================== Domain Types ====================
@@ -265,6 +268,7 @@ export interface EchoCheckResult {
   model: string;
   usage: SystemOneUsage;
   latencyMs: number;
+  cached?: boolean;
 }
 
 export interface ImplicitActionInput {
@@ -280,6 +284,7 @@ export interface ImplicitActionResult {
   model: string;
   usage: SystemOneUsage;
   latencyMs: number;
+  cached?: boolean;
 }
 
 export interface TaskAckInput {
@@ -292,6 +297,8 @@ export interface TaskAckOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
   minConfidence?: number;
+  /** 为 true 时，本次超时仅静默降级本地应答而不计入熔断器失败 */
+  softTimeout?: boolean;
 }
 
 export interface TaskAckClassificationResult {
@@ -303,6 +310,7 @@ export interface TaskAckClassificationResult {
   model: string;
   usage: SystemOneUsage;
   latencyMs: number;
+  cached?: boolean;
 }
 
 // ==================== Health & Circuit Breaker Types ====================
@@ -322,8 +330,11 @@ export interface SystemOneHealthSnapshot {
   openReason: SystemOneOpenReason | null;
   retryAfterMs: number;
   lastLatencyMs: number | null;
+  avgLatencyMs?: number | null;
   totalCalls: number;
   cacheHits: number;
+  coalescedCalls?: number;
+  softTimeouts?: number;
   lastFailureKind: SystemOneFailureKind;
   lastError: string | null;
 }
@@ -347,6 +358,13 @@ export const DEFAULT_SYSTEMONE_CONFIDENCE_THRESHOLD = 0.65;
 export const GOODBYE_CONFIDENCE_THRESHOLD = 0.65;
 export const SYSTEMONE_CACHE_MAX_ENTRIES = 64;
 export const SYSTEMONE_CACHE_TTL_MS = 10_000;
+export const SYSTEMONE_TASK_ACK_CACHE_MAX_ENTRIES = 128;
+export const SYSTEMONE_TASK_ACK_CACHE_TTL_MS = 5 * 60 * 1000;
+const AUX_CACHE_MAX_ENTRIES = 64;
+const AUX_CACHE_TTL_MS = 15_000;
+const PRECONNECT_MIN_INTERVAL_MS = 15_000;
+const CONGESTION_COOLDOWN_MS = 15_000;
+const CONGESTION_EWMA_THRESHOLD_MS = 1_200;
 
 const UNSUPPORTED_COOLDOWN_MS = 10 * 60 * 1000; // 10 min
 const AUTH_COOLDOWN_MS = 5 * 60 * 1000; // 5 min
@@ -355,108 +373,98 @@ const TRANSIENT_BACKOFF_SCHEDULE_MS = [30_000, 60_000, 120_000, 300_000] as cons
 
 const HISTORY_MAX_ENTRIES = 5;
 const HISTORY_MAX_CHARS = 80;
+const TASK_ACK_HISTORY_MAX_ENTRIES = 3;
+const TASK_ACK_HISTORY_MAX_CHARS = 60;
 
-// ==================== Calibrated Bilingual-Safe Question Schemas ====================
+// ==================== Calibrated Compact Bilingual-Safe Question Schemas ====================
 
 const WAKE_DECISION_QUESTION: SystemOneChoiceQuestion<WakeAttentionDecision> = {
   type: "choice",
   instructions:
-    "唤醒词检测已触发，仅判断语音转写文本 utterance 是不是误听有人在叫触发词（wake_words，支持中英文及语音识别常见同音/近音/音译误差），不需要做上下文、背景环境、设备能力或后续意图等其它判断。重要判别法（同音/近音语义替换检验）：中英混说时语音识别常将句首触发词误听为谐音中文词且连读时可能无逗号（如把 Neo 听成“你有/你又/你好/你给/六，/牛/钮/纽/尼奥/里奥/你哦”等）。请对比原句 utterance 字面语义与替换回触发词后的语义（若 state 提供 suspected_wake_alias.if_replaced 请直接参考）：若原句按字面语义生硬/不通顺/语法别扭，而替换回触发词后语义自然通顺（例如“你有播放点音乐吧”字面不通顺、替换为“Neo，播放点音乐吧”完全自然，“六，我觉得客厅有点暗呢”替换为“Neo，我觉得客厅有点暗呢”完全自然），尤其配合 acoustic_wake 声学唤醒命中时，判定为 valid_wake；反之，即使声学唤醒命中，若原句按字面本身就是自然通顺的日常问句/陈述句（如“你有打开窗户吗？”“你有时间吗？”“你好，晚饭吃什么”“六个苹果多少钱”），或只是聊天/转述/评价/否定中顺带提及触发词而非呼叫（如“我刚才聊到Neo挺好用的”），判定为 false_wake。",
+    "唤醒词检测已触发，仅判断 utterance 是否在呼叫 wake_words（支持中英文及同音/近音误听），不做上下文或设备能力判断。同音替换检验：对比原句字面与 suspected_wake_alias.if_replaced（或把句首近音词换回触发词），若原句生硬不通顺而替换后自然（如“你有播放点音乐吧”→“Neo，播放点音乐吧”），尤其伴随 acoustic_wake 命中，判 valid_wake；若原句字面本就是自然问句/陈述句（如“你有打开窗户吗？”“六个苹果多少钱”）或聊天/转述/评价/否定中顺带提及触发词，判 false_wake。",
   criteria: {
     valid_wake:
-      "确实有人在呼唤触发词（不是误听）：直接叫出触发词（单独叫或后接任意内容），或句首近音/同音词按原字面语义不通顺/语法别扭、替换回触发词（if_replaced）后语义自然通顺（如“你有播放点音乐吧”->“Neo，播放点音乐吧”，“六，我觉得客厅有点暗呢”->“Neo，我觉得客厅有点暗呢”）。",
+      "真正在呼唤触发词：直呼触发词，或句首近音词按字面不通顺、按 if_replaced 替换回触发词后自然通顺。",
     false_wake:
-      "误听或误唤醒：并没有人在叫触发词，包括原句按字面本就是自然通顺的日常问句/陈述句（如“你有打开窗户吗？”“你有时间吗？”“六个苹果多少钱”）、纯杂音碎片，或在与他人聊天、转述、评价、否定中顺带提及该词而并非在呼叫触发词。",
+      "误听/误唤醒：字面本就是自然日常问句/陈述句、纯杂音碎片，或在聊天/转述/评价/否定中顺带提及而非呼叫。",
   },
 };
 
 const WAKE_DEVICE_COMMAND_QUESTION: SystemOneChoiceQuestion<WakeDeviceCommandDecision> = {
   type: "choice",
   instructions:
-    "作为唤醒词判定的或条件，仅判断语音转写文本 utterance 中是否存在控制智能家居设备的指令或明确设备操作命令（支持中英文及轻微语音识别同音误差）：包括开关或调节灯光/亮度/色温/颜色、空调/温度/风速/模式、风扇、窗帘、电视/投影仪、音箱/音量/静音/播放/暂停/切歌、洗衣机/烘干/洗袜子/洗内裤、扫地机、加湿器/除湿机/净化器、浴霸/热水器、插座/开关、喂食器/出粮、场景/模式切换等。注意区分：纯日常是非问句（如“你有打开窗户吗？”“空调是不是开着？”）、普通闲聊/天气问答/家务跑腿（如“晚饭吃什么”“明天北京天气怎么样”“帮我倒杯水”“六个苹果多少钱”）、对触发词的第三人称提及或评价（如“我刚才聊到Neo挺好用的”）以及纯呼唤词/杂音碎片均不属于控制设备指令，判定为 no_device_command。",
+    "或条件：仅判断 utterance 是否含明确智能家居设备控制指令（开关/调节灯、空调、风扇、窗帘、电视、音箱/播放/音量、洗衣/烘干/洗袜子内裤、扫地机、加湿/除湿/净化、浴霸/热水器、插座、喂食器、场景模式，支持中英文及轻微同音误差）。纯是非问句、闲聊/天气/家务跑腿、第三人称提及、纯呼唤或杂音判 no_device_command。",
   criteria: {
     has_device_command:
-      "文本中存在明确控制或调节智能家居设备的指令（如“打开客厅灯”“把卧室空调调到26度”“关灯”“播放点音乐吧”“把电视声音调小”“暂停播放”“启动扫地机”“把窗帘拉上”“帮我洗一下袜子”等，即使没有唤醒词或句首唤醒词被吞字/误听也属此类）。",
+      "含明确控制或调节智能家居设备的祈使指令（即使无唤醒词或句首唤醒词被吞字/误听）。",
     no_device_command:
-      "文本中不存在控制设备指令：包括纯日常问句（如“你有打开窗户吗？”“你有时间吗？”）、普通闲聊/天气问答、家务跑腿、对唤醒词的第三人称提及/评价、纯呼唤词或杂音碎片。",
+      "不含控制设备指令：日常问句（如“你有打开窗户吗？”）、闲聊问答、家务跑腿、第三人称提及、纯呼唤或杂音。",
   },
 };
 
 const CONVERSATION_ACTION_QUESTION: SystemOneChoiceQuestion<ConversationActionChoice> = {
   type: "choice",
   instructions:
-    "你是运行在电脑上的多平台智能家居控制助手，可控制家中各类智能设备（见 home_capabilities，含多筒洗衣机袜子筒/内裤筒、干衣机、扫地机、喂食器、智能灌溉等）与回答问题。当前处于连续对话模式（用户可省略唤醒词；若 acoustic_wake 非空表示刚刚检测到唤醒词；若 pending_confirmation 非空表示正在等用户确认；若 same_speaker 为 true 表示声纹与本轮对话说话人一致）。请结合 home_capabilities、learned_triggers、pending_confirmation、acoustic_wake、same_speaker 与 history 判断最新 utterance 的性质。重要：当 utterance 明显承接 history 对助手进行叮嘱、提醒、批评、反馈、要求改进、追问或自然回应（如“那以后不要出现这种情况了”“下次注意一点”“为什么刚才没反应”“你刚才说的是什么意思”），即使未提及具体设备名称，也应归类为 followup，不要误判为 side_talk 或 goodbye。",
+    "你是多平台智能家居控制助手（能力见 home_capabilities，含多筒洗衣机袜子/内裤筒、干衣机、扫地机、喂食器、灌溉等），当前处于连续对话模式（可省唤醒词；参考 history、learned_triggers、pending_confirmation、acoustic_wake、same_speaker）判断最新 utterance 性质。承接 history 对助手的叮嘱、提醒、批评、反馈、追问或自然回应，即使未提设备名也判 followup。",
   criteria: {
     followup:
-      "用户在继续与智能家居助手对话：包括下达显式或隐式设备控制/调节指令（凡命中 home_capabilities 或 learned_triggers 的请求如“帮我洗一下袜子”“洗内裤”“浇花”“扫地”“喂猫”均属此类）、回复 pending_confirmation 的肯定/否定/改选/消歧答复（如“嗯”“好”“对”“用下筒”“方寸别院那台”“不用了”）、保存或管理长期偏好规则、补充参数、纠正撤销、查询设备状态、环境抱怨反馈、面向助手的自然追问，以及承接上文对助手表现的叮嘱、提醒、批评、改进要求、表态或回应（如“那以后不要出现这种情况了”“下次注意一点”“以后别再这样了”“别再听错了”“知道了下次记得”“这次反应挺快”等）。",
+      "继续与助手对话：显式/隐式设备控制（含命中 home_capabilities 或 learned_triggers）、回复 pending_confirmation、设偏好规则、查状态、环境抱怨、追问，或承接上文叮嘱/批评/反馈（如“那以后不要出现这种情况了”“下次注意一点”）。",
     side_talk:
-      "用户在与旁边家人/朋友说话、自言自语、聊与当前对话无关的日常琐事或要求真人完成家中无任何联网设备支持的跑腿家务（如晚饭吃什么、帮我倒水、拿双筷子、洗碗做饭、去取快递），或纯背景歌词/电视广播/环境噪声，未面向智能家居助手说话且未承接 history 对话。",
+      "与旁人聊天、自言自语、无联网设备支持的家务跑腿（如晚饭吃什么、倒水、拿筷子、取快递）或背景歌词/电视/噪声，未面向助手且未承接 history。",
     goodbye:
-      "用户明确示意结束本次对话、道谢收尾或让助手退下/停止聆听（如“谢谢不用了”、“没事了”、“好了退下吧”、“再见”、“先这样吧”、“that's all thanks”、“goodbye”）。注意：1) 当 pending_confirmation 存在时，用户回复“算了/取消/不用了”优先视作对确认请求的拒绝 followup 而非直接退出；2) 对助手的叮嘱、批评、提醒改进或承接上文的反馈（如“那以后不要出现这种情况了”“下次别这样了”“下次注意一点”）属于 followup，绝不是 goodbye。",
+      "明确示意结束对话、道谢收尾或退下（如“谢谢不用了”“先这样吧”“再见”）。pending_confirmation 存在时“算了/不用了”优先算 followup；对助手的叮嘱/批评/提醒属 followup，绝不是 goodbye。",
   },
 };
 
 const COMMAND_INTENT_QUESTION: SystemOneChoiceQuestion<CommandIntentChoice> = {
   type: "choice",
-  instructions: "判断用户对智能家居助手发出的指令或请求所属核心意图类别（支持中英文）。",
+  instructions: "判断智能家居用户指令的核心意图类别（支持中英文）。",
   criteria: {
     device_control:
-      "直接控制或调节单个/多个智能家居设备（开关、亮度、色温、颜色、音量、空调温度、窗帘、喂食、播放/暂停，或隐式调节抱怨如太暗/太亮/太吵/太热）。",
+      "直接或隐式控制/调节智能设备（开关、亮度、色温、音量、温度、窗帘、喂食、播放等）。",
     status_query:
-      "查询设备当前状态、开关情况或室内外环境传感数据（温度、湿度、PM2.5、电量、某设备是否开启等）。",
+      "仅查询设备状态或环境传感读数（温湿度、PM2.5、电量、是否开启等）。",
     scene:
-      "触发或切换智能联动场景、全屋模式或批量模式（如回家模式、离家模式、观影模式、睡眠模式、全屋关灯）。",
+      "触发或切换多设备联动场景或全屋模式（回家/离家/观影/睡眠/全屋关灯）。",
     general_chat:
-      "非设备控制类普通闲聊、知识问答、打招呼、纯唤醒确认或无关内容。",
+      "非设备控制类普通闲聊、知识问答、打招呼或纯唤醒确认。",
   },
 };
 
 const DUAL_TRACK_ASR_QUESTION: SystemOneChoiceQuestion<DualTrackAsrChoice> = {
   type: "choice",
   instructions:
-    "对比双轨语音识别文本 track_a 与 track_b，结合 wake_words 与声学环境信息，选出最准确反映人类对智能家居助手说出的真实话语（支持中英文），避免误选歌词或噪声幻觉。",
+    "对比双轨识别 track_a 与 track_b（结合 wake_words 与声学信息），选出最准确反映人类对助手真实话语的轨，避免歌词或噪声幻觉。",
   criteria: {
-    track_a:
-      "track_a 更通顺完整，更准确地保留了唤醒词、设备名称或有效智能家居指令。",
-    track_b:
-      "track_b 更通顺完整，相比 track_a 更有效去除背景噪声/歌词并准确保留了真实用户指令。",
-    neither_noise:
-      "track_a 与 track_b 都明显是背景音乐歌词、环境杂音、无意义识别碎片或非面向助手的杂音。",
+    track_a: "track_a 更通顺完整，更准确保留唤醒词、设备名或有效指令。",
+    track_b: "track_b 更通顺完整，更有效去噪并保留真实用户指令。",
+    neither_noise: "双轨均为背景歌词、环境杂音或无意义碎片。",
   },
 };
 
 const ECHO_CHECK_QUESTION: SystemOneChoiceQuestion<EchoCheckChoice> = {
   type: "choice",
   instructions:
-    "判断麦克风听到的 heard 是系统刚刚朗读的 last_spoken 的扬声器回声（含局部截断、吞字或谐音误差），还是用户新发出的控制指令或追问（支持中英文）。注意：若刚播报“已关闭客厅灯”，用户紧接着说“打开客厅灯”属于反向新指令 user_command，不是回声。",
+    "判断 heard 是刚朗读 last_spoken 的扬声器回声（含截断/谐音误差）还是用户新指令（中英文）。刚播报“已关闭客厅灯”后用户说“打开客厅灯”属反向新指令 user_command。",
   criteria: {
-    echo: "heard 是 last_spoken 的重复、子串、截断残片或识别谐音误差，没有表达新的用户意图。",
-    user_command:
-      "heard 是用户新说出的指令、反向控制、参数调节、追问或新对话，即使包含相同设备名称也属此类。",
+    echo: "heard 是 last_spoken 的重复、子串、截断残片或谐音误差，无新意图。",
+    user_command: "用户新指令、反向控制、参数调节或追问，即使含相同设备名。",
   },
 };
 
 const IMPLICIT_ACTION_QUESTION: SystemOneChoiceQuestion<ImplicitActionChoice> = {
   type: "choice",
   instructions:
-    "根据用户的隐式表达或自然语言反馈（结合 history），判断其最直接对应的单一智能家居快捷动作，或是否应交由完整 LLM Agent 规划处理（支持中英文）。",
+    "结合 history 判断用户隐式表达最直接对应的单一智能家居快捷动作，或交由 LLM Agent 处理（中英文）。",
   criteria: {
-    light_brighter:
-      "嫌太暗、看不清或希望把灯调亮/提高亮度（如“有点暗”、“亮一点”、“too dark”）。",
-    light_dimmer:
-      "嫌太亮、刺眼或希望把灯调暗/降低亮度（如“太刺眼了”、“暗一点”、“too bright”）。",
-    speaker_quieter:
-      "嫌声音太大、太吵或希望调小音量/小声一点（如“太吵了”、“小声点”、“too loud”）。",
-    speaker_louder:
-      "嫌声音太小、听不清或希望调大音量/大声一点（如“听不清”、“大声点”、“turn it up”）。",
-    power_off:
-      "明确想关闭当前讨论或刚操作设备的电源（如“关了吧”、“太费电关掉”、“turn it off”）。",
-    power_on:
-      "明确想开启当前讨论或刚操作设备的电源（如“开一下”、“打开吧”、“turn it on”）。",
-    query_status:
-      "仅查询当前设备状态、温度、湿度等读数，不需要修改设备状态。",
-    needs_llm_agent:
-      "多步复合指令、具体数值/色温/定时、多设备编排、场景切换、喂食、普通问答或意图不明确，需交由 LLM Agent 处理。",
+    light_brighter: "嫌太暗或希望调亮灯光。",
+    light_dimmer: "嫌太亮/刺眼或希望调暗灯光。",
+    speaker_quieter: "嫌太吵或希望调小音量。",
+    speaker_louder: "嫌听不清或希望调大音量。",
+    power_off: "想关闭当前讨论设备电源。",
+    power_on: "想开启当前讨论设备电源。",
+    query_status: "仅查询当前设备状态或温湿度读数。",
+    needs_llm_agent: "多步复合指令、具体数值/色温/定时、多设备、场景、喂食、问答或意图不明。",
   },
 };
 
@@ -719,6 +727,13 @@ class ShortTtlLruCache<T> {
 
 // ==================== SystemOneClient ====================
 
+interface InFlightRequestEntry {
+  promise: Promise<SystemOneResponse<Record<string, SystemOneQuestion>> | null>;
+  controller: AbortController;
+  waiters: number;
+  timeoutMs: number;
+}
+
 export class SystemOneClient {
   private readonly _enabled: boolean;
   private readonly _endpoint: string;
@@ -732,6 +747,9 @@ export class SystemOneClient {
   private readonly _rawFetcher: FetchLike | undefined;
   private readonly _now: () => number;
   private readonly _cache: ShortTtlLruCache<unknown>;
+  private readonly _taskAckCache: ShortTtlLruCache<TaskAckClassificationResult>;
+  private readonly _auxCache: ShortTtlLruCache<unknown>;
+  private readonly _inFlight = new Map<string, InFlightRequestEntry>();
 
   // Circuit breaker state
   private _circuitState: SystemOneCircuitState = "closed";
@@ -743,10 +761,15 @@ export class SystemOneClient {
   private _lastFailureKind: SystemOneFailureKind = "none";
   private _lastError: string | null = null;
 
-  // Telemetry
+  // Telemetry & connection warmup
   private _lastLatencyMs: number | null = null;
+  private _avgLatencyMs: number | null = null;
   private _totalCalls = 0;
   private _cacheHits = 0;
+  private _coalescedCalls = 0;
+  private _softTimeouts = 0;
+  private _lastSoftTimeoutAtMs = 0;
+  private _lastPreconnectAtMs = 0;
 
   constructor(options: SystemOneClientOptions) {
     this._endpoint = buildSystemOneEndpoint(options.baseUrl);
@@ -779,6 +802,16 @@ export class SystemOneClient {
     this._cache = new ShortTtlLruCache<unknown>(
       options.cacheMaxEntries ?? SYSTEMONE_CACHE_MAX_ENTRIES,
       options.cacheTtlMs ?? SYSTEMONE_CACHE_TTL_MS,
+      this._now,
+    );
+    this._taskAckCache = new ShortTtlLruCache<TaskAckClassificationResult>(
+      SYSTEMONE_TASK_ACK_CACHE_MAX_ENTRIES,
+      SYSTEMONE_TASK_ACK_CACHE_TTL_MS,
+      this._now,
+    );
+    this._auxCache = new ShortTtlLruCache<unknown>(
+      AUX_CACHE_MAX_ENTRIES,
+      AUX_CACHE_TTL_MS,
       this._now,
     );
   }
@@ -826,11 +859,50 @@ export class SystemOneClient {
     return this._lastFailureKind;
   }
 
+  get avgLatencyMs(): number | null {
+    return this._avgLatencyMs;
+  }
+
+  /**
+   * 指示 SystemOne 当前是否处于高延迟/刚发生软超时拥塞窗口，供非门禁调用（如即时应答词分类）自动避峰降级。
+   */
+  get isCongestedForNonCritical(): boolean {
+    if (this._circuitState === "open") {
+      return this._now() < this._openedUntilMs;
+    }
+    if (
+      this._lastSoftTimeoutAtMs > 0 &&
+      this._now() - this._lastSoftTimeoutAtMs < CONGESTION_COOLDOWN_MS
+    ) {
+      return true;
+    }
+    return (
+      this._avgLatencyMs !== null &&
+      this._avgLatencyMs >= CONGESTION_EWMA_THRESHOLD_MS &&
+      this._totalCalls >= 2
+    );
+  }
+
   /**
    * 预热到 SystemOne 网关的 TCP/TLS 连接（若运行时支持 `fetch.preconnect`）。
+   * 内置节流窗口（默认 15s）以便在唤醒命中、开口说话与任务提交前安全高频调用。
    */
-  preconnect(): void {
+  preconnect(options?: { force?: boolean; minIntervalMs?: number }): void {
     if (!this._enabled || !this._endpointOrigin) return;
+    const nowMs = this._now();
+    const minInterval =
+      typeof options?.minIntervalMs === "number" && options.minIntervalMs >= 0
+        ? options.minIntervalMs
+        : PRECONNECT_MIN_INTERVAL_MS;
+    if (
+      !options?.force &&
+      this._lastPreconnectAtMs > 0 &&
+      nowMs >= this._lastPreconnectAtMs &&
+      nowMs - this._lastPreconnectAtMs < minInterval
+    ) {
+      return;
+    }
+    this._lastPreconnectAtMs = nowMs;
     try {
       if (this._rawFetcher) {
         const customPreconnect = (
@@ -848,7 +920,7 @@ export class SystemOneClient {
   }
 
   /**
-   * 重置熔断器状态并清空负向结果 LRU 缓存。
+   * 重置熔断器状态并清空所有结果缓存与在途合并索引。
    */
   reset(): void {
     this._circuitState = "closed";
@@ -859,7 +931,13 @@ export class SystemOneClient {
     this._halfOpenProbeInFlight = false;
     this._lastFailureKind = "none";
     this._lastError = null;
+    this._avgLatencyMs = null;
+    this._lastSoftTimeoutAtMs = 0;
+    this._lastPreconnectAtMs = 0;
     this._cache.clear();
+    this._taskAckCache.clear();
+    this._auxCache.clear();
+    this._inFlight.clear();
   }
 
   /**
@@ -887,8 +965,11 @@ export class SystemOneClient {
       openReason: effectiveState === "closed" ? null : this._openReason,
       retryAfterMs,
       lastLatencyMs: this._lastLatencyMs,
+      avgLatencyMs: this._avgLatencyMs,
       totalCalls: this._totalCalls,
       cacheHits: this._cacheHits,
+      coalescedCalls: this._coalescedCalls,
+      softTimeouts: this._softTimeouts,
       lastFailureKind: this._lastFailureKind,
       lastError: this._lastError,
     };
@@ -909,6 +990,10 @@ export class SystemOneClient {
     this._lastFailureKind = "none";
     this._lastError = null;
     this._lastLatencyMs = latencyMs;
+    this._avgLatencyMs =
+      this._avgLatencyMs === null
+        ? latencyMs
+        : Math.round(this._avgLatencyMs * 0.7 + latencyMs * 0.3);
   }
 
   private _recordFailure(
@@ -950,9 +1035,53 @@ export class SystemOneClient {
     }
   }
 
+  private _awaitInFlight<Q extends Record<string, SystemOneQuestion>>(
+    entry: InFlightRequestEntry,
+    callerSignal?: AbortSignal,
+  ): Promise<SystemOneResponse<Q> | null> {
+    if (!callerSignal) {
+      return entry.promise as Promise<SystemOneResponse<Q> | null>;
+    }
+    if (callerSignal.aborted) {
+      entry.waiters = Math.max(0, entry.waiters - 1);
+      if (entry.waiters === 0) {
+        entry.controller.abort(callerSignal.reason);
+      }
+      return Promise.resolve(null);
+    }
+    return new Promise<SystemOneResponse<Q> | null>((resolve) => {
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        entry.waiters = Math.max(0, entry.waiters - 1);
+        if (entry.waiters === 0) {
+          entry.controller.abort(callerSignal.reason);
+        }
+        resolve(null);
+      };
+      callerSignal.addEventListener("abort", onAbort, { once: true });
+      entry.promise.then(
+        (res) => {
+          if (settled) return;
+          settled = true;
+          callerSignal.removeEventListener("abort", onAbort);
+          resolve(res as SystemOneResponse<Q> | null);
+        },
+        () => {
+          if (settled) return;
+          settled = true;
+          callerSignal.removeEventListener("abort", onAbort);
+          resolve(null);
+        },
+      );
+    });
+  }
+
   /**
    * 通用 SystemOne 决策调用。
-   * 支持任意 `choice` / `score` / `noul` 问题组合的单次批量调用。
+   * 支持任意 `choice` / `score` / `noul` 问题组合的单次批量调用，
+   * 并在闭路状态下自动合并并发相同请求以消除单 GPU 重复排队开销。
    */
   async decide<Q extends Record<string, SystemOneQuestion>>(
     state: SystemOneState,
@@ -996,14 +1125,6 @@ export class SystemOneClient {
       isHalfOpenProbe = true;
     }
 
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    };
-    if (this._apiKey) {
-      headers["Authorization"] = `Bearer ${this._apiKey}`;
-    }
-
     const effectiveTimeoutMs =
       typeof options?.timeoutMs === "number" &&
       Number.isFinite(options.timeoutMs) &&
@@ -1017,70 +1138,124 @@ export class SystemOneClient {
       questions,
     });
 
-    this._totalCalls += 1;
-    const t0 = performance.now();
-
-    try {
-      const res = await this._fetch(this._endpoint, {
-        method: "POST",
-        headers,
-        body,
-        timeoutMs: effectiveTimeoutMs,
-        ...(options?.signal ? { signal: options.signal } : {}),
-      });
-
-      const elapsedMs = Math.max(0, Math.round(performance.now() - t0));
-      const text = await res.text();
-
-      if (!res.ok) {
-        const snippet = text.slice(0, 240);
-        const detail = snippet ? `HTTP ${res.status}: ${snippet}` : `HTTP ${res.status}`;
-        if (res.status === 404 || res.status === 405 || res.status === 501) {
-          this._recordFailure("unsupported", detail, isHalfOpenProbe);
-        } else if (res.status === 401 || res.status === 403) {
-          this._recordFailure("auth", detail, isHalfOpenProbe);
-        } else if (res.status === 408 || res.status === 504) {
-          this._recordFailure("timeout", detail, isHalfOpenProbe);
-        } else {
-          this._recordFailure("network", detail, isHalfOpenProbe);
-        }
-        return null;
+    const softTimeout = Boolean(options?.softTimeout);
+    const canCoalesce = !isHalfOpenProbe && !softTimeout;
+    if (canCoalesce) {
+      const existing = this._inFlight.get(body);
+      if (existing && existing.timeoutMs <= effectiveTimeoutMs) {
+        existing.waiters += 1;
+        this._coalescedCalls += 1;
+        return this._awaitInFlight<Q>(existing, options?.signal);
       }
-
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(text);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        this._recordFailure("network", `无效 JSON 响应: ${msg}`, isHalfOpenProbe);
-        return null;
-      }
-
-      const validated = validateAndNormalizeResponse(parsed, questions, this._model);
-      if (!validated) {
-        this._recordFailure("network", "SystemOne 响应结构不合法或缺少预期答案字段", isHalfOpenProbe);
-        return null;
-      }
-
-      this._recordSuccess(elapsedMs);
-      if (cacheKey) {
-        this._cache.set(cacheKey, validated);
-      }
-      return validated;
-    } catch (err) {
-      if (options?.signal?.aborted) {
-        if (isHalfOpenProbe) {
-          this._halfOpenProbeInFlight = false;
-        }
-        return null;
-      }
-      const msg = err instanceof Error ? err.message : String(err);
-      const kind: Exclude<SystemOneFailureKind, "none"> = isTimeoutError(err)
-        ? "timeout"
-        : "network";
-      this._recordFailure(kind, msg, isHalfOpenProbe);
-      return null;
     }
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    };
+    if (this._apiKey) {
+      headers["Authorization"] = `Bearer ${this._apiKey}`;
+    }
+
+    const controller = new AbortController();
+    const runRequest = async (): Promise<SystemOneResponse<Q> | null> => {
+      this._totalCalls += 1;
+      const t0 = performance.now();
+
+      try {
+        const res = await this._fetch(this._endpoint, {
+          method: "POST",
+          headers,
+          body,
+          timeoutMs: effectiveTimeoutMs,
+          signal: controller.signal,
+        });
+
+        const elapsedMs = Math.max(0, Math.round(performance.now() - t0));
+        const text = await res.text();
+
+        if (!res.ok) {
+          const snippet = text.slice(0, 240);
+          const detail = snippet ? `HTTP ${res.status}: ${snippet}` : `HTTP ${res.status}`;
+          if (res.status === 404 || res.status === 405 || res.status === 501) {
+            this._recordFailure("unsupported", detail, isHalfOpenProbe);
+          } else if (res.status === 401 || res.status === 403) {
+            this._recordFailure("auth", detail, isHalfOpenProbe);
+          } else if (res.status === 408 || res.status === 504) {
+            if (softTimeout) {
+              if (isHalfOpenProbe) this._halfOpenProbeInFlight = false;
+              this._softTimeouts += 1;
+              this._lastSoftTimeoutAtMs = this._now();
+            } else {
+              this._recordFailure("timeout", detail, isHalfOpenProbe);
+            }
+          } else {
+            this._recordFailure("network", detail, isHalfOpenProbe);
+          }
+          return null;
+        }
+
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this._recordFailure("network", `无效 JSON 响应: ${msg}`, isHalfOpenProbe);
+          return null;
+        }
+
+        const validated = validateAndNormalizeResponse(parsed, questions, this._model);
+        if (!validated) {
+          this._recordFailure("network", "SystemOne 响应结构不合法或缺少预期答案字段", isHalfOpenProbe);
+          return null;
+        }
+
+        this._recordSuccess(elapsedMs);
+        if (cacheKey) {
+          this._cache.set(cacheKey, validated);
+        }
+        return validated;
+      } catch (err) {
+        if (controller.signal.aborted) {
+          if (isHalfOpenProbe) {
+            this._halfOpenProbeInFlight = false;
+          }
+          return null;
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        const isTimeout = isTimeoutError(err);
+        if (softTimeout && isTimeout) {
+          if (isHalfOpenProbe) {
+            this._halfOpenProbeInFlight = false;
+          }
+          this._softTimeouts += 1;
+          this._lastSoftTimeoutAtMs = this._now();
+          return null;
+        }
+        const kind: Exclude<SystemOneFailureKind, "none"> = isTimeout ? "timeout" : "network";
+        this._recordFailure(kind, msg, isHalfOpenProbe);
+        return null;
+      }
+    };
+
+    const promise = runRequest();
+    const entry: InFlightRequestEntry = {
+      promise: promise as Promise<SystemOneResponse<Record<string, SystemOneQuestion>> | null>,
+      controller,
+      waiters: 1,
+      timeoutMs: effectiveTimeoutMs,
+    };
+
+    if (canCoalesce) {
+      this._inFlight.set(body, entry);
+      void promise.finally(() => {
+        if (this._inFlight.get(body) === entry) {
+          this._inFlight.delete(body);
+        }
+      });
+    }
+
+    return this._awaitInFlight<Q>(entry, options?.signal);
   }
 
   /**
@@ -1266,10 +1441,18 @@ export class SystemOneClient {
       state.track_a = primaryText;
       state.track_b = cleanAlt;
     }
-    if (wakeWords.length > 0) {
-      state.wake_words = wakeWords;
+    if (wakeWords.length > 0 && (hasDistinctAlt || input.acousticWake)) {
+      state.wake_words = wakeWords.slice(0, 4);
     }
-    if (lastSpoken) {
+    const latestAssistantHistory = [...compactHistory]
+      .reverse()
+      .find((line) => line.startsWith("A: "));
+    const lastSpokenAlreadyInHistory = Boolean(
+      lastSpoken &&
+        latestAssistantHistory &&
+        latestAssistantHistory.slice(3).includes(lastSpoken.slice(0, 24)),
+    );
+    if (lastSpoken && !lastSpokenAlreadyInHistory) {
       state.last_spoken_reply = lastSpoken;
     }
     if (input.acousticEvent) state.acoustic_event = input.acousticEvent;
@@ -1282,10 +1465,14 @@ export class SystemOneClient {
       };
     }
     if (input.homeCapabilities && input.homeCapabilities.length > 0) {
-      state.home_capabilities = input.homeCapabilities.slice(0, 12);
+      state.home_capabilities = input.homeCapabilities
+        .slice(0, 8)
+        .map((line) => truncateText(line, 56));
     }
     if (input.learnedTriggers && input.learnedTriggers.length > 0) {
-      state.learned_triggers = input.learnedTriggers.slice(0, 12);
+      state.learned_triggers = input.learnedTriggers
+        .slice(0, 8)
+        .map((line) => truncateText(line, 36));
     }
     if (hasPendingConfirm && input.pendingConfirmation) {
       state.pending_confirmation = {
@@ -1495,9 +1682,18 @@ export class SystemOneClient {
     const cleanHeard = collapseWhitespace(input.heard);
     if (!cleanLastSpoken || !cleanHeard) return null;
 
+    const spokenCompact = truncateText(cleanLastSpoken, 120);
+    const heardCompact = truncateText(cleanHeard, 120);
+    const cacheKey = JSON.stringify(["echo", spokenCompact.toLowerCase(), heardCompact.toLowerCase()]);
+    const cached = this._auxCache.get(cacheKey) as EchoCheckResult | undefined;
+    if (cached) {
+      this._cacheHits += 1;
+      return { ...cached, latencyMs: 0, cached: true };
+    }
+
     const state: Record<string, unknown> = {
-      last_spoken: truncateText(cleanLastSpoken, 160),
-      heard: truncateText(cleanHeard, 160),
+      last_spoken: spokenCompact,
+      heard: heardCompact,
     };
 
     const t0 = performance.now();
@@ -1508,7 +1704,7 @@ export class SystemOneClient {
 
     const latencyMs = Math.max(0, Math.round(performance.now() - t0));
     const ans = res.answers.echo_check;
-    return {
+    const result: EchoCheckResult = {
       choice: ans.choice,
       isEcho: ans.choice === "echo" && ans.confidence >= this._confidenceThreshold,
       confidence: ans.confidence,
@@ -1516,7 +1712,10 @@ export class SystemOneClient {
       model: res.model,
       usage: res.usage,
       latencyMs,
+      cached: false,
     };
+    this._auxCache.set(cacheKey, result);
+    return result;
   }
 
   /**
@@ -1527,14 +1726,21 @@ export class SystemOneClient {
     const cleanUtterance = collapseWhitespace(input.utterance);
     if (!cleanUtterance) return null;
 
+    const history = formatCompactHistory(
+      input.recentHistory,
+      TASK_ACK_HISTORY_MAX_ENTRIES,
+      TASK_ACK_HISTORY_MAX_CHARS,
+    );
+    const cacheKey = JSON.stringify(["implicit", cleanUtterance.toLowerCase(), history]);
+    const cached = this._auxCache.get(cacheKey) as ImplicitActionResult | undefined;
+    if (cached) {
+      this._cacheHits += 1;
+      return { ...cached, latencyMs: 0, cached: true };
+    }
+
     const state: Record<string, unknown> = {
       utterance: cleanUtterance,
     };
-    const history = formatCompactHistory(
-      input.recentHistory,
-      HISTORY_MAX_ENTRIES,
-      HISTORY_MAX_CHARS,
-    );
     if (history.length > 0) {
       state.history = history;
     }
@@ -1547,7 +1753,7 @@ export class SystemOneClient {
 
     const latencyMs = Math.max(0, Math.round(performance.now() - t0));
     const ans = res.answers.implicit_action;
-    return {
+    const result: ImplicitActionResult = {
       action: ans.choice,
       confidence: ans.confidence,
       probabilities: ans.probabilities,
@@ -1555,11 +1761,15 @@ export class SystemOneClient {
       model: res.model,
       usage: res.usage,
       latencyMs,
+      cached: false,
     };
+    this._auxCache.set(cacheKey, result);
+    return result;
   }
 
   /**
    * (g) 场景化即时简短应答词快速判定（`execute_control | query_status | think_creative | ...`）。
+   * 置信度达标的结果缓存 5 分钟（自包含语句跨轮次共享缓存），高频常用指令 0ms 零往返命中。
    */
   async classifyTaskAck(
     input: TaskAckInput,
@@ -1569,17 +1779,45 @@ export class SystemOneClient {
     const cleanUtterance = collapseWhitespace(input.utterance);
     if (!cleanUtterance) return null;
 
+    const history = formatCompactHistory(
+      input.recentHistory,
+      TASK_ACK_HISTORY_MAX_ENTRIES,
+      TASK_ACK_HISTORY_MAX_CHARS,
+    );
+    const minConfidence =
+      typeof opts?.minConfidence === "number" && Number.isFinite(opts.minConfidence)
+        ? clamp01(opts.minConfidence)
+        : TASK_ACK_MIN_CONFIDENCE;
+    const normUtterance = cleanUtterance
+      .toLowerCase()
+      .replace(/[。！!？?，,\s]+$/g, "")
+      .trim();
+    const selfContained = isSelfContainedTaskAckUtterance(cleanUtterance);
+    const cacheKey = JSON.stringify([
+      "task_ack",
+      normUtterance || cleanUtterance.toLowerCase(),
+      input.source ?? "",
+      selfContained ? [] : history.slice(-2),
+    ]);
+
+    const cached = this._taskAckCache.get(cacheKey);
+    if (cached && cached.confidence >= minConfidence) {
+      this._cacheHits += 1;
+      return {
+        ...cached,
+        ackText: resolveTaskAckPhrase(cached.scenario, cleanUtterance),
+        confident: true,
+        latencyMs: 0,
+        cached: true,
+      };
+    }
+
     const state: Record<string, unknown> = {
-      utterance: truncateText(cleanUtterance, 200),
+      utterance: truncateText(cleanUtterance, 160),
     };
     if (input.source) {
       state.source = input.source;
     }
-    const history = formatCompactHistory(
-      input.recentHistory,
-      HISTORY_MAX_ENTRIES,
-      HISTORY_MAX_CHARS,
-    );
     if (history.length > 0) {
       state.history = history;
     }
@@ -1593,26 +1831,29 @@ export class SystemOneClient {
       {
         timeoutMs: opts?.timeoutMs,
         signal: opts?.signal,
+        softTimeout: opts?.softTimeout,
       },
     );
     if (!res) return null;
 
     const latencyMs = Math.max(0, Math.round(performance.now() - t0));
     const ans = res.answers.task_ack;
-    const minConfidence =
-      typeof opts?.minConfidence === "number" && Number.isFinite(opts.minConfidence)
-        ? clamp01(opts.minConfidence)
-        : TASK_ACK_MIN_CONFIDENCE;
     const scenario = ans.choice;
-    return {
+    const confident = ans.confidence >= minConfidence;
+    const result: TaskAckClassificationResult = {
       scenario,
       ackText: resolveTaskAckPhrase(scenario, cleanUtterance),
-      confident: ans.confidence >= minConfidence,
+      confident,
       confidence: ans.confidence,
       probabilities: ans.probabilities,
       model: res.model,
       usage: res.usage,
       latencyMs,
+      cached: false,
     };
+    if (confident) {
+      this._taskAckCache.set(cacheKey, result);
+    }
+    return result;
   }
 }

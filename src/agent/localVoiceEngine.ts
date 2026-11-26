@@ -1251,7 +1251,8 @@ export class LocalVoiceEngine {
               ...dualRawRes,
               engine: "sensevoice-dual-raw",
               durationMs: dualRawRes.durationMs + dualDenRes.durationMs + sel.latencyMs,
-              altText: dualDenRes.text,
+              // SystemOne 已完成双轨择优，清空 altText 避免下游 evaluateConversationTurn 二次发起 asr_best 评估
+              altText: undefined,
               scoreMargin: best.scoreMargin,
             };
           } else if (sel.choice === "track_b") {
@@ -1259,7 +1260,8 @@ export class LocalVoiceEngine {
               ...dualDenRes,
               engine: "sensevoice-dual-denoised",
               durationMs: dualRawRes.durationMs + dualDenRes.durationMs + sel.latencyMs,
-              altText: dualRawRes.text,
+              // SystemOne 已完成双轨择优，清空 altText 避免下游 evaluateConversationTurn 二次发起 asr_best 评估
+              altText: undefined,
               scoreMargin: best.scoreMargin,
             };
           }
