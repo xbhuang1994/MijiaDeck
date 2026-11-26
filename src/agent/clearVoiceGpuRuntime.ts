@@ -18,6 +18,7 @@ import {
   decodeWavPcm,
   encodeWavPcm16,
   estimateSnrDb,
+  hasAudibleAudioEnergy,
   resampleLinear,
 } from "./audioPcm.ts";
 import {
@@ -26,6 +27,57 @@ import {
   DEFAULT_CLEARVOICE_CHUNKER_CONFIG,
   pruneInactiveOrDuplicateTracks,
 } from "./clearVoiceChunker.ts";
+
+/**
+ * 物理增益上限护栏：防止远端 ClearVoice 降噪模型（如 MossFormer2_SE_48K）内部执行峰值/RMS 归一化时，
+ * 将极微弱的环境底噪、尾音气声或残余回声过度放大成高电平尖峰（如 +48dB 假 SNR 增益并诱导 ASR 幻觉出单字“呀。”）。
+ * 正常人声降噪后能量通常小于等于输入信号，因此 1.35x RMS / 1.45x Peak 上限对真实语音完全透明无损。
+ */
+export function capDenoisedGainToInput(rawInput: Float32Array, denoised: Float32Array): Float32Array {
+  if (denoised.length === 0) return denoised;
+  if (rawInput.length === 0) return new Float32Array(denoised.length);
+
+  let inSumSq = 0;
+  let inPeak = 0;
+  for (let i = 0; i < rawInput.length; i += 1) {
+    const s = rawInput[i]!;
+    inSumSq += s * s;
+    const a = s < 0 ? -s : s;
+    if (a > inPeak) inPeak = a;
+  }
+  const inRms = Math.sqrt(inSumSq / rawInput.length);
+  if (inRms < 1e-6 || inPeak < 1e-5) {
+    return new Float32Array(denoised.length);
+  }
+
+  let outSumSq = 0;
+  let outPeak = 0;
+  for (let i = 0; i < denoised.length; i += 1) {
+    const s = denoised[i]!;
+    outSumSq += s * s;
+    const a = s < 0 ? -s : s;
+    if (a > outPeak) outPeak = a;
+  }
+  const outRms = Math.sqrt(outSumSq / denoised.length);
+  if (outRms < 1e-9 || outPeak < 1e-9) {
+    return denoised;
+  }
+
+  const maxOutRms = inRms * 1.35;
+  const maxOutPeak = Math.max(inPeak * 1.45, 1e-4);
+  const scaleRms = outRms > maxOutRms ? maxOutRms / outRms : 1;
+  const scalePeak = outPeak > maxOutPeak ? maxOutPeak / outPeak : 1;
+  const scale = Math.min(1, scaleRms, scalePeak);
+  if (scale >= 0.999) {
+    return denoised;
+  }
+
+  const capped = new Float32Array(denoised.length);
+  for (let i = 0; i < denoised.length; i += 1) {
+    capped[i] = denoised[i]! * scale;
+  }
+  return capped;
+}
 
 export interface ClearVoiceGpuStatus {
   gpuDetected: boolean;
@@ -675,7 +727,7 @@ export class ClearVoiceGpuRuntime {
 
       const resampled =
         decodedSr === outSr ? decodedSamples : resampleLinear(decodedSamples, decodedSr, outSr);
-      const outSamples = fitAudioLength(resampled, expectedOutLen);
+      const outSamples = capDenoisedGainToInput(pcmWithContext, fitAudioLength(resampled, expectedOutLen));
       const durationMs = Math.round(performance.now() - t0);
       const inferMs = Number.isFinite(inferMsRaw) ? Number(inferMsRaw.toFixed(1)) : durationMs;
 
@@ -936,8 +988,8 @@ export class ClearVoiceGpuRuntime {
         await Promise.all(
           workingSlots.map(async (slot) => {
             const trRms = computeRms(slot.samples);
-            // 流式滑窗模式下保留全槽位，但对极低能量死静音槽位跳过远程 /enhance 降低延迟与带宽
-            if (applyDenoise && trRms >= 0.002) {
+            // 流式滑窗模式下保留全槽位，但对极低能量或无可听能量的静音/残影槽位跳过远程 /enhance 降低延迟并防止底噪被放大
+            if (applyDenoise && trRms >= 0.003 && hasAudibleAudioEnergy(slot.samples, inSr)) {
               try {
                 const enh = await this.denoiseSlice(slot.samples, {
                   inputSampleRate: inSr,

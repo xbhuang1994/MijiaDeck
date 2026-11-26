@@ -1203,6 +1203,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       };
     }
 
+    const prevLastTranscript = this._lastTranscript;
     this._lastTranscript = text;
     this._error = null;
 
@@ -1337,6 +1338,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     } else if (decision.echoStripped) {
       this._echoGuard.recordStripped();
     }
+    const isRejectedNoiseOrEcho =
+      !decision.accept && (decision.stage === "echo" || decision.stage === "acoustic");
+    if (isRejectedNoiseOrEcho) {
+      // 纯回声或单字噪声碎片不覆盖最近一次有效识别字幕与状态指标
+      this._lastTranscript = prevLastTranscript;
+    }
 
     const preMs =
       (options.timingsBase?.denoiseMs ?? 0) +
@@ -1376,15 +1383,17 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       this._history = this._history.slice(-25);
     }
 
-    this._lastMetrics = {
-      ...(this._lastMetrics ?? {}),
-      voiceprint: options.voiceprint ?? this._lastMetrics?.voiceprint ?? null,
-      acousticWake: options.acousticWake ?? this._lastMetrics?.acousticWake ?? null,
-      ...(decision.intent ? { intent: decision.intent } : {}),
-      attention: decision,
-      timings,
-      updatedAt: now,
-    };
+    if (!isRejectedNoiseOrEcho) {
+      this._lastMetrics = {
+        ...(this._lastMetrics ?? {}),
+        voiceprint: options.voiceprint ?? this._lastMetrics?.voiceprint ?? null,
+        acousticWake: options.acousticWake ?? this._lastMetrics?.acousticWake ?? null,
+        ...(decision.intent ? { intent: decision.intent } : {}),
+        attention: decision,
+        timings,
+        updatedAt: now,
+      };
+    }
 
     // 仅唤醒词：切入连续对话状态；回复自定义短语（默认“嗯?”），若配置为空则静默不回复并持续监听
     if (decision.accept && decision.wokeOnly) {
@@ -3102,8 +3111,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         speechRatio = vad.speechRatio;
         vadEngine = meta.vadLabelOverride ?? `${meta.vadLabelPrefix ?? "clearvoice"}-${vad.engine}`;
         if (!vad.hasSpeech && tr.samples.length >= 3200) {
-          // 流式多轨时仅在 VAD 判无声且能量很低时直接判静音，避免误杀短促清晰指令
-          if (!meta.preVadSegmented || rms < 0.008) {
+          // 流式多轨时若 Silero VAD 判定无人声且信号能量较低，直接判无声，防止降噪后的气音/尾音噪声穿透到声纹与 ASR
+          if (!meta.preVadSegmented || rms < 0.022) {
             speechDetected = false;
           }
         } else if (vad.hasSpeech && vad.speechSamples.length >= 1600) {
@@ -3569,7 +3578,18 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       tracks: trackResults,
     };
 
-    if (speakingTracks.length > 0 || trackResults.length > 1) {
+    const isPureNoiseOrEchoBatch =
+      acceptedTracks.length === 0 &&
+      trackResults.every(
+        (t) =>
+          !t.muted &&
+          (!t.speechDetected ||
+            !t.text ||
+            t.attention?.stage === "acoustic" ||
+            t.attention?.stage === "echo"),
+      );
+
+    if (!isPureNoiseOrEchoBatch && (speakingTracks.length > 0 || trackResults.length > 1)) {
       this._lastTrackBatch = batchSnapshot;
       this._recentTrackBatches.push(batchSnapshot);
       if (this._recentTrackBatches.length > 8) {
@@ -3602,25 +3622,27 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const vadEngineLabel =
       prepared[0]?.vadEngine ?? meta.vadLabelOverride ?? `${meta.vadLabelPrefix ?? "clearvoice"}-silero`;
 
-    this._lastMetrics = {
-      denoiseEngine: meta.denoiseEngine,
-      snrGainDb: primaryTrack?.snrGainDb ?? 0,
-      vadEngine: vadEngineLabel,
-      speechRatio: primaryTrack?.speechRatio ?? 0,
-      asrEngine: primaryTrack?.asrEngine ?? "skipped-no-speech",
-      detectedSoundTypes:
-        trackResults.length > 1 ? ["speech", "multi_speaker"] : speakingTracks.length > 0 ? ["speech"] : [],
-      detectedSpeakerCount: speakingTracks.length,
-      separatedStreams,
-      tracks: trackResults,
-      trackBatch: batchSnapshot,
-      voiceprint: primaryTrack?.voiceprint ?? null,
-      acousticWake: primaryTrack?.acousticWake ?? null,
-      ...(primaryTrack?.attention?.intent ? { intent: primaryTrack.attention.intent } : {}),
-      attention: primaryTrack?.attention ?? null,
-      timings: batchTimings,
-      updatedAt: Date.now(),
-    };
+    if (!isPureNoiseOrEchoBatch) {
+      this._lastMetrics = {
+        denoiseEngine: meta.denoiseEngine,
+        snrGainDb: primaryTrack?.snrGainDb ?? 0,
+        vadEngine: vadEngineLabel,
+        speechRatio: primaryTrack?.speechRatio ?? 0,
+        asrEngine: primaryTrack?.asrEngine ?? "skipped-no-speech",
+        detectedSoundTypes:
+          trackResults.length > 1 ? ["speech", "multi_speaker"] : speakingTracks.length > 0 ? ["speech"] : [],
+        detectedSpeakerCount: speakingTracks.length,
+        separatedStreams,
+        tracks: trackResults,
+        trackBatch: batchSnapshot,
+        voiceprint: primaryTrack?.voiceprint ?? null,
+        acousticWake: primaryTrack?.acousticWake ?? null,
+        ...(primaryTrack?.attention?.intent ? { intent: primaryTrack.attention.intent } : {}),
+        attention: primaryTrack?.attention ?? null,
+        timings: batchTimings,
+        updatedAt: Date.now(),
+      };
+    }
 
     const snap = this.snapshot();
     this.emit("stateChanged", snap);
