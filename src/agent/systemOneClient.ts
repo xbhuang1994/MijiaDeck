@@ -112,6 +112,7 @@ export interface SystemOneHistoryEntry {
 
 export type WakeAttentionDecision = "valid_wake" | "false_wake";
 export type ConversationActionChoice = "followup" | "side_talk" | "goodbye";
+export type ConversationEndChoice = "continue" | "ready_to_end";
 export type CommandIntentChoice = "device_control" | "status_query" | "scene" | "general_chat";
 export type DualTrackAsrChoice = "track_a" | "track_b" | "neither_noise";
 export type EchoCheckChoice = "echo" | "user_command";
@@ -322,6 +323,35 @@ export interface MultiTrackNoiseResult {
   cached: boolean;
 }
 
+export interface ConversationEndInput {
+  recentHistory: ReadonlyArray<SystemOneHistoryEntry>;
+  lastUserUtterance?: string;
+  lastAssistantReply?: string;
+  silentCompleted?: boolean;
+  hasPendingConfirmation?: boolean;
+  pendingConfirmationQuestion?: string;
+  activeTaskCount?: number;
+  idleSeconds?: number;
+  nonAddressedCount?: number;
+  lastNonAddressedUtterance?: string;
+}
+
+export interface ConversationEndOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  minEndConfidence?: number;
+}
+
+export interface ConversationEndResult {
+  decision: ConversationEndChoice;
+  shouldStartExitCountdown: boolean;
+  confidence: number;
+  probabilities: Record<ConversationEndChoice, number>;
+  model: string;
+  usage: SystemOneUsage;
+  latencyMs: number;
+}
+
 // ==================== Health & Circuit Breaker Types ====================
 
 export type SystemOneCircuitState = "closed" | "open" | "half-open";
@@ -362,6 +392,7 @@ export interface SystemOneClientOptions {
 export const DEFAULT_SYSTEMONE_TIMEOUT_MS = 2_000;
 export const DEFAULT_SYSTEMONE_CONFIDENCE_THRESHOLD = 0.65;
 export const GOODBYE_CONFIDENCE_THRESHOLD = 0.65;
+export const CONVERSATION_END_MIN_CONFIDENCE = 0.6;
 export const SYSTEMONE_CACHE_MAX_ENTRIES = 64;
 export const SYSTEMONE_CACHE_TTL_MS = 10_000;
 
@@ -481,6 +512,18 @@ function buildMultiTrackNoiseQuestion(
   };
 }
 
+const CONVERSATION_END_QUESTION: SystemOneChoiceQuestion<ConversationEndChoice> = {
+  type: "choice",
+  instructions:
+    "你是智能家居语音助手的对话生命周期决策器。请结合最近对话历史 history、用户最新话语 last_user、助手最新回复 last_assistant、是否静默核验完成 silent_completed、是否存在待确认问题 has_pending_confirmation、非面向助手旁白次数 non_addressed_count 以及静默等待秒数 idle_seconds，动态判断当前对话是否已经自然结束（可以开始倒计时退出对话），还是仍处于持续交流中（应保持对话状态、暂不开始倒计时）。注意：只要助手刚提出问题/澄清/确认/给出多个方案等待用户选择、任务失败需要用户补充信息、存在 has_pending_confirmation、或双方正处于开放式多轮讨论且静默时间很短，就必须选择 continue；只有当用户本次指令或提问已经完整闭环且助手没有追问（例如简单控灯/开关 silent_completed 或已回答完毕）、用户表达了结束/道谢，或用户已长时间静默无回应（idle_seconds 较大）/已转向旁白聊天时，才选择 ready_to_end。",
+  criteria: {
+    continue:
+      "当前对话尚未结束，预期用户还会继续说话或回复：例如助手刚向用户提问/澄清/请求确认/列出多个选项或方案待用户挑选（如“选方案一还是方案二？”“要调客厅还是卧室？”“需要我帮您开启吗？”）、存在 has_pending_confirmation、任务需要用户补充参数或进一步指示、用户表示还有后续事宜、或双方正处于未收尾的多轮连续对话中（支持中英文）。",
+    ready_to_end:
+      "当前对话已自然闭环，可以开始退出对话倒计时：例如单次设备控制已完整执行完毕（含 silent_completed 静默完成）、单一状态/传感查询已给出完整答案且助手未再反问、用户已表达道谢或阶段性收尾、用户已较长时间静默未继续发言（idle_seconds >= 30），或已连续出现非面向助手的旁白/无关声响（支持中英文）。",
+  },
+};
+
 // ==================== Pure Helpers ====================
 
 /**
@@ -534,6 +577,18 @@ function truncateText(text: string, maxChars: number): string {
   if (clean.length <= maxChars) return clean;
   if (maxChars <= 1) return clean.slice(0, maxChars);
   return `${clean.slice(0, maxChars - 1)}…`;
+}
+
+/**
+ * 截断长回复时同时保留首部摘要与末尾问句/收尾句，避免截掉助手末尾的追问或确认问题。
+ */
+function truncatePreservingEnds(text: string, maxChars: number): string {
+  const clean = collapseWhitespace(text);
+  if (clean.length <= maxChars) return clean;
+  if (maxChars <= 12) return truncateText(clean, maxChars);
+  const tailBudget = Math.min(Math.floor(maxChars * 0.55), maxChars - 6);
+  const headBudget = Math.max(4, maxChars - tailBudget - 1);
+  return `${clean.slice(0, headBudget)}…${clean.slice(clean.length - tailBudget)}`;
 }
 
 /**
@@ -1703,5 +1758,88 @@ export class SystemOneClient {
     }
 
     return result;
+  }
+
+  /**
+   * (i) 动态判断当前对话是否应该结束（`continue` 保持对话态 vs `ready_to_end` 开始倒计时退出对话）。
+   * 绝不写入 LRU 缓存，确保每轮交互与静默复检都基于最新上下文动态判定。
+   */
+  async evaluateConversationEnd(
+    input: ConversationEndInput,
+    opts?: ConversationEndOptions,
+  ): Promise<ConversationEndResult | null> {
+    if (!this._enabled || opts?.signal?.aborted) return null;
+
+    const history = formatCompactHistory(input.recentHistory, 6, 120);
+    const lastUser = input.lastUserUtterance ? truncateText(input.lastUserUtterance, 160) : "";
+    const lastAssistant = input.lastAssistantReply
+      ? truncatePreservingEnds(input.lastAssistantReply, 220)
+      : "";
+    if (
+      history.length === 0 &&
+      !lastUser &&
+      !lastAssistant &&
+      !input.silentCompleted &&
+      !input.hasPendingConfirmation
+    ) {
+      return null;
+    }
+
+    const state: Record<string, unknown> = {
+      history,
+    };
+    if (lastUser) state.last_user = lastUser;
+    if (lastAssistant) state.last_assistant = lastAssistant;
+    if (input.silentCompleted) state.silent_completed = true;
+    if (input.hasPendingConfirmation) {
+      state.has_pending_confirmation = true;
+      if (input.pendingConfirmationQuestion) {
+        state.pending_confirmation_question = truncateText(input.pendingConfirmationQuestion, 140);
+      }
+    }
+    if (typeof input.activeTaskCount === "number" && input.activeTaskCount > 0) {
+      state.active_task_count = Math.round(input.activeTaskCount);
+    }
+    if (typeof input.idleSeconds === "number" && Number.isFinite(input.idleSeconds) && input.idleSeconds > 0) {
+      state.idle_seconds = Math.round(input.idleSeconds);
+    }
+    if (typeof input.nonAddressedCount === "number" && input.nonAddressedCount > 0) {
+      state.non_addressed_count = Math.round(input.nonAddressedCount);
+    }
+    if (input.lastNonAddressedUtterance) {
+      state.last_non_addressed = truncateText(input.lastNonAddressedUtterance, 100);
+    }
+
+    const t0 = performance.now();
+    const res = await this.decide(
+      state,
+      {
+        conv_end: CONVERSATION_END_QUESTION,
+      },
+      {
+        timeoutMs: opts?.timeoutMs,
+        signal: opts?.signal,
+      },
+    );
+    if (!res) return null;
+
+    const latencyMs = Math.max(0, Math.round(performance.now() - t0));
+    const ans = res.answers.conv_end;
+    const minEndConf =
+      typeof opts?.minEndConfidence === "number" && Number.isFinite(opts.minEndConfidence)
+        ? clamp01(opts.minEndConfidence)
+        : CONVERSATION_END_MIN_CONFIDENCE;
+    const decision = ans.choice;
+    const shouldStartExitCountdown = decision === "ready_to_end" && ans.confidence >= minEndConf;
+
+    return {
+      decision,
+      shouldStartExitCountdown,
+      confidence: ans.confidence,
+      probabilities: ans.probabilities,
+      model: res.model,
+      usage: res.usage,
+      latencyMs,
+    };
   }
 }

@@ -214,6 +214,8 @@ const DEFAULT_WAKE_RING_LOOKBACK_MS = 1800; // 唤醒后回溯循环录制缓冲
 const POST_WAKE_GAP_REPLAY_MAX_SAMPLES = Math.round(TARGET_SR * 1.6);
 const MAX_UTTERANCE_SEC = 30.0; // 正常人声/对话/唤醒锚定单句安全上限（避免 3.8s 强行腰斩长语音）
 const STANDBY_BGM_ROLL_SEC = 4.2; // 仅待机持续高底噪背景音乐时启用滚动切窗防积压
+const CONV_AMBIENT_PROBE_SEC = 2.0; // 对话态连续无停顿时的 CED 声学背景探测窗长（区分真实人声长句 vs 持续歌曲/电视杂音）
+const CONV_AMBIENT_PROBE_STEP_SEC = 1.5; // 对话态连续无停顿时的 CED 复检步进（避免因边界采样偏移错过电视群聊窗口）
 const LONG_UTTERANCE_THRESHOLD_SEC = 3.0;
 const DEFAULT_LONG_UTTERANCE_EXTRA_MS = 350;
 const DEFAULT_INCOMPLETE_GRACE_MS = 650;
@@ -308,6 +310,7 @@ export class VoiceStreamSession {
   private _vadDetected = false;
   private _lastFrameRms = 0;
   private _activeSegmentStartSample: number | null = null;
+  private _lastConvAmbientProbeSample = 0;
   private _wakeAnchorSample: number | null = null;
   private _wakeAnchorHit: WakeWordAcousticHit | null = null;
   private _lastRawOverlap = new Float32Array(0);
@@ -2331,6 +2334,28 @@ export class VoiceStreamSession {
         continue;
       }
 
+      // 对话态持续无停顿（>= 2.0s）时，通过轻量 CED 声学场景探测（~20ms）精准区分“真实用户连续说话”与“持续背景音乐/电视群聊噪声”：
+      // - 真实用户长句（speechProb 高且非纯音乐/电视噪声）绝不切窗、全程保活对话态；
+      // - 仅在明确检出纯背景音乐（musicProb >= 0.50 且 speechProb < 0.15）或持续高噪电视群聊（noiseProb >= 0.14 且 crowdTvProb >= 0.14）时才滚窗交付注意力门控判拒。
+      const currentFrameEndSample = this._rawTotalSamples - remainingAfterFrame;
+      if (
+        step.continuing &&
+        !this._opts.bypassWakeWord &&
+        this._opts.isInConversation?.() &&
+        this._wakeAnchorSample === null &&
+        this._activeSegmentStartSample !== null &&
+        currentFrameEndSample - this._activeSegmentStartSample >= TARGET_SR * CONV_AMBIENT_PROBE_SEC &&
+        currentFrameEndSample - this._lastConvAmbientProbeSample >= TARGET_SR * CONV_AMBIENT_PROBE_STEP_SEC
+      ) {
+        this._lastConvAmbientProbeSample = currentFrameEndSample;
+        if (this._isConversationContinuousAmbientBackground()) {
+          this._segmenter.reset();
+          this._emitSegmenterWindow(true, remainingAfterFrame);
+          offset += 512;
+          continue;
+        }
+      }
+
       if (!step.continuing) {
         if (this._wakeAnchorSample !== null) {
           this._emitWakeAnchoredSegment(step.timedOut, remainingAfterFrame);
@@ -2969,6 +2994,24 @@ export class VoiceStreamSession {
       }
     }
     return headHit ?? fullHit ?? null;
+  }
+
+  private _isConversationContinuousAmbientBackground(): boolean {
+    const sep = this._opts.localEngine.sourceSeparator;
+    if (!sep || typeof sep.analyzeAudioScene !== "function") {
+      return false;
+    }
+    const probeLen = Math.round(TARGET_SR * CONV_AMBIENT_PROBE_SEC);
+    if (this._rawTotalSamples < probeLen) return false;
+    const recentRaw = this._readRingTail(this._rawRing, this._rawTotalSamples, probeLen);
+    try {
+      const scene = sep.analyzeAudioScene(recentRaw, 12);
+      const isPureMusic = scene.musicProb >= 0.5 && scene.speechProb < 0.15;
+      const isNoisyTvChatter = scene.noiseProb >= 0.14 && scene.crowdTvProb >= 0.14;
+      return isPureMusic || isNoisyTvChatter;
+    } catch {
+      return false;
+    }
   }
 
   private _shouldDropStandbyPureMusic(

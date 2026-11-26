@@ -51,6 +51,9 @@ import type {
 import { stripCommittedPrefix } from "./qwen3StreamingTranscriber.ts";
 import type {
   CommandIntentChoice,
+  ConversationEndChoice,
+  ConversationEndInput,
+  ConversationEndResult,
   SystemOneClient,
   SystemOneHealthSnapshot,
   SystemOneHistoryEntry,
@@ -60,6 +63,7 @@ import type { VoiceStreamSegmentPayload } from "./voiceStreamSession.ts";
 import {
   evaluateVoiceAttention,
   findWakeWordSpan,
+  inferConversationEndFallback,
   type AttentionDecision,
   type AttentionLlmEvaluator,
 } from "./voiceAttentionGate.ts";
@@ -83,6 +87,32 @@ import {
 export type VoiceListenMode = "idle" | "listening" | "awake" | "processing" | "speaking" | "error";
 export type VoiceDialogState = "standby" | "conversation";
 export type VoiceRuntimeEngine = "local" | "browser" | "whisper" | "manual";
+export type ConversationExitPhase = "idle" | "holding" | "evaluating" | "countdown";
+export type ConversationEndVerdict = ConversationEndChoice | null;
+export type ConversationHoldReason =
+  | "user_speaking"
+  | "audio_processing"
+  | "task_running"
+  | "tts_speaking"
+  | "pending_confirmation"
+  | "systemone_continue"
+  | "evaluating_end"
+  | null;
+
+export interface VoiceListenerControllerOptions {
+  fetcher?: FetchLike;
+  localEngine?: LocalVoiceEngine;
+  /** 连续说话保活安全上限（默认 35_000ms，覆盖 30s 长句，收到实时流式字幕时自动续期） */
+  maxSpeechHoldMs?: number;
+  /** SystemOne 判定对话未结束（holding）时的静默复检间隔（ms，默认 Math.max(30_000, conversationWindowSec * 1000)） */
+  idleRecheckIntervalMs?: number;
+  /** holding 状态最多连续静默复检次数（默认 3 次后自动进入退出倒计时防无人值守永久挂起） */
+  maxIdleRechecks?: number;
+  /** 可选自定义对话结束判定覆盖（供测试注入） */
+  conversationEndEvaluatorOverride?: (
+    input: ConversationEndInput,
+  ) => Promise<ConversationEndResult | null>;
+}
 
 export interface WakeWordSpotRecord extends WakeWordAcousticHit {
   timestamp: number;
@@ -234,6 +264,9 @@ export interface VoiceListenerSnapshot {
   dialogEpoch: number;
   serverNow: number;
   timerPaused: boolean;
+  conversationExitPhase: ConversationExitPhase;
+  conversationEndDecision: ConversationEndVerdict;
+  conversationHoldReason: ConversationHoldReason;
   conversationRemainingMs: number;
   conversationWindowSec: number;
   maxConsecutiveSidetalk: number;
@@ -380,9 +413,9 @@ const LEADING_PUNCT_RE = /^[\s,，。．.、!！?？:：;；\-—~～]+/;
 const TRAILING_PUNCT_RE = /[\s,，。．.、!！?？:：;；]+$/;
 const CANCEL_RUNNING_TASK_RE =
   /^(?:停止执行|取消执行|取消任务|取消刚才的任务|取消刚才的操作|别执行了|不要执行了|停止刚才的操作|停止任务)$/i;
-const MAX_SPEECH_GRACE_MS = 3500;
-const CONTINUOUS_VAD_STALE_MS = 5000;
 const TTS_PAUSE_WATCHDOG_MS = 30_000;
+const DEFAULT_MAX_SPEECH_HOLD_MS = 35_000;
+const DEFAULT_MAX_IDLE_RECHECKS = 3;
 
 /**
  * 兼容式唤醒词提取器（供单元测试与轻量调用使用，现支持常见中文同音纠错）。
@@ -445,17 +478,38 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   private _mode: VoiceListenMode = "idle";
   private _dialogState: VoiceDialogState = "standby";
   private _dialogEpoch = 0;
+  private _turnSeq = 0;
+  private _conversationExitPhase: ConversationExitPhase = "idle";
+  private _conversationEndDecision: ConversationEndVerdict = null;
   private _conversationTimer: ReturnType<typeof setTimeout> | null = null;
   private _ttsPauseWatchdog: ReturnType<typeof setTimeout> | null = null;
+  private _speechHoldWatchdog: ReturnType<typeof setTimeout> | null = null;
+  private _idleRecheckTimer: ReturnType<typeof setTimeout> | null = null;
+  private _idleRecheckCount = 0;
+  private _idleHoldStartedAt: number | null = null;
+  private _ttsSpeaking = false;
   private _timerPaused = false;
   private _remainingConversationMs = 0;
-  private _conversationBaseUntil: number | null = null;
-  private _conversationHardUntil: number | null = null;
+  private _countdownOriginAt: number | null = null;
   private _speechInProgress = false;
   private _speechActivityStartedAt: number | null = null;
-  private _speechGraceSuppressed = false;
+  private _speechHoldWindowStartedAt: number | null = null;
+  private _speechHoldSuppressed = false;
+  private _inFlightSegmentCount = 0;
   private _consecutiveAmbientNoiseCount = 0;
   private _consecutiveSidetalkCount = 0;
+  private _lastNonAddressedUtterance = "";
+  private _lastTurnContext: {
+    userUtterance: string;
+    assistantReply: string;
+    silentCompleted: boolean;
+  } | null = null;
+  private readonly _maxSpeechHoldMs: number;
+  private readonly _idleRecheckIntervalOverrideMs?: number;
+  private readonly _maxIdleRechecks: number;
+  private readonly _conversationEndEvaluatorOverride?: (
+    input: ConversationEndInput,
+  ) => Promise<ConversationEndResult | null>;
   private _lastTransitionReason: string | null = null;
   private _lastWakeHit: WakeWordSpotRecord | null = null;
   private _engine: VoiceRuntimeEngine = "local";
@@ -479,12 +533,31 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
 
   constructor(
     agent: PiAgentService,
-    options: { fetcher?: FetchLike; localEngine?: LocalVoiceEngine } = {},
+    options: VoiceListenerControllerOptions = {},
   ) {
     super();
     this._agent = agent;
     this._fetcher = options.fetcher ?? globalThis.fetch;
     this._localEngine = options.localEngine ?? new LocalVoiceEngine();
+    this._maxSpeechHoldMs =
+      typeof options.maxSpeechHoldMs === "number" &&
+      Number.isFinite(options.maxSpeechHoldMs) &&
+      options.maxSpeechHoldMs >= 500
+        ? Math.round(options.maxSpeechHoldMs)
+        : DEFAULT_MAX_SPEECH_HOLD_MS;
+    this._idleRecheckIntervalOverrideMs =
+      typeof options.idleRecheckIntervalMs === "number" &&
+      Number.isFinite(options.idleRecheckIntervalMs) &&
+      options.idleRecheckIntervalMs >= 100
+        ? Math.round(options.idleRecheckIntervalMs)
+        : undefined;
+    this._maxIdleRechecks =
+      typeof options.maxIdleRechecks === "number" &&
+      Number.isFinite(options.maxIdleRechecks) &&
+      options.maxIdleRechecks >= 1
+        ? Math.round(options.maxIdleRechecks)
+        : DEFAULT_MAX_IDLE_RECHECKS;
+    this._conversationEndEvaluatorOverride = options.conversationEndEvaluatorOverride;
     this._localEngine.setPreferredAsrEngine?.(this.config.localAsrEngine);
     this._localEngine.setQwen3ComputeDevice?.(this.config.qwen3ComputeDevice);
     this._localEngine.setClearVoiceServiceUrl?.(this.config.clearVoiceServiceUrl);
@@ -510,23 +583,25 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       },
     );
 
-    // 当 Pi Agent 抛出结构化待确认提问时，强制保持至少 20s 连续对话窗口（即使 conversationWindowSec === 0）
+    // 当 Pi Agent 抛出结构化待确认提问时，强制保持连续对话态（即便 conversationWindowSec === 0 也保活至少 20s）
     this._unsubConfirmationPending = this._agent.on("confirmationPending", () => {
       const keepMs = Math.max(20_000, this.config.conversationWindowSec * 1000);
       const nowMs = Date.now();
       this._dialogState = "conversation";
       this._consecutiveSidetalkCount = 0;
       this._consecutiveAmbientNoiseCount = 0;
-      this._speechGraceSuppressed = false;
+      this._speechHoldSuppressed = false;
+      this._speechHoldWindowStartedAt = null;
+      this._idleRecheckCount = 0;
+      this._idleHoldStartedAt = null;
+      this._conversationEndDecision = "continue";
+      this._conversationExitPhase =
+        this.config.conversationWindowSec > 0 ? "holding" : "countdown";
       this._lastTransitionReason = "confirmation_pending";
-      const nextUntil = nowMs + keepMs;
-      this._conversationUntil = nextUntil;
-      this._awakeUntil = nextUntil;
       this._remainingConversationMs = keepMs;
-      this._setConversationDeadlines(nextUntil, true);
-      if (!this._timerPaused) {
-        this._armConversationTimer(keepMs, this._dialogEpoch);
-      }
+      this._awakeUntil = this.config.conversationWindowSec > 0 ? null : nowMs + keepMs;
+      this._conversationUntil = this.config.conversationWindowSec > 0 ? null : nowMs + keepMs;
+      this._syncConversationTimers({ now: nowMs, emitState: false });
       if (this._active) {
         this._mode = "awake";
       }
@@ -583,109 +658,158 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     }
   }
 
-  private _setConversationDeadlines(baseUntil: number | null, allowSpeechGrace = true): void {
-    this._conversationBaseUntil = baseUntil;
-    this._conversationHardUntil =
-      baseUntil !== null ? baseUntil + (allowSpeechGrace ? MAX_SPEECH_GRACE_MS : 0) : null;
+  private _clearSpeechHoldWatchdog(): void {
+    if (this._speechHoldWatchdog !== null) {
+      clearTimeout(this._speechHoldWatchdog);
+      this._speechHoldWatchdog = null;
+    }
   }
 
-  /**
-   * 计算当前对话轮次还剩余多少“说话中防截断顺延”额度（严格有界，防止背景音乐/环境噪音驱动 VAD 无限续期）。
-   */
-  private _remainingSpeechGraceMs(now: number): number {
+  private _clearIdleRecheckTimer(): void {
+    if (this._idleRecheckTimer !== null) {
+      clearTimeout(this._idleRecheckTimer);
+      this._idleRecheckTimer = null;
+    }
+  }
+
+  private _clearAllDialogTimers(): void {
+    this._clearConversationTimer();
+    this._clearTtsPauseWatchdog();
+    this._clearSpeechHoldWatchdog();
+    this._clearIdleRecheckTimer();
+  }
+
+  private _postSpeechHandoffGraceMs(): number {
+    const baseMs =
+      this.config.conversationWindowSec > 0
+        ? this.config.conversationWindowSec * 1000
+        : this.config.wakeWindowSec * 1000;
+    return Math.min(2500, Math.max(800, baseMs));
+  }
+
+  private _resolveIdleRecheckMs(): number {
+    if (this._idleRecheckIntervalOverrideMs !== undefined) {
+      return this._idleRecheckIntervalOverrideMs;
+    }
+    return Math.max(30_000, this.config.conversationWindowSec * 1000);
+  }
+
+  private _resolveConversationHoldReason(): ConversationHoldReason {
+    if (this._dialogState !== "conversation") return null;
+    if (this._agent.activeTaskCount > 0) return "task_running";
+    if (this._ttsSpeaking) return "tts_speaking";
+    if (this._speechInProgress && !this._speechHoldSuppressed) return "user_speaking";
+    if (this._inFlightSegmentCount > 0) return "audio_processing";
+    if (this._conversationExitPhase === "evaluating") return "evaluating_end";
+    if (this._agent.getActivePendingConfirmationGateContext()) return "pending_confirmation";
+    if (this._conversationExitPhase === "holding") return "systemone_continue";
+    return null;
+  }
+
+  private _isLiveActivityHolding(): boolean {
+    return (
+      this._ttsSpeaking ||
+      this._agent.activeTaskCount > 0 ||
+      this._inFlightSegmentCount > 0 ||
+      (this._speechInProgress && !this._speechHoldSuppressed) ||
+      this._conversationExitPhase === "evaluating"
+    );
+  }
+
+  private _freezeRunningCountdown(now: number, floorMs = 1000): void {
+    if (this._conversationTimer !== null) {
+      const currentDeadline = this._conversationUntil ?? this._awakeUntil;
+      if (currentDeadline !== null) {
+        this._remainingConversationMs = Math.max(floorMs, currentDeadline - now);
+      }
+      this._clearConversationTimer();
+    }
+  }
+
+  private _triggerSpeechHoldWatchdogRelease(epoch: number): void {
     if (
       this._dialogState !== "conversation" ||
-      this._timerPaused ||
-      !this._speechInProgress ||
-      this._speechGraceSuppressed ||
-      this._conversationHardUntil === null
+      this._dialogEpoch !== epoch ||
+      !this._speechInProgress
     ) {
-      return 0;
+      return;
     }
+    // 超过单句安全上限（默认 35s）且无任何实时流式新文本或有效对话推进，判定为硬件/VAD 卡死，自动释放说话保活锁
+    this._speechInProgress = false;
+    this._speechActivityStartedAt = null;
+    this._speechHoldWindowStartedAt = null;
+    this._speechHoldSuppressed = true;
     if (
-      this._speechActivityStartedAt !== null &&
-      now - this._speechActivityStartedAt > CONTINUOUS_VAD_STALE_MS
+      this._conversationExitPhase === "holding" &&
+      this._agent.activeTaskCount === 0 &&
+      !this._agent.getActivePendingConfirmationGateContext()
     ) {
-      return 0;
+      this._conversationExitPhase = "countdown";
+      this._conversationEndDecision = "ready_to_end";
+      this._remainingConversationMs = Math.max(1000, this.config.conversationWindowSec * 1000);
+      this._lastTransitionReason = "speech_hold_watchdog";
     }
-    return Math.max(0, this._conversationHardUntil - now);
+    this._syncConversationTimers({ emitState: true });
   }
 
-  /**
-   * 记录连续对话期间收到一段纯背景噪音/背景音乐或被注意力门控拒绝的片段：
-   * - 连续 >= 2 段纯背景音/音乐时抑制 VAD 说话顺延并回收已提前扩展的窗口；
-   * - 若已超过基础对话截止时间（仅靠顺延等待中），立即退出对话模式。
-   */
-  private _noteNonConversationSegment(
-    kind: "ambient_noise" | "rejected",
-    now = Date.now(),
-  ): boolean {
-    if (this._dialogState !== "conversation" || this._timerPaused) {
-      return false;
+  private _armSpeechHoldWatchdog(epoch: number): void {
+    this._clearSpeechHoldWatchdog();
+    if (this._dialogState !== "conversation" || !this._speechInProgress || this._speechHoldSuppressed) {
+      return;
     }
-    if (kind === "ambient_noise") {
-      this._consecutiveAmbientNoiseCount += 1;
-      if (this._consecutiveAmbientNoiseCount >= 2) {
-        this._speechGraceSuppressed = true;
-      }
+    const now = Date.now();
+    if (this._speechHoldWindowStartedAt === null) {
+      this._speechHoldWindowStartedAt = now;
     }
+    const elapsed = Math.max(0, now - this._speechHoldWindowStartedAt);
+    const remainingHoldMs = this._maxSpeechHoldMs - elapsed;
+    if (remainingHoldMs <= 0) {
+      this._triggerSpeechHoldWatchdogRelease(epoch);
+      return;
+    }
+    this._speechHoldWatchdog = setTimeout(() => {
+      this._speechHoldWatchdog = null;
+      this._triggerSpeechHoldWatchdogRelease(epoch);
+    }, remainingHoldMs);
+    (this._speechHoldWatchdog as { unref?: () => void }).unref?.();
+  }
 
-    if (this._conversationBaseUntil !== null && now >= this._conversationBaseUntil) {
-      this.exitConversation("timeout", { speakAck: false, now });
-      return true;
+  private _armIdleRecheckTimer(epoch: number, turnSeq: number): void {
+    if (this._idleRecheckTimer !== null) {
+      return;
     }
-
-    if (this._speechGraceSuppressed && this._conversationBaseUntil !== null) {
-      this._conversationHardUntil = this._conversationBaseUntil;
-      const currentDeadline = this._conversationUntil ?? this._awakeUntil;
-      if (currentDeadline !== null && currentDeadline > this._conversationBaseUntil) {
-        const clamped = this._conversationBaseUntil;
-        if (this._conversationUntil !== null) {
-          this._conversationUntil = clamped;
-        } else if (this._awakeUntil !== null) {
-          this._awakeUntil = clamped;
-        }
-        const remaining = clamped - now;
-        if (remaining <= 0) {
-          this.exitConversation("timeout", { speakAck: false, now });
-          return true;
-        }
-        this._armConversationTimer(remaining, this._dialogEpoch);
-        this.emit("stateChanged", this.snapshot());
-      }
+    if (this._dialogState !== "conversation" || this._conversationExitPhase !== "holding") {
+      return;
     }
-    return false;
+    const intervalMs = this._resolveIdleRecheckMs();
+    this._idleRecheckTimer = setTimeout(() => {
+      this._idleRecheckTimer = null;
+      void this._handleIdleRecheck(epoch, turnSeq);
+    }, Math.max(50, Math.round(intervalMs)));
+    (this._idleRecheckTimer as { unref?: () => void }).unref?.();
   }
 
   private _armConversationTimer(durationMs: number, epoch: number): void {
     this._clearConversationTimer();
-    if (durationMs <= 0 || this._dialogState !== "conversation") {
+    if (
+      durationMs <= 0 ||
+      this._dialogState !== "conversation" ||
+      this._timerPaused ||
+      this._conversationExitPhase !== "countdown"
+    ) {
       return;
     }
     this._remainingConversationMs = Math.max(0, Math.round(durationMs));
-    if (this._timerPaused) {
-      return;
-    }
     this._conversationTimer = setTimeout(() => {
       this._conversationTimer = null;
       if (this._dialogState !== "conversation" || this._dialogEpoch !== epoch) {
         return;
       }
-      if (this._timerPaused) {
-        return;
-      }
-      const now = Date.now();
-      const graceMs = this._remainingSpeechGraceMs(now);
-      if (graceMs >= 250) {
-        const extendMs = Math.min(MAX_SPEECH_GRACE_MS, graceMs);
-        const nextUntil = now + extendMs;
-        if (this._conversationUntil !== null) {
-          this._conversationUntil = nextUntil;
-        } else if (this._awakeUntil !== null) {
-          this._awakeUntil = nextUntil;
-        }
-        this._armConversationTimer(extendMs, epoch);
-        this.emit("stateChanged", this.snapshot());
+      if (
+        this._timerPaused ||
+        this._conversationExitPhase !== "countdown" ||
+        this._isLiveActivityHolding()
+      ) {
         return;
       }
       this.exitConversation("timeout", { speakAck: false });
@@ -694,7 +818,340 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   }
 
   /**
-   * 显式进入连续对话状态（由服务端状态机托管倒计时，到期自动推 WS 回归待机）。
+   * 统一协调对话状态机的计时器与保活状态：
+   * - 只要处于连续说话、音频识别、后台任务执行、TTS 播报或 SystemOne 结束判定中，立即冻结并暂停倒计时；
+   * - 若 SystemOne 判定对话尚未结束（holding），持续保持对话态并仅在完全静默后定期复检，不启动退出倒计时；
+   * - 仅当对话已判定可结束（countdown）且无实时活动占用时，启动退出倒计时并在到期后回归待机。
+   */
+  private _syncConversationTimers(
+    options: { now?: number; minResumeMs?: number; emitState?: boolean } = {},
+  ): void {
+    const now = options.now ?? Date.now();
+    if (this._dialogState !== "conversation") {
+      this._clearConversationTimer();
+      this._clearSpeechHoldWatchdog();
+      this._clearIdleRecheckTimer();
+      this._timerPaused = false;
+      this._conversationExitPhase = "idle";
+      return;
+    }
+
+    const hasLiveSpeech = this._speechInProgress && !this._speechHoldSuppressed;
+    const hasLiveActivity = this._isLiveActivityHolding();
+    const hasPendingConfirm = Boolean(this._agent.getActivePendingConfirmationGateContext());
+
+    // Branch A: 实时对话活动（用户连续说话 / 音频识别中 / 任务执行中 / TTS 播报中 / SystemOne 判定中）-> 保持对话态、暂停倒计时
+    if (hasLiveActivity) {
+      this._freezeRunningCountdown(now, 1000);
+      this._clearIdleRecheckTimer();
+      this._idleHoldStartedAt = null;
+      this._timerPaused = true;
+      if (hasLiveSpeech) {
+        if (this._speechHoldWatchdog === null) {
+          this._armSpeechHoldWatchdog(this._dialogEpoch);
+        }
+      } else {
+        this._clearSpeechHoldWatchdog();
+      }
+      if (options.emitState) {
+        this.emit("stateChanged", this.snapshot());
+      }
+      return;
+    }
+
+    // Branch B: SystemOne 判定对话尚未结束（或存在待确认槽位且开启连续对话）-> 持续保活，暂不开始退出倒计时
+    if (
+      this._conversationExitPhase === "holding" ||
+      (hasPendingConfirm && this.config.conversationWindowSec > 0)
+    ) {
+      this._clearConversationTimer();
+      this._clearSpeechHoldWatchdog();
+      this._timerPaused = true;
+      this._conversationUntil = null;
+      this._awakeUntil = null;
+      if (this._remainingConversationMs <= 0 && this.config.conversationWindowSec > 0) {
+        this._remainingConversationMs = this.config.conversationWindowSec * 1000;
+      }
+      if (this._idleHoldStartedAt === null) {
+        this._idleHoldStartedAt = now;
+      }
+      this._armIdleRecheckTimer(this._dialogEpoch, this._turnSeq);
+      if (options.emitState) {
+        this.emit("stateChanged", this.snapshot());
+      }
+      return;
+    }
+
+    // Branch C: 对话已可进入退出倒计时（countdown）且当前无任何实时活动 -> 启动/恢复退出倒计时
+    this._clearIdleRecheckTimer();
+    this._clearSpeechHoldWatchdog();
+    this._idleHoldStartedAt = null;
+    this._timerPaused = false;
+
+    if (this._conversationTimer !== null) {
+      if (options.emitState) {
+        this.emit("stateChanged", this.snapshot());
+      }
+      return;
+    }
+
+    const cfg = this.config;
+    const baseWindowMs =
+      cfg.conversationWindowSec > 0
+        ? cfg.conversationWindowSec * 1000
+        : hasPendingConfirm
+          ? 20_000
+          : cfg.wakeWindowSec * 1000;
+    let durationMs = this._remainingConversationMs > 0 ? this._remainingConversationMs : baseWindowMs;
+    if (typeof options.minResumeMs === "number" && options.minResumeMs > 0) {
+      durationMs = Math.max(options.minResumeMs, durationMs);
+    }
+
+    if (durationMs <= 0) {
+      this.exitConversation("timeout", { speakAck: false, now });
+      return;
+    }
+
+    const nextUntil = now + durationMs;
+    if (cfg.conversationWindowSec > 0 || hasPendingConfirm) {
+      this._conversationUntil = nextUntil;
+      if (this._awakeUntil !== null) {
+        this._awakeUntil = nextUntil;
+      }
+    } else {
+      this._awakeUntil = nextUntil;
+    }
+    this._remainingConversationMs = durationMs;
+    this._armConversationTimer(durationMs, this._dialogEpoch);
+
+    if (options.emitState) {
+      this.emit("stateChanged", this.snapshot());
+    }
+  }
+
+  /**
+   * 调用 SystemOne 动态判定当前对话是否已经自然结束：
+   * - `continue`：保持对话态（holding），暂不启动退出倒计时，并开启静默复检；
+   * - `ready_to_end`：切入退出倒计时（countdown），在 TTS/说话结束后按 conversationWindowSec 倒计时回归待机。
+   */
+  private async _evaluateConversationEndAfterTurn(params: {
+    epoch: number;
+    turnSeq: number;
+    userUtterance: string;
+    assistantReply: string;
+    silentCompleted: boolean;
+    idleSeconds?: number;
+    nonAddressedCount?: number;
+    lastNonAddressedUtterance?: string;
+  }): Promise<void> {
+    if (
+      this._dialogState !== "conversation" ||
+      this._dialogEpoch !== params.epoch ||
+      this._turnSeq !== params.turnSeq ||
+      this._agent.activeTaskCount > 0
+    ) {
+      return;
+    }
+
+    const cfg = this.config;
+    if (cfg.conversationWindowSec <= 0) {
+      return;
+    }
+
+    const pendingCtx = this._agent.getActivePendingConfirmationGateContext();
+    if (pendingCtx) {
+      this._conversationExitPhase = "holding";
+      this._conversationEndDecision = "continue";
+      this._lastTransitionReason = "confirmation_pending";
+      this._remainingConversationMs = Math.max(20_000, cfg.conversationWindowSec * 1000);
+      this._syncConversationTimers({ emitState: true });
+      return;
+    }
+
+    this._conversationExitPhase = "evaluating";
+    this._syncConversationTimers({ emitState: true });
+
+    const input: ConversationEndInput = {
+      recentHistory: this._agent.recentConversationTurns(6).map((t) => ({
+        role: t.role,
+        text: t.text,
+      })),
+      lastUserUtterance: params.userUtterance,
+      lastAssistantReply: params.assistantReply,
+      silentCompleted: params.silentCompleted,
+      hasPendingConfirmation: false,
+      activeTaskCount: this._agent.activeTaskCount,
+      ...(typeof params.idleSeconds === "number" && params.idleSeconds > 0
+        ? { idleSeconds: params.idleSeconds }
+        : {}),
+      ...(typeof params.nonAddressedCount === "number" && params.nonAddressedCount > 0
+        ? { nonAddressedCount: params.nonAddressedCount }
+        : {}),
+      ...(params.lastNonAddressedUtterance
+        ? { lastNonAddressedUtterance: params.lastNonAddressedUtterance }
+        : {}),
+    };
+
+    let s1Result: ConversationEndResult | null = null;
+    try {
+      if (this._conversationEndEvaluatorOverride) {
+        s1Result = await this._conversationEndEvaluatorOverride(input);
+      } else if (this._agent.systemOneClient?.enabled) {
+        s1Result = await this._agent.systemOneClient.evaluateConversationEnd(input);
+      }
+    } catch {
+      s1Result = null;
+    }
+
+    // 若在等待 SystemOne 判定期间已切换轮次、开始新任务或手动退出，丢弃过期结果
+    if (
+      this._dialogState !== "conversation" ||
+      this._dialogEpoch !== params.epoch ||
+      this._turnSeq !== params.turnSeq ||
+      this._agent.activeTaskCount > 0
+    ) {
+      return;
+    }
+
+    const usedSystemOne = s1Result !== null;
+    const shouldStartCountdown = usedSystemOne
+      ? s1Result!.shouldStartExitCountdown
+      : inferConversationEndFallback(input) === "ready_to_end";
+
+    const convMs = cfg.conversationWindowSec * 1000;
+    if (!shouldStartCountdown) {
+      this._conversationExitPhase = "holding";
+      this._conversationEndDecision = "continue";
+      this._remainingConversationMs = convMs;
+      this._lastTransitionReason = usedSystemOne ? "systemone_continue" : "conversation_continue";
+      this._syncConversationTimers({ emitState: true });
+      return;
+    }
+
+    this._conversationExitPhase = "countdown";
+    this._conversationEndDecision = "ready_to_end";
+    this._idleRecheckCount = 0;
+    this._idleHoldStartedAt = null;
+    this._countdownOriginAt = Date.now();
+    this._remainingConversationMs = convMs;
+    this._lastTransitionReason =
+      typeof params.idleSeconds === "number" && params.idleSeconds > 0
+        ? usedSystemOne
+          ? "systemone_idle_ready_to_end"
+          : "idle_ready_to_end"
+        : usedSystemOne
+          ? "systemone_ready_to_end"
+          : "command_done";
+    this._syncConversationTimers({ emitState: true });
+  }
+
+  private async _handleIdleRecheck(epoch: number, turnSeq: number): Promise<void> {
+    if (
+      this._dialogState !== "conversation" ||
+      this._dialogEpoch !== epoch ||
+      this._turnSeq !== turnSeq ||
+      this._conversationExitPhase !== "holding" ||
+      this._isLiveActivityHolding()
+    ) {
+      return;
+    }
+
+    this._idleRecheckCount += 1;
+    const idleSeconds = Math.max(
+      1,
+      Math.round((Date.now() - (this._idleHoldStartedAt ?? Date.now())) / 1000),
+    );
+
+    if (this._idleRecheckCount > this._maxIdleRechecks) {
+      this._conversationExitPhase = "countdown";
+      this._conversationEndDecision = "ready_to_end";
+      this._idleHoldStartedAt = null;
+      this._countdownOriginAt = Date.now();
+      this._remainingConversationMs = Math.max(1000, this.config.conversationWindowSec * 1000);
+      this._lastTransitionReason = "idle_recheck_limit";
+      this._syncConversationTimers({ emitState: true });
+      return;
+    }
+
+    const ctx = this._lastTurnContext;
+    await this._evaluateConversationEndAfterTurn({
+      epoch,
+      turnSeq,
+      userUtterance: ctx?.userUtterance ?? this._lastCommand,
+      assistantReply: ctx?.assistantReply ?? "",
+      silentCompleted: ctx?.silentCompleted ?? false,
+      idleSeconds,
+      nonAddressedCount: this._consecutiveSidetalkCount,
+      lastNonAddressedUtterance: this._lastNonAddressedUtterance || undefined,
+    });
+  }
+
+  /**
+   * 记录连续对话期间收到纯背景噪音/背景音乐或被注意力门控拒绝的片段：
+   * - 仅在连续 >= 2 段确认属于纯非语音背景噪音/音乐或连续 >= 2 段非面向助手的旁白/电视杂音时，
+   *   才抑制 VAD 说话保活（真实用户连续说话为 0 拒识段，绝不被误当背景音乐截断）；
+   * - 若此前处于 holding 保活态，连续纯背景音后自动切入正常退出倒计时；
+   * - 若已超过基础倒计时窗口且累计均为非对话背景音，立即超时回归待机。
+   */
+  private _noteNonConversationSegment(
+    kind: "ambient_noise" | "rejected",
+    now = Date.now(),
+    meta: { confirmedPureBgm?: boolean } = {},
+  ): boolean {
+    if (this._dialogState !== "conversation") {
+      return false;
+    }
+    if (kind === "ambient_noise") {
+      this._consecutiveAmbientNoiseCount += 1;
+    }
+    const baseWindowMs =
+      this.config.conversationWindowSec > 0
+        ? this.config.conversationWindowSec * 1000
+        : this.config.wakeWindowSec * 1000;
+    const pastBaseWindow =
+      this._conversationExitPhase === "countdown" &&
+      !this._ttsSpeaking &&
+      this._agent.activeTaskCount === 0 &&
+      !this._agent.getActivePendingConfirmationGateContext() &&
+      this._countdownOriginAt !== null &&
+      baseWindowMs > 0 &&
+      now - this._countdownOriginAt >= baseWindowMs;
+
+    // 若整段对话窗口已超时且经声源分离/声学分类确认为纯背景音乐（零人声），无需再苦等第二轮重分离即可立即退出；
+    // 其余情况需连续 >= 2 段非对话音频才抑制 VAD 保活，绝不误伤真实用户连续说话。
+    if (meta.confirmedPureBgm && pastBaseWindow) {
+      this._speechHoldSuppressed = true;
+      this._clearSpeechHoldWatchdog();
+      this.exitConversation("timeout", { speakAck: false, now });
+      return true;
+    }
+
+    const nonConvCount = Math.max(this._consecutiveAmbientNoiseCount, this._consecutiveSidetalkCount);
+    if (nonConvCount >= 2) {
+      this._speechHoldSuppressed = true;
+      this._clearSpeechHoldWatchdog();
+      if (
+        this._conversationExitPhase === "holding" &&
+        this._agent.activeTaskCount === 0 &&
+        !this._agent.getActivePendingConfirmationGateContext()
+      ) {
+        this._conversationExitPhase = "countdown";
+        this._conversationEndDecision = "ready_to_end";
+        this._countdownOriginAt = now;
+        this._remainingConversationMs = Math.max(1000, this.config.conversationWindowSec * 1000);
+        this._lastTransitionReason = "ambient_noise_suppressed";
+      }
+      if (pastBaseWindow) {
+        this.exitConversation("timeout", { speakAck: false, now });
+        return true;
+      }
+      this._syncConversationTimers({ now, emitState: true });
+    }
+    return false;
+  }
+
+  /**
+   * 显式进入连续对话状态（由服务端状态机托管倒计时，用户开口即刻保活、暂停倒计时）。
    */
   enterConversation(
     reason: string,
@@ -706,30 +1163,36 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const willSpeakAck = Boolean(options.speakAck && cfg.autoSpeakReply && ack.length > 0);
     const ttsGraceMs = willSpeakAck ? 1200 : 0;
     this._dialogEpoch += 1;
-    const epoch = this._dialogEpoch;
+    this._turnSeq += 1;
     if (reason === "manual_toggle") {
       this._trackMuteManager.reset();
     }
-    this._clearTtsPauseWatchdog();
+    this._clearAllDialogTimers();
     this._dialogState = "conversation";
+    this._conversationExitPhase = "countdown";
+    this._conversationEndDecision = null;
+    this._idleRecheckCount = 0;
+    this._idleHoldStartedAt = null;
+    this._countdownOriginAt = now;
     this._consecutiveSidetalkCount = 0;
     this._consecutiveAmbientNoiseCount = 0;
-    this._speechGraceSuppressed = false;
+    this._speechHoldSuppressed = false;
+    this._speechHoldWindowStartedAt = null;
+    this._lastNonAddressedUtterance = "";
     this._lastTransitionReason = reason;
-    this._timerPaused = false;
     const wakeMs = cfg.wakeWindowSec * 1000 + ttsGraceMs;
-    this._awakeUntil = now + wakeMs;
     const convMs =
       cfg.conversationWindowSec > 0 ? cfg.conversationWindowSec * 1000 + ttsGraceMs : 0;
-    this._conversationUntil = convMs > 0 ? now + convMs : null;
     const timerMs = convMs > 0 ? convMs : reason === "wake_only" ? wakeMs : 0;
-    this._remainingConversationMs = convMs > 0 ? convMs : wakeMs;
-    this._setConversationDeadlines(timerMs > 0 ? now + timerMs : null, true);
+    this._awakeUntil = now + wakeMs;
+    this._conversationUntil = convMs > 0 ? now + convMs : null;
+    this._remainingConversationMs = timerMs > 0 ? timerMs : wakeMs;
     this._mode = "awake";
 
     if (timerMs > 0) {
-      this._armConversationTimer(timerMs, epoch);
+      this._syncConversationTimers({ now, emitState: false });
     } else {
+      this._timerPaused = false;
       this._clearConversationTimer();
     }
 
@@ -756,18 +1219,24 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const now = options.now ?? Date.now();
     const cfg = this.config;
     this._dialogEpoch += 1;
-    this._clearConversationTimer();
-    this._clearTtsPauseWatchdog();
+    this._turnSeq += 1;
+    this._clearAllDialogTimers();
     this._dialogState = "standby";
+    this._conversationExitPhase = "idle";
+    this._conversationEndDecision = null;
+    this._idleRecheckCount = 0;
+    this._idleHoldStartedAt = null;
+    this._countdownOriginAt = null;
     this._awakeUntil = null;
     this._conversationUntil = null;
-    this._conversationBaseUntil = null;
-    this._conversationHardUntil = null;
     this._remainingConversationMs = 0;
     this._timerPaused = false;
+    this._ttsSpeaking = false;
     this._consecutiveSidetalkCount = 0;
     this._consecutiveAmbientNoiseCount = 0;
-    this._speechGraceSuppressed = false;
+    this._speechHoldSuppressed = false;
+    this._speechHoldWindowStartedAt = null;
+    this._lastNonAddressedUtterance = "";
     this._lastTransitionReason = reason;
     this._trackMuteManager.reset();
     this._resetDedupState();
@@ -804,65 +1273,34 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
    */
   setTtsSpeaking(speaking: boolean): void {
     if (speaking) {
-      const currentDeadline = this._conversationUntil ?? this._awakeUntil;
-      if (!this._timerPaused && this._dialogState === "conversation" && currentDeadline !== null) {
-        this._remainingConversationMs = Math.max(1000, currentDeadline - Date.now());
-      }
-      const changed = !this._timerPaused;
-      this._timerPaused = true;
-      this._clearConversationTimer();
+      const changed = !this._ttsSpeaking;
+      this._ttsSpeaking = true;
       this._clearTtsPauseWatchdog();
       const pauseEpoch = this._dialogEpoch;
       this._ttsPauseWatchdog = setTimeout(() => {
         this._ttsPauseWatchdog = null;
-        if (this._timerPaused && this._dialogEpoch === pauseEpoch) {
+        if (this._ttsSpeaking && this._dialogEpoch === pauseEpoch) {
           this.setTtsSpeaking(false);
         }
       }, TTS_PAUSE_WATCHDOG_MS);
       (this._ttsPauseWatchdog as { unref?: () => void }).unref?.();
-      if (changed) {
-        this.emit("stateChanged", this.snapshot());
-      }
+      this._syncConversationTimers({ emitState: changed });
       return;
     }
     this._clearTtsPauseWatchdog();
-    if (!this._timerPaused) return;
-    this._timerPaused = false;
+    if (!this._ttsSpeaking) return;
+    this._ttsSpeaking = false;
     if (this._dialogState === "conversation") {
-      const cfg = this.config;
-      if (cfg.conversationWindowSec > 0) {
-        const resumeMs = Math.max(
-          3000,
-          this._remainingConversationMs > 0
-            ? this._remainingConversationMs
-            : cfg.conversationWindowSec * 1000,
-        );
-        const nextUntil = Date.now() + resumeMs;
-        this._conversationUntil = nextUntil;
-        this._setConversationDeadlines(nextUntil, !this._speechGraceSuppressed);
-        this._armConversationTimer(resumeMs, this._dialogEpoch);
-        this.emit("stateChanged", this.snapshot());
-      } else if (this._awakeUntil !== null) {
-        const resumeMs = Math.max(
-          3000,
-          this._remainingConversationMs > 0
-            ? this._remainingConversationMs
-            : cfg.wakeWindowSec * 1000,
-        );
-        const nextUntil = Date.now() + resumeMs;
-        this._awakeUntil = nextUntil;
-        this._setConversationDeadlines(nextUntil, !this._speechGraceSuppressed);
-        this._armConversationTimer(resumeMs, this._dialogEpoch);
-        this.emit("stateChanged", this.snapshot());
-      } else {
-        this.emit("stateChanged", this.snapshot());
+      if (this._conversationExitPhase === "countdown") {
+        this._countdownOriginAt = Date.now();
       }
+      this._syncConversationTimers({ minResumeMs: 3000, emitState: true });
     }
   }
 
   /**
-   * 实时说话活动通知：若用户正说到一半临近超时，在单轮有界顺延额度（最多 +3.5s）内防截断，
-   * 绝不被持续环境噪音/背景音乐触发的 VAD 无限续期。
+   * 实时说话活动通知：只要用户正在说话（且未被连续纯背景噪音抑制），立即暂停退出倒计时并保持对话状态，
+   * 绝不把用户连续说出的长句子误判为背景音乐而中途踢出对话！
    */
   setSpeechInProgress(speaking: boolean): void {
     const now = Date.now();
@@ -872,37 +1310,59 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       if (!wasSpeaking) {
         this._speechActivityStartedAt = now;
       }
-    } else {
-      this._speechActivityStartedAt = null;
+      if (this._speechHoldWindowStartedAt === null) {
+        this._speechHoldWindowStartedAt = now;
+      }
+      if (this._dialogState === "conversation") {
+        if (!this._speechHoldSuppressed) {
+          this._syncConversationTimers({ now, emitState: !wasSpeaking });
+        } else if (!wasSpeaking) {
+          this.emit("stateChanged", this.snapshot());
+        }
+      } else if (!wasSpeaking) {
+        this.emit("stateChanged", this.snapshot());
+      }
       return;
     }
 
-    const currentDeadline = this._conversationUntil ?? this._awakeUntil;
-    if (
-      this._dialogState === "conversation" &&
-      !this._timerPaused &&
-      currentDeadline !== null &&
-      this._conversationHardUntil !== null
-    ) {
-      const graceLeft = this._remainingSpeechGraceMs(now);
-      const remaining = currentDeadline - now;
-      if (
-        graceLeft >= 250 &&
-        remaining < MAX_SPEECH_GRACE_MS &&
-        currentDeadline < this._conversationHardUntil
-      ) {
-        const nextUntil = Math.min(this._conversationHardUntil, now + MAX_SPEECH_GRACE_MS);
-        if (nextUntil > currentDeadline + 100) {
-          if (this._conversationUntil !== null) {
-            this._conversationUntil = nextUntil;
-          } else if (this._awakeUntil !== null) {
-            this._awakeUntil = nextUntil;
-          }
-          this._armConversationTimer(nextUntil - now, this._dialogEpoch);
-          this.emit("stateChanged", this.snapshot());
-        }
-      }
+    this._speechActivityStartedAt = null;
+    this._clearSpeechHoldWatchdog();
+    if (this._dialogState === "conversation") {
+      this._syncConversationTimers({
+        now,
+        minResumeMs: !this._speechHoldSuppressed ? this._postSpeechHandoffGraceMs() : undefined,
+        emitState: wasSpeaking,
+      });
+    } else if (wasSpeaking) {
+      this.emit("stateChanged", this.snapshot());
     }
+  }
+
+  /**
+   * 流式 ASR 实时字幕活动通知：一旦识别出真实人声文字，即刻确认为有效人类说话（非背景音乐），
+   * 清除偶然的噪声计数与抑制锁，并刷新连续说话保活看门狗，保障长语音全程保持对话态。
+   */
+  noteLiveSpeechActivity(partialText: string): void {
+    const clean = partialText.trim();
+    if (!clean) return;
+    this._interimTranscript = clean;
+    if (this._dialogState !== "conversation") {
+      return;
+    }
+    const meaningful = clean.replace(/[\s,，。．.、!！?？:：;；\-—~～"'“”‘’]+/g, "");
+    if (meaningful.length < 2) {
+      return;
+    }
+    const now = Date.now();
+    this._consecutiveAmbientNoiseCount = 0;
+    this._consecutiveSidetalkCount = 0;
+    this._speechHoldSuppressed = false;
+    this._speechInProgress = true;
+    this._speechActivityStartedAt = now;
+    this._speechHoldWindowStartedAt = now;
+    this._countdownOriginAt = null;
+    this._armSpeechHoldWatchdog(this._dialogEpoch);
+    this._syncConversationTimers({ now, emitState: true });
   }
 
   recordWakeWordSpot(hit: WakeWordAcousticHit): void {
@@ -936,12 +1396,15 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         const keepMs = Math.max(20_000, this.config.conversationWindowSec * 1000);
         const nowMs = Date.now();
         this._dialogState = "conversation";
-        const nextUntil = nowMs + keepMs;
-        this._conversationUntil = nextUntil;
-        this._awakeUntil = nextUntil;
+        this._conversationEndDecision = "continue";
+        this._conversationExitPhase =
+          this.config.conversationWindowSec > 0 ? "holding" : "countdown";
         this._remainingConversationMs = keepMs;
-        this._setConversationDeadlines(nextUntil, true);
-        this._armConversationTimer(keepMs, this._dialogEpoch);
+        if (this.config.conversationWindowSec <= 0) {
+          this._conversationUntil = nowMs + keepMs;
+          this._awakeUntil = nowMs + keepMs;
+        }
+        this._syncConversationTimers({ now: nowMs, emitState: false });
       }
     }
     if (typeof patch.speaking === "boolean") {
@@ -1029,23 +1492,28 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     if (patch.active !== undefined) {
       this._active = Boolean(patch.active);
       if (!this._active) {
-        this._clearConversationTimer();
-        this._clearTtsPauseWatchdog();
+        this._clearAllDialogTimers();
         this._dialogEpoch += 1;
+        this._turnSeq += 1;
         this._dialogState = "standby";
+        this._conversationExitPhase = "idle";
+        this._conversationEndDecision = null;
+        this._idleRecheckCount = 0;
+        this._idleHoldStartedAt = null;
         this._mode = "idle";
         this._interimTranscript = "";
         this._awakeUntil = null;
         this._conversationUntil = null;
-        this._conversationBaseUntil = null;
-        this._conversationHardUntil = null;
         this._remainingConversationMs = 0;
         this._timerPaused = false;
+        this._ttsSpeaking = false;
         this._speechInProgress = false;
         this._speechActivityStartedAt = null;
-        this._speechGraceSuppressed = false;
+        this._speechHoldWindowStartedAt = null;
+        this._speechHoldSuppressed = false;
         this._consecutiveAmbientNoiseCount = 0;
         this._consecutiveSidetalkCount = 0;
+        this._lastNonAddressedUtterance = "";
         this._lastTransitionReason = "stopped";
         this._trackMuteManager.reset();
         this._resetDedupState();
@@ -1109,9 +1577,13 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     }
 
     if (options.isFinal === false) {
-      this._interimTranscript = text;
+      if (text) {
+        this.noteLiveSpeechActivity(text);
+      } else {
+        this._interimTranscript = "";
+        this.emit("stateChanged", this.snapshot());
+      }
       const snap = this.snapshot();
-      this.emit("stateChanged", snap);
       return {
         ok: true,
         matched: false,
@@ -1177,20 +1649,25 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     }
     if (
       this._dialogState === "conversation" &&
+      this._conversationExitPhase === "countdown" &&
       !awakeActive &&
       !convWindowActive &&
-      !this._timerPaused
+      !this._timerPaused &&
+      !this._isLiveActivityHolding()
     ) {
       this._dialogEpoch += 1;
+      this._turnSeq += 1;
       this._dialogState = "standby";
-      this._clearConversationTimer();
-      this._clearTtsPauseWatchdog();
-      this._conversationBaseUntil = null;
-      this._conversationHardUntil = null;
+      this._conversationExitPhase = "idle";
+      this._conversationEndDecision = null;
+      this._idleRecheckCount = 0;
+      this._idleHoldStartedAt = null;
+      this._clearAllDialogTimers();
       this._remainingConversationMs = 0;
       this._consecutiveSidetalkCount = 0;
       this._consecutiveAmbientNoiseCount = 0;
-      this._speechGraceSuppressed = false;
+      this._speechHoldSuppressed = false;
+      this._lastNonAddressedUtterance = "";
       this._lastTransitionReason = "timeout";
       this._trackMuteManager.reset();
       if (this._mode !== "processing" && this._mode !== "error") {
@@ -1229,37 +1706,60 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const ttsActiveNow = this._echoGuard.isSpeaking;
     const duringTtsPlayback = options.duringTtsPlayback ?? ttsActiveNow;
 
-    const decision =
-      options.precomputedAttention ??
-      (await evaluateVoiceAttention({
-        rawText: text,
-        altText: options.altText,
-        wakeWordEnabled: cfg.wakeWordEnabled,
-        wakeWords: cfg.wakeWords,
-        attentionMode: cfg.attentionMode,
-        bypassWakeWord: options.bypassWakeWord,
-        awakeActive,
-        inConversation,
-        dialogState: this._dialogState,
-        acousticWake: options.acousticWake ?? null,
-        owwActiveForWord,
-        systemOneClient: this._agent.systemOneClient,
-        recentTurns: this._agent.recentConversationTurns(5),
-        lastSpokenReply: legacySpoken.text || this._lastSpokenReply,
-        lastSpokenAt: legacySpoken.at || this._lastSpokenAt,
-        recentSpokenUtterances,
-        ttsActive: ttsActiveNow,
-        duringTtsPlayback,
-        echoCancellationMode: cfg.echoCancellationMode,
-        now,
-        acousticEvent: options.acousticEvent,
-        voiceprint: options.voiceprint,
-        voiceprintMode: cfg.voiceprintMode,
-        llmEvaluator,
-        capabilityDigest: this._agent.getCapabilityDigest(),
-        learnedTriggers: this._agent.getLearnedTriggerSamples(),
-        pendingConfirmation: activePendingCtx,
-      }));
+    // 注意力门控（可能调用 SystemOne / LLM）执行期间暂停退出倒计时，防止分析途中超时误退
+    this._inFlightSegmentCount += 1;
+    if (this._dialogState === "conversation") {
+      this._syncConversationTimers({ emitState: false });
+    }
+    let evalInFlightReleased = false;
+    const releaseEvalInFlight = (resync = false) => {
+      if (evalInFlightReleased) return;
+      evalInFlightReleased = true;
+      this._inFlightSegmentCount = Math.max(0, this._inFlightSegmentCount - 1);
+      if (resync && this._dialogState === "conversation") {
+        this._syncConversationTimers({ emitState: false });
+      }
+    };
+
+    let decision: AttentionDecision;
+    try {
+      decision =
+        options.precomputedAttention ??
+        (await evaluateVoiceAttention({
+          rawText: text,
+          altText: options.altText,
+          wakeWordEnabled: cfg.wakeWordEnabled,
+          wakeWords: cfg.wakeWords,
+          attentionMode: cfg.attentionMode,
+          bypassWakeWord: options.bypassWakeWord,
+          awakeActive,
+          inConversation,
+          dialogState: this._dialogState,
+          acousticWake: options.acousticWake ?? null,
+          owwActiveForWord,
+          systemOneClient: this._agent.systemOneClient,
+          recentTurns: this._agent.recentConversationTurns(5),
+          lastSpokenReply: legacySpoken.text || this._lastSpokenReply,
+          lastSpokenAt: legacySpoken.at || this._lastSpokenAt,
+          recentSpokenUtterances,
+          ttsActive: ttsActiveNow,
+          duringTtsPlayback,
+          echoCancellationMode: cfg.echoCancellationMode,
+          now,
+          acousticEvent: options.acousticEvent,
+          voiceprint: options.voiceprint,
+          voiceprintMode: cfg.voiceprintMode,
+          llmEvaluator,
+          capabilityDigest: this._agent.getCapabilityDigest(),
+          learnedTriggers: this._agent.getLearnedTriggerSamples(),
+          pendingConfirmation: activePendingCtx,
+        }));
+    } catch (err) {
+      releaseEvalInFlight(true);
+      throw err;
+    }
+    // 门控评估完毕，释放 in-flight 计数（具体是否进入 holding/countdown 由下方状态迁移统一协调）
+    releaseEvalInFlight(false);
 
     if (decision.stage === "echo") {
       this._echoGuard.recordSuppressed();
@@ -1377,6 +1877,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       if (this._dialogState === "conversation" && !options.suppressSidetalkPenalty) {
         if (decision.stage !== "echo") {
           this._consecutiveSidetalkCount += 1;
+          this._lastNonAddressedUtterance = text;
           if (this._consecutiveSidetalkCount >= cfg.maxConsecutiveSidetalk) {
             const snap = this.exitConversation("sidetalk_limit", { speakAck: false, now });
             return {
@@ -1409,7 +1910,32 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
               voiceState: this.snapshot(),
             };
           }
+          // 若当前处于 SystemOne 保持对话态（holding）且出现非面向助手的旁白聊天，立即让 SystemOne 动态重估是否应开始退出倒计时
+          if (
+            this._conversationExitPhase === "holding" &&
+            decision.stage !== "acoustic" &&
+            this._agent.activeTaskCount === 0 &&
+            !this._agent.getActivePendingConfirmationGateContext() &&
+            (this._conversationEndEvaluatorOverride || this._agent.systemOneClient?.enabled)
+          ) {
+            const ctx = this._lastTurnContext;
+            void this._evaluateConversationEndAfterTurn({
+              epoch: this._dialogEpoch,
+              turnSeq: this._turnSeq,
+              userUtterance: ctx?.userUtterance ?? this._lastCommand,
+              assistantReply: ctx?.assistantReply ?? "",
+              silentCompleted: ctx?.silentCompleted ?? false,
+              nonAddressedCount: this._consecutiveSidetalkCount,
+              lastNonAddressedUtterance: text,
+            });
+          } else {
+            this._syncConversationTimers({ emitState: false });
+          }
+        } else {
+          this._syncConversationTimers({ emitState: false });
         }
+      } else if (this._dialogState === "conversation") {
+        this._syncConversationTimers({ emitState: false });
       }
       if (this._active && this._mode !== "awake") {
         this._mode = "listening";
@@ -1439,6 +1965,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       this._agent.taintRecentAutoExecutedMemoryIfWithin(120_000);
       const cancelReply = "已取消正在执行的任务";
       entry.reply = cancelReply;
+      this._syncConversationTimers({ emitState: false });
       const cancelSnap = this.snapshot();
       this.emit("stateChanged", cancelSnap);
       if (cfg.autoSpeakReply) {
@@ -1465,10 +1992,16 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
 
     // 确认在呼叫/对话：进入异步解耦的 Pi Agent 执行通道（支持非阻塞投递，对话与播报持续畅通）
     const commandEpoch = this._dialogEpoch;
+    this._turnSeq += 1;
+    const commandTurnSeq = this._turnSeq;
     const useAsyncDispatch = Boolean(options.asyncDispatch && cfg.asyncVoicePipeline !== false);
     this._consecutiveSidetalkCount = 0;
     this._consecutiveAmbientNoiseCount = 0;
-    this._speechGraceSuppressed = false;
+    this._speechHoldSuppressed = false;
+    this._speechHoldWindowStartedAt = null;
+    this._idleRecheckCount = 0;
+    this._idleHoldStartedAt = null;
+    this._lastNonAddressedUtterance = "";
     this._awakeUntil = null;
     this._lastDispatchedText = text;
     this._lastDispatchedNormText = normText;
@@ -1477,16 +2010,18 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._lastDispatchedCompletedAt = 0;
     this._lastCommand = decision.command;
 
-    // 立即维持/刷新连续对话窗口：即便任务在后台执行，用户也无需重复喊唤醒词即可继续对话
+    // 立即保持对话态并暂停退出倒计时：执行与对话过程中绝不提前倒计时踢出，待本轮完成后交由 SystemOne 动态判断是否结束再开始倒计时
     if (cfg.conversationWindowSec > 0) {
       const convMs = cfg.conversationWindowSec * 1000;
       this._dialogState = "conversation";
+      this._conversationExitPhase = "holding";
+      this._conversationEndDecision = null;
+      this._countdownOriginAt = null;
       this._lastTransitionReason = useAsyncDispatch ? "command_dispatched_async" : "command_running";
-      const nextUntil = Date.now() + convMs;
-      this._conversationUntil = nextUntil;
+      this._conversationUntil = null;
       this._remainingConversationMs = convMs;
-      this._setConversationDeadlines(nextUntil, true);
-      this._armConversationTimer(convMs, this._dialogEpoch);
+      this._clearConversationTimer();
+      this._clearIdleRecheckTimer();
     }
 
     if (useAsyncDispatch) {
@@ -1514,9 +2049,10 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         ...(options.trackId ? { trackId: options.trackId } : {}),
       },
     });
+    this._syncConversationTimers({ emitState: false });
     this.emit("stateChanged", this.snapshot());
 
-    const finalizeRunResult = (runResult: PiAgentRunResult): VoiceListenerSnapshot => {
+    const finalizeRunResult = async (runResult: PiAgentRunResult): Promise<VoiceListenerSnapshot> => {
       const agentMs = Math.round(performance.now() - agentStart);
       this._lastDispatchedCompletedAt =
         options.now !== undefined ? Math.max(now, now + agentMs) : Date.now();
@@ -1536,55 +2072,13 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         entry.error = runResult.error;
       }
 
-      // 执行完成后若 epoch 未被手动退出打断，刷新连续对话窗口且绝不抢占其他仍在进行中的后台任务状态
-      if (commandEpoch === this._dialogEpoch) {
-        if (cfg.conversationWindowSec > 0 && runResult.ok) {
-          const convMs = cfg.conversationWindowSec * 1000;
-          this._dialogState = "conversation";
-          this._consecutiveSidetalkCount = 0;
-          this._consecutiveAmbientNoiseCount = 0;
-          this._speechGraceSuppressed = false;
-          this._lastTransitionReason = "command_done";
-          const nextUntil = Date.now() + convMs;
-          this._conversationUntil = nextUntil;
-          this._remainingConversationMs = convMs;
-          this._setConversationDeadlines(nextUntil, true);
-          this._armConversationTimer(convMs, this._dialogEpoch);
-        } else if (
-          cfg.conversationWindowSec <= 0 &&
-          this._agent.activeTaskCount === 0 &&
-          !this._agent.getActivePendingConfirmationGateContext()
-        ) {
-          this._dialogState = "standby";
-          this._conversationUntil = null;
-          this._conversationBaseUntil = null;
-          this._conversationHardUntil = null;
-          this._remainingConversationMs = 0;
-          this._consecutiveAmbientNoiseCount = 0;
-          this._speechGraceSuppressed = false;
-          this._clearConversationTimer();
-          this._clearTtsPauseWatchdog();
-          this._lastTransitionReason = "command_done_no_window";
-          this._trackMuteManager.reset();
-        }
-        if (this._agent.activeTaskCount === 0) {
-          this._mode = this._active
-            ? useAsyncDispatch && this._dialogState === "conversation"
-              ? "awake"
-              : "listening"
-            : "idle";
-        }
-      }
-
-      this._lastMetrics = {
-        ...(this._lastMetrics ?? {}),
-        attention: decision,
-        timings,
-        updatedAt: Date.now(),
+      this._lastTurnContext = {
+        userUtterance: decision.command,
+        assistantReply: runResult.reply,
+        silentCompleted: Boolean(runResult.silentCompleted),
       };
-      const finalSnap = this.snapshot();
-      this.emit("stateChanged", finalSnap);
 
+      // 先下发语音播报请求（保证零额外首字延迟），随后再由 SystemOne 动态判定对话是否结束
       if (
         cfg.autoSpeakReply &&
         runResult.reply &&
@@ -1602,18 +2096,80 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           interrupt: false,
         });
       }
+
+      // 执行完成后若 epoch 未被手动退出打断，且全部后台任务已结束，交由 SystemOne 动态判定是否开启退出倒计时
+      let shouldEvalEnd = false;
+      if (commandEpoch === this._dialogEpoch) {
+        if (cfg.conversationWindowSec > 0) {
+          this._dialogState = "conversation";
+          this._consecutiveSidetalkCount = 0;
+          this._consecutiveAmbientNoiseCount = 0;
+          this._speechHoldSuppressed = false;
+          if (this._agent.activeTaskCount === 0 && commandTurnSeq === this._turnSeq) {
+            shouldEvalEnd = true;
+          } else {
+            this._syncConversationTimers({ emitState: false });
+          }
+        } else if (
+          cfg.conversationWindowSec <= 0 &&
+          this._agent.activeTaskCount === 0 &&
+          !this._agent.getActivePendingConfirmationGateContext()
+        ) {
+          this._dialogState = "standby";
+          this._conversationExitPhase = "idle";
+          this._conversationEndDecision = null;
+          this._conversationUntil = null;
+          this._awakeUntil = null;
+          this._remainingConversationMs = 0;
+          this._timerPaused = false;
+          this._consecutiveAmbientNoiseCount = 0;
+          this._speechHoldSuppressed = false;
+          this._clearAllDialogTimers();
+          this._lastTransitionReason = "command_done_no_window";
+          this._trackMuteManager.reset();
+        }
+        if (this._agent.activeTaskCount === 0) {
+          this._mode = this._active
+            ? this._dialogState === "conversation"
+              ? "awake"
+              : "listening"
+            : "idle";
+        }
+      }
+
+      this._lastMetrics = {
+        ...(this._lastMetrics ?? {}),
+        attention: decision,
+        timings,
+        updatedAt: Date.now(),
+      };
+
+      if (shouldEvalEnd) {
+        await this._evaluateConversationEndAfterTurn({
+          epoch: commandEpoch,
+          turnSeq: commandTurnSeq,
+          userUtterance: decision.command,
+          assistantReply: runResult.reply,
+          silentCompleted: Boolean(runResult.silentCompleted),
+        });
+        return this.snapshot();
+      }
+
+      const finalSnap = this.snapshot();
+      this.emit("stateChanged", finalSnap);
       return finalSnap;
     };
 
     if (useAsyncDispatch) {
       entry.reply = submission.ack;
       void submission.promise
-        .then((runResult) => {
-          finalizeRunResult(runResult);
+        .then(async (runResult) => {
+          await finalizeRunResult(runResult);
         })
         .catch((err) => {
           const msg = err instanceof Error ? err.message : String(err);
           entry.error = msg;
+          this._syncConversationTimers({ emitState: false });
           this.emit("stateChanged", this.snapshot());
         });
 
@@ -1636,7 +2192,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     }
 
     const runResult: PiAgentRunResult = await submission.promise;
-    const finalSnap = finalizeRunResult(runResult);
+    const finalSnap = await finalizeRunResult(runResult);
 
     return {
       ok: runResult.ok,
@@ -1656,6 +2212,29 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     };
   }
 
+  private async _runWithInFlightAudio<T>(
+    fn: (releaseInFlight: () => void) => Promise<T>,
+  ): Promise<T> {
+    this._inFlightSegmentCount += 1;
+    if (this._dialogState === "conversation") {
+      this._syncConversationTimers({ emitState: false });
+    }
+    let released = false;
+    const releaseInFlight = (resync = true) => {
+      if (released) return;
+      released = true;
+      this._inFlightSegmentCount = Math.max(0, this._inFlightSegmentCount - 1);
+      if (resync && this._dialogState === "conversation") {
+        this._syncConversationTimers({ emitState: false });
+      }
+    };
+    try {
+      return await fn(() => releaseInFlight(false));
+    } finally {
+      releaseInFlight(true);
+    }
+  }
+
   /**
    * 统一的高性能音频处理管线：
    * 16kHz PCM WAV -> 环境降噪 (GTCRN/DSP) -> 神经 VAD (Silero) -> 声纹识别 (3D-Speaker CAM++)
@@ -1673,6 +2252,25 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       asyncDispatch?: boolean;
       duringTtsPlayback?: boolean;
     } = {},
+  ): Promise<ProcessAudioUploadResult> {
+    return this._runWithInFlightAudio((releaseInFlight) =>
+      this._processAudioUploadCore(audioBlob, options, releaseInFlight),
+    );
+  }
+
+  private async _processAudioUploadCore(
+    audioBlob: Blob,
+    options: {
+      filename?: string;
+      lang?: string;
+      bypassWakeWord?: boolean;
+      autoDispatch?: boolean;
+      preferredEngine?: "auto" | "local" | "whisper";
+      llmAttentionOverride?: AttentionLlmEvaluator;
+      asyncDispatch?: boolean;
+      duringTtsPlayback?: boolean;
+    },
+    releaseInFlight: () => void,
   ): Promise<ProcessAudioUploadResult> {
     const totalStart = performance.now();
     const cfg = this.config;
@@ -1700,6 +2298,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           voiceState: this.snapshot(),
         };
       }
+      releaseInFlight();
       const dispatched = await this.handleTranscript(text, {
         isFinal: true,
         bypassWakeWord: options.bypassWakeWord,
@@ -1849,6 +2448,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
               asyncDispatch: options.asyncDispatch,
               duringTtsPlayback: options.duringTtsPlayback,
               totalStart,
+              releaseInFlight,
             },
           );
         }
@@ -2033,6 +2633,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         this._dialogState === "standby" &&
         !sep.attention.wakeWord;
 
+      releaseInFlight();
       const dispatched = await this.handleTranscript(sep.text, {
         isFinal: true,
         bypassWakeWord: options.bypassWakeWord,
@@ -2232,6 +2833,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     }
 
     // ---- Stage 6: 唤醒词注意力门控 + Pi Agent 执行 ----
+    releaseInFlight();
     const dispatched = await this.handleTranscript(transcript, {
       isFinal: true,
       bypassWakeWord: options.bypassWakeWord,
@@ -2279,6 +2881,23 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       asyncDispatch?: boolean;
       duringTtsPlayback?: boolean;
     } = {},
+  ): Promise<ProcessAudioUploadResult> {
+    return this._runWithInFlightAudio((releaseInFlight) =>
+      this._processDualTrackSegmentCore(segment, options, releaseInFlight),
+    );
+  }
+
+  private async _processDualTrackSegmentCore(
+    segment: VoiceStreamSegmentPayload,
+    options: {
+      lang?: string;
+      bypassWakeWord?: boolean;
+      preferredEngine?: "auto" | "local" | "whisper";
+      llmAttentionOverride?: AttentionLlmEvaluator;
+      asyncDispatch?: boolean;
+      duringTtsPlayback?: boolean;
+    },
+    releaseInFlight: () => void,
   ): Promise<ProcessAudioUploadResult> {
     const totalStart = performance.now();
     const cfg = this.config;
@@ -2369,6 +2988,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           asyncDispatch: options.asyncDispatch,
           duringTtsPlayback: options.duringTtsPlayback ?? segment.duringTtsPlayback,
           totalStart,
+          releaseInFlight,
         },
       );
     }
@@ -2539,7 +3159,14 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           : sep.text;
 
         if (!sep.speechDetected || !sepText.trim()) {
-          this._noteNonConversationSegment("ambient_noise");
+          const isPureBgm = Boolean(
+            !sep.speechDetected &&
+              (sep.acousticEvent?.toUpperCase().includes("BGM") ||
+                (sep.detectedSoundTypes.includes("bgm") && !sep.detectedSoundTypes.includes("speech"))),
+          );
+          this._noteNonConversationSegment("ambient_noise", Date.now(), {
+            confirmedPureBgm: isPureBgm,
+          });
           return {
             ok: true,
             text: "",
@@ -2571,6 +3198,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           this._dialogState === "standby" &&
           !sep.attention.wakeWord;
 
+        releaseInFlight();
         const dispatched = await this.handleTranscript(sepText, {
           isFinal: true,
           bypassWakeWord: options.bypassWakeWord,
@@ -2705,6 +3333,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     }
 
     // 等用户整段话说完后作为一整条完整指令统一发送给 Pi Agent，绝不按句中标点强拆成多条独立请求！
+    releaseInFlight();
     const dispatched = await this.handleTranscript(transcript, {
       isFinal: true,
       bypassWakeWord: options.bypassWakeWord,
@@ -2787,6 +3416,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       duringTtsPlayback?: boolean;
       now?: number;
       totalStart?: number;
+      releaseInFlight?: () => void;
     },
   ): Promise<ProcessAudioUploadResult> {
     const totalStart = options.totalStart ?? performance.now();
@@ -3242,6 +3872,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const dispatchResults = new Map<string, HandleTranscriptResult>();
 
     if (options.autoDispatch) {
+      options.releaseInFlight?.();
       if (speakingPrepared.length === 0) {
         this._noteNonConversationSegment("ambient_noise");
       } else {
@@ -3751,10 +4382,15 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   }
 
   clearHistory(): void {
-    this._clearConversationTimer();
-    this._clearTtsPauseWatchdog();
+    this._clearAllDialogTimers();
     this._dialogEpoch += 1;
+    this._turnSeq += 1;
     this._dialogState = "standby";
+    this._conversationExitPhase = "idle";
+    this._conversationEndDecision = null;
+    this._idleRecheckCount = 0;
+    this._idleHoldStartedAt = null;
+    this._countdownOriginAt = null;
     this._history = [];
     this._lastTrackBatch = null;
     this._recentTrackBatches = [];
@@ -3762,13 +4398,15 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._lastCommand = "";
     this._awakeUntil = null;
     this._conversationUntil = null;
-    this._conversationBaseUntil = null;
-    this._conversationHardUntil = null;
     this._remainingConversationMs = 0;
     this._timerPaused = false;
+    this._ttsSpeaking = false;
     this._consecutiveSidetalkCount = 0;
     this._consecutiveAmbientNoiseCount = 0;
-    this._speechGraceSuppressed = false;
+    this._speechHoldSuppressed = false;
+    this._speechHoldWindowStartedAt = null;
+    this._lastNonAddressedUtterance = "";
+    this._lastTurnContext = null;
     this._lastTransitionReason = "cleared";
     this._trackMuteManager.reset();
     this._echoGuard.reset();
@@ -3781,10 +4419,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._localEngine.setQwen3ComputeDevice?.(cfg.qwen3ComputeDevice);
     this._localEngine.setClearVoiceServiceUrl?.(cfg.clearVoiceServiceUrl);
     const now = Date.now();
+    const conversationHoldReason = this._resolveConversationHoldReason();
+    const effectivePaused = this._timerPaused || conversationHoldReason !== null;
     const conversationRemainingMs =
       this._dialogState === "conversation"
-        ? this._timerPaused
-          ? Math.max(0, this._remainingConversationMs)
+        ? effectivePaused
+          ? Math.max(0, this._remainingConversationMs || cfg.conversationWindowSec * 1000)
           : this._conversationUntil !== null
             ? Math.max(0, this._conversationUntil - now)
             : this._awakeUntil !== null
@@ -3831,7 +4471,10 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       dialogState: this._dialogState,
       dialogEpoch: this._dialogEpoch,
       serverNow: now,
-      timerPaused: this._timerPaused,
+      timerPaused: effectivePaused,
+      conversationExitPhase: this._dialogState === "conversation" ? this._conversationExitPhase : "idle",
+      conversationEndDecision: this._dialogState === "conversation" ? this._conversationEndDecision : null,
+      conversationHoldReason,
       conversationRemainingMs,
       conversationWindowSec: cfg.conversationWindowSec,
       maxConsecutiveSidetalk: cfg.maxConsecutiveSidetalk,
@@ -3890,24 +4533,32 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   }
 
   dispose(): void {
-    this._clearConversationTimer();
-    this._clearTtsPauseWatchdog();
+    this._clearAllDialogTimers();
     this._unsubAgentSpeak();
     this._unsubConfirmationPending();
     this._localEngine.dispose();
     this._active = false;
     this._dialogState = "standby";
+    this._conversationExitPhase = "idle";
+    this._conversationEndDecision = null;
+    this._idleRecheckCount = 0;
+    this._idleHoldStartedAt = null;
+    this._countdownOriginAt = null;
     this._mode = "idle";
     this._awakeUntil = null;
     this._conversationUntil = null;
-    this._conversationBaseUntil = null;
-    this._conversationHardUntil = null;
     this._remainingConversationMs = 0;
     this._timerPaused = false;
+    this._ttsSpeaking = false;
     this._speechInProgress = false;
     this._speechActivityStartedAt = null;
-    this._speechGraceSuppressed = false;
+    this._speechHoldWindowStartedAt = null;
+    this._speechHoldSuppressed = false;
+    this._inFlightSegmentCount = 0;
     this._consecutiveAmbientNoiseCount = 0;
+    this._consecutiveSidetalkCount = 0;
+    this._lastNonAddressedUtterance = "";
+    this._lastTurnContext = null;
     this._lastTrackBatch = null;
     this._recentTrackBatches = [];
     this._trackMuteManager.reset();
