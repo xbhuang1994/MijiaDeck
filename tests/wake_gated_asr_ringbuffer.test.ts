@@ -7,11 +7,10 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { decodeWavPcm, encodeWavPcm16 } from "../src/agent/audioPcm.ts";
-import { ClearVoiceGpuRuntime } from "../src/agent/clearVoiceGpuRuntime.ts";
 import { LocalVoiceEngine, type LocalAsrOutput, type StreamingVadHandleLike } from "../src/agent/localVoiceEngine.ts";
 import type { OpenWakeWordStreamSession, WakeWordAcousticHit } from "../src/agent/openWakeWordEngine.ts";
 import { PiAgentService } from "../src/agent/piAgentService.ts";
-import { VoiceListenerController, type ProcessAudioUploadResult } from "../src/agent/voiceListenerController.ts";
+import { VoiceListenerController } from "../src/agent/voiceListenerController.ts";
 import { VoiceStreamSession, type VoiceStreamSegmentPayload } from "../src/agent/voiceStreamSession.ts";
 import { addWakeWordPrototype } from "../src/agent/wakewordPrototypeStore.ts";
 import { defaultAgentVoiceConfig, normalizeAgentVoiceConfig } from "../src/core/agentConfigStore.ts";
@@ -29,7 +28,6 @@ const BENCH_AUDIO_DIR = path.resolve(import.meta.dir, "..", "benchmarks", "voice
 const HAS_BENCH_WAVS = existsSync(path.join(BENCH_AUDIO_DIR, "clip_001.wav"));
 
 let tempDir: string | null = null;
-let mockCvServer: ReturnType<typeof Bun.serve> | null = null;
 let runningServer: MijiaDeckServer | null = null;
 
 function useTempDataDir(): string {
@@ -43,10 +41,6 @@ afterEach(async () => {
   if (runningServer) {
     await runningServer.stop();
     runningServer = null;
-  }
-  if (mockCvServer) {
-    mockCvServer.stop(true);
-    mockCvServer = null;
   }
   setDataPathOverrides(null);
   if (tempDir) {
@@ -81,7 +75,7 @@ function pushChunked(session: VoiceStreamSession, samples: Float32Array, chunkSi
 }
 
 /**
- * 确定性能量门控模拟 Silero VAD，同时支持 legacy（pop 出段）与 ClearVoice（帧级 isDetected）。
+ * 确定性能量门控模拟 Silero VAD（支持 pop 出段与帧级 isDetected）。
  */
 function createEnergyMockVad(threshold = 0.02, silenceFramesToEnd = 10): StreamingVadHandleLike {
   let detected = false;
@@ -249,58 +243,8 @@ function createMockOwwController(initialActive = true): MockOwwController {
   return ctrl;
 }
 
-function startMockClearVoiceServer() {
-  const receivedSlices: Float32Array[] = [];
-  const srv = Bun.serve({
-    port: 0,
-    hostname: "127.0.0.1",
-    async fetch(req) {
-      const u = new URL(req.url);
-      if (u.pathname === "/health") {
-        return Response.json({
-          status: "ok",
-          upstreams: {
-            clearvoice: {
-              status: "ok",
-              details: {
-                status: "ok",
-                gpu_name: "Mock Online GPU",
-                loaded_models: [{ name: "MossFormer2_SE_48K", task: "speech_enhancement" }],
-              },
-            },
-          },
-        });
-      }
-      if (u.pathname === "/clearvoice/v1/enhance") {
-        const form = await req.formData();
-        const file = form.get("file") as Blob;
-        const decoded = decodeWavPcm(new Uint8Array(await file.arrayBuffer()));
-        receivedSlices.push(new Float32Array(decoded.samples));
-        // 原样返回（乘 0.9 便于区分降噪前后且保持每个样点标记值可精确断言）
-        const out = new Float32Array(decoded.samples.length);
-        for (let i = 0; i < decoded.samples.length; i += 1) {
-          out[i] = decoded.samples[i]! * 0.9;
-        }
-        const wav = encodeWavPcm16(out, decoded.sampleRate);
-        return new Response(new Uint8Array(wav), {
-          status: 200,
-          headers: {
-            "Content-Type": "audio/wav",
-            "X-ClearVoice-Model": "MossFormer2_SE_48K",
-            "X-Elapsed-Ms": "12.0",
-          },
-        });
-      }
-      return new Response("not found", { status: 404 });
-    },
-  });
-  mockCvServer = srv;
-  return { server: srv, receivedSlices };
-}
-
 function createFakeLocalEngine(opts: {
   owwCtrl?: MockOwwController | null;
-  cvRuntime?: ClearVoiceGpuRuntime;
   vadThreshold?: number;
   transcribeFn?: (samples: Float32Array, signal?: AbortSignal) => Promise<LocalAsrOutput>;
 }) {
@@ -318,12 +262,8 @@ function createFakeLocalEngine(opts: {
       wakeWords: string[],
       wOpts: { threshold?: number; onSpot?: (hit: WakeWordAcousticHit) => void },
     ) => (opts.owwCtrl ? opts.owwCtrl.sessionFactory(wakeWords, wOpts) : null),
-    clearVoiceGpu: opts.cvRuntime,
     getStatus: () => ({
       readyForLocalAsr: true,
-      activeQwen3Device: "remote",
-      readyForClearVoiceGpu: Boolean(opts.cvRuntime),
-      clearVoice: opts.cvRuntime?.getStatus(),
     }),
     denoise: (s: Float32Array) => ({
       samples: new Float32Array(s),
@@ -356,9 +296,8 @@ function createFakeLocalEngine(opts: {
         lang: "zh",
         emotion: "",
         event: "",
-        engine: "qwen3-asr-remote",
+        engine: "sensevoice-local",
         durationMs: 40,
-        computeDevice: "remote",
       };
     },
   } as unknown as LocalVoiceEngine;
@@ -410,78 +349,6 @@ describe("未唤醒门控待机（零实时转写 + 循环录制缓冲区持续�
     expect(partials.length).toBe(0);
     expect(segments.length).toBe(0);
     expect(speechActivities.length).toBe(0);
-
-    session.dispose();
-  });
-
-  test("clearvoice 模式未唤醒时：开启降噪对非静音音频执行 ClearVoice 降噪唤醒（零转写/零分段/零 UI 闪烁）；纯静音或降噪关闭时零 GPU 请求", async () => {
-    const dir = useTempDataDir();
-    const { server, receivedSlices } = startMockClearVoiceServer();
-    const cvRuntime = new ClearVoiceGpuRuntime({
-      serviceUrl: `http://127.0.0.1:${server.port}`,
-    });
-    const owwCtrl = createMockOwwController(true);
-    const { fakeEngine, asrCalls } = createFakeLocalEngine({ owwCtrl, cvRuntime });
-
-    const segments: VoiceStreamSegmentPayload[] = [];
-    const partials: string[] = [];
-    const speechActivities: boolean[] = [];
-
-    const session = new VoiceStreamSession({
-      localEngine: fakeEngine,
-      noiseMode: "auto",
-      voicePipelineMode: "clearvoice",
-      wakeWords: ["Neo"],
-      wakeWordEnabled: true,
-      owwEnabled: true,
-      streamingAsrEnabled: true,
-      onPartialTranscript: (p) => partials.push(p.text),
-      onSpeechActivity: (speaking) => speechActivities.push(speaking),
-      onSegmentReady: async (seg) => {
-        segments.push(seg);
-        return null;
-      },
-    });
-
-    expect(session.isAwake).toBe(false);
-    expect(session.isWakeGatedStandby).toBe(true);
-
-    // 1. 纯静音待机：零 ClearVoice GPU 请求
-    const pureSilence = makeSilence(2.0);
-    pushChunked(session, pureSilence);
-    await session.flush();
-    await session.waitForIdle();
-    expect(receivedSlices.length).toBe(0);
-
-    // 2. 非静音环境音（未说唤醒词）：运行待机 ClearVoice 降噪喂给 openWakeWord，但严格零 ASR、零字幕、零分段、零 UI 闪烁
-    const speech = makeSine(3.0, 500, 0.28);
-    const silence = makeSilence(1.5);
-    pushChunked(session, speech);
-    pushChunked(session, silence);
-    await session.flush();
-    await session.waitForIdle();
-
-    expect(session.ringBufferedSamples).toBe(pureSilence.length + speech.length + silence.length);
-    expect(receivedSlices.length).toBeGreaterThanOrEqual(1);
-    expect(session.standbyClearVoiceProcessedSlices).toBeGreaterThanOrEqual(1);
-    expect(owwCtrl.pushedSamples.reduce((a, b) => a + b, 0)).toBeGreaterThan(
-      pureSilence.length + speech.length + silence.length,
-    );
-    expect(asrCalls.length).toBe(0);
-    expect(partials.length).toBe(0);
-    expect(segments.length).toBe(0);
-    expect(speechActivities.length).toBe(0);
-
-    // 3. 热关闭降噪（noiseMode: "off"）：后续待机音频零新增 ClearVoice GPU 请求
-    const slicesBeforeOff = receivedSlices.length;
-    session.setNoiseMode("off");
-    pushChunked(session, makeSine(2.5, 440, 0.25));
-    pushChunked(session, makeSilence(1.0));
-    await session.flush();
-    await session.waitForIdle();
-    expect(receivedSlices.length).toBe(slicesBeforeOff);
-    expect(asrCalls.length).toBe(0);
-    expect(segments.length).toBe(0);
 
     session.dispose();
   });
@@ -582,224 +449,9 @@ describe("唤醒后回放循环录制缓冲区 + 无缝衔接后续音频", () =
 
     session.dispose();
   });
-
-  test("clearvoice 模式：唤醒前零 GPU 降噪/零 ASR，唤醒后注入 0.3s lookback 并无缝回放缓冲区 + 后续音频（零重复帧）", async () => {
-    const dir = useTempDataDir();
-    const { server, receivedSlices } = startMockClearVoiceServer();
-    const cvRuntime = new ClearVoiceGpuRuntime({
-      serviceUrl: `http://127.0.0.1:${server.port}`,
-    });
-    const owwCtrl = createMockOwwController(true);
-    const { fakeEngine, asrCalls } = createFakeLocalEngine({ owwCtrl, cvRuntime });
-
-    const segments: VoiceStreamSegmentPayload[] = [];
-    const partials: string[] = [];
-
-    const session = new VoiceStreamSession({
-      localEngine: fakeEngine,
-      noiseMode: "off",
-      voicePipelineMode: "clearvoice",
-      clearVoiceSilenceMs: 256,
-      clearVoiceUtteranceSilenceMs: 700,
-      clearVoiceMaxChunkMs: 1800,
-      clearVoiceLookbackMs: 300,
-      wakeRingLookbackMs: 1000,
-      wakeWords: ["Neo"],
-      wakeWordEnabled: true,
-      owwEnabled: true,
-      streamingAsrEnabled: true,
-      onPartialTranscript: (p) => partials.push(p.text),
-      onSegmentReady: async (seg) => {
-        segments.push(seg);
-        return null;
-      },
-    });
-
-    // 1. 先在待机状态下录制 1.2s 背景（特征值 0.05，作为 pre-context 观察）+ 0.7s 唤醒前音频（特征值 0.31）
-    //    将唤醒触发点设在 preWake 末尾
-    const bgPre = makeConstant(1.2, 0.005);
-    const preWake = makeConstant(0.7, 0.31);
-    owwCtrl.triggerAtGlobalSample = bgPre.length + preWake.length;
-
-    pushChunked(session, bgPre, 1024);
-    expect(receivedSlices.length).toBe(0);
-    expect(asrCalls.length).toBe(0);
-
-    // 喂入唤醒词音频（未达末尾前零 GPU；到达末尾触发声学唤醒并回放环形缓冲）
-    pushChunked(session, preWake, 1024);
-    expect(session.isAwake).toBe(true);
-
-    // 2. 紧接唤醒词继续说 1.6s 后续指令（特征值 0.57，总活跃语音 > 1.8s 会先触发 timeout 增量切片并刷流式预览）+ 0.9s 静音收句
-    const postWake = makeConstant(1.6, 0.57);
-    const tailSilence = makeSilence(0.95);
-    pushChunked(session, postWake, 1024);
-    pushChunked(session, tailSilence, 1024);
-    await session.waitForIdle();
-
-    expect(receivedSlices.length).toBeGreaterThanOrEqual(2);
-    // 第 1 个切片送入 GPU 时已前置拼接 0.3s 历史上下文（4800 samples）
-    expect(receivedSlices[0]!.length).toBeGreaterThan(Math.round(SR * 0.3));
-    // 唤醒后实时流式字幕预览已工作
-    expect(partials.length).toBeGreaterThanOrEqual(1);
-    expect(asrCalls.length).toBeGreaterThanOrEqual(1);
-
-    expect(segments.length).toBe(1);
-    const seg = segments[0]!;
-    expect(seg.pipelineMode).toBe("clearvoice");
-    expect(seg.wakeAnchored).toBe(true);
-    expect(seg.acousticWake?.wakeWord).toBe("Neo");
-    expect(seg.denoisedSamples.length).toBe(seg.rawSamples.length);
-
-    // 精确计数校验：
-    // - preWake（0.31）与 postWake（0.57）均完整存在且绝无唤醒帧重复喂入！
-    let preCount = 0;
-    let postCount = 0;
-    for (let i = 0; i < seg.rawSamples.length; i += 1) {
-      const v = seg.rawSamples[i]!;
-      if (Math.abs(v - 0.31) < 0.015) preCount += 1;
-      if (Math.abs(v - 0.57) < 0.015) postCount += 1;
-    }
-    expect(preCount).toBe(preWake.length);
-    expect(postCount).toBe(postWake.length);
-
-    session.dispose();
-  });
-
-  test("clearvoice 模式轻声仅说唤醒词（VAD 未翻转）也能通过 ensureUtteranceActive 完整降噪并交付唤醒段", async () => {
-    const dir = useTempDataDir();
-    const { server, receivedSlices } = startMockClearVoiceServer();
-    const cvRuntime = new ClearVoiceGpuRuntime({
-      serviceUrl: `http://127.0.0.1:${server.port}`,
-    });
-    const owwCtrl = createMockOwwController(true);
-    // 将能量 VAD 阈值设高（0.08），模拟轻声呼唤“Neo”幅值 0.03 未翻起 Silero VAD 的场景
-    const { fakeEngine } = createFakeLocalEngine({ owwCtrl, cvRuntime, vadThreshold: 0.08 });
-
-    const segments: VoiceStreamSegmentPayload[] = [];
-    const session = new VoiceStreamSession({
-      localEngine: fakeEngine,
-      noiseMode: "off",
-      voicePipelineMode: "clearvoice",
-      clearVoiceSilenceMs: 256,
-      clearVoiceUtteranceSilenceMs: 600,
-      wakeRingLookbackMs: 900,
-      wakeWords: ["Neo"],
-      wakeWordEnabled: true,
-      owwEnabled: true,
-      onSegmentReady: async (seg) => {
-        segments.push(seg);
-        return null;
-      },
-    });
-
-    const softWake = makeConstant(0.8, 0.03);
-    owwCtrl.triggerAtGlobalSample = softWake.length;
-    pushChunked(session, softWake, 1024);
-    pushChunked(session, makeSilence(0.85), 1024);
-    await session.waitForIdle();
-
-    expect(receivedSlices.length).toBeGreaterThanOrEqual(1);
-    expect(segments.length).toBe(1);
-    expect(segments[0]!.wakeAnchored).toBe(true);
-    expect(segments[0]!.acousticWake?.wakeWord).toBe("Neo");
-
-    session.dispose();
-  });
 });
 
-describe("连续对话续说、异步间隙回放、退出对话回归零 ASR 及热配置降级", () => {
-  test("clearvoice 模式：唤醒段异步识别期间的续说音频先暂存缓冲区，切入连续对话后无缝回放，退出对话立即恢复零 ASR 待机", async () => {
-    const dir = useTempDataDir();
-    const { server, receivedSlices } = startMockClearVoiceServer();
-    const cvRuntime = new ClearVoiceGpuRuntime({
-      serviceUrl: `http://127.0.0.1:${server.port}`,
-    });
-    const owwCtrl = createMockOwwController(true);
-    const { fakeEngine, asrCalls } = createFakeLocalEngine({ owwCtrl, cvRuntime });
-
-    let inConversation = false;
-    const segments: VoiceStreamSegmentPayload[] = [];
-    let releaseSeg1!: () => void;
-    const seg1Started = new Promise<void>((resolve) => {
-      releaseSeg1 = resolve;
-    });
-    let allowSeg1Finish!: () => void;
-    const seg1Gate = new Promise<void>((resolve) => {
-      allowSeg1Finish = resolve;
-    });
-
-    const session = new VoiceStreamSession({
-      localEngine: fakeEngine,
-      noiseMode: "off",
-      voicePipelineMode: "clearvoice",
-      clearVoiceSilenceMs: 256,
-      clearVoiceUtteranceSilenceMs: 600,
-      wakeRingLookbackMs: 900,
-      wakeWords: ["Neo"],
-      wakeWordEnabled: true,
-      owwEnabled: true,
-      streamingAsrEnabled: true,
-      isInConversation: () => inConversation,
-      onSegmentReady: async (seg) => {
-        segments.push(seg);
-        if (segments.length === 1) {
-          releaseSeg1();
-          await seg1Gate;
-          inConversation = true;
-          session.syncDialogState(true, "command_dispatched_async");
-          return { matched: true } as unknown as ProcessAudioUploadResult;
-        }
-        return { matched: true } as unknown as ProcessAudioUploadResult;
-      },
-    });
-
-    // Utterance 1：声学唤醒 -> 交付段 1（此时故意挂起 onSegmentReady 模拟异步 Qwen3-ASR 耗时）
-    const utt1 = makeConstant(0.8, 0.35);
-    owwCtrl.triggerAtGlobalSample = utt1.length;
-    pushChunked(session, utt1, 1024);
-    pushChunked(session, makeSilence(0.8), 1024);
-    await seg1Started;
-
-    const slicesAfterUtt1 = receivedSlices.length;
-    // 在段 1 异步识别期间，用户立刻开口续说（特征值 0.49）——此时仍未进入连续对话，不应提前发 GPU 切片
-    const gapFollowUp = makeConstant(0.4, 0.49);
-    pushChunked(session, gapFollowUp, 1024);
-    expect(receivedSlices.length).toBe(slicesAfterUtt1);
-
-    // 放行段 1 -> 进入连续对话 -> 自动回放 gapFollowUp -> 继续说尾段（特征值 0.63）+ 静音收句
-    allowSeg1Finish();
-    await Bun.sleep(25);
-    const tailFollowUp = makeConstant(0.5, 0.63);
-    pushChunked(session, tailFollowUp, 1024);
-    pushChunked(session, makeSilence(0.8), 1024);
-    await session.waitForIdle();
-
-    expect(segments.length).toBe(2);
-    const seg2 = segments[1]!;
-    expect(seg2.wakeAnchored).toBe(false);
-    // 异步识别间隙里说的 0.49 续说首字与后续 0.63 完整衔接，无首字丢失
-    expect(seg2.rawSamples.some((v) => Math.abs(v - 0.49) < 0.02)).toBe(true);
-    expect(seg2.rawSamples.some((v) => Math.abs(v - 0.63) < 0.02)).toBe(true);
-
-    // 退出连续对话 -> 立即回归零 ASR / 零 GPU 待机
-    inConversation = false;
-    session.syncDialogState(false, "timeout");
-    expect(session.isWakeGatedStandby).toBe(true);
-
-    const slicesBeforeStandby = receivedSlices.length;
-    const asrBeforeStandby = asrCalls.length;
-    pushChunked(session, makeSine(2.0, 440, 0.28), 1024);
-    pushChunked(session, makeSilence(1.0), 1024);
-    await session.flush();
-    await session.waitForIdle();
-
-    expect(receivedSlices.length).toBe(slicesBeforeStandby);
-    expect(asrCalls.length).toBe(asrBeforeStandby);
-    expect(segments.length).toBe(2);
-
-    session.dispose();
-  });
-
+describe("连续对话续说、退出对话回归零 ASR 及热配置降级", () => {
   test("legacy 模式：退出对话时立即中止在途实时流式转写（AbortSignal），后续回归零 ASR 待机", async () => {
     const owwCtrl = createMockOwwController(true);
     let inConversation = true;
@@ -822,9 +474,8 @@ describe("连续对话续说、异步间隙回放、退出对话回归零 ASR �
           lang: "zh",
           emotion: "",
           event: "",
-          engine: "qwen3-asr-remote",
+          engine: "sensevoice-local",
           durationMs: 400,
-          computeDevice: "remote",
         };
       },
     });
@@ -931,7 +582,7 @@ describe("连续对话续说、异步间隙回放、退出对话回归零 ASR �
 });
 
 describe("HTTP /api/voice/audio 兜底上传门控与 WebSocket /ws 端到端集成", () => {
-  test("VoiceListenerController.processAudioUpload 未唤醒且 OWW 就绪未命中时跳过 ClearVoice/ASR，命中或对话态正常转写", async () => {
+  test("VoiceListenerController.processAudioUpload 未唤醒且 OWW 就绪未命中时跳过 ASR，命中或对话态正常转写", async () => {
     useTempDataDir();
     applyTheme("dark", "green");
     // 写入 1 条唤醒词原型，使 getPrototypesForWords(["Neo"]) 非空
@@ -1023,9 +674,8 @@ describe("HTTP /api/voice/audio 兜底上传门控与 WebSocket /ws 端到端集
         lang: "zh",
         emotion: "",
         event: "",
-        engine: "qwen3-asr-remote",
+        engine: "sensevoice-local",
         durationMs: 30,
-        computeDevice: "remote",
       };
     };
 
@@ -1096,7 +746,6 @@ describe("HTTP /api/voice/audio 兜底上传门控与 WebSocket /ws 端到端集
       ...LocalVoiceEngine.prototype.getStatus.call(vl.localEngine),
       readyForLocalAsr: true,
       readyForWakeWord: true,
-      activeQwen3Device: "remote",
     });
     engine.transcribeLocal = async () => {
       asrCalls += 1;
@@ -1106,9 +755,8 @@ describe("HTTP /api/voice/audio 兜底上传门控与 WebSocket /ws 端到端集
         lang: "zh",
         emotion: "",
         event: "",
-        engine: "qwen3-asr-remote",
+        engine: "sensevoice-local",
         durationMs: 25,
-        computeDevice: "remote",
       };
     };
 
@@ -1217,8 +865,8 @@ describe("真实 ONNX 模型端到端验证（背景音零 ASR + 真实唤醒词
         await engine.warmup();
         await engine.openWakeWord.bootstrapWakeWords(wakeWords);
 
-        // 1. 待机下播放流行歌曲 (clip_026) 和电视对话 (clip_066)：legacy 与 clearvoice 双模式均必须 0 触发、0 分段！
-        for (const mode of ["legacy", "clearvoice"] as const) {
+        // 1. 待机下播放流行歌曲 (clip_026) 和电视对话 (clip_066)：legacy 模式必须 0 触发、0 分段！
+        for (const mode of ["legacy"] as const) {
           for (const noiseFile of ["clip_026.wav", "clip_066.wav"]) {
             const decoded = decodeWavPcm(
               new Uint8Array(readFileSync(path.join(BENCH_AUDIO_DIR, noiseFile))),

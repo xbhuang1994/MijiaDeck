@@ -3,27 +3,23 @@
 // Copyright (C) 2026 MiHome-Windows contributors
 
 /**
- * 语音 AI 引擎（在线 ClearVoice / Qwen3-ASR 网关 + 本地 sherpa-onnx-node 基础管线）：
- * - 环境降噪：
- *   - 在线新方案：ClearVoice（Voice & ASR Gateway，多轨 MossFormer2_SS_16K 盲源分离 + 分轨 MossFormer2_SE_48K 降噪）
- *   - 本地原方案/兜底：GTCRN（gtcrn_simple.onnx）/ DPDFNet4（dpdfnet4.onnx）/ VoxLock 目标人声提取 / 纯 TS 频谱减法
+ * 语音 AI 引擎（本地 sherpa-onnx-node 基础管线 + 讯飞语音听写大模型 2.0 在线接入）：
+ * - 环境降噪：GTCRN（gtcrn_simple.onnx）/ DPDFNet4（dpdfnet4.onnx）/ VoxLock 目标人声提取 / 纯 TS 频谱减法
  * - 语音活动检测：Silero VAD 神经端点检测（支持离线与连续流式检测），无模型时自动降级自适应能量+过零率 VAD
  * - 声纹识别：阿里 3D-Speaker CAM++（192 维中文说话人嵌入），无模型时自动降级声学指纹
  * - 语音识别（ASR）：
- *   - 主方案（仅在线）：Qwen3-ASR-0.6B（通过在线 Voice & ASR Gateway 调用远端 GPU）
- *   - 备用/储备方案（本地离线）：FunAudioLLM SenseVoiceSmall int8（在线主方案未配置或异常时自动无缝降级，亦可手动切换）
+ *   - 本地离线：FunAudioLLM SenseVoiceSmall int8
+ *   - 在线直推：讯飞语音听写大模型 2.0（Spark ASR V2 WebSocket，openWakeWord 唤醒后直推 16kHz 原始音频）
  */
 
 import { existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import {
-  DEFAULT_LOCAL_ASR_ENGINE,
-  type LocalAsrEngineMode,
-  type NoiseSuppressionMode,
-  type VadEngineMode,
-  type VoicePipelineMode,
+import type {
+  NoiseSuppressionMode,
+  VadEngineMode,
+  VoicePipelineMode,
 } from "../core/agentConfigStore.ts";
 import { projectRoot } from "../core/appMeta.ts";
 import { sanitizeAsrTranscript } from "./asrHallucinationGuard.ts";
@@ -65,14 +61,6 @@ import {
   matchEnglishHeadWakeWord,
 } from "./voiceAttentionGate.ts";
 import {
-  ClearVoiceGpuRuntime,
-  type ClearVoiceGpuStatus,
-} from "./clearVoiceGpuRuntime.ts";
-import {
-  Qwen3AsrGpuRuntime,
-  type Qwen3GpuStatus,
-} from "./qwen3AsrGpuRuntime.ts";
-import {
   XfyunIatV2Runtime,
   type XfyunIatConfig,
   type XfyunIatStatus,
@@ -85,10 +73,7 @@ import {
 import { getPrimaryOwnerRefWavPath } from "./voiceprintStore.ts";
 
 export type {
-  ClearVoiceGpuStatus,
-  LocalAsrEngineMode,
   NoiseSuppressionMode,
-  Qwen3GpuStatus,
   VadEngineMode,
   VoicePipelineMode,
   VoiceWsAsrConfig,
@@ -96,7 +81,7 @@ export type {
   XfyunIatConfig,
   XfyunIatStatus,
 };
-export { ClearVoiceGpuRuntime, Qwen3AsrGpuRuntime, VoiceWsAsrRuntime, XfyunIatV2Runtime };
+export { VoiceWsAsrRuntime, XfyunIatV2Runtime };
 
 export interface LocalVoiceModelPaths {
   modelsDir: string;
@@ -130,41 +115,27 @@ export interface LocalVoiceEngineStatus {
     voxlock: boolean;
     sileroVad: boolean;
     speakerCampp: boolean;
-    qwen3Asr: boolean;
-    qwen3AsrGpu?: boolean;
     senseVoice: boolean;
     openWakeWord: boolean;
     cedAudioTagging?: boolean;
     pyannoteDiarization?: boolean;
     spleeterSeparation?: boolean;
     localTts?: boolean;
-    clearVoiceMossformer2?: boolean;
-    clearVoiceMossformer2Ss?: boolean;
     xfyunIat?: boolean;
     voiceWsAsr?: boolean;
   };
   readyForDenoise: boolean;
   readyForDpdfnet: boolean;
   readyForVoxlock: boolean;
-  readyForClearVoiceGpu: boolean;
-  readyForClearVoiceBss?: boolean;
-  clearVoice: ClearVoiceGpuStatus;
   readyForXfyunIat: boolean;
   xfyunIat: XfyunIatStatus;
   readyForVoiceWsAsr: boolean;
   voiceWsAsr: VoiceWsAsrStatus;
   readyForVad: boolean;
   readyForVoiceprint: boolean;
-  readyForQwen3Asr: boolean;
-  readyForQwen3Gpu: boolean;
-  readyForQwen3Remote?: boolean;
-  activeQwen3Device: "remote" | null;
-  gpu: Qwen3GpuStatus;
   readyForSenseVoice: boolean;
   readyForLocalAsr: boolean;
-  primaryAsrEngine: "qwen3-asr" | "sensevoice" | null;
-  fallbackAsrEngine: "sensevoice" | null;
-  activeLocalAsrMode: LocalAsrEngineMode;
+  primaryAsrEngine: "sensevoice" | null;
   readyForWakeWord: boolean;
   readyForSourceSeparation?: boolean;
   readyForLocalTts?: boolean;
@@ -202,20 +173,13 @@ export interface SpeakerEmbeddingOutput {
 export type LocalAsrResultEngine =
   | "xfyun-iat-v2"
   | "voice-ws-asr"
-  | "qwen3-asr-remote"
-  | "qwen3-asr-remote-stream"
-  | "qwen3-asr-remote-dual-raw"
-  | "qwen3-asr-remote-dual-denoised"
   | "sensevoice-local"
-  | "sensevoice-fallback"
   | "sensevoice-dual-raw"
   | "sensevoice-dual-denoised";
 
 export interface LocalAsrTranscribeOptions {
-  engine?: LocalAsrEngineMode;
   hotwords?: readonly string[];
   maxNewTokens?: number;
-  allowFallback?: boolean;
   /** 流式转写实时局部回调 */
   onPartial?: (partialText: string) => void;
   signal?: AbortSignal;
@@ -229,13 +193,9 @@ export interface LocalAsrOutput {
   event: string;
   engine: LocalAsrResultEngine;
   durationMs: number;
-  computeDevice?: "remote" | "cpu";
-  gpuDeviceName?: string | null;
   altText?: string;
   enHeadText?: string;
   scoreMargin?: number;
-  fallbackUsed?: boolean;
-  fallbackReason?: string;
 }
 
 export interface OnlineDenoiserHandleLike {
@@ -380,18 +340,6 @@ export function cleanSenseVoiceText(raw: string): string {
     .trim();
 }
 
-/**
- * 清洗 Qwen3-ASR 输出中可能残留的语言脚手架前缀（如 `language Chinese<asr_text>`）与特殊控制标签。
- */
-export function cleanQwen3AsrText(raw: string): string {
-  return raw
-    .replace(/^\s*language\s+[A-Za-z_-]+\s*<asr_text>\s*/i, "")
-    .replace(/<asr_text>/gi, " ")
-    .replace(/<\|[^|>]+\|>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
 function mapSenseVoiceLang(voiceLang?: string): string {
   const lower = (voiceLang ?? "").trim().toLowerCase();
   if (!lower || lower === "auto") return "auto";
@@ -401,20 +349,6 @@ function mapSenseVoiceLang(voiceLang?: string): string {
   if (lower.startsWith("ja")) return "ja";
   if (lower.startsWith("ko")) return "ko";
   return "auto";
-}
-
-/**
- * 将 UI 识别语言映射为 Qwen3-ASR `stream.setOption("language", ...)` 支持的语种名。
- * 中文（zh-CN）与 auto 保持空字符串以启用 Qwen3-ASR 原生中英混说自动识别。
- */
-export function mapQwen3AsrLang(voiceLang?: string): string {
-  const lower = (voiceLang ?? "").trim().toLowerCase();
-  if (!lower || lower === "auto" || lower === "zh" || lower.startsWith("zh-cn")) return "";
-  if (lower.startsWith("zh-hk") || lower.includes("yue")) return "Cantonese";
-  if (lower.startsWith("en")) return "English";
-  if (lower.startsWith("ja")) return "Japanese";
-  if (lower.startsWith("ko")) return "Korean";
-  return "";
 }
 
 /**
@@ -481,23 +415,17 @@ export function chooseBestAsrCandidate(
   const scoreMargin = Number(Math.abs(rawScore - denScore).toFixed(2));
 
   if (rawScore >= denScore) {
-    const engine: LocalAsrResultEngine = rawAsr.engine.startsWith("qwen3-asr")
-      ? "qwen3-asr-remote-dual-raw"
-      : "sensevoice-dual-raw";
     return {
       ...rawAsr,
-      engine,
+      engine: "sensevoice-dual-raw",
       durationMs: rawAsr.durationMs + denoisedAsr.durationMs,
       altText: denoisedAsr.text,
       scoreMargin,
     };
   }
-  const engine: LocalAsrResultEngine = denoisedAsr.engine.startsWith("qwen3-asr")
-    ? "qwen3-asr-remote-dual-denoised"
-    : "sensevoice-dual-denoised";
   return {
     ...denoisedAsr,
-    engine,
+    engine: "sensevoice-dual-denoised",
     durationMs: rawAsr.durationMs + denoisedAsr.durationMs,
     altText: rawAsr.text,
     scoreMargin,
@@ -508,11 +436,8 @@ export class LocalVoiceEngine {
   private readonly _modelsDirOverride?: string;
   private readonly _oww: OpenWakeWordEngine;
   private readonly _tts: LocalTtsEngine;
-  private readonly _qwen3Gpu: Qwen3AsrGpuRuntime;
-  private readonly _clearVoiceGpu: ClearVoiceGpuRuntime;
   private readonly _xfyunIat: XfyunIatV2Runtime;
   private readonly _voiceWsAsr: VoiceWsAsrRuntime;
-  private _preferredAsrEngine: LocalAsrEngineMode = DEFAULT_LOCAL_ASR_ENGINE;
   private _sourceSeparator: AudioSourceSeparator | null = null;
   private _gtcrnDenoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
   private _dpdfnetDenoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
@@ -532,42 +457,14 @@ export class LocalVoiceEngine {
   constructor(
     options: {
       modelsDir?: string;
-      preferredAsrEngine?: LocalAsrEngineMode;
     } = {},
   ) {
     this._modelsDirOverride = options.modelsDir;
-    this._preferredAsrEngine = options.preferredAsrEngine ?? DEFAULT_LOCAL_ASR_ENGINE;
     const p = resolveVoiceModelPaths(options.modelsDir);
     this._oww = new OpenWakeWordEngine({ modelsDir: p.modelsDir });
     this._tts = new LocalTtsEngine({ modelsDir: p.modelsDir });
-    this._qwen3Gpu = new Qwen3AsrGpuRuntime();
-    this._clearVoiceGpu = new ClearVoiceGpuRuntime();
     this._xfyunIat = new XfyunIatV2Runtime();
     this._voiceWsAsr = new VoiceWsAsrRuntime();
-  }
-
-  get preferredAsrEngine(): LocalAsrEngineMode {
-    return this._preferredAsrEngine;
-  }
-
-  set preferredAsrEngine(mode: LocalAsrEngineMode) {
-    if (this._preferredAsrEngine !== mode) {
-      this._preferredAsrEngine = mode;
-      // 切换策略时重置在线 Qwen3-ASR 失败冷却以便立即重检
-      this._qwen3Gpu.resetFailureCooldown();
-    }
-  }
-
-  setPreferredAsrEngine(mode: LocalAsrEngineMode): void {
-    this.preferredAsrEngine = mode;
-  }
-
-  get qwen3Gpu(): Qwen3AsrGpuRuntime {
-    return this._qwen3Gpu;
-  }
-
-  get clearVoiceGpu(): ClearVoiceGpuRuntime {
-    return this._clearVoiceGpu;
   }
 
   get xfyunIat(): XfyunIatV2Runtime {
@@ -585,19 +482,6 @@ export class LocalVoiceEngine {
   setVoiceWsAsrConfig(config: VoiceWsAsrConfig): void {
     this._voiceWsAsr.setConfig(config);
   }
-
-  setClearVoiceServiceUrl(url: string): void {
-    this._clearVoiceGpu.setCustomServiceUrl(url);
-  }
-
-  setClearVoiceRemoteConfig(config: { serviceUrl?: string; apiKey?: string; model?: string }): void {
-    this._clearVoiceGpu.setRemoteConfig(config);
-  }
-
-  setQwen3AsrRemoteConfig(config: { serviceUrl?: string; apiKey?: string; model?: string }): void {
-    this._qwen3Gpu.setRemoteConfig(config);
-  }
-
   get paths(): LocalVoiceModelPaths {
     return resolveVoiceModelPaths(this._modelsDirOverride);
   }
@@ -650,13 +534,8 @@ export class LocalVoiceEngine {
     const voxlock = existsSync(p.voxlockEnroll) && existsSync(p.voxlockChunk);
     const sileroVad = existsSync(p.sileroVad);
     const speakerCampp = existsSync(p.speakerCampp);
-    const gpuStatus = this._qwen3Gpu.getStatus();
-    const clearVoiceStatus = this._clearVoiceGpu.getStatus();
     const xfyunStatus = this._xfyunIat.getStatus();
     const voiceWsAsrStatus = this._voiceWsAsr.getStatus();
-    const readyForQwen3Remote = Boolean(gpuStatus.remote && gpuStatus.ready);
-    const readyForQwen3Gpu = readyForQwen3Remote;
-    const readyForQwen3Asr = readyForQwen3Remote;
     const senseVoice = this._hasSenseVoiceModels(p);
     const openWakeWord = existsSync(p.openWakeWordMel) && existsSync(p.openWakeWordEmbedding);
     const cedAudioTagging = existsSync(p.cedModel) && existsSync(p.cedLabels);
@@ -664,25 +543,9 @@ export class LocalVoiceEngine {
     const spleeterSeparation = existsSync(p.spleeterVocals) && existsSync(p.spleeterAccompaniment);
     const ttsStatus = this._tts.getStatus();
     const addonAvailable = sherpa !== null;
-    const activeQwen3Device: "remote" | null = readyForQwen3Remote ? "remote" : null;
     const readyForSenseVoice = addonAvailable && senseVoice;
-    const readyForLocalAsr =
-      this._preferredAsrEngine === "qwen3-asr"
-        ? readyForQwen3Asr
-        : this._preferredAsrEngine === "sensevoice"
-          ? readyForSenseVoice
-          : readyForQwen3Asr || readyForSenseVoice;
-    const primaryAsrEngine: "qwen3-asr" | "sensevoice" | null =
-      this._preferredAsrEngine === "sensevoice"
-        ? readyForSenseVoice
-          ? "sensevoice"
-          : null
-        : readyForQwen3Asr
-          ? "qwen3-asr"
-          : this._preferredAsrEngine === "auto" && readyForSenseVoice
-            ? "sensevoice"
-            : null;
-    const fallbackAsrEngine: "sensevoice" | null = readyForSenseVoice ? "sensevoice" : null;
+    const readyForLocalAsr = readyForSenseVoice;
+    const primaryAsrEngine: "sensevoice" | null = readyForSenseVoice ? "sensevoice" : null;
     return {
       addonAvailable,
       addonVersion: sherpa?.version ?? null,
@@ -693,48 +556,34 @@ export class LocalVoiceEngine {
         voxlock,
         sileroVad,
         speakerCampp,
-        qwen3Asr: readyForQwen3Remote,
-        qwen3AsrGpu: readyForQwen3Remote,
         senseVoice,
         openWakeWord,
         cedAudioTagging,
         pyannoteDiarization,
         spleeterSeparation,
         localTts: ttsStatus.ready,
-        clearVoiceMossformer2: clearVoiceStatus.modelReady,
-        clearVoiceMossformer2Ss: clearVoiceStatus.ssModelReady,
         xfyunIat: xfyunStatus.ready,
         voiceWsAsr: voiceWsAsrStatus.ready,
       },
       readyForDenoise: addonAvailable && gtcrn,
       readyForDpdfnet: addonAvailable && dpdfnet4,
       readyForVoxlock: addonAvailable && voxlock,
-      readyForClearVoiceGpu: clearVoiceStatus.ready,
-      readyForClearVoiceBss: clearVoiceStatus.multiTrackReady,
-      clearVoice: clearVoiceStatus,
       readyForXfyunIat: xfyunStatus.ready,
       xfyunIat: xfyunStatus,
       readyForVoiceWsAsr: voiceWsAsrStatus.ready,
       voiceWsAsr: voiceWsAsrStatus,
       readyForVad: addonAvailable && sileroVad,
       readyForVoiceprint: addonAvailable && speakerCampp,
-      readyForQwen3Asr,
-      readyForQwen3Gpu,
-      readyForQwen3Remote,
-      activeQwen3Device,
-      gpu: gpuStatus,
       readyForSenseVoice,
       readyForLocalAsr,
       primaryAsrEngine,
-      fallbackAsrEngine,
-      activeLocalAsrMode: this._preferredAsrEngine,
       readyForWakeWord: this._oww.getStatus().ready,
       readyForSourceSeparation:
         readyForLocalAsr && (cedAudioTagging || pyannoteDiarization || spleeterSeparation),
       readyForLocalTts: ttsStatus.ready,
       tts: ttsStatus,
       downloading: this._downloading || ttsStatus.downloading,
-      lastError: this._lastError ?? gpuStatus.lastError ?? ttsStatus.lastError,
+      lastError: this._lastError ?? ttsStatus.lastError,
     };
   }
 
@@ -751,18 +600,16 @@ export class LocalVoiceEngine {
   }
 
   /**
-   * 后台异步分阶段预热本地 ONNX 基础模型（GTCRN / CAM++ / SenseVoice 备用 / openWakeWord）
-   * 与在线 ClearVoice / Qwen3-ASR 网关轻量探活，每步让出事件循环避免启动/开麦瞬间卡顿。
+   * 后台异步分阶段预热本地 ONNX 基础模型（GTCRN / CAM++ / SenseVoice / openWakeWord），
+   * 每步让出事件循环避免启动/开麦瞬间卡顿。
    */
   async warmup(
     options: {
       preloadEnglish?: boolean;
-      localAsrEngine?: LocalAsrEngineMode;
       voicePipelineMode?: VoicePipelineMode;
     } = {},
   ): Promise<void> {
     const yieldTick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
-    const mode = options.localAsrEngine ?? this._preferredAsrEngine;
     try {
       this._oww.ensureLoaded();
       await yieldTick();
@@ -775,30 +622,6 @@ export class LocalVoiceEngine {
       await yieldTick();
       this._ensureSpeakerExtractor();
       await yieldTick();
-      if (
-        options.voicePipelineMode === "clearvoice" &&
-        this._clearVoiceGpu.getStatus().ready &&
-        !this._clearVoiceGpu.isInFailureCooldown()
-      ) {
-        void this._clearVoiceGpu.warmup().catch(() => {});
-      }
-      if (mode !== "sensevoice") {
-        // 已配置在线 Qwen3-ASR 网关时执行轻量 /health 探活
-        if (this._qwen3Gpu.getStatus().ready && !this._qwen3Gpu.isInFailureCooldown()) {
-          try {
-            await this._qwen3Gpu.warmup();
-            if (options.preloadEnglish && this._hasSenseVoiceModels()) {
-              await yieldTick();
-              await this._ensureRecognizer("en");
-            }
-            return;
-          } catch {
-            // 在线探活异常时按 auto 策略降级预热 SenseVoice 储备模型
-            if (mode === "qwen3-asr") return;
-          }
-        }
-        if (mode === "qwen3-asr") return;
-      }
       await this._ensureRecognizer("auto");
       if (options.preloadEnglish) {
         await yieldTick();
@@ -1253,57 +1076,13 @@ export class LocalVoiceEngine {
   }
 
   /**
-   * 主方案：在线 Qwen3-ASR-0.6B（仅支持在线 Voice & ASR Gateway 远端 GPU 推理）。
-   */
-  async transcribeWithQwen3Asr(
-    input: Float32Array,
-    sampleRate = 16000,
-    voiceLang = "zh-CN",
-    options: Pick<
-      LocalAsrTranscribeOptions,
-      "hotwords" | "maxNewTokens" | "allowFallback" | "onPartial" | "signal"
-    > = {},
-  ): Promise<LocalAsrOutput> {
-    if (options.signal?.aborted) {
-      throw new DOMException("Aborted", "AbortError");
-    }
-    const pcm16k = sampleRate === 16000 ? input : resampleLinear(input, sampleRate, 16000);
-    const gpuStatus = this._qwen3Gpu.getStatus();
-    if (!gpuStatus.ready) {
-      throw new Error(
-        "在线 Qwen3-ASR-0.6B 服务尚未配置（仅支持在线模式），请在「设置 → 语音与 Pi Agent → 在线 ClearVoice 与 Qwen3-ASR 模型网关」中填写服务地址与授权码，或切换备用 SenseVoice 方案。",
-      );
-    }
-
-    const gpuRes = await this._qwen3Gpu.transcribe(pcm16k, {
-      voiceLang,
-      hotwords: options.hotwords,
-      maxTokens: options.maxNewTokens,
-      onPartial: options.onPartial,
-      signal: options.signal,
-    });
-    return {
-      text: gpuRes.text,
-      rawText: gpuRes.rawText,
-      lang: gpuRes.lang,
-      emotion: "",
-      event: "",
-      engine: options.onPartial ? "qwen3-asr-remote-stream" : "qwen3-asr-remote",
-      durationMs: gpuRes.durationMs,
-      computeDevice: "remote",
-      gpuDeviceName: gpuRes.deviceName,
-      fallbackUsed: false,
-    };
-  }
-
-  /**
-   * 储备/备用方案：本地离线 FunAudioLLM SenseVoiceSmall int8（异步非阻塞解码）。
+   * 本地离线 FunAudioLLM SenseVoiceSmall int8（异步非阻塞解码）。
    */
   async transcribeWithSenseVoice(
     input: Float32Array,
     sampleRate = 16000,
     voiceLang = "zh-CN",
-    meta: { asFallback?: boolean; fallbackReason?: string; hotwords?: readonly string[] } = {},
+    meta: { hotwords?: readonly string[] } = {},
   ): Promise<LocalAsrOutput> {
     const t0 = performance.now();
     const pcm16k = sampleRate === 16000 ? input : resampleLinear(input, sampleRate, 16000);
@@ -1311,7 +1090,7 @@ export class LocalVoiceEngine {
     const recognizer = await this._ensureRecognizer(svLang);
     if (!recognizer) {
       throw new Error(
-        "本地离线 SenseVoice 备用语音识别模型尚未就绪，请在「设置 → 语音与 Pi Agent」中点击一键补齐本地模型，或配置在线 Qwen3-ASR / STT 接口。",
+        "本地离线 SenseVoice 语音识别模型尚未就绪，请在「设置 → 语音与 Pi Agent」中点击一键补齐本地模型，或配置讯飞听写 2.0 / STT 接口。",
       );
     }
 
@@ -1322,10 +1101,8 @@ export class LocalVoiceEngine {
         lang: "",
         emotion: "",
         event: "",
-        engine: meta.asFallback ? "sensevoice-fallback" : "sensevoice-local",
+        engine: "sensevoice-local",
         durationMs: Math.round(performance.now() - t0),
-        fallbackUsed: Boolean(meta.asFallback),
-        ...(meta.fallbackReason ? { fallbackReason: meta.fallbackReason } : {}),
       };
     }
 
@@ -1343,18 +1120,13 @@ export class LocalVoiceEngine {
       lang: String(rawResult?.lang ?? ""),
       emotion: String(rawResult?.emotion ?? ""),
       event: String(rawResult?.event ?? ""),
-      engine: meta.asFallback ? "sensevoice-fallback" : "sensevoice-local",
+      engine: "sensevoice-local",
       durationMs: Math.round(performance.now() - t0),
-      fallbackUsed: Boolean(meta.asFallback),
-      ...(meta.fallbackReason ? { fallbackReason: meta.fallbackReason } : {}),
     };
   }
 
   /**
-   * 多语种语音识别统一入口：
-   * - `auto`（默认）：主用在线 Qwen3-ASR-0.6B，若在线服务未配置或异常则无缝切换至本地备用 SenseVoiceSmall int8
-   * - `qwen3-asr`：显式指定在线 Qwen3-ASR-0.6B
-   * - `sensevoice`：显式切换至本地备用 SenseVoiceSmall int8
+   * 本地离线多语种语音识别统一入口（FunAudioLLM SenseVoiceSmall int8）。
    */
   async transcribeLocal(
     input: Float32Array,
@@ -1365,78 +1137,19 @@ export class LocalVoiceEngine {
     if (options.signal?.aborted) {
       throw new DOMException("Aborted", "AbortError");
     }
-    const mode: LocalAsrEngineMode = options.engine ?? this._preferredAsrEngine;
-    if (mode === "sensevoice") {
-      const svRes = await this.transcribeWithSenseVoice(input, sampleRate, voiceLang, {
-        hotwords: options.hotwords,
-      });
-      if (!options.signal?.aborted && svRes.text && options.onPartial) {
-        options.onPartial(svRes.text);
-      }
-      return svRes;
+    const svRes = await this.transcribeWithSenseVoice(input, sampleRate, voiceLang, {
+      hotwords: options.hotwords,
+    });
+    if (!options.signal?.aborted && svRes.text && options.onPartial) {
+      options.onPartial(svRes.text);
     }
-
-    const qwenStatus = this._qwen3Gpu.getStatus();
-    const hasQwen3Remote = qwenStatus.ready && !this._qwen3Gpu.isInFailureCooldown();
-    const hasSenseVoice = this._hasSenseVoiceModels();
-    const allowFallback = options.allowFallback ?? mode === "auto";
-
-    if (hasQwen3Remote) {
-      try {
-        return await this.transcribeWithQwen3Asr(input, sampleRate, voiceLang, {
-          hotwords: options.hotwords,
-          maxNewTokens: options.maxNewTokens,
-          allowFallback,
-          onPartial: options.onPartial,
-          signal: options.signal,
-        });
-      } catch (err) {
-        if (options.signal?.aborted || (err instanceof DOMException && err.name === "AbortError")) {
-          throw err;
-        }
-        const reason = err instanceof Error ? err.message : String(err);
-        this._lastError = reason;
-        if (allowFallback && hasSenseVoice) {
-          const svRes = await this.transcribeWithSenseVoice(input, sampleRate, voiceLang, {
-            asFallback: true,
-            fallbackReason: `qwen3-asr-error: ${reason}`,
-            hotwords: options.hotwords,
-          });
-          if (!options.signal?.aborted && svRes.text && options.onPartial) {
-            options.onPartial(svRes.text);
-          }
-          return svRes;
-        }
-        throw err;
-      }
-    }
-
-    if (allowFallback && hasSenseVoice) {
-      const svRes = await this.transcribeWithSenseVoice(input, sampleRate, voiceLang, {
-        asFallback: true,
-        fallbackReason: this._qwen3Gpu.isInFailureCooldown()
-          ? `qwen3-asr-cooldown: ${qwenStatus.lastError || "remote auth/init failed"}`
-          : "qwen3-asr-remote-unconfigured",
-        hotwords: options.hotwords,
-      });
-      if (!options.signal?.aborted && svRes.text && options.onPartial) {
-        options.onPartial(svRes.text);
-      }
-      return svRes;
-    }
-
-    throw new Error(
-      mode === "qwen3-asr"
-        ? "在线 Qwen3-ASR-0.6B 服务尚未配置（仅支持在线模式），请在「设置 → 语音与 Pi Agent → 在线 ClearVoice 与 Qwen3-ASR 模型网关」中填写地址与授权码，或将转写方案设为「自动」。"
-        : "在线 Qwen3-ASR-0.6B 主方案与本地 SenseVoice 备用方案均未就绪，请在「设置 → 语音与 Pi Agent」中配置在线模型网关、补齐本地备用模型或配置 STT 接口。",
-    );
+    return svRes;
   }
 
   /**
-   * 抗音乐/强噪双轨识别 + 中英混说唤醒词句首英文探针恢复：
-   * - 默认优先使用在线 Qwen3-ASR-0.6B 主方案，未配置/异常时自动降级本地 SenseVoice 备用方案；
+   * 抗音乐/强噪双轨识别 + 中英混说唤醒词句首英文探针恢复（本地离线 SenseVoiceSmall int8）：
    * - 高信噪比安静环境优先单轨极速解码；
-   * - 嘈杂环境/音乐播放，或降噪单轨未检出唤醒词：融合「高通原始轨」与「神经降噪轨」择优（在线 Qwen3-ASR 顺序单轨优先且首轨精确命中时早退减少往返）；
+   * - 嘈杂环境/音乐播放，或降噪单轨未检出唤醒词：融合「高通原始轨」与「神经降噪轨」择优；
    * - 若配置了英文唤醒词且主解码仍未命中，按需触发句首英文探针恢复。
    */
   async transcribeDualTrack(
@@ -1449,7 +1162,6 @@ export class LocalVoiceEngine {
       forceDual?: boolean;
       systemOneClient?: SystemOneClient | null;
       acousticWake?: WakeWordAcousticHit | null;
-      localAsrEngine?: LocalAsrEngineMode;
       hotwords?: readonly string[];
     } = {},
   ): Promise<LocalAsrOutput> {
@@ -1457,15 +1169,9 @@ export class LocalVoiceEngine {
     const wakeWords = options.wakeWords ?? [];
     const inputSnrDb = options.inputSnrDb ?? estimateSnrDb(rawPcm16k, 16000);
     const hasAsciiWake = wakeWords.some((w) => /^[a-z][a-z0-9\s-]*$/i.test(w.trim()));
-    const asrMode = options.localAsrEngine ?? this._preferredAsrEngine;
     const asrOpts: LocalAsrTranscribeOptions = {
-      engine: asrMode,
       hotwords: options.hotwords ?? (wakeWords.length > 0 ? wakeWords : undefined),
     };
-    const usingQwen3Primary =
-      asrMode !== "sensevoice" &&
-      this._qwen3Gpu.getStatus().ready &&
-      !this._qwen3Gpu.isInFailureCooldown();
 
     let best: LocalAsrOutput;
     let dualRawRes: LocalAsrOutput | null = null;
@@ -1474,8 +1180,7 @@ export class LocalVoiceEngine {
 
     // 非常安静的环境：若无需唤醒词检查或降噪单轨已精确命中唤醒词且无模糊误听，直接单轨返回保持最低延迟
     const acousticWake = options.acousticWake ?? null;
-    const cleanSnrThreshold = usingQwen3Primary ? 18 : 24;
-    if (!options.forceDual && inputSnrDb >= cleanSnrThreshold && denoisedPcm16k.length > 0) {
+    if (!options.forceDual && inputSnrDb >= 24 && denoisedPcm16k.length > 0) {
       const single = await this.transcribeLocal(denoisedPcm16k, 16000, lang, asrOpts);
       const singleSpan = wakeWords.length > 0 ? findWakeWordSpan(single.text, wakeWords) : null;
       const singleExactWake = wakeWords.length === 0 || Boolean(singleSpan && !singleSpan.fuzzy);
@@ -1491,23 +1196,6 @@ export class LocalVoiceEngine {
       dualRawRes = rawRes;
       dualDenRes = single;
       best = chooseBestAsrCandidate(rawRes, single, { wakeWords, inputSnrDb, acousticWake });
-    } else if (usingQwen3Primary) {
-      // Qwen3-ASR-0.6B 在 CPU 上采用顺序单轨优先 + 按需补跑双轨，避免两个 0.6B 解码器同时争抢内存带宽与核间缓存
-      const primaryAudio = denoisedPcm16k.length > 0 ? denoisedPcm16k : hpRaw;
-      const denRes = await this.transcribeLocal(primaryAudio, 16000, lang, asrOpts);
-      const denSpan = wakeWords.length > 0 ? findWakeWordSpan(denRes.text, wakeWords) : null;
-      const denStrongHit =
-        denRes.text.length > 0 &&
-        (wakeWords.length === 0 ||
-          (denSpan !== null && !denSpan.fuzzy && (!denSpan.afterText || looksLikeDirectDeviceCommand(denSpan.afterText))));
-      if (denStrongHit || primaryAudio === hpRaw) {
-        best = denRes;
-      } else {
-        const rawRes = await this.transcribeLocal(hpRaw, 16000, lang, asrOpts);
-        dualRawRes = rawRes;
-        dualDenRes = denRes;
-        best = chooseBestAsrCandidate(rawRes, denRes, { wakeWords, inputSnrDb, acousticWake });
-      }
     } else {
       const [rawRes, denRes] = await Promise.all([
         this.transcribeLocal(hpRaw, 16000, lang, asrOpts),
@@ -1559,23 +1247,17 @@ export class LocalVoiceEngine {
               };
             }
           } else if (sel.choice === "track_a") {
-            const rawDualEngine: LocalAsrResultEngine = dualRawRes.engine.startsWith("qwen3-asr")
-              ? "qwen3-asr-remote-dual-raw"
-              : "sensevoice-dual-raw";
             best = {
               ...dualRawRes,
-              engine: rawDualEngine,
+              engine: "sensevoice-dual-raw",
               durationMs: dualRawRes.durationMs + dualDenRes.durationMs + sel.latencyMs,
               altText: dualDenRes.text,
               scoreMargin: best.scoreMargin,
             };
           } else if (sel.choice === "track_b") {
-            const denDualEngine: LocalAsrResultEngine = dualDenRes.engine.startsWith("qwen3-asr")
-              ? "qwen3-asr-remote-dual-denoised"
-              : "sensevoice-dual-denoised";
             best = {
               ...dualDenRes,
-              engine: denDualEngine,
+              engine: "sensevoice-dual-denoised",
               durationMs: dualRawRes.durationMs + dualDenRes.durationMs + sel.latencyMs,
               altText: dualRawRes.text,
               scoreMargin: best.scoreMargin,
@@ -1633,7 +1315,6 @@ export class LocalVoiceEngine {
         denoisedPcm16k,
         best,
         wakeWords,
-        asrMode,
       );
       if (recovered) {
         return recovered;
@@ -1645,15 +1326,13 @@ export class LocalVoiceEngine {
 
   /**
    * 针对中英混说时的句首英文唤醒词恢复（例如快速连读 "Neo关灯" 或强噪下句首英文被吞掉）：
-   * 对句首 0.65s~1.35s 音频做轻量 en 语种提示解码，并严格校验避免纯中文对话误唤醒。
-   * 当备用 SenseVoice 可用时，极短句首英文探针优先复用轻量 SenseVoice en（~55ms）避免阻塞 CPU。
+   * 对句首 0.65s~1.35s 音频做轻量 SenseVoice en 语种提示解码，并严格校验避免纯中文对话误唤醒。
    */
   private async _recoverBilingualEnglishWake(
     hpRaw16k: Float32Array,
     denoised16k: Float32Array,
     best: LocalAsrOutput,
     wakeWords: readonly string[],
-    asrMode: LocalAsrEngineMode = this._preferredAsrEngine,
   ): Promise<LocalAsrOutput | null> {
     const asciiWakes = wakeWords.filter((w) => /^[a-z][a-z0-9\s-]*$/i.test(w.trim()));
     if (asciiWakes.length === 0) return null;
@@ -1680,8 +1359,6 @@ export class LocalVoiceEngine {
       return null;
     }
 
-    const probeEngine: LocalAsrEngineMode =
-      asrMode !== "qwen3-asr" && this._hasSenseVoiceModels() ? "sensevoice" : asrMode;
     let extraMs = 0;
     const probeClip = async (
       clip: Float32Array,
@@ -1691,7 +1368,6 @@ export class LocalVoiceEngine {
       hit: { wakeWord: string; matchedSurface: string; fuzzy: boolean } | null;
     }> => {
       const enRes = await this.transcribeLocal(clip, 16000, "en-US", {
-        engine: probeEngine,
         maxNewTokens: 24,
       });
       extraMs += enRes.durationMs;
@@ -1760,8 +1436,7 @@ export class LocalVoiceEngine {
 
   /**
    * 一键补齐下载缺失的本地 ONNX 基础模型（GTCRN / DPDFNet4 / Silero VAD / 3D-Speaker CAM++ /
-   * SenseVoiceSmall int8 备用方案 / openWakeWord / 本地温柔女声 TTS）。
-   * 注：ClearVoice 与 Qwen3-ASR 仅支持在线网关模式，不再下载本地模型权重。
+   * SenseVoiceSmall int8 / openWakeWord / 本地温柔女声 TTS）。
    */
   async downloadMissingModels(): Promise<LocalVoiceEngineStatus> {
     if (this._downloading) {
@@ -1841,7 +1516,7 @@ export class LocalVoiceEngine {
       await fetchFile(OPEN_WAKEWORD_MODEL_URLS.embedding, p.openWakeWordEmbedding);
       this._oww.ensureLoaded();
 
-      // 补齐 SenseVoice 本地备用模型（在线 Qwen3-ASR 未配置或异常时无缝兜底）
+      // 补齐 SenseVoice 本地离线识别模型
       if (!this._hasSenseVoiceModels(p)) {
         await fetchAndExtractTar(MODEL_URLS.senseVoiceTar, "sensevoice.tar.bz2", "SenseVoice");
       }
@@ -1888,8 +1563,6 @@ export class LocalVoiceEngine {
   dispose(): void {
     this._sourceSeparator?.dispose();
     this._sourceSeparator = null;
-    this._clearVoiceGpu.dispose();
-    this._qwen3Gpu.dispose();
     this._xfyunIat.dispose();
     this._voiceWsAsr.dispose();
     this._oww.dispose();

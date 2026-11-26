@@ -155,9 +155,6 @@ export interface UiAgentTimelineEntry {
   role: "user" | "assistant";
   source: "text" | "voice";
   text: string;
-  trackIndex?: number;
-  trackCount?: number;
-  trackId?: string;
   speakerName?: string | null;
   speakerScore?: number;
   thinking?: string;
@@ -236,12 +233,6 @@ export interface UiPublicAgentConfig extends ClientVoiceConfig {
   envApiKeyDetected: boolean;
   hasSttApiKey: boolean;
   sttApiKeyPreview: string;
-  hasClearVoiceApiKey?: boolean;
-  clearVoiceApiKeyPreview?: string;
-  effectiveClearVoiceRemoteConfigured?: boolean;
-  hasQwen3AsrApiKey?: boolean;
-  qwen3AsrApiKeyPreview?: string;
-  effectiveQwen3AsrRemoteConfigured?: boolean;
   xfyunEndpointUrl?: string;
   xfyunAppId?: string;
   hasXfyunApiKey?: boolean;
@@ -336,33 +327,6 @@ export interface UiLocalVoiceStatus {
   readyForDenoise: boolean;
   readyForDpdfnet?: boolean;
   readyForVoxlock?: boolean;
-  readyForClearVoiceGpu?: boolean;
-  readyForClearVoiceBss?: boolean;
-  clearVoice?: {
-    gpuDetected: boolean;
-    gpuName: string | null;
-    vramTotalMb: number | null;
-    vramFreeMb: number | null;
-    runtimeReady: boolean;
-    modelReady: boolean;
-    ssModelReady?: boolean;
-    scriptReady: boolean;
-    customServiceUrl: string;
-    remote?: boolean;
-    hasApiKey?: boolean;
-    ready: boolean;
-    multiTrackReady?: boolean;
-    serverRunning: boolean;
-    provider: "remote" | "none";
-    ssProvider?: "remote" | "none";
-    modelName: string;
-    ssModelName?: string;
-    serviceUrl: string | null;
-    lastLatencyMs: number | null;
-    lastInferMs: number | null;
-    lastSeparateMs?: number | null;
-    lastError: string | null;
-  };
   readyForXfyunIat?: boolean;
   xfyunIat?: {
     configured: boolean;
@@ -393,32 +357,9 @@ export interface UiLocalVoiceStatus {
   };
   readyForVad: boolean;
   readyForVoiceprint: boolean;
-  readyForQwen3Asr?: boolean;
-  readyForQwen3Gpu?: boolean;
-  readyForQwen3Remote?: boolean;
-  activeQwen3Device?: "remote" | null;
-  gpu?: {
-    detected: boolean;
-    backend: "remote" | "none";
-    remote?: boolean;
-    serviceUrl?: string | null;
-    modelName?: string;
-    deviceId: string | null;
-    deviceName: string | null;
-    vramTotalMb: number | null;
-    vramFreeMb: number | null;
-    runtimeReady: boolean;
-    modelReady: boolean;
-    ready: boolean;
-    serverRunning: boolean;
-    lastLatencyMs?: number | null;
-    lastError: string | null;
-  };
   readyForSenseVoice?: boolean;
   readyForLocalAsr: boolean;
-  primaryAsrEngine?: "qwen3-asr" | "sensevoice" | null;
-  fallbackAsrEngine?: "sensevoice" | null;
-  activeLocalAsrMode?: "auto" | "qwen3-asr" | "sensevoice";
+  primaryAsrEngine?: "sensevoice" | null;
   readyForWakeWord?: boolean;
   readyForLocalTts?: boolean;
   tts?: {
@@ -440,84 +381,12 @@ export interface UiLocalVoiceStatus {
     voxlock?: boolean;
     sileroVad: boolean;
     speakerCampp: boolean;
-    qwen3Asr?: boolean;
-    qwen3AsrGpu?: boolean;
     senseVoice: boolean;
     openWakeWord?: boolean;
     localTts?: boolean;
-    clearVoiceMossformer2?: boolean;
-    clearVoiceMossformer2Ss?: boolean;
     xfyunIat?: boolean;
     voiceWsAsr?: boolean;
   };
-}
-
-export interface UiStreamingPartialTrack {
-  trackId: string;
-  trackIndex: number;
-  text: string;
-  energyRatio?: number;
-}
-
-export interface UiVoiceTrackResult {
-  trackId: string;
-  trackIndex: number;
-  trackCount: number;
-  batchId: string;
-  rms?: number;
-  energyRatio?: number;
-  speechDetected: boolean;
-  speechRatio?: number;
-  durationSec?: number;
-  denoiseEngine?: string;
-  snrGainDb?: number;
-  asrEngine?: string;
-  text: string;
-  acousticEvent?: string;
-  voiceprint?: {
-    evaluated?: boolean;
-    matched?: boolean;
-    speakerId?: string | null;
-    speakerName?: string | null;
-    role?: string | null;
-    score?: number;
-  } | null;
-  attention?: {
-    accept?: boolean;
-    stage?: string;
-    reason?: string;
-    command?: string;
-    wokeOnly?: boolean;
-    passSource?: string;
-    matchedCapability?: string;
-  } | null;
-  matched: boolean;
-  wokeOnly: boolean;
-  command: string;
-  reply?: string;
-  taskId?: string;
-  entryId?: string;
-  dispatchedAsync?: boolean;
-  error?: string;
-  timings?: {
-    totalMs?: number;
-    asrMs?: number;
-    denoiseMs?: number;
-    voiceprintMs?: number;
-    attentionMs?: number;
-  } | null;
-  timestamp: number;
-}
-
-export interface UiVoiceTrackBatch {
-  batchId: string;
-  timestamp: number;
-  engine: string;
-  bssUsed: boolean;
-  trackCount: number;
-  acceptedCount: number;
-  totalMs: number;
-  tracks: UiVoiceTrackResult[];
 }
 
 export interface UiVoiceprintProfile {
@@ -533,11 +402,7 @@ export interface UiVoiceSnapshot {
   active: boolean;
   mode: ClientVoiceMode;
   engine: "local" | "browser" | "whisper" | "manual";
-  voicePipelineMode?: "legacy" | "clearvoice" | "xfyun" | "voice-ws";
-  clearVoiceServiceUrl?: string;
-  clearVoiceModel?: string;
-  qwen3AsrServiceUrl?: string;
-  qwen3AsrModel?: string;
+  voicePipelineMode?: "legacy" | "xfyun" | "voice-ws";
   xfyunEndpointUrl?: string;
   xfyunAppId?: string;
   effectiveXfyunConfigured?: boolean;
@@ -545,8 +410,7 @@ export interface UiVoiceSnapshot {
   voiceWsAsrDenoise?: boolean;
   voiceWsAsrLanguage?: string;
   effectiveVoiceWsAsrConfigured?: boolean;
-  localAsrEngine?: "auto" | "qwen3-asr" | "sensevoice";
-  qwen3StreamingEnabled?: boolean;
+  streamingAsrEnabled?: boolean;
   interimTranscript: string;
   lastTranscript: string;
   lastCommand: string;
@@ -583,15 +447,11 @@ export interface UiVoiceSnapshot {
   lanes?: UiVoiceRuntimeLanes;
   localEngine?: UiLocalVoiceStatus;
   voiceprints?: UiVoiceprintProfile[];
-  lastTrackBatch?: UiVoiceTrackBatch | null;
-  recentTrackBatches?: UiVoiceTrackBatch[];
   lastMetrics?: {
     denoiseEngine?: string;
     snrGainDb?: number;
     vadEngine?: string;
     asrEngine?: string;
-    tracks?: UiVoiceTrackResult[];
-    trackBatch?: UiVoiceTrackBatch | null;
     voiceprint?: {
       evaluated?: boolean;
       matched?: boolean;
@@ -712,8 +572,6 @@ export class PiAgentPanelController {
   private skillsExpanded = false;
   private instructionsExpanded = false;
   private memoriesExpanded = false;
-  private tracksExpanded = true;
-  private livePartialTracks: UiStreamingPartialTrack[] = [];
   private resolvingConfirmIds = new Set<string>();
   private thinkingCollapsed = new Map<string, boolean>();
   private agentState: UiPiAgentSnapshot | null = null;
@@ -919,24 +777,7 @@ export class PiAgentPanelController {
     }
 
     if (kind === "partial") {
-      const rawTracks = Array.isArray(ev.tracks) ? ev.tracks : [];
-      const parsedTracks: UiStreamingPartialTrack[] = [];
-      for (const item of rawTracks) {
-        const rec = asRec(item);
-        if (!rec) continue;
-        const tText = typeof rec.text === "string" ? rec.text.trim() : "";
-        if (!tText) continue;
-        const idx = typeof rec.trackIndex === "number" ? rec.trackIndex : parsedTracks.length + 1;
-        parsedTracks.push({
-          trackId: typeof rec.trackId === "string" ? rec.trackId : `cv_track_${idx}`,
-          trackIndex: idx,
-          text: tText,
-          ...(typeof rec.energyRatio === "number" ? { energyRatio: rec.energyRatio } : {}),
-        });
-      }
-      this.livePartialTracks = parsedTracks;
       this.voiceClient.handleStreamServerEvent({ kind, text, matched });
-      this.renderVoiceTracksPanel();
       this.renderLivePill();
       return;
     }
@@ -944,10 +785,8 @@ export class PiAgentPanelController {
     this.voiceClient.handleStreamServerEvent({ kind, text, matched });
 
     if (kind === "result") {
-      this.livePartialTracks = [];
       if (ev.agent) this.applyAgentSnapshot(ev.agent);
       if (ev.voiceState) this.applyVoiceSnapshot(ev.voiceState);
-      this.renderVoiceTracksPanel();
       if (matched && wokeOnly) {
         this.flashLivePill(
           reply ? `已唤醒「${reply}」` : "已唤醒，静默持续监听中…",
@@ -1085,12 +924,6 @@ export class PiAgentPanelController {
       this.memoriesExpanded = !this.memoriesExpanded;
       this.renderMemoriesBar();
       this.scrollTimelineToBottom();
-    });
-
-    const tracksToggleBtn = document.getElementById("pi-tracks-toggle-btn");
-    tracksToggleBtn?.addEventListener("click", () => {
-      this.tracksExpanded = !this.tracksExpanded;
-      this.renderVoiceTracksPanel();
     });
 
     const input = node<HTMLInputElement>("pi-agent-input");
@@ -1268,14 +1101,14 @@ export class PiAgentPanelController {
 
   async toggleStreamingAsrMode(): Promise<void> {
     const current =
-      (this.voiceState?.qwen3StreamingEnabled ?? this.agentState?.config.qwen3StreamingEnabled ?? true) !==
+      (this.voiceState?.streamingAsrEnabled ?? this.agentState?.config.streamingAsrEnabled ?? true) !==
       false;
     const next = !current;
     try {
       const res = await this.deps.apiPost<{
         agent?: UiPiAgentSnapshot;
         voice?: UiVoiceSnapshot;
-      }>("/api/agent/config", { qwen3StreamingEnabled: next });
+      }>("/api/agent/config", { streamingAsrEnabled: next });
       if (res.agent) this.applyAgentSnapshot(res.agent);
       if (res.voice) this.applyVoiceSnapshot(res.voice);
       this.deps.showToast(
@@ -1291,9 +1124,8 @@ export class PiAgentPanelController {
   async toggleVoicePipelineMode(): Promise<void> {
     const current =
       this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy";
-    const order: ReadonlyArray<"legacy" | "clearvoice" | "xfyun" | "voice-ws"> = [
+    const order: ReadonlyArray<"legacy" | "xfyun" | "voice-ws"> = [
       "legacy",
-      "clearvoice",
       "xfyun",
       "voice-ws",
     ];
@@ -1311,9 +1143,7 @@ export class PiAgentPanelController {
           ? "已切换方案：统一流式语音听写网关（openWakeWord 唤醒后直推原始音频）"
           : next === "xfyun"
             ? "已切换方案：讯飞语音听写大模型 2.0（openWakeWord 唤醒后直推原始音频）"
-            : next === "clearvoice"
-              ? "已切换方案：ClearVoice 多轨盲源分离 + 降噪 → 分轨独立声纹/ASR/判定"
-              : "已切回原方案（GTCRN + 声源分离）",
+            : "已切回原方案（GTCRN + 声源分离 + 本地 SenseVoice）",
         2400,
       );
     } catch (err) {
@@ -2421,24 +2251,21 @@ export class PiAgentPanelController {
 
     if (streamingBtn) {
       const streamingOn =
-        (this.voiceState?.qwen3StreamingEnabled ?? this.agentState?.config.qwen3StreamingEnabled ?? true) !==
+        (this.voiceState?.streamingAsrEnabled ?? this.agentState?.config.streamingAsrEnabled ?? true) !==
         false;
       streamingBtn.textContent = streamingOn ? "流式：开" : "流式：关";
       streamingBtn.classList.toggle("active", streamingOn);
       streamingBtn.setAttribute("aria-pressed", String(streamingOn));
       streamingBtn.title = streamingOn
-        ? "Qwen3-ASR 实时流式转写与智能断句已开启（点击切换为传统整句模式）"
+        ? "实时流式转写与智能断句已开启（点击切换为传统整句模式）"
         : "流式转写已关闭，当前使用传统静音判停整句识别（点击开启实时流式转写）";
     }
 
     if (pipelineBtn) {
       const pipelineMode =
         this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy";
-      const isClearVoice = pipelineMode === "clearvoice";
       const isXfyun = pipelineMode === "xfyun";
       const isVoiceWs = pipelineMode === "voice-ws";
-      const cvInfo = this.voiceState?.localEngine?.clearVoice;
-      const cvReady = Boolean(this.voiceState?.localEngine?.readyForClearVoiceGpu ?? cvInfo?.ready);
       const xfyunReady = Boolean(
         this.voiceState?.localEngine?.readyForXfyunIat ??
           this.voiceState?.effectiveXfyunConfigured ??
@@ -2457,20 +2284,14 @@ export class PiAgentPanelController {
           ? xfyunReady
             ? "讯飞 2.0(在线)"
             : "讯飞 2.0(未配置)"
-          : isClearVoice
-            ? cvReady
-              ? "ClearVoice(在线)"
-              : "ClearVoice(未配置)"
-            : "方案：原方案";
-      pipelineBtn.classList.toggle("active", isClearVoice || isXfyun || isVoiceWs);
-      pipelineBtn.setAttribute("aria-pressed", String(isClearVoice || isXfyun || isVoiceWs));
+          : "方案：原方案";
+      pipelineBtn.classList.toggle("active", isXfyun || isVoiceWs);
+      pipelineBtn.setAttribute("aria-pressed", String(isXfyun || isVoiceWs));
       pipelineBtn.title = isVoiceWs
-        ? "当前方案：统一流式语音听写网关（openWakeWord 唤醒后直推 16kHz PCM Binary 帧，服务端 GTCRN+Silero VAD → Qwen3-ASR，点击切回原方案）"
+        ? "当前方案：统一流式语音听写网关（openWakeWord 唤醒后直推 16kHz PCM Binary 帧，服务端 GTCRN+Silero VAD 流式识别，点击切回原方案）"
         : isXfyun
           ? "当前方案：讯飞语音听写大模型 2.0（openWakeWord 唤醒后直接推送原始 16kHz PCM 至讯飞 WebSocket，点击切换为统一流式语音听写网关）"
-          : isClearVoice
-            ? "当前方案：在线 ClearVoice 多轨切片（Silero VAD 双触发 + 0.3s 上下文 + 20ms 淡入淡出）→ 在线 Qwen3-ASR（点击切换为讯飞语音听写大模型 2.0 方案）"
-            : "当前方案：原方案（GTCRN + Silero VAD + 声源分离），点击切换为 ClearVoice / 讯飞 2.0 / 统一流式网关";
+          : "当前方案：原方案（GTCRN + Silero VAD + 声源分离 + 本地 SenseVoice），点击切换为讯飞 2.0 / 统一流式网关";
     }
 
     if (cavemanBtn) {
@@ -2517,25 +2338,19 @@ export class PiAgentPanelController {
     } else if (isListening) {
       const localEngine = this.voiceState?.localEngine;
       const streamingOn =
-        (this.voiceState?.qwen3StreamingEnabled ?? this.agentState?.config.qwen3StreamingEnabled ?? true) !==
+        (this.voiceState?.streamingAsrEnabled ?? this.agentState?.config.streamingAsrEnabled ?? true) !==
         false;
       const pipelineModeNow =
         this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy";
-      const pipelineIsCv = pipelineModeNow === "clearvoice";
       const pipelineIsXfyun = pipelineModeNow === "xfyun";
       const pipelineIsVoiceWs = pipelineModeNow === "voice-ws";
-      const cvPrefix = pipelineIsCv ? "在线 ClearVoice → " : "";
       const localAsrLabel = pipelineIsVoiceWs
         ? "统一流式听写网关 · WS 原始直推"
         : pipelineIsXfyun
           ? "讯飞听写大模型 2.0 · 原始音频直推"
-          : localEngine?.primaryAsrEngine === "qwen3-asr"
-          ? `${cvPrefix}在线 Qwen3-ASR 0.6B${streamingOn ? " · 流式" : ""}`
           : localEngine?.primaryAsrEngine === "sensevoice"
-            ? localEngine.activeLocalAsrMode === "sensevoice"
-              ? `${cvPrefix}本地 SenseVoice (备用)`
-              : `${cvPrefix}本地 SenseVoice (兜底)`
-            : `${cvPrefix}语音识别`;
+            ? `本地 SenseVoice${streamingOn ? " · 流式" : ""}`
+            : "语音识别";
       const engineLabel =
         this.localClientState.engine === "local"
           ? localAsrLabel
@@ -2551,19 +2366,14 @@ export class PiAgentPanelController {
     } else {
       const le = this.voiceState?.localEngine;
       const streamingOn =
-        (this.voiceState?.qwen3StreamingEnabled ?? this.agentState?.config.qwen3StreamingEnabled ?? true) !==
+        (this.voiceState?.streamingAsrEnabled ?? this.agentState?.config.streamingAsrEnabled ?? true) !==
         false;
       const asrReadyPrefix =
-        le?.primaryAsrEngine === "qwen3-asr"
-          ? le.readyForSenseVoice
-            ? `在线 Qwen3-ASR 0.6B (${streamingOn ? "在线·流式" : "在线"}) · 本地 SenseVoice (备用)`
-            : `在线 Qwen3-ASR 0.6B (${streamingOn ? "在线·流式" : "在线"})`
-          : le?.primaryAsrEngine === "sensevoice"
-            ? "本地 SenseVoice (备用)"
-            : "";
+        le?.primaryAsrEngine === "sensevoice"
+          ? `本地 SenseVoice${streamingOn ? " (流式)" : ""}`
+          : "";
       const pipelineModeIdle =
         this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy";
-      const pipelineIsCv = pipelineModeIdle === "clearvoice";
       const pipelineIsXfyun = pipelineModeIdle === "xfyun";
       const pipelineIsVoiceWs = pipelineModeIdle === "voice-ws";
       const xfyunReadyIdle = Boolean(
@@ -2578,16 +2388,14 @@ export class PiAgentPanelController {
       );
       const readyHint = pipelineIsVoiceWs
         ? voiceWsReadyIdle
-          ? "统一流式语音听写网关（openWakeWord 唤醒后直推原始 PCM，服务端 GTCRN+Silero VAD → Qwen3-ASR）已就绪"
+          ? "统一流式语音听写网关（openWakeWord 唤醒后直推原始 PCM，服务端 GTCRN+Silero VAD 流式识别）已就绪"
           : "统一流式语音听写网关尚未配置授权码，请在设置中填写网关地址与授权码"
         : pipelineIsXfyun
           ? xfyunReadyIdle
             ? "讯飞听写大模型 2.0（openWakeWord 唤醒后直推原始音频）已就绪"
             : "讯飞听写大模型 2.0 尚未配置密钥，请在设置中填写 APPID / APIKey / APISecret"
           : le?.readyForLocalAsr && asrReadyPrefix
-          ? pipelineIsCv
-            ? `新方案 在线 ClearVoice (MossFormer2 切片) → ${asrReadyPrefix} 已就绪`
-            : `${asrReadyPrefix} · openWakeWord · 降噪已就绪`
+            ? `${asrReadyPrefix} · openWakeWord · 降噪已就绪`
           : wakeEnabled
             ? `点击「进入对话」或「开启持续监听」（唤醒词：${wakeWords.slice(0, 3).join(" / ")}）`
             : "点击「进入对话」或按 Alt+V 即可语音操控 Pi Agent";
@@ -2597,7 +2405,6 @@ export class PiAgentPanelController {
 
     this.renderVoiceLanes();
     this.renderVoiceTelemetry();
-    this.renderVoiceTracksPanel();
   }
 
   private renderVoiceLanes(): void {
@@ -2653,28 +2460,14 @@ export class PiAgentPanelController {
     const cfg = this.agentState?.config;
     const tags: Array<{ label: string; warn?: boolean; title?: string }> = [];
 
-    if (vs?.localEngine?.readyForLocalAsr) {
+    const pipelineMode = vs?.voicePipelineMode ?? cfg?.voicePipelineMode ?? "legacy";
+    if (vs?.localEngine?.readyForLocalAsr && pipelineMode === "legacy") {
       const streamingOn =
-        (vs?.qwen3StreamingEnabled ?? cfg?.qwen3StreamingEnabled ?? true) !== false;
-      if (vs.localEngine.primaryAsrEngine === "qwen3-asr") {
-        const gpuName = vs.localEngine.gpu?.deviceName;
-        tags.push({
-          label: "Qwen3-ASR 0.6B · 在线",
-          title: `主方案在线 Qwen3-ASR-0.6B (${gpuName || "远程 GPU"})${vs.localEngine.readyForSenseVoice ? " · 本地 SenseVoice 备用热待命" : ""}`,
-        });
-      } else {
-        tags.push({
-          label:
-            vs.localEngine.activeLocalAsrMode === "sensevoice"
-              ? "SenseVoice 备用"
-              : "SenseVoice 兜底",
-          warn: vs.localEngine.activeLocalAsrMode === "auto" && !vs.localEngine.readyForQwen3Asr,
-          title:
-            vs.localEngine.activeLocalAsrMode === "sensevoice"
-              ? "当前已手动切换至本地 SenseVoice 备用方案"
-              : "在线 Qwen3-ASR 尚未配置或暂不可用，当前自动使用本地 SenseVoice 储备方案",
-        });
-      }
+        (vs?.streamingAsrEnabled ?? cfg?.streamingAsrEnabled ?? true) !== false;
+      tags.push({
+        label: "SenseVoice · 本地",
+        title: "本地离线 SenseVoiceSmall 语音识别引擎已就绪",
+      });
       if (streamingOn) {
         tags.push({
           label: "流式转写",
@@ -2687,7 +2480,6 @@ export class PiAgentPanelController {
     if (owwOn && owwReady) {
       tags.push({ label: "openWakeWord" });
     }
-    const pipelineMode = vs?.voicePipelineMode ?? cfg?.voicePipelineMode ?? "legacy";
     if (pipelineMode === "voice-ws") {
       const wsStatus = vs?.localEngine?.voiceWsAsr;
       const wsReady = Boolean(
@@ -2717,23 +2509,6 @@ export class PiAgentPanelController {
         title: xfReady
           ? `讯飞语音听写大模型 2.0 (${xfStatus?.endpointUrl || "wss://iat.cn-huabei-1.xf-yun.com/v1"}) · openWakeWord 唤醒后直接推送原始 16kHz PCM`
           : xfStatus?.lastError || "请在设置中填写讯飞 APPID / APIKey / APISecret",
-      });
-    } else if (pipelineMode === "clearvoice") {
-      const cvStatus = vs?.localEngine?.clearVoice;
-      const cvReady = Boolean(vs?.localEngine?.readyForClearVoiceGpu ?? cvStatus?.ready);
-      const cvBssReady = Boolean(vs?.localEngine?.readyForClearVoiceBss ?? cvStatus?.multiTrackReady);
-      tags.push({
-        label: cvReady
-          ? cvBssReady
-            ? "ClearVoice BSS+SE · 在线"
-            : "ClearVoice · 在线"
-          : "ClearVoice · 未配置在线",
-        warn: !cvReady,
-        title: cvReady
-          ? cvBssReady
-            ? `在线 ClearVoice 多轨盲源分离 (MossFormer2_SS_16K) + 分轨降噪去背景音 (${cvStatus?.modelName || "MossFormer2_SE_48K"} · ${cvStatus?.gpuName || "远程 GPU"}) → 分轨独立声纹/ASR/逻辑判定`
-            : `在线 ClearVoice (${cvStatus?.modelName || "MossFormer2_SE_48K"} · ${cvStatus?.gpuName || "远程 GPU"}) 准实时切片降噪 → 独立声纹/ASR/逻辑判定`
-          : "在线 ClearVoice 网关尚未配置或缺少授权码（自动兜底本地 GTCRN 降噪）",
       });
     } else if (vs?.noiseSuppressionMode !== "off") {
       const nMode = vs?.noiseSuppressionMode;
@@ -2894,180 +2669,6 @@ export class PiAgentPanelController {
     }
   }
 
-  private renderVoiceTracksPanel(): void {
-    const panel = document.getElementById("pi-voice-tracks-panel");
-    const list = document.getElementById("pi-tracks-list");
-    const countBadge = document.getElementById("pi-tracks-count-badge");
-    const engineBadge = document.getElementById("pi-tracks-engine-badge");
-    const toggleBtn = document.getElementById("pi-tracks-toggle-btn");
-    if (!panel || !list || !countBadge || !engineBadge || !toggleBtn) return;
-
-    const livePartials = this.livePartialTracks;
-    const batch = this.voiceState?.lastTrackBatch ?? this.voiceState?.lastMetrics?.trackBatch ?? null;
-
-    const hasLive = livePartials.length > 0;
-    const hasBatch = Boolean(batch && Array.isArray(batch.tracks) && batch.tracks.length > 0);
-    if (!hasLive && !hasBatch) {
-      panel.hidden = true;
-      list.replaceChildren();
-      return;
-    }
-
-    panel.hidden = false;
-    toggleBtn.setAttribute("aria-expanded", String(this.tracksExpanded));
-    toggleBtn.textContent = this.tracksExpanded ? "收起" : "展开";
-    list.hidden = !this.tracksExpanded;
-    list.replaceChildren();
-
-    if (hasLive) {
-      countBadge.textContent = `${livePartials.length} 轨实时转写中`;
-      countBadge.classList.add("is-live");
-      countBadge.classList.toggle("is-multi", livePartials.length > 1);
-      engineBadge.hidden = false;
-      engineBadge.textContent = "分轨流式预览";
-
-      if (!this.tracksExpanded) return;
-
-      for (const pt of livePartials) {
-        const card = document.createElement("div");
-        const colorIdx = ((pt.trackIndex - 1) % 3) + 1;
-        card.className = `pi-track-card is-streaming track-color-${colorIdx}`;
-        card.setAttribute("role", "listitem");
-        card.dataset.trackIndex = String(pt.trackIndex);
-
-        const head = document.createElement("div");
-        head.className = "pi-track-head";
-
-        const trackPill = document.createElement("span");
-        trackPill.className = `pi-track-badge track-color-${colorIdx}`;
-        trackPill.textContent = `音轨 ${pt.trackIndex}`;
-
-        const verdict = document.createElement("span");
-        verdict.className = "pi-track-verdict is-streaming";
-        verdict.textContent = "… 识别中";
-
-        head.append(trackPill, verdict);
-
-        const body = document.createElement("div");
-        body.className = "pi-track-text";
-        body.textContent = pt.text;
-
-        card.append(head, body);
-        list.appendChild(card);
-      }
-      return;
-    }
-
-    if (!batch) return;
-    const tracks = batch.tracks;
-    countBadge.classList.remove("is-live");
-    countBadge.classList.toggle("is-multi", tracks.length > 1);
-    countBadge.textContent =
-      tracks.length > 1
-        ? `${tracks.length} 轨独立 · ${batch.acceptedCount} 命中`
-        : batch.acceptedCount > 0
-          ? "1 轨 · 已命中"
-          : "1 轨";
-
-    engineBadge.hidden = false;
-    const engineLabel = batch.bssUsed ? "BSS+SE" : "SE";
-    engineBadge.textContent =
-      batch.totalMs > 0 ? `${engineLabel} ${Math.round(batch.totalMs)}ms` : engineLabel;
-
-    if (!this.tracksExpanded) return;
-
-    for (const tr of tracks) {
-      const card = document.createElement("div");
-      const colorIdx = ((tr.trackIndex - 1) % 3) + 1;
-      const verdictClass = !tr.speechDetected
-        ? "is-silent"
-        : tr.matched && tr.wokeOnly
-          ? "is-woke"
-          : tr.matched
-            ? "is-accepted"
-            : "is-rejected";
-      card.className = `pi-track-card ${verdictClass} track-color-${colorIdx}`;
-      card.setAttribute("role", "listitem");
-      card.dataset.trackIndex = String(tr.trackIndex);
-      card.dataset.trackId = tr.trackId;
-
-      const head = document.createElement("div");
-      head.className = "pi-track-head";
-
-      const leftGroup = document.createElement("div");
-      leftGroup.className = "pi-track-head-left";
-
-      const trackPill = document.createElement("span");
-      trackPill.className = `pi-track-badge track-color-${colorIdx}`;
-      trackPill.textContent = `音轨 ${tr.trackIndex}`;
-      leftGroup.appendChild(trackPill);
-
-      const vp = tr.voiceprint;
-      if (vp?.evaluated) {
-        const vpPill = document.createElement("span");
-        const vpMatched = Boolean(vp.matched && vp.speakerName);
-        vpPill.className = `pi-track-vp-badge${vpMatched ? " is-matched" : ""}`;
-        const pct = typeof vp.score === "number" ? ` ${Math.round(vp.score * 100)}%` : "";
-        vpPill.textContent = vpMatched ? `声纹: ${vp.speakerName}${pct}` : `未知声纹${pct}`;
-        leftGroup.appendChild(vpPill);
-      }
-
-      const verdict = document.createElement("span");
-      verdict.className = `pi-track-verdict ${verdictClass}`;
-      if (!tr.speechDetected) {
-        verdict.textContent = "无有效语音";
-      } else if (tr.matched && tr.wokeOnly) {
-        verdict.textContent = "⚡ 已唤醒";
-      } else if (tr.matched) {
-        verdict.textContent = tr.dispatchedAsync ? "✓ 已派发执行" : "✓ 已执行";
-      } else if (tr.attention?.stage === "echo") {
-        verdict.textContent = "⊘ 回声过滤";
-      } else if (tr.attention?.stage === "voiceprint") {
-        verdict.textContent = "⊘ 声纹拦截";
-      } else if (tr.attention?.stage === "exit") {
-        verdict.textContent = "↪ 退出对话";
-      } else {
-        verdict.textContent = "⊘ 已忽略";
-      }
-      if (tr.attention?.reason) {
-        verdict.title = tr.attention.reason;
-      }
-
-      head.append(leftGroup, verdict);
-
-      const body = document.createElement("div");
-      body.className = `pi-track-text${!tr.text ? " is-empty" : ""}`;
-      body.textContent = tr.text || "（该音轨未检测到有效语音文字）";
-
-      const footParts: string[] = [];
-      if (tr.matched && tr.command) {
-        footParts.push(`指令：“${tr.command}”`);
-      } else if (tr.attention?.reason && tr.speechDetected) {
-        footParts.push(`判定：${tr.attention.reason}`);
-      }
-      if (tr.reply) {
-        const shortReply = tr.reply.length > 34 ? `${tr.reply.slice(0, 34)}…` : tr.reply;
-        footParts.push(`回复：${shortReply}`);
-      }
-      if (typeof tr.energyRatio === "number" && tracks.length > 1) {
-        footParts.push(`能量 ${Math.round(tr.energyRatio * 100)}%`);
-      }
-      if (typeof tr.snrGainDb === "number" && tr.snrGainDb > 0) {
-        footParts.push(`降噪 +${tr.snrGainDb.toFixed(1)}dB`);
-      }
-
-      card.append(head, body);
-      if (footParts.length > 0) {
-        const foot = document.createElement("div");
-        foot.className = "pi-track-foot";
-        foot.textContent = footParts.join(" · ");
-        card.appendChild(foot);
-      }
-
-      list.appendChild(card);
-    }
-  }
-
   private renderTimeline(): void {
     const list = node("pi-agent-timeline");
     const emptyBox = node("pi-agent-empty");
@@ -3104,18 +2705,6 @@ export class PiAgentPanelController {
         roleSpan.textContent = "π Pi Agent";
       }
       meta.appendChild(roleSpan);
-      if (entry.role === "user" && entry.source === "voice" && typeof entry.trackIndex === "number") {
-        const trTag = document.createElement("span");
-        const colorIdx = ((entry.trackIndex - 1) % 3) + 1;
-        trTag.className = `pi-msg-track-badge track-color-${colorIdx}`;
-        const countSuffix =
-          typeof entry.trackCount === "number" && entry.trackCount > 1
-            ? `/${entry.trackCount}`
-            : "";
-        const spkSuffix = entry.speakerName ? ` · ${entry.speakerName}` : "";
-        trTag.textContent = `音轨 ${entry.trackIndex}${countSuffix}${spkSuffix}`;
-        meta.appendChild(trTag);
-      }
       const timeSpan = document.createElement("span");
       timeSpan.className = "pi-msg-time";
       timeSpan.textContent = formatTime(entry.timestamp);
@@ -3470,11 +3059,7 @@ export class PiAgentPanelController {
       pill.classList.toggle("is-awake", mode === "awake");
       pill.classList.toggle("is-processing", mode === "processing");
       pill.classList.toggle("is-conversation", isConv && !interim && mode !== "processing");
-      if (this.livePartialTracks.length > 1) {
-        textEl.textContent = this.livePartialTracks
-          .map((t) => `[轨${t.trackIndex}] ${t.text}`)
-          .join("  |  ");
-      } else if (interim) {
+      if (interim) {
         textEl.textContent = interim.startsWith("⚡") ? interim : `🎤 ${interim}`;
       } else if (mode === "processing") {
         textEl.textContent = `π Pi Agent 正在执行：${this.voiceState?.lastCommand || "设备控制…"}`;

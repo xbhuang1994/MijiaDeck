@@ -15,8 +15,7 @@ import {
 import { hasAudibleAudioEnergy } from "../src/agent/audioPcm.ts";
 import type { LocalAsrOutput, LocalVoiceEngine, StreamingVadHandleLike } from "../src/agent/localVoiceEngine.ts";
 import { PiAgentService } from "../src/agent/piAgentService.ts";
-import { Qwen3AsrGpuRuntime } from "../src/agent/qwen3AsrGpuRuntime.ts";
-import type { StreamingPartialUpdate } from "../src/agent/qwen3StreamingTranscriber.ts";
+import type { StreamingPartialUpdate } from "../src/agent/streamingAsrTracker.ts";
 import { evaluateVoiceAttention } from "../src/agent/voiceAttentionGate.ts";
 import { VoiceListenerController } from "../src/agent/voiceListenerController.ts";
 import { VoiceStreamSession, type VoiceStreamSegmentPayload } from "../src/agent/voiceStreamSession.ts";
@@ -35,7 +34,6 @@ import { applyTheme, ThemeController } from "../src/ui/theme.ts";
 const USER_WAKE_WORDS = ["嘿Neo", "尼奥", "鸟", "嘿6", "Neo"];
 
 let tmpDir = "";
-let mockAsrServer: ReturnType<typeof Bun.serve> | null = null;
 
 function makeSine(durationSec: number, amp = 0.2, freqHz = 440, sr = 16000): Float32Array {
   const n = Math.round(durationSec * sr);
@@ -53,10 +51,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  if (mockAsrServer) {
-    mockAsrServer.stop(true);
-    mockAsrServer = null;
-  }
   setDataPathOverrides(null);
   if (tmpDir) {
     rmSync(tmpDir, { recursive: true, force: true });
@@ -65,7 +59,7 @@ afterEach(() => {
 });
 
 describe("ASR Hallucination & Hotword Prompt Leakage Guard", () => {
-  test("detects exact wakeword-list regurgitation hallucinations from Qwen3-ASR", () => {
+  test("detects exact wakeword-list regurgitation hallucinations", () => {
     const hallucinations = [
       "嘿Neo 尼奥 鸟 嘿6 Neo",
       "嘿，Neo 尼奥 鸟 嘿6。",
@@ -170,96 +164,6 @@ describe("ASR Hallucination & Hotword Prompt Leakage Guard", () => {
   });
 });
 
-describe("Qwen3AsrGpuRuntime Anti-Hallucination & Zero-Prompt-Leakage", () => {
-  test("never sends hotwords as prompt on multipart or JSON endpoints, skips silence with 0 network calls, and sanitizes upstream leaks", async () => {
-    let multipartCalls = 0;
-    let jsonCalls = 0;
-    const seenPrompts: Array<string | null> = [];
-    let mockReplyText = "打开客厅吸顶灯。";
-
-    mockAsrServer = Bun.serve({
-      port: 0,
-      hostname: "127.0.0.1",
-      async fetch(req) {
-        const u = new URL(req.url);
-        if (u.pathname === "/v1/audio/transcriptions") {
-          multipartCalls += 1;
-          const form = await req.formData();
-          const p = form.get("prompt");
-          seenPrompts.push(p === null ? null : String(p));
-          return Response.json({ text: mockReplyText, language: "Chinese" });
-        }
-        if (u.pathname === "/v1/transcribe") {
-          jsonCalls += 1;
-          const body = (await req.json()) as { prompt?: string };
-          seenPrompts.push(typeof body.prompt === "string" ? body.prompt : null);
-          return Response.json({ text: mockReplyText, language: "Chinese" });
-        }
-        return new Response("not found", { status: 404 });
-      },
-    });
-
-    const baseUrl = `http://127.0.0.1:${mockAsrServer.port}`;
-    const rtMultipart = new Qwen3AsrGpuRuntime({
-      serviceUrl: baseUrl,
-      apiKey: "test-key",
-    });
-
-    // 1. Silence & near-silence are blocked BEFORE any HTTP call
-    const silentRes = await rtMultipart.transcribe(new Float32Array(16000), {
-      voiceLang: "zh-CN",
-      hotwords: USER_WAKE_WORDS,
-    });
-    expect(silentRes.text).toBe("");
-    expect(multipartCalls).toBe(0);
-
-    const tinyFloor = makeSine(1.0, 0.003);
-    const floorRes = await rtMultipart.transcribe(tinyFloor, {
-      voiceLang: "zh-CN",
-      hotwords: USER_WAKE_WORDS,
-    });
-    expect(floorRes.text).toBe("");
-    expect(multipartCalls).toBe(0);
-
-    // 2. Audible audio sends NO prompt even when hotwords are supplied
-    const audible = makeSine(1.0, 0.15);
-    const okRes = await rtMultipart.transcribe(audible, {
-      voiceLang: "zh-CN",
-      hotwords: USER_WAKE_WORDS,
-    });
-    expect(okRes.text).toBe("打开客厅吸顶灯。");
-    expect(multipartCalls).toBe(1);
-    expect(seenPrompts).toEqual([null]);
-
-    // 3. Even if an upstream proxy still returns a wakeword-list dump, post-ASR sanitizer drops it
-    mockReplyText = "嘿Neo 尼奥 鸟 嘿6 Neo";
-    const partials: string[] = [];
-    const leakedRes = await rtMultipart.transcribe(audible, {
-      voiceLang: "zh-CN",
-      hotwords: USER_WAKE_WORDS,
-      onPartial: (t) => partials.push(t),
-    });
-    expect(leakedRes.text).toBe("");
-    expect(partials).toEqual([]);
-    rtMultipart.dispose();
-
-    // 4. JSON /v1/transcribe endpoint also omits prompt and sanitizes leaks
-    mockReplyText = "关掉卧室灯。";
-    const rtJson = new Qwen3AsrGpuRuntime({
-      serviceUrl: `${baseUrl}/v1/transcribe`,
-      apiKey: "test-key",
-    });
-    const jsonRes = await rtJson.transcribe(audible, {
-      voiceLang: "zh-CN",
-      hotwords: USER_WAKE_WORDS,
-    });
-    expect(jsonRes.text).toBe("关掉卧室灯。");
-    expect(jsonCalls).toBe(1);
-    expect(seenPrompts).toEqual([null, null, null]);
-    rtJson.dispose();
-  });
-});
-
 describe("End-to-End VoiceStreamSession, Attention Gate & VoiceListenerController Protection", () => {
   test("VoiceStreamSession drops silent VAD blips and strips hallucinated streaming partials", async () => {
     let emittedFakeSeg = false;
@@ -302,7 +206,7 @@ describe("End-to-End VoiceStreamSession, Attention Gate & VoiceListenerControlle
       createOnlineDenoiser: () => null,
       createStreamingVad: () => falseTriggerVad,
       createWakeWordStream: () => null,
-      getStatus: () => ({ readyForLocalAsr: true, activeQwen3Device: "remote" as const }),
+      getStatus: () => ({ readyForLocalAsr: true }),
       transcribeLocal: async (): Promise<LocalAsrOutput> => {
         asrCalls += 1;
         return {
@@ -311,7 +215,7 @@ describe("End-to-End VoiceStreamSession, Attention Gate & VoiceListenerControlle
           lang: "Chinese",
           emotion: "",
           event: "",
-          engine: "qwen3-asr-remote-stream",
+          engine: "sensevoice-local",
           durationMs: 10,
         };
       },

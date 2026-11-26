@@ -69,7 +69,7 @@ const ECHO_TAIL_WINDOW_MS = 5500;
 const SHORT_ACK_TAIL_WINDOW_MS = 3200;
 const DISTORTED_RESIDUAL_TAIL_WINDOW_MS = 2600;
 const MAX_LEDGER_ENTRIES = 16;
-/** 经扬声器+AEC/ClearVoice 失真后极易被 ASR 误拼出的单字拟声/尾音残片（绝不包含“好/嗯/对/是/开/关/一/二/不”等有效回复） */
+/** 经扬声器+AEC/降噪失真后极易被 ASR 误拼出的单字拟声/尾音残片（绝不包含“好/嗯/对/是/开/关/一/二/不”等有效回复） */
 const TTS_RESIDUAL_NOISE_CHAR_RE = /^[呀啊哦喔噢呃额哈呵啦呢嘛哎唉哟咦呜嘿哇哒啪咔咚嗡哼嘶嘘噗喂]$/;
 /** 有效单字用户回复/确认/数字集合，播报期间即使声纹偏低也不走失真回声兜底误杀 */
 const VALID_SINGLE_CHAR_USER_REPLY_RE = /^[好嗯对是行要开关停不没别算一二三四五六七八九十两零0-9]$/;
@@ -800,7 +800,7 @@ export function evaluateTtsEcho(options: EchoEvaluateOptions): EchoEvaluationRes
   );
 
   // 2.5 播报期/紧邻尾音失真单字回声残片保护：
-  // 扬声器回声经硬件 AEC / ClearVoice 强降噪后常畸变为单字拟声残片（如“好的”→“呀。”、“啊。”），
+  // 扬声器回声经硬件 AEC / 降噪后常畸变为单字拟声残片（如“好的”→“呀。”、“啊。”），
   // 文本与原播报字面零重合且常呈现低置信未知声纹；在不影响“好/嗯/对/是/开/关/一/二/不”等有效单字答复前提下直接按回声抑制。
   if (!options.hasWakeWord && !looksDirect && heardNorm.length === 1 && !ownerVoiceMatched) {
     const hasRecentShortTailTts =

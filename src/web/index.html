@@ -293,7 +293,7 @@
         <button type="button" id="pi-voice-oneshot-btn" class="secondary-button btn-compact" title="免唤醒单次语音输入（快捷键 Alt+V）">单次说话</button>
         <button type="button" id="pi-voice-wake-toggle-btn" class="pi-wake-pill active" title="点击切换唤醒词模式或免唤醒直达模式">唤醒词：小派</button>
         <button type="button" id="pi-streaming-toggle-btn" class="pi-wake-pill active" title="点击快速开启或关闭实时流式转写与智能断句">流式：开</button>
-        <button type="button" id="pi-voice-pipeline-toggle-btn" class="pi-wake-pill" title="点击循环切换语音方案：原方案 / ClearVoice 多轨方案 / 讯飞听写大模型 2.0">方案：原方案</button>
+        <button type="button" id="pi-voice-pipeline-toggle-btn" class="pi-wake-pill" title="点击切换语音方案：原方案 / 讯飞听写大模型 2.0">方案：原方案</button>
         <button type="button" id="pi-caveman-toggle-btn" class="pi-caveman-pill active" title="点击切换语音与文字回复风格">自然 · Lite</button>
         <select id="pi-thinking-level-select" class="pi-thinking-select" aria-label="AI 思考等级" title="设置 AI 思考等级（思考过程显示在对话框，不语音播报）">
           <option value="off">思考：关</option>
@@ -306,17 +306,6 @@
         </select>
       </div>
       <div id="pi-voice-telemetry" class="pi-voice-telemetry" hidden></div>
-      <div id="pi-voice-tracks-panel" class="pi-voice-tracks-panel" hidden aria-label="ClearVoice 多轨分离音频识别输出">
-        <div class="pi-tracks-header">
-          <div class="pi-tracks-header-left">
-            <span class="pi-tracks-title">ClearVoice 分轨输出</span>
-            <span id="pi-tracks-count-badge" class="pi-tracks-count-badge">0 轨</span>
-            <span id="pi-tracks-engine-badge" class="pi-tracks-engine-badge" hidden></span>
-          </div>
-          <button type="button" id="pi-tracks-toggle-btn" class="pi-tracks-toggle-btn" aria-expanded="true" title="展开或收起多轨输出明细">收起</button>
-        </div>
-        <div id="pi-tracks-list" class="pi-tracks-list" role="list"></div>
-      </div>
     </div>
 
     <!-- Precipitated Agent Skills Bar (auto-shown once skills are learned) -->
@@ -829,17 +818,14 @@
 
           <div class="setting-card setting-card-wrap" id="voice-pipeline-status-card">
             <div class="setting-info">
-              <div class="setting-label">语音 AI 引擎状态（在线 ClearVoice / Qwen3-ASR · 本地 Sherpa-ONNX）</div>
-              <div class="setting-desc" id="voice-pipeline-status-desc">在线调用 ClearVoice（多轨分离与降噪）与 Qwen3-ASR-0.6B（主识别），本机轻量运行 SenseVoice（备用识别）、GTCRN 降噪、Silero VAD、3D-Speaker 声纹与 openWakeWord 唤醒</div>
+              <div class="setting-label">语音 AI 引擎状态（本地 Sherpa-ONNX · 讯飞听写 2.0 · 统一流式听写网关）</div>
+              <div class="setting-desc" id="voice-pipeline-status-desc">本机轻量运行 SenseVoice 识别、GTCRN / DPDFNet4 降噪、Silero VAD、3D-Speaker 声纹、openWakeWord 唤醒与 Matcha TTS，可选切换讯飞语音听写大模型 2.0 或统一流式语音听写 WebSocket 网关</div>
             </div>
             <div class="voice-status-row">
               <div class="voice-status-badges" id="voice-model-badges">
-                <span class="voice-badge-pill" id="badge-model-qwen3-asr">Qwen3-ASR 0.6B (在线)</span>
-                <span class="voice-badge-pill" id="badge-model-clearvoice">ClearVoice SE (在线)</span>
-                <span class="voice-badge-pill" id="badge-model-clearvoice-ss">ClearVoice BSS (在线)</span>
                 <span class="voice-badge-pill" id="badge-model-xfyun-iat">讯飞听写 2.0 (在线)</span>
                 <span class="voice-badge-pill" id="badge-model-voice-ws-asr">统一流式听写 (在线)</span>
-                <span class="voice-badge-pill" id="badge-model-asr">SenseVoice (备用)</span>
+                <span class="voice-badge-pill" id="badge-model-asr">SenseVoice 识别</span>
                 <span class="voice-badge-pill" id="badge-model-gtcrn">GTCRN 降噪</span>
                 <span class="voice-badge-pill" id="badge-model-dpdfnet">DPDFNet4 强噪</span>
                 <span class="voice-badge-pill" id="badge-model-voxlock">VoxLock 声纹提取</span>
@@ -855,57 +841,43 @@
           <div class="setting-card">
             <div class="setting-info">
               <div class="setting-label">语音识别引擎</div>
-              <div class="setting-desc">「自动」优先在线 Qwen3-ASR-0.6B（主）/ 本地 SenseVoice（备用）+ 降噪 + 声纹管线，未就绪时自动降级云端 STT 或浏览器原生识别</div>
+              <div class="setting-desc">「自动」优先本地 SenseVoice（或讯飞听写 2.0）+ 降噪 + 声纹管线，未就绪时自动降级云端 STT 或浏览器原生识别</div>
             </div>
             <select id="set-voice-engine" class="md-select" aria-label="语音识别引擎">
-              <option value="auto">自动（优先在线 Qwen3-ASR 主方案）</option>
-              <option value="local">内置语音管线（在线 Qwen3-ASR 主 / 本地 SenseVoice 备用）</option>
+              <option value="auto">自动（优先内置语音管线）</option>
+              <option value="local">内置语音管线（本地 SenseVoice / 讯飞听写 2.0）</option>
               <option value="whisper">云端/本地 Whisper 兼容 STT（含降噪）</option>
               <option value="browser">浏览器原生实时语音识别</option>
             </select>
           </div>
 
-          <div class="setting-card" id="setting-row-local-asr-engine">
+          <div class="setting-card" id="setting-row-streaming-asr">
             <div class="setting-info">
-              <div class="setting-label">语音转写主备方案</div>
-              <div class="setting-desc">默认优先使用在线 Qwen3-ASR-0.6B 提升中英转写准确率，在线服务未配置或异常时自动无缝切换至本地 SenseVoice 备用方案</div>
-            </div>
-            <select id="set-voice-local-asr-engine" class="md-select" aria-label="语音转写主备方案">
-              <option value="auto">自动：在线 Qwen3-ASR-0.6B 主用 · 本地 SenseVoice 备用（推荐）</option>
-              <option value="qwen3-asr">仅主方案：在线 Qwen3-ASR-0.6B（需配置在线网关）</option>
-              <option value="sensevoice">切换备用：本地 SenseVoiceSmall（轻量离线）</option>
-            </select>
-          </div>
-
-          <div class="setting-card" id="setting-row-qwen3-streaming">
-            <div class="setting-info">
-              <div class="setting-label">Qwen3-ASR 流式转写与智能断句</div>
-              <div class="setting-desc" id="set-voice-qwen3-streaming-desc">开启后说话期间实时逐字流式转写并智能断句（句末标点+短停顿快速收句、唤醒词防误拆，兼容在线 Qwen3-ASR 与本地备用引擎）；关闭则恢复传统静音判停整句转写</div>
+              <div class="setting-label">实时流式转写与智能断句</div>
+              <div class="setting-desc" id="set-voice-streaming-asr-desc">开启后说话期间实时逐字流式预览并支持慢语速/未闭合句尾保护；关闭则恢复静音判停整句转写</div>
             </div>
             <label class="md-switch">
-              <input type="checkbox" id="set-voice-qwen3-streaming" checked aria-label="Qwen3-ASR 流式转写开关">
+              <input type="checkbox" id="set-voice-streaming-asr" checked aria-label="实时流式转写开关">
               <span class="md-switch-track"></span>
             </label>
           </div>
 
-          <div class="setting-card" id="setting-row-clearvoice-pipeline">
+          <div class="setting-card" id="setting-row-voice-pipeline">
             <div class="setting-info">
               <div class="setting-label">语音前端与识别方案</div>
-              <div class="setting-desc" id="set-voice-clearvoice-desc">可在原方案（GTCRN/声源分离）、在线 ClearVoice 多轨方案、讯飞语音听写大模型 2.0 与统一流式语音听写网关（openWakeWord 唤醒后直推 16kHz 原始 PCM，服务端 CPU ONNX GTCRN+Silero VAD → GPU Qwen3-ASR）间自由切换</div>
+              <div class="setting-desc" id="set-voice-pipeline-desc">可在原方案（GTCRN / 声源分离 + 本地 SenseVoice）、讯飞语音听写大模型 2.0 与统一流式语音听写网关（openWakeWord 唤醒后直推 16kHz 原始音频至 WebSocket 网关）间自由切换</div>
             </div>
             <select id="set-voice-pipeline-mode" class="md-select" aria-label="语音前端与识别方案">
-              <option value="legacy">原方案（GTCRN / 声源分离 + Qwen3-ASR / SenseVoice）</option>
-              <option value="clearvoice">ClearVoice 多轨方案（MossFormer2 BSS+SE → 分轨独立处理）</option>
+              <option value="legacy">原方案（GTCRN / 声源分离 + 本地 SenseVoice）</option>
               <option value="xfyun">讯飞语音听写大模型 2.0（openWakeWord 唤醒后直推原始音频）</option>
               <option value="voice-ws">统一流式语音听写网关（openWakeWord 唤醒后直推原始音频）</option>
             </select>
-            <input type="checkbox" id="set-voice-clearvoice-enabled" hidden aria-hidden="true" tabindex="-1">
           </div>
 
           <div class="setting-card setting-card-wrap" id="setting-row-voice-ws-asr">
             <div class="setting-info">
               <div class="setting-label">统一流式语音听写网关配置（Unified Streaming WS ASR）</div>
-              <div class="setting-desc" id="set-voice-ws-asr-desc">切换至「统一流式语音听写网关」方案后，openWakeWord 命中唤醒词即刻以 Binary Frame 直推 16kHz 原始 PCM 至 WebSocket 网关，由服务端 CPU ONNX（GTCRN 降噪 + Silero VAD v5）过滤静音并增量送入 GPU Qwen3-ASR-0.6B 流式识别；授权码仅保存于本机配置文件</div>
+              <div class="setting-desc" id="set-voice-ws-asr-desc">切换至「统一流式语音听写网关」方案后，openWakeWord 命中唤醒词即刻以 Binary Frame 直推 16kHz 原始 PCM 至 WebSocket 网关，由服务端 CPU ONNX（GTCRN 降噪 + Silero VAD v5）过滤静音并增量流式识别；授权码仅保存于本机配置文件</div>
             </div>
             <div class="systemone-grid">
               <div class="systemone-row">
@@ -956,41 +928,10 @@
             </div>
           </div>
 
-          <div class="setting-card setting-card-wrap" id="setting-row-voice-gateway">
-            <div class="setting-info">
-              <div class="setting-label">在线 ClearVoice 与 Qwen3-ASR 模型网关</div>
-              <div class="setting-desc" id="set-voice-gateway-desc">ClearVoice 与 Qwen3-ASR 仅支持在线网关模式。配置远程 Voice &amp; ASR Gateway（如 https://voice.1inch.cn:18443）与授权码以启用远端 GPU 多轨分离降噪与高精度语音识别；未配置或异常时自动平滑回落本地 GTCRN / SenseVoice 兜底</div>
-            </div>
-            <div class="systemone-grid">
-              <div class="systemone-row">
-                <input type="text" id="set-clearvoice-service-url" class="md-text-input" placeholder="ClearVoice 在线服务地址（如 https://voice.1inch.cn:18443）" spellcheck="false" aria-label="ClearVoice 在线服务地址">
-                <select id="set-clearvoice-model" class="md-select" aria-label="ClearVoice 降噪模型">
-                  <option value="MossFormer2_SE_48K">MossFormer2_SE_48K（高保真 48kHz · 默认）</option>
-                  <option value="FRCRN_SE_16K">FRCRN_SE_16K（轻量 16kHz）</option>
-                  <option value="MossFormerGAN_SE_16K">MossFormerGAN_SE_16K（GAN 16kHz）</option>
-                </select>
-              </div>
-              <div class="agent-key-row">
-                <input type="password" id="set-clearvoice-api-key" class="md-text-input" placeholder="ClearVoice 授权码（留空保持不变）" autocomplete="off" aria-label="ClearVoice 授权码">
-                <button type="button" id="set-clearvoice-clear-key-btn" class="secondary-button btn-compact" hidden>清除</button>
-              </div>
-              <div class="systemone-row">
-                <input type="text" id="set-qwen3-asr-service-url" class="md-text-input" placeholder="Qwen3-ASR 在线服务地址（如 https://voice.1inch.cn:18443）" spellcheck="false" aria-label="Qwen3-ASR 在线服务地址">
-                <input type="text" id="set-qwen3-asr-model" class="md-text-input" placeholder="模型 ID（默认 Qwen/Qwen3-ASR-0.6B）" spellcheck="false" aria-label="Qwen3-ASR 在线模型 ID">
-              </div>
-              <div class="agent-key-row">
-                <input type="password" id="set-qwen3-asr-api-key" class="md-text-input" placeholder="Qwen3-ASR 授权码（同域名留空可复用 ClearVoice 密钥）" autocomplete="off" aria-label="Qwen3-ASR 授权码">
-                <button type="button" id="set-qwen3-asr-clear-key-btn" class="secondary-button btn-compact" hidden>清除</button>
-                <button type="button" id="set-voice-gateway-test-btn" class="secondary-button btn-compact" title="测试在线 ClearVoice 与 Qwen3-ASR 网关连通性与远端 GPU 状态">测试连接</button>
-              </div>
-              <div id="set-voice-gateway-test-result" class="agent-inst-status" hidden></div>
-            </div>
-          </div>
-
           <div class="setting-card">
             <div class="setting-info">
               <div class="setting-label">识别语言</div>
-              <div class="setting-desc">用于在线 Qwen3-ASR / 本地 SenseVoice、Whisper 转写与浏览器语音识别</div>
+              <div class="setting-desc">用于本地 SenseVoice、Whisper 转写与浏览器语音识别</div>
             </div>
             <select id="set-voice-lang" class="md-select" aria-label="语音识别语言">
               <option value="zh-CN">中文（普通话 · 兼容中英混合）</option>
