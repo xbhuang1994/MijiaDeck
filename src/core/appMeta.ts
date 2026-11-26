@@ -6,7 +6,7 @@ import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const APP_VERSION = "1.1.2";
+export const APP_VERSION = "2.0.0";
 export const APP_NAME = "MijiaDeck";
 export const UPDATE_REPOSITORY = "Songmanual/MijiaDeck";
 

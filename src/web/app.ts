@@ -1373,7 +1373,7 @@ export class MijiaDeckWebApp {
 
   private createDefaultState(): AppState {
     return {
-      version: "1.1.2",
+      version: "2.0.0",
       apiVersion: "",
       demo: false,
       accessState: "ready",

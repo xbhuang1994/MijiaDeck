@@ -1,6 +1,6 @@
 {
   "name": "mijiadeck",
-  "version": "1.1.2",
+  "version": "2.0.0",
   "description": "MijiaDeck — 米家设备的桌面控制端 (Bun + TypeScript 重构版)",
   "license": "GPL-3.0-or-later",
   "type": "module",
