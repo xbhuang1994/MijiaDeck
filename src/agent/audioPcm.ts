@@ -260,6 +260,73 @@ export function computeRms(samples: Float32Array): number {
   return Math.sqrt(sum / samples.length);
 }
 
+export interface AudibleAudioEnergyOptions {
+  /** 最低峰值绝对幅值（默认 0.01，约 -40 dBFS，过滤纯静音与极微弱底噪） */
+  minPeakAbs?: number;
+  /** 整体最低有效 RMS（默认 0.003，约 -50.5 dBFS） */
+  minOverallRms?: number;
+  /** 20ms 活跃语音帧的最低 RMS（默认 0.007，兼容长静音中夹带的轻声短词如“对”） */
+  minActiveFrameRms?: number;
+  /** 达到活跃门限的最少 20ms 帧数（默认 3 帧 = 60ms，过滤单个瞬态点击/爆音） */
+  minActiveFrames?: number;
+}
+
+/**
+ * 判断 PCM 音频是否包含可听的有效语音/声学能量（防静音、极微弱电底噪或单脉冲爆音送入 ASR 引发幻觉）：
+ * - 任一样本峰值未超过 `minPeakAbs`（默认 0.01）直接判无声；
+ * - 整体 RMS >= `minOverallRms` 或至少有 `minActiveFrames` 个 20ms 帧达到 `minActiveFrameRms` 才视为有效可听音频。
+ */
+export function hasAudibleAudioEnergy(
+  samples: Float32Array,
+  sampleRate = 16000,
+  options: AudibleAudioEnergyOptions = {},
+): boolean {
+  if (samples.length === 0) return false;
+  const minPeakAbs = options.minPeakAbs ?? 0.01;
+  const minOverallRms = options.minOverallRms ?? 0.003;
+  const minActiveFrameRms = options.minActiveFrameRms ?? 0.007;
+  const minActiveFrames = options.minActiveFrames ?? 3;
+
+  let peakAbs = 0;
+  let totalSumSq = 0;
+  for (let i = 0; i < samples.length; i += 1) {
+    const v = samples[i]!;
+    const av = v < 0 ? -v : v;
+    if (av > peakAbs) peakAbs = av;
+    totalSumSq += v * v;
+  }
+  if (peakAbs < minPeakAbs) {
+    return false;
+  }
+
+  const overallRms = Math.sqrt(totalSumSq / samples.length);
+  if (overallRms >= minOverallRms) {
+    return true;
+  }
+
+  const frameLen = Math.max(80, Math.round(sampleRate * 0.02));
+  if (samples.length < frameLen) {
+    return overallRms >= minActiveFrameRms;
+  }
+
+  const activeThresholdSq = minActiveFrameRms * minActiveFrameRms;
+  let activeFrames = 0;
+  for (let off = 0; off + frameLen <= samples.length; off += frameLen) {
+    let sumSq = 0;
+    for (let i = 0; i < frameLen; i += 1) {
+      const v = samples[off + i]!;
+      sumSq += v * v;
+    }
+    if (sumSq / frameLen >= activeThresholdSq) {
+      activeFrames += 1;
+      if (activeFrames >= minActiveFrames) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 /**
  * 分帧估计语音分段信噪比（SNR dB）：
  * 使用 20ms 帧能量的第 15 百分位估计底噪，第 90 百分位估计语音峰值。

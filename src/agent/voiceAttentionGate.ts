@@ -13,6 +13,10 @@
  */
 
 import type { EchoCancellationMode } from "../core/agentConfigStore.ts";
+import {
+  isAsrHallucinationText,
+  stripRepeatedLeadingWakeWords,
+} from "./asrHallucinationGuard.ts";
 import { isCustomInstructionVoiceCommand } from "./customInstructionStore.ts";
 import {
   computeEnhancedEchoOverlap,
@@ -1202,6 +1206,22 @@ export async function evaluateVoiceAttention(
     });
   }
 
+  // 0. 静音/热词 Prompt 回显幻觉拦截（如 Qwen3-ASR 静音复读“嘿Neo 尼奥 鸟 嘿6 Neo”或“感谢观看”字幕幻觉）
+  if (isAsrHallucinationText(cleaned, input.wakeWords)) {
+    return wrap({
+      accept: false,
+      wokeOnly: false,
+      addressed: false,
+      inConversation: inConversationEffective,
+      confidence: 0.96,
+      stage: "acoustic",
+      reason: "检测到 ASR 静音或热词回显幻觉，已自动忽略",
+      wakeWord: null,
+      command: "",
+      usedLlm: false,
+    });
+  }
+
   // 0A. 声纹严格校验门控（非手动单次直说）
   if (
     !input.bypassWakeWord &&
@@ -1488,7 +1508,11 @@ export async function evaluateVoiceAttention(
     }
 
     const cleanBefore = wakeSpan.beforeText;
-    const cleanAfter = wakeSpan.afterText;
+    const cleanAfter = stripRepeatedLeadingWakeWords(
+      wakeSpan.afterText,
+      wakeSpan.wakeWord,
+      input.wakeWords,
+    );
     const hasVocativeStart =
       cleanBefore.length === 0 || VOCATIVE_PREFIX_RE.test(cleanBefore);
     const hasReferentialBefore =

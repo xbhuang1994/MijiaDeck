@@ -18,7 +18,8 @@
  */
 
 import type { VadSensitivityMode, VoicePipelineMode } from "../core/agentConfigStore.ts";
-import { computeRms, estimateSnrDb, resampleLinear } from "./audioPcm.ts";
+import { sanitizeAsrTranscript } from "./asrHallucinationGuard.ts";
+import { computeRms, estimateSnrDb, hasAudibleAudioEnergy, resampleLinear } from "./audioPcm.ts";
 import {
   ClearVoiceMultiTrackAssembler,
   ClearVoiceMultiTrackEndpointTracker,
@@ -1583,6 +1584,7 @@ export class VoiceStreamSession {
                     activeView.length > maxPreviewSamples
                       ? activeView.subarray(activeView.length - maxPreviewSamples)
                       : activeView;
+                  if (!hasAudibleAudioEnergy(previewAudio, TARGET_SR)) continue;
                   const asrRes = await this._opts.localEngine.transcribeLocal(
                     previewAudio,
                     TARGET_SR,
@@ -1594,7 +1596,9 @@ export class VoiceStreamSession {
                   if (this._disposed || gen !== this._cvGen) return;
                   previewEngine = asrRes.engine;
                   previewLatencyMs += asrRes.durationMs;
-                  const cleanedText = asrRes.text.trim();
+                  const cleanedText = sanitizeAsrTranscript(asrRes.text, {
+                    wakeWords: this._wakeWords,
+                  });
                   if (!cleanedText) continue;
                   rawPreviewEntries.push({
                     trackId,
@@ -3103,6 +3107,12 @@ export class VoiceStreamSession {
     const rawSlice = this._readRingRange(this._rawRing, this._rawTotalSamples, clampedOrigin, endSample);
     const denSlice = this._readRingTail(this._denRing, this._denTotalSamples, rawSlice.length);
     const decodeAudio = denSlice.length >= 3200 ? denSlice : rawSlice;
+    const energyCheckAudio = rawSlice.length >= 800 ? rawSlice : decodeAudio;
+    if (!hasAudibleAudioEnergy(energyCheckAudio, TARGET_SR)) {
+      this._streamDecodeInFlight = false;
+      this._streamAbort = null;
+      return;
+    }
     const t0 = performance.now();
 
     try {
@@ -3111,7 +3121,11 @@ export class VoiceStreamSession {
         signal: abort.signal,
         onPartial: (partialRaw) => {
           if (this._disposed || gen !== this._streamGen || abort.signal.aborted) return;
-          const clean = stripCommittedPrefix(partialRaw, this._streamTracker.committedPrefix);
+          const sanitizedPartial = sanitizeAsrTranscript(partialRaw, {
+            wakeWords: this._wakeWords,
+          });
+          if (!sanitizedPartial) return;
+          const clean = stripCommittedPrefix(sanitizedPartial, this._streamTracker.committedPrefix);
           if (!clean) return;
           const stable = this._streamTracker.stableText;
           const stablePrefix = clean.startsWith(stable) ? stable : "";
@@ -3133,7 +3147,14 @@ export class VoiceStreamSession {
       this._streamLastEngine = res.engine;
       this._streamLastLatencyMs = res.durationMs;
 
-      const ingested = this._streamTracker.ingestHypothesis(res.text, {
+      const sanitizedFinal = sanitizeAsrTranscript(res.text, {
+        wakeWords: this._wakeWords,
+      });
+      if (!sanitizedFinal) {
+        return;
+      }
+
+      const ingested = this._streamTracker.ingestHypothesis(sanitizedFinal, {
         engine: res.engine,
         latencyMs: res.durationMs,
       });
@@ -3359,6 +3380,14 @@ export class VoiceStreamSession {
     this._lastDenOverlap = new Float32Array(0);
     this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, rawEnd);
 
+    const wakeEnergyAudio = rawSlice.length >= 800 ? rawSlice : denSlice;
+    if (!hasAudibleAudioEnergy(wakeEnergyAudio, TARGET_SR)) {
+      if (this._streamingAsrEnabled) {
+        this._resetStreamingState(true);
+      }
+      return;
+    }
+
     const inputSnrDb = estimateSnrDb(rawSlice, TARGET_SR);
     const outputSnrDb = estimateSnrDb(denSlice, TARGET_SR);
     this._enqueueWithStreamingHandoff(
@@ -3426,6 +3455,14 @@ export class VoiceStreamSession {
 
     if (this._shouldDropStandbyPureMusic(rawSlice, timedOut, acousticWake)) {
       this._droppedPureMusicCount += 1;
+      return;
+    }
+
+    const segWinEnergyAudio = rawSlice.length >= 800 ? rawSlice : denSlice;
+    if (!hasAudibleAudioEnergy(segWinEnergyAudio, TARGET_SR)) {
+      if (this._streamingAsrEnabled) {
+        this._resetStreamingState(true);
+      }
       return;
     }
 
@@ -3709,6 +3746,16 @@ export class VoiceStreamSession {
       // 待机纯背景音乐快速过滤（15~65ms 放行零负担，彻底杜绝持续放歌时 CPU 跑满与识别队列雪崩）
       if (this._shouldDropStandbyPureMusic(rawSlice, forcedRoll, acousticWake)) {
         this._droppedPureMusicCount += 1;
+        continue;
+      }
+
+      // 静音/极微弱底噪早退：防止 AGC 放大微弱呼吸或电底噪触发 Silero VAD 后送入 ASR 产生幻觉词
+      const vadEnergyAudio = rawSlice.length >= 800 ? rawSlice : denSlice;
+      if (!hasAudibleAudioEnergy(vadEnergyAudio, TARGET_SR)) {
+        this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, absEnd);
+        if (this._streamingAsrEnabled) {
+          this._resetStreamingState(true);
+        }
         continue;
       }
 

@@ -26,11 +26,13 @@ import {
   type VoicePipelineMode,
 } from "../core/agentConfigStore.ts";
 import { projectRoot } from "../core/appMeta.ts";
+import { sanitizeAsrTranscript } from "./asrHallucinationGuard.ts";
 import {
   adaptiveEnergyVad,
   applyHighPassFilter,
   estimateSnrDb,
   extractFallbackVoiceprint,
+  hasAudibleAudioEnergy,
   l2Normalize,
   resampleLinear,
   spectralSubtractDenoise,
@@ -1246,7 +1248,7 @@ export class LocalVoiceEngine {
     input: Float32Array,
     sampleRate = 16000,
     voiceLang = "zh-CN",
-    meta: { asFallback?: boolean; fallbackReason?: string } = {},
+    meta: { asFallback?: boolean; fallbackReason?: string; hotwords?: readonly string[] } = {},
   ): Promise<LocalAsrOutput> {
     const t0 = performance.now();
     const pcm16k = sampleRate === 16000 ? input : resampleLinear(input, sampleRate, 16000);
@@ -1258,11 +1260,27 @@ export class LocalVoiceEngine {
       );
     }
 
+    if (pcm16k.length < 800 || !hasAudibleAudioEnergy(pcm16k, 16000)) {
+      return {
+        text: "",
+        rawText: "",
+        lang: "",
+        emotion: "",
+        event: "",
+        engine: meta.asFallback ? "sensevoice-fallback" : "sensevoice-local",
+        durationMs: Math.round(performance.now() - t0),
+        fallbackUsed: Boolean(meta.asFallback),
+        ...(meta.fallbackReason ? { fallbackReason: meta.fallbackReason } : {}),
+      };
+    }
+
     const stream = recognizer.createStream();
     stream.acceptWaveform({ samples: pcm16k, sampleRate: 16000 });
     const rawResult = await recognizer.decodeAsync(stream);
     const rawText = String(rawResult?.text ?? "");
-    const text = cleanSenseVoiceText(rawText);
+    const text = sanitizeAsrTranscript(cleanSenseVoiceText(rawText), {
+      wakeWords: meta.hotwords,
+    });
 
     return {
       text,
@@ -1294,7 +1312,9 @@ export class LocalVoiceEngine {
     }
     const mode: LocalAsrEngineMode = options.engine ?? this._preferredAsrEngine;
     if (mode === "sensevoice") {
-      const svRes = await this.transcribeWithSenseVoice(input, sampleRate, voiceLang);
+      const svRes = await this.transcribeWithSenseVoice(input, sampleRate, voiceLang, {
+        hotwords: options.hotwords,
+      });
       if (!options.signal?.aborted && svRes.text && options.onPartial) {
         options.onPartial(svRes.text);
       }
@@ -1325,6 +1345,7 @@ export class LocalVoiceEngine {
           const svRes = await this.transcribeWithSenseVoice(input, sampleRate, voiceLang, {
             asFallback: true,
             fallbackReason: `qwen3-asr-error: ${reason}`,
+            hotwords: options.hotwords,
           });
           if (!options.signal?.aborted && svRes.text && options.onPartial) {
             options.onPartial(svRes.text);
@@ -1341,6 +1362,7 @@ export class LocalVoiceEngine {
         fallbackReason: this._qwen3Gpu.isInFailureCooldown()
           ? `qwen3-asr-cooldown: ${qwenStatus.lastError || "remote auth/init failed"}`
           : "qwen3-asr-remote-unconfigured",
+        hotwords: options.hotwords,
       });
       if (!options.signal?.aborted && svRes.text && options.onPartial) {
         options.onPartial(svRes.text);
