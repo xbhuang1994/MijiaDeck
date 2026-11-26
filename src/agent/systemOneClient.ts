@@ -117,7 +117,6 @@ export type ConversationActionChoice = "followup" | "side_talk" | "goodbye";
 export type CommandIntentChoice = "device_control" | "status_query" | "scene" | "general_chat";
 export type DualTrackAsrChoice = "track_a" | "track_b" | "neither_noise";
 export type EchoCheckChoice = "echo" | "user_command";
-export type TrackNoiseClassChoice = "background_noise_tv" | "human_speech";
 export type ImplicitActionChoice =
   | "light_brighter"
   | "light_dimmer"
@@ -304,46 +303,6 @@ export interface TaskAckClassificationResult {
   latencyMs: number;
 }
 
-export interface MultiTrackNoiseTrackInput {
-  trackId: string;
-  trackIndex: number;
-  text: string;
-  speakerName?: string | null;
-  acousticEvent?: string;
-  /** 是否需要对该音轨生成独立判别问题（默认 true；设为 false 时仅作为对比上下文放入 state.tracks） */
-  evaluate?: boolean;
-}
-
-export interface MultiTrackNoiseInput {
-  tracks: ReadonlyArray<MultiTrackNoiseTrackInput>;
-  wakeWords?: readonly string[];
-  recentHistory?: ReadonlyArray<SystemOneHistoryEntry>;
-}
-
-export interface MultiTrackNoiseOptions {
-  timeoutMs?: number;
-  signal?: AbortSignal;
-  minConfidence?: number;
-}
-
-export interface MultiTrackNoiseTrackVerdict {
-  trackId: string;
-  trackIndex: number;
-  choice: TrackNoiseClassChoice;
-  shouldMute: boolean;
-  confidence: number;
-  probabilities: Record<TrackNoiseClassChoice, number>;
-}
-
-export interface MultiTrackNoiseResult {
-  verdicts: MultiTrackNoiseTrackVerdict[];
-  mutedTrackIds: string[];
-  model: string;
-  usage: SystemOneUsage;
-  latencyMs: number;
-  cached: boolean;
-}
-
 // ==================== Health & Circuit Breaker Types ====================
 
 export type SystemOneCircuitState = "closed" | "open" | "half-open";
@@ -498,22 +457,6 @@ const IMPLICIT_ACTION_QUESTION: SystemOneChoiceQuestion<ImplicitActionChoice> = 
       "多步复合指令、具体数值/色温/定时、多设备编排、场景切换、喂食、普通问答或意图不明确，需交由 LLM Agent 处理。",
   },
 };
-
-function buildMultiTrackNoiseQuestion(
-  trackIndex: number,
-  trackId: string,
-): SystemOneChoiceQuestion<TrackNoiseClassChoice> {
-  return {
-    type: "choice",
-    instructions: `当前处于多音轨分离语音对话中（全部音轨转写见 state.tracks）。请专门判断音轨 ${trackIndex}（track_id=${trackId}）转换出来的文字是不是背景音、旁白、噪音或电视/视频/广播外放声。请结合其他音轨内容、wake_words、speaker 与 history 综合判别；若文字过短或难以确定，宁可判为 human_speech，避免误屏蔽现场真实用户。`,
-    criteria: {
-      background_noise_tv:
-        "该音轨文字是背景音、电视/电影/综艺/新闻/广告/纪录片/视频外放台词、画外音旁白、解说词、背景音乐歌词、环境噪音或无意义识别乱码，并非现场真人在与智能助手交互。",
-      human_speech:
-        "该音轨文字是现场真实用户在向智能家居助手发出控制指令、状态查询、呼唤唤醒词、回应确认或真实人机对话，或文字过短尚不足以确认为背景音/旁白/噪音/电视。",
-    },
-  };
-}
 
 // ==================== Pure Helpers ====================
 
@@ -1647,146 +1590,5 @@ export class SystemOneClient {
       usage: res.usage,
       latencyMs,
     };
-  }
-
-  /**
-   * (h) 多轨分离音轨背景音/旁白/噪音/电视批量判别（单次 HTTP 请求同时评估所有待检音轨）。
-   * 仅缓存命中屏蔽（存在 `background_noise_tv`）的负向结果，绝不缓存纯 `human_speech`。
-   */
-  async classifyMultiTrackNoise(
-    input: MultiTrackNoiseInput,
-    opts?: MultiTrackNoiseOptions,
-  ): Promise<MultiTrackNoiseResult | null> {
-    if (!this._enabled || opts?.signal?.aborted) return null;
-
-    const cleanTracks = input.tracks
-      .map((t) => ({
-        trackId: t.trackId.trim() || `cv_track_${t.trackIndex}`,
-        trackIndex: t.trackIndex,
-        text: truncateText(t.text ?? "", 240),
-        speakerName: t.speakerName?.trim() || null,
-        acousticEvent: t.acousticEvent?.trim() || "",
-        evaluate: t.evaluate !== false,
-      }))
-      .filter((t) => t.text.length > 0);
-
-    const targets = cleanTracks.filter((t) => t.evaluate);
-    if (targets.length === 0) return null;
-
-    const wakeWords = (input.wakeWords ?? []).map((w) => w.trim()).filter(Boolean);
-    const compactHistory = formatCompactHistory(
-      input.recentHistory,
-      HISTORY_MAX_ENTRIES,
-      HISTORY_MAX_CHARS,
-    );
-    const threshold =
-      typeof opts?.minConfidence === "number" && Number.isFinite(opts.minConfidence)
-        ? clamp01(opts.minConfidence)
-        : this._confidenceThreshold;
-
-    const cacheKey = JSON.stringify([
-      "mt_noise",
-      cleanTracks.map((t) => [
-        t.trackId,
-        t.trackIndex,
-        t.text.toLowerCase(),
-        t.speakerName ?? "",
-        t.acousticEvent,
-        t.evaluate,
-      ]),
-      wakeWords.map((w) => w.toLowerCase()),
-      compactHistory,
-      Number(threshold.toFixed(2)),
-    ]);
-
-    const cached = this._cache.get(cacheKey) as MultiTrackNoiseResult | undefined;
-    if (cached) {
-      this._cacheHits += 1;
-      return {
-        ...cached,
-        verdicts: cached.verdicts.map((v) => ({ ...v, probabilities: { ...v.probabilities } })),
-        mutedTrackIds: [...cached.mutedTrackIds],
-        latencyMs: 0,
-        cached: true,
-      };
-    }
-
-    const state: Record<string, unknown> = {
-      tracks: cleanTracks.map((t) => ({
-        track_id: t.trackId,
-        track_index: t.trackIndex,
-        text: t.text,
-        ...(t.speakerName ? { speaker: t.speakerName } : {}),
-        ...(t.acousticEvent ? { acoustic_event: t.acousticEvent } : {}),
-      })),
-    };
-    if (wakeWords.length > 0) {
-      state.wake_words = wakeWords;
-    }
-    if (compactHistory.length > 0) {
-      state.history = compactHistory;
-    }
-
-    const questions: Record<string, SystemOneChoiceQuestion<TrackNoiseClassChoice>> = {};
-    const keyToTarget: Array<{
-      qKey: string;
-      trackId: string;
-      trackIndex: number;
-    }> = [];
-    const usedKeys = new Set<string>();
-
-    for (let i = 0; i < targets.length; i += 1) {
-      const t = targets[i]!;
-      let qKey = `track_${t.trackIndex}`;
-      if (usedKeys.has(qKey)) {
-        qKey = `track_${t.trackIndex}_${i}`;
-      }
-      usedKeys.add(qKey);
-      questions[qKey] = buildMultiTrackNoiseQuestion(t.trackIndex, t.trackId);
-      keyToTarget.push({ qKey, trackId: t.trackId, trackIndex: t.trackIndex });
-    }
-
-    const t0 = performance.now();
-    const res = await this.decide(state, questions, {
-      timeoutMs: opts?.timeoutMs,
-      signal: opts?.signal,
-    });
-    if (!res) return null;
-
-    const latencyMs = Math.max(0, Math.round(performance.now() - t0));
-    const verdicts: MultiTrackNoiseTrackVerdict[] = [];
-    const mutedTrackIds: string[] = [];
-
-    for (const item of keyToTarget) {
-      const ans = res.answers[item.qKey];
-      if (!ans) continue;
-      const shouldMute = ans.choice === "background_noise_tv" && ans.confidence >= threshold;
-      verdicts.push({
-        trackId: item.trackId,
-        trackIndex: item.trackIndex,
-        choice: ans.choice,
-        shouldMute,
-        confidence: ans.confidence,
-        probabilities: ans.probabilities,
-      });
-      if (shouldMute) {
-        mutedTrackIds.push(item.trackId);
-      }
-    }
-
-    const result: MultiTrackNoiseResult = {
-      verdicts,
-      mutedTrackIds,
-      model: res.model,
-      usage: res.usage,
-      latencyMs,
-      cached: false,
-    };
-
-    if (mutedTrackIds.length > 0) {
-      this._cache.set(cacheKey, result);
-    }
-
-    return result;
   }
 }

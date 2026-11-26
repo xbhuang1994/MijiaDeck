@@ -3,16 +3,16 @@
 // Copyright (C) 2026 MiHome-Windows contributors
 
 /**
- * Qwen3-ASR-0.6B 实时流式转写与智能断句引擎：
+ * 实时流式转写与智能断句状态追踪器：
  *
  * 1. LocalAgreement 稳定前缀算法：连续两次流式假设取公共稳定前缀，防止实时字幕频繁跳动闪烁；
  * 2. 双语智能断句（Sentence Segmentation）：
  *    - 强句末标点断句（。！？!? 及非小数点句号 .），并内置唤醒词防拆保护（绝不把“Neo。打开客厅灯”拆成两句）；
- *    - 标点+短停顿快速收句（句尾已稳定带句末标点且静音 >= 320ms 即刻断句，比常规 650ms VAD 快一倍）；
+ *    - 标点+短停顿快速收句（句尾已稳定带句末标点且静音 >= 320ms 即刻断句）；
  *    - 连续长语音超长上限保护（优先在分号/逗号/空格子句边界干净切分）；
- * 3. 无缝去重与兼容：
+ * 3. 无缝去重与慢语速保护：
  *    - 句中切分后自动剥离已提交前缀，防止重叠窗口重复吐字；
- *    - 完整兼容 Qwen3-ASR GPU（SSE 逐 token 流式）、Qwen3-ASR CPU 与备用 SenseVoice。
+ *    - 语义未闭合启发式（looksLikeIncompleteUtterance / joinUtteranceFragments）避免慢语速句中停顿误拆。
  */
 
 import { findWakeWordSpan, isWakeQueryText } from "./voiceAttentionGate.ts";
@@ -24,13 +24,6 @@ export type StreamingCommitReason =
   | "max_duration"
   | "manual_flush";
 
-export interface StreamingPartialTrack {
-  trackId: string;
-  trackIndex: number;
-  text: string;
-  energyRatio?: number;
-}
-
 export interface StreamingPartialUpdate {
   /** 当前展示的完整实时文本（稳定部分 + 未稳定尾部） */
   text: string;
@@ -40,8 +33,6 @@ export interface StreamingPartialUpdate {
   unstableText: string;
   engine: string;
   latencyMs: number;
-  /** ClearVoice 多轨盲源分离场景下的各轨独立实时字幕（绝不混杂成一条音轨） */
-  tracks?: StreamingPartialTrack[];
 }
 
 export interface StreamingSentenceSplitResult {
@@ -442,7 +433,7 @@ export function splitStreamingSentences(
   return { completed, remainder };
 }
 
-export interface Qwen3StreamingHypothesisTrackerOptions {
+export interface StreamingAsrHypothesisTrackerOptions {
   wakeWords?: readonly string[];
   /** 末尾带强句末标点后等待多少毫秒静音即触发快速断句（仅在开启 enablePunctuationPauseCommit 时生效，默认 320ms） */
   punctuationPauseMs?: number;
@@ -459,7 +450,7 @@ export interface Qwen3StreamingHypothesisTrackerOptions {
  * 追踪当前话语的 LocalAgreement 稳定前缀、语义未闭合提示与可选句中拆分，
  * 默认等用户整段话说完后再统一提交，避免慢语速长语音被提前拆碎。
  */
-export class Qwen3StreamingHypothesisTracker {
+export class StreamingAsrHypothesisTracker {
   private _wakeWords: string[];
   private readonly _punctuationPauseMs: number;
   private readonly _maxCharsWithoutPunct: number;
@@ -472,7 +463,7 @@ export class Qwen3StreamingHypothesisTracker {
   private _committedPrefix = "";
   private _trailingSilenceMs = 0;
 
-  constructor(options: Qwen3StreamingHypothesisTrackerOptions = {}) {
+  constructor(options: StreamingAsrHypothesisTrackerOptions = {}) {
     this._wakeWords = [...(options.wakeWords ?? [])];
     this._punctuationPauseMs = options.punctuationPauseMs ?? 320;
     this._maxCharsWithoutPunct = options.maxCharsWithoutPunct ?? 64;

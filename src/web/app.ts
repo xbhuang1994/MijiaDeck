@@ -1193,8 +1193,6 @@ export class MijiaDeckWebApp {
   private lastAutoFilledWakeWord = "";
   private agentClearKeyPending = false;
   private sttClearKeyPending = false;
-  private clearVoiceClearKeyPending = false;
-  private qwen3AsrClearKeyPending = false;
   private xfyunClearKeyPending = false;
   private xfyunClearSecretPending = false;
   private agentModelsFetchGen = 0;
@@ -3669,8 +3667,6 @@ export class MijiaDeckWebApp {
     };
     this.agentClearKeyPending = false;
     this.sttClearKeyPending = false;
-    this.clearVoiceClearKeyPending = false;
-    this.qwen3AsrClearKeyPending = false;
     this.xfyunClearKeyPending = false;
     this.xfyunClearSecretPending = false;
 
@@ -3808,16 +3804,12 @@ export class MijiaDeckWebApp {
     this.renderReinforcementMemories();
 
     el<HTMLSelectElement>("set-voice-engine").value = cfg?.voiceEngine || "auto";
-    el<HTMLSelectElement>("set-voice-local-asr-engine").value = cfg?.localAsrEngine || "auto";
-    el<HTMLInputElement>("set-voice-qwen3-streaming").checked = cfg?.qwen3StreamingEnabled !== false;
+    el<HTMLInputElement>("set-voice-streaming-asr").checked = cfg?.streamingAsrEnabled !== false;
     const pipelineModeVal = cfg?.voicePipelineMode || "legacy";
     const pipelineSelect = document.getElementById("set-voice-pipeline-mode") as HTMLSelectElement | null;
     if (pipelineSelect) {
-      pipelineSelect.value =
-        pipelineModeVal === "clearvoice" || pipelineModeVal === "xfyun" ? pipelineModeVal : "legacy";
+      pipelineSelect.value = pipelineModeVal === "xfyun" ? "xfyun" : "legacy";
     }
-    el<HTMLInputElement>("set-voice-clearvoice-enabled").checked =
-      pipelineModeVal === "clearvoice";
 
     const xfyunEndpointEl = document.getElementById("set-xfyun-endpoint-url") as HTMLInputElement | null;
     if (xfyunEndpointEl) {
@@ -3850,36 +3842,6 @@ export class MijiaDeckWebApp {
     if (xfyunTestStatus) {
       xfyunTestStatus.hidden = true;
       xfyunTestStatus.textContent = "";
-    }
-    el<HTMLInputElement>("set-clearvoice-service-url").value = cfg?.clearVoiceServiceUrl || "";
-    const cvModelSel = el<HTMLSelectElement>("set-clearvoice-model");
-    const cvModelVal = cfg?.clearVoiceModel || "MossFormer2_SE_48K";
-    if (!Array.from(cvModelSel.options).some((opt) => opt.value === cvModelVal)) {
-      const opt = document.createElement("option");
-      opt.value = cvModelVal;
-      opt.textContent = cvModelVal;
-      cvModelSel.appendChild(opt);
-    }
-    cvModelSel.value = cvModelVal;
-    const cvKeyInput = el<HTMLInputElement>("set-clearvoice-api-key");
-    cvKeyInput.value = "";
-    cvKeyInput.placeholder = cfg?.hasClearVoiceApiKey
-      ? `已保存 ClearVoice 授权码 (${cfg.clearVoiceApiKeyPreview})，留空保持不变`
-      : "ClearVoice 授权码（留空则同域名复用 Qwen3-ASR 密钥或环境变量）";
-    el("set-clearvoice-clear-key-btn").hidden = !cfg?.hasClearVoiceApiKey;
-
-    el<HTMLInputElement>("set-qwen3-asr-service-url").value = cfg?.qwen3AsrServiceUrl || "";
-    el<HTMLInputElement>("set-qwen3-asr-model").value = cfg?.qwen3AsrModel || "Qwen/Qwen3-ASR-0.6B";
-    const qwenKeyInput = el<HTMLInputElement>("set-qwen3-asr-api-key");
-    qwenKeyInput.value = "";
-    qwenKeyInput.placeholder = cfg?.hasQwen3AsrApiKey
-      ? `已保存 Qwen3-ASR 授权码 (${cfg.qwen3AsrApiKeyPreview})，留空保持不变`
-      : "Qwen3-ASR 授权码（同域名留空可复用 ClearVoice 密钥）";
-    el("set-qwen3-asr-clear-key-btn").hidden = !cfg?.hasQwen3AsrApiKey;
-    const gwTestStatus = document.getElementById("set-voice-gateway-test-result");
-    if (gwTestStatus) {
-      gwTestStatus.hidden = true;
-      gwTestStatus.textContent = "";
     }
     el<HTMLSelectElement>("set-voice-lang").value = cfg?.voiceLang || "zh-CN";
     el<HTMLSelectElement>("set-voice-noise-mode").value = cfg?.noiseSuppressionMode || "auto";
@@ -3950,11 +3912,6 @@ export class MijiaDeckWebApp {
     const voxOk = Boolean(status?.readyForVoxlock);
     const vadOk = Boolean(status?.readyForVad);
     const vpOk = Boolean(status?.readyForVoiceprint);
-    const qwen3Ok = Boolean(status?.readyForQwen3Remote ?? status?.readyForQwen3Asr);
-    const gpuInfo = status?.gpu ?? null;
-    const cvInfo = status?.clearVoice ?? null;
-    const cvOk = Boolean(status?.readyForClearVoiceGpu ?? cvInfo?.ready);
-    const cvBssOk = Boolean(status?.readyForClearVoiceBss ?? cvInfo?.multiTrackReady);
     const xfyunInfo = status?.xfyunIat ?? null;
     const xfyunOk = Boolean(
       status?.readyForXfyunIat ??
@@ -3965,34 +3922,6 @@ export class MijiaDeckWebApp {
     const owwOk = Boolean(status?.readyForWakeWord ?? status?.models?.openWakeWord);
     const ttsOk = Boolean(status?.readyForLocalTts ?? status?.models?.localTts);
 
-    const qwen3BadgeLabel = qwen3Ok
-      ? "Qwen3-ASR 0.6B (在线)"
-      : "Qwen3-ASR 0.6B (未配置在线)";
-    setBadge("badge-model-qwen3-asr", qwen3BadgeLabel, qwen3Ok);
-    const qwen3BadgeEl = document.getElementById("badge-model-qwen3-asr");
-    if (qwen3BadgeEl) {
-      qwen3BadgeEl.title = qwen3Ok
-        ? `在线 Qwen3-ASR 已就绪 (${gpuInfo?.modelName || "Qwen/Qwen3-ASR-0.6B"}${gpuInfo?.deviceName ? ` · ${gpuInfo.deviceName}` : ""})`
-        : gpuInfo?.lastError || "请在下方配置在线 Qwen3-ASR 网关地址与授权码（仅支持在线模式）";
-    }
-    const cvBadgeLabel = cvOk ? "ClearVoice SE (在线)" : "ClearVoice SE (未配置在线)";
-    setBadge("badge-model-clearvoice", cvBadgeLabel, cvOk);
-    const cvBadgeEl = document.getElementById("badge-model-clearvoice");
-    if (cvBadgeEl) {
-      cvBadgeEl.title = cvOk
-        ? `在线 ${cvInfo?.modelName || "MossFormer2_SE_48K"} 降噪去背景音已就绪${cvInfo?.gpuName ? ` · ${cvInfo.gpuName}` : ""}${typeof cvInfo?.lastInferMs === "number" ? ` · 最近推理 ${cvInfo.lastInferMs}ms` : ""}`
-        : cvInfo?.lastError || "请在下方配置在线 ClearVoice 网关地址与授权码（仅支持在线模式）";
-    }
-    const cvSsBadgeLabel = cvBssOk
-      ? "ClearVoice BSS 多轨 (在线)"
-      : "ClearVoice BSS (未配置在线)";
-    setBadge("badge-model-clearvoice-ss", cvSsBadgeLabel, cvBssOk);
-    const cvSsBadgeEl = document.getElementById("badge-model-clearvoice-ss");
-    if (cvSsBadgeEl) {
-      cvSsBadgeEl.title = cvBssOk
-        ? `在线 MossFormer2_SS_16K 多轨盲源分离已就绪${typeof cvInfo?.lastSeparateMs === "number" ? ` · 最近分离 ${cvInfo.lastSeparateMs}ms` : ""}`
-        : cvInfo?.lastError || "请在下方配置在线 ClearVoice 网关地址与授权码以启用多轨盲源分离";
-    }
     const xfyunBadgeLabel = xfyunOk ? "讯飞听写 2.0 (在线)" : "讯飞听写 2.0 (未配置)";
     setBadge("badge-model-xfyun-iat", xfyunBadgeLabel, xfyunOk);
     const xfyunBadgeEl = document.getElementById("badge-model-xfyun-iat");
@@ -4001,33 +3930,22 @@ export class MijiaDeckWebApp {
         ? `讯飞语音听写大模型 2.0 已就绪 (${xfyunInfo?.endpointUrl || "wss://iat.cn-huabei-1.xf-yun.com/v1"}${typeof xfyunInfo?.lastLatencyMs === "number" ? ` · 最近 ${xfyunInfo.lastLatencyMs}ms` : ""})`
         : xfyunInfo?.lastError || "请在下方配置讯飞 APPID / APIKey / APISecret";
     }
-    const cvDescEl = document.getElementById("set-voice-clearvoice-desc");
-    if (cvDescEl) {
+    const pipelineDescEl = document.getElementById("set-voice-pipeline-desc");
+    if (pipelineDescEl) {
       const selectedMode =
         (document.getElementById("set-voice-pipeline-mode") as HTMLSelectElement | null)?.value ??
         this.agentConfigCache?.voicePipelineMode ??
         "legacy";
       if (selectedMode === "xfyun") {
-        cvDescEl.textContent = xfyunOk
-          ? `讯飞语音听写大模型 2.0 已就绪（${xfyunInfo?.endpointUrl || "wss://iat.cn-huabei-1.xf-yun.com/v1"}）。openWakeWord 命中唤醒后直接将 16kHz 原始音频流推送至讯飞 WebSocket，不做额外降噪与特殊处理，支持随时切回 ClearVoice 或原方案`
-          : "讯飞语音听写大模型 2.0 方案：openWakeWord 唤醒后直接推送原始音频至讯飞 WebSocket（请先在下方填写 APPID / APIKey / APISecret）；可随时切换回 ClearVoice 或原方案";
-      } else if (selectedMode === "clearvoice") {
-        if (cvOk && cvBssOk) {
-          const gpuLabel = cvInfo?.gpuName ? `${cvInfo.gpuName} (在线)` : "在线 GPU";
-          cvDescEl.textContent = `在线 ClearVoice 多轨盲源分离与降噪服务已全面就绪（MossFormer2_SS_16K + ${cvInfo?.modelName || "MossFormer2_SE_48K"} · ${gpuLabel}）。先盲源分离再分轨降噪与剔除背景音，每条音轨独立执行声纹识别、语音转文字、逻辑判定与后续流程，界面分轨展示绝不混轨`;
-        } else if (cvOk) {
-          const gpuLabel = cvInfo?.gpuName ? `${cvInfo.gpuName} (在线)` : "在线 GPU";
-          cvDescEl.textContent = `在线 ClearVoice SE 降噪已就绪（${cvInfo?.modelName || "MossFormer2_SE_48K"} · ${gpuLabel}）。按准实时滑窗降噪并送入独立分轨处理管线`;
-        } else {
-          cvDescEl.textContent =
-            "在线 ClearVoice 多轨盲源分离 + 分轨降噪去背景音 → 分轨独立声纹/语音识别/逻辑判定方案（当前未配置在线网关或缺少授权码，将自动平滑降级本地 GTCRN 降噪）";
-        }
+        pipelineDescEl.textContent = xfyunOk
+          ? `讯飞语音听写大模型 2.0 已就绪（${xfyunInfo?.endpointUrl || "wss://iat.cn-huabei-1.xf-yun.com/v1"}）。openWakeWord 命中唤醒后直接将 16kHz 原始音频流推送至讯飞 WebSocket，不做额外降噪与特殊处理，支持随时切回原方案`
+          : "讯飞语音听写大模型 2.0 方案：openWakeWord 唤醒后直接推送原始音频至讯飞 WebSocket（请先在下方填写 APPID / APIKey / APISecret）；可随时切换回原方案";
       } else {
-        cvDescEl.textContent =
-          "当前为原方案（GTCRN / 声源分离 + Qwen3-ASR / SenseVoice），可在下拉菜单中随时切换至 ClearVoice 多轨方案或讯飞语音听写大模型 2.0 方案";
+        pipelineDescEl.textContent =
+          "当前为原方案（GTCRN / 声源分离 + 本地 SenseVoice），可在下拉菜单中随时切换至讯飞语音听写大模型 2.0 方案";
       }
     }
-    setBadge("badge-model-asr", "SenseVoice (备用)", senseVoiceOk);
+    setBadge("badge-model-asr", "SenseVoice 识别", senseVoiceOk);
     setBadge("badge-model-gtcrn", "GTCRN 降噪", gtcrnOk);
     setBadge("badge-model-dpdfnet", "DPDFNet4 强噪", dpdfOk);
     setBadge("badge-model-voxlock", "VoxLock 声纹提取", voxOk);
@@ -4046,19 +3964,14 @@ export class MijiaDeckWebApp {
     }
     const desc = document.getElementById("voice-pipeline-status-desc");
     if (desc) {
-      const onlineParts: string[] = [];
-      if (cvOk) onlineParts.push(`在线 ClearVoice (${cvInfo?.gpuName || "远程 GPU"})`);
-      if (qwen3Ok) onlineParts.push(`在线 Qwen3-ASR-0.6B (${gpuInfo?.deviceName || "远程 GPU"})`);
-      if (xfyunOk) onlineParts.push("讯飞语音听写 2.0 (在线)");
-      const onlineSummary =
-        onlineParts.length > 0
-          ? onlineParts.join(" + ")
-          : "在线 ClearVoice / Qwen3-ASR 尚未配置（请在下方模型网关填写地址与授权码）";
+      const onlineSummary = xfyunOk
+        ? "讯飞语音听写 2.0 (在线) 已就绪"
+        : "讯飞语音听写 2.0 未配置（可选）";
       desc.textContent = localAllReady
-        ? `${onlineSummary}；本机基础组件（SenseVoice 备用 + openWakeWord 唤醒 + GTCRN 降噪 + Silero VAD + 3D-Speaker 声纹）已全部就绪`
+        ? `本机离线组件（SenseVoice 识别 + openWakeWord 唤醒 + GTCRN 降噪 + Silero VAD + 3D-Speaker 声纹 + Matcha 女声）已全部就绪；${onlineSummary}`
         : localCoreReady
-          ? `${onlineSummary}；本机核心组件已就绪（可点击「一键补齐本地模型」补齐 openWakeWord / 本地女声）`
-          : `${onlineSummary}；本机基础组件尚未完全就绪，可点击「一键补齐本地模型」下载 SenseVoice 备用 / GTCRN / Silero VAD / 声纹等轻量模型`;
+          ? `本机核心组件（SenseVoice + GTCRN + Silero VAD + 声纹）已就绪，可点击「一键补齐本地模型」补齐 openWakeWord / 本地女声；${onlineSummary}`
+          : `本机离线组件尚未完全就绪，可点击「一键补齐本地模型」下载 SenseVoice / GTCRN / Silero VAD / 声纹等轻量模型；${onlineSummary}`;
     }
   }
 
@@ -4124,94 +4037,6 @@ export class MijiaDeckWebApp {
     }
     desc.textContent =
       "在对话模式中由决策模型判定语音是指令还是旁白（配置主网关或下方 Base URL 后自动生效）；连续旁白达上限自动退回待唤醒";
-  }
-
-  private async testVoiceGatewayConnection(): Promise<void> {
-    const btn = document.getElementById("set-voice-gateway-test-btn") as HTMLButtonElement | null;
-    const statusEl = document.getElementById("set-voice-gateway-test-result");
-    const cvUrl = el<HTMLInputElement>("set-clearvoice-service-url").value.trim();
-    const cvKey = el<HTMLInputElement>("set-clearvoice-api-key").value.trim();
-    const qwenUrl = el<HTMLInputElement>("set-qwen3-asr-service-url").value.trim();
-    const qwenKey = el<HTMLInputElement>("set-qwen3-asr-api-key").value.trim();
-
-    if (!cvUrl && !qwenUrl) {
-      if (statusEl) {
-        statusEl.hidden = false;
-        statusEl.textContent = "请先填写 ClearVoice 或 Qwen3-ASR 在线服务地址";
-      }
-      return;
-    }
-
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = "测试中…";
-    }
-    if (statusEl) {
-      statusEl.hidden = false;
-      statusEl.textContent = "正在检测在线 Voice & ASR 网关连通性与远端 GPU 状态…";
-    }
-
-    try {
-      const payload: Record<string, unknown> = {
-        clearVoiceServiceUrl: cvUrl,
-        qwen3AsrServiceUrl: qwenUrl,
-      };
-      if (this.clearVoiceClearKeyPending) payload.clearClearVoiceApiKey = true;
-      else if (cvKey) payload.clearVoiceApiKey = cvKey;
-      if (this.qwen3AsrClearKeyPending) payload.clearQwen3AsrApiKey = true;
-      else if (qwenKey) payload.qwen3AsrApiKey = qwenKey;
-
-      const res = await apiPost<{
-        ok?: boolean;
-        clearvoice?: {
-          ok: boolean;
-          latencyMs: number;
-          gpuName: string | null;
-          loadedModels?: string[];
-          error?: string;
-        } | null;
-        asr?: {
-          ok: boolean;
-          latencyMs: number;
-          gpuName: string | null;
-          model?: string | null;
-          error?: string;
-        } | null;
-      }>("/api/voice/gateway/test", payload);
-
-      const parts: string[] = [];
-      if (res.clearvoice) {
-        parts.push(
-          res.clearvoice.ok
-            ? `✓ ClearVoice 就绪 (${res.clearvoice.gpuName || "GPU"} · ${res.clearvoice.latencyMs}ms)`
-            : `✕ ClearVoice 失败：${res.clearvoice.error || "不可达"}`,
-        );
-      }
-      if (res.asr) {
-        parts.push(
-          res.asr.ok
-            ? `✓ Qwen3-ASR 就绪 (${res.asr.model || "Qwen3-ASR"} · ${res.asr.gpuName || "GPU"} · ${res.asr.latencyMs}ms)`
-            : `✕ Qwen3-ASR 失败：${res.asr.error || "不可达"}`,
-        );
-      }
-      const summary = parts.join(" ｜ ") || "检测完成";
-      if (statusEl) {
-        statusEl.hidden = false;
-        statusEl.textContent = summary;
-      }
-      this.showToast(res.ok ? "在线语音网关连接正常" : "部分在线语音服务不可用，请检查地址与授权码", 2600);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (statusEl) {
-        statusEl.hidden = false;
-        statusEl.textContent = `✕ 检测失败：${msg}`;
-      }
-    } finally {
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = "测试连接";
-      }
-    }
   }
 
   private async testXfyunIatConnection(): Promise<void> {
@@ -5497,15 +5322,11 @@ export class MijiaDeckWebApp {
       cavemanMode: el<HTMLSelectElement>("set-agent-caveman-mode").value,
       systemPromptExtra: el<HTMLTextAreaElement>("set-agent-system-prompt").value.trim(),
       voiceEngine: el<HTMLSelectElement>("set-voice-engine").value,
-      localAsrEngine: el<HTMLSelectElement>("set-voice-local-asr-engine").value,
-      qwen3StreamingEnabled: el<HTMLInputElement>("set-voice-qwen3-streaming").checked,
+      streamingAsrEnabled: el<HTMLInputElement>("set-voice-streaming-asr").checked,
       voicePipelineMode:
-        (document.getElementById("set-voice-pipeline-mode") as HTMLSelectElement | null)?.value ||
-        (el<HTMLInputElement>("set-voice-clearvoice-enabled").checked ? "clearvoice" : "legacy"),
-      clearVoiceServiceUrl: el<HTMLInputElement>("set-clearvoice-service-url").value.trim(),
-      clearVoiceModel: el<HTMLSelectElement>("set-clearvoice-model").value,
-      qwen3AsrServiceUrl: el<HTMLInputElement>("set-qwen3-asr-service-url").value.trim(),
-      qwen3AsrModel: el<HTMLInputElement>("set-qwen3-asr-model").value.trim(),
+        (document.getElementById("set-voice-pipeline-mode") as HTMLSelectElement | null)?.value === "xfyun"
+          ? "xfyun"
+          : "legacy",
       xfyunEndpointUrl:
         (document.getElementById("set-xfyun-endpoint-url") as HTMLInputElement | null)?.value.trim() ??
         "",
@@ -5551,18 +5372,6 @@ export class MijiaDeckWebApp {
     } else if (newSttKey) {
       agentPayload.sttApiKey = newSttKey;
     }
-    const newCvKey = el<HTMLInputElement>("set-clearvoice-api-key").value.trim();
-    if (this.clearVoiceClearKeyPending) {
-      agentPayload.clearClearVoiceApiKey = true;
-    } else if (newCvKey) {
-      agentPayload.clearVoiceApiKey = newCvKey;
-    }
-    const newQwenKey = el<HTMLInputElement>("set-qwen3-asr-api-key").value.trim();
-    if (this.qwen3AsrClearKeyPending) {
-      agentPayload.clearQwen3AsrApiKey = true;
-    } else if (newQwenKey) {
-      agentPayload.qwen3AsrApiKey = newQwenKey;
-    }
     const newXfyunKey = (
       document.getElementById("set-xfyun-api-key") as HTMLInputElement | null
     )?.value.trim() ?? "";
@@ -5590,8 +5399,6 @@ export class MijiaDeckWebApp {
       this.settingsOriginal = null;
       this.agentClearKeyPending = false;
       this.sttClearKeyPending = false;
-      this.clearVoiceClearKeyPending = false;
-      this.qwen3AsrClearKeyPending = false;
       this.xfyunClearKeyPending = false;
       this.xfyunClearSecretPending = false;
       if (asRecord(res)) {
@@ -7136,29 +6943,7 @@ export class MijiaDeckWebApp {
       el("set-stt-clear-key-btn").hidden = true;
     });
 
-    el("set-clearvoice-clear-key-btn").addEventListener("click", () => {
-      this.clearVoiceClearKeyPending = true;
-      const input = el<HTMLInputElement>("set-clearvoice-api-key");
-      input.value = "";
-      input.placeholder = "将在保存设置后清除已保存的 ClearVoice 授权码";
-      el("set-clearvoice-clear-key-btn").hidden = true;
-    });
-
-    el("set-qwen3-asr-clear-key-btn").addEventListener("click", () => {
-      this.qwen3AsrClearKeyPending = true;
-      const input = el<HTMLInputElement>("set-qwen3-asr-api-key");
-      input.value = "";
-      input.placeholder = "将在保存设置后清除已保存的 Qwen3-ASR 授权码";
-      el("set-qwen3-asr-clear-key-btn").hidden = true;
-    });
-
-    el("set-voice-gateway-test-btn").addEventListener("click", () => {
-      void this.testVoiceGatewayConnection();
-    });
-
-    document.getElementById("set-voice-pipeline-mode")?.addEventListener("change", (ev) => {
-      const val = (ev.target as HTMLSelectElement).value;
-      el<HTMLInputElement>("set-voice-clearvoice-enabled").checked = val === "clearvoice";
+    document.getElementById("set-voice-pipeline-mode")?.addEventListener("change", () => {
       this.renderVoicePipelineStatus();
     });
 

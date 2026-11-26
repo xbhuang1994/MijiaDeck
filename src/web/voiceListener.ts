@@ -17,16 +17,11 @@ export type ClientVoiceMode = "idle" | "listening" | "awake" | "processing" | "s
 export interface ClientVoiceConfig {
   voiceEnabled: boolean;
   voiceEngine: "auto" | "local" | "browser" | "whisper";
-  voicePipelineMode?: "legacy" | "clearvoice" | "xfyun";
-  clearVoiceServiceUrl?: string;
-  clearVoiceModel?: string;
-  qwen3AsrServiceUrl?: string;
-  qwen3AsrModel?: string;
+  voicePipelineMode?: "legacy" | "xfyun";
   xfyunEndpointUrl?: string;
   xfyunAppId?: string;
   effectiveXfyunConfigured?: boolean;
-  localAsrEngine?: "auto" | "qwen3-asr" | "sensevoice";
-  qwen3StreamingEnabled?: boolean;
+  streamingAsrEnabled?: boolean;
   voiceLang: string;
   wakeWordEnabled: boolean;
   wakeWords: string[];
@@ -721,7 +716,7 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
 
   pushToStreamOrVad(cleanSamples) {
     // 关闭语音打断（bargeInEnabled=false）且正在 TTS 播报/尾音保护期：
-    // 在 Worklet 源头静音门控上行帧，保持流时钟连续但彻底阻断系统提示音/残余回声进入 VAD 与 ClearVoice！
+    // 在 Worklet 源头静音门控上行帧，保持流时钟连续但彻底阻断系统提示音/残余回声进入后端 VAD！
     const ttsMicGated = this.ttsActive && !this.bargeInEnabled;
     if (ttsMicGated) {
       this.levelAccumN += cleanSamples.length;
@@ -1213,7 +1208,7 @@ export class VoiceListenerClient {
     const engine = this.pickEngine(options.forceEngine);
     if (!engine) {
       const msg =
-        "当前浏览器无法访问麦克风且不支持在线语音识别，请允许麦克风权限并配置在线 Qwen3-ASR / 本地 SenseVoice 引擎或 STT 接口。";
+        "当前浏览器无法访问麦克风且不支持在线语音识别，请允许麦克风权限并使用本地 SenseVoice 引擎、讯飞听写 2.0 或 STT 接口。";
       this.active = false;
       this.mode = "error";
       this.lastError = msg;
@@ -1912,7 +1907,7 @@ export class VoiceListenerClient {
     }
 
     // auto（深度优化后）：
-    // 1. 优先本地离线 Qwen3-ASR / SenseVoice + GTCRN 降噪 + Silero VAD + 声纹
+    // 1. 优先本地离线 SenseVoice + GTCRN 降噪 + Silero VAD + 声纹（或讯飞听写大模型 2.0）
     // 2. 其次云端 Whisper STT（同样走 AudioWorklet 16kHz PCM + AEC + 降噪）
     // 3. 兜底浏览器原生 Web Speech API
     if (hasMic && localReady) return "local";
@@ -2068,7 +2063,7 @@ export class VoiceListenerClient {
           const wasOneShot = this.oneShot;
           this.cb.onToast(
             fallbackEngine === "local"
-              ? "浏览器在线识别不可达，已自动切换至内置语音管线（在线 Qwen3-ASR / 本地 SenseVoice）"
+              ? "浏览器在线识别不可达，已自动切换至内置语音管线（本地 SenseVoice / 讯飞听写 2.0）"
               : "浏览器在线识别不可达，已自动切换至 Whisper VAD 降噪转写模式",
             3200,
           );
@@ -2079,7 +2074,7 @@ export class VoiceListenerClient {
           return;
         }
         this.lastError =
-          "浏览器在线语音识别网络不可达（建议在「设置 → 语音与 Pi Agent」配置在线 Qwen3-ASR / 补齐本地 SenseVoice 或配置 STT 接口）。";
+          "浏览器在线语音识别网络不可达（建议在「设置 → 语音与 Pi Agent」补齐本地 SenseVoice、配置讯飞听写 2.0 或配置 STT 接口）。";
         this.active = false;
         this.mode = "error";
         this.stopAudioCapture();

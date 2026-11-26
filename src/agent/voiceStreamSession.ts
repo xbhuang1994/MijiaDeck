@@ -20,35 +20,21 @@
 import type { VadSensitivityMode, VoicePipelineMode } from "../core/agentConfigStore.ts";
 import { sanitizeAsrTranscript } from "./asrHallucinationGuard.ts";
 import { computeRms, estimateSnrDb, hasAudibleAudioEnergy, resampleLinear } from "./audioPcm.ts";
-import {
-  ClearVoiceMultiTrackAssembler,
-  ClearVoiceMultiTrackEndpointTracker,
-  ClearVoiceRealtimeChunker,
-  pruneInactiveOrDuplicateTracks,
-  type ClearVoiceChunkDescriptor,
-  type ClearVoiceReadyTrackSlot,
-  type ClearVoiceTriggerReason,
-} from "./clearVoiceChunker.ts";
 import type {
   LocalVoiceEngine,
   OnlineDenoiserHandleLike,
   StreamingVadHandleLike,
 } from "./localVoiceEngine.ts";
-import {
-  ConversationTrackMuteManager,
-  type MutedTrackRecord,
-} from "./multiTrackNoiseFilter.ts";
 import type { OpenWakeWordStreamSession, WakeWordAcousticHit } from "./openWakeWordEngine.ts";
 import {
   joinUtteranceFragments,
   looksLikeIncompleteUtterance,
-  Qwen3StreamingHypothesisTracker,
   splitStreamingSentences,
+  StreamingAsrHypothesisTracker,
   stripCommittedPrefix,
   type StreamingCommitReason,
   type StreamingPartialUpdate,
-} from "./qwen3StreamingTranscriber.ts";
-import type { SystemOneClient, SystemOneHistoryEntry } from "./systemOneClient.ts";
+} from "./streamingAsrTracker.ts";
 import {
   StreamingAutoGain,
   vadSensitivityToSeconds,
@@ -59,23 +45,9 @@ import type { ProcessAudioUploadResult } from "./voiceListenerController.ts";
 import { listVoiceprintRefWavPaths } from "./voiceprintStore.ts";
 import type { XfyunIatV2StreamSession } from "./xfyunIatV2Runtime.ts";
 
-export interface VoiceStreamSeparatedTrack {
-  trackId: string;
-  trackIndex: number;
-  sourceSlot: number;
-  samples: Float32Array;
-  sampleRate: number;
-  rms: number;
-  energyRatio: number;
-  outputSnrDb: number;
-  snrGainDb: number;
-}
-
 export interface VoiceStreamSegmentPayload {
   rawSamples: Float32Array;
   denoisedSamples: Float32Array;
-  /** ClearVoice 盲源分离 + 分轨降噪去背景音产出的独立多轨音频（严禁混回单轨！） */
-  separatedTracks?: VoiceStreamSeparatedTrack[];
   denoiseEngine: string;
   inputSnrDb: number;
   outputSnrDb: number;
@@ -96,25 +68,8 @@ export interface VoiceStreamSegmentPayload {
   stripCommittedPrefixHint?: string;
   /** 流式智能断句触发原因 */
   commitReason?: StreamingCommitReason;
-  /** 产出该分段的语音前端方案：legacy（原方案）或 clearvoice（新方案 GPU 盲源分离 + 分轨降噪） */
+  /** 产出该分段的语音前端方案：legacy（本地原方案）或 xfyun（讯飞听写大模型 2.0 原始直推） */
   pipelineMode?: VoicePipelineMode;
-  /** ClearVoice 准实时切片与盲源分离元数据（切片数、20ms 交叉淡入淡出次数、轨数、PIT 换轨次数等） */
-  clearVoiceMeta?: {
-    sliceCount: number;
-    crossfadeCount: number;
-    triggerReason: ClearVoiceTriggerReason;
-    denoiseMs: number;
-    ssMs?: number;
-    seMs?: number;
-    trackCount?: number;
-    bssUsed?: boolean;
-    permutationSwaps?: number;
-    gpuName?: string | null;
-    /** 是否由多轨分轨独立判停提前出段（如音轨 1 已说完命令而音轨 2 电视仍在持续发声） */
-    independentTrackEmit?: boolean;
-    /** 独立出段时的原始分离槽位编号（0-based） */
-    sourceSlot?: number;
-  };
   /** 该分段是否在 TTS 播报活跃期或刚结束尾窗内采集（供服务端回声防护增强判定） */
   duringTtsPlayback?: boolean;
 }
@@ -131,7 +86,7 @@ export interface VoiceStreamSessionOptions {
   wakeWordEnabled?: boolean;
   /**
    * 未唤醒时禁用实时语音转文字（默认 true）：
-   * - 未唤醒待机期仅持续写入循环录制缓冲区并运行轻量级 openWakeWord 声学唤醒检测，不执行实时流式 ASR / ClearVoice 切片 / 分段转写；
+   * - 未唤醒待机期仅持续写入循环录制缓冲区并运行轻量级 openWakeWord 声学唤醒检测，不执行实时流式 ASR / 分段转写；
    * - 命中唤醒后再将循环录制缓冲区与后续音频统一送入降噪与语音转文字管线。
    */
   wakeGatedAsr?: boolean;
@@ -145,45 +100,22 @@ export interface VoiceStreamSessionOptions {
   wakeWords?: readonly string[];
   owwEnabled?: boolean;
   owwThreshold?: number;
-  /** 是否启用 Qwen3-ASR 实时流式字幕转写（默认 false 保持非流式兼容，服务端按配置透传） */
+  /** 是否启用实时流式字幕转写（默认 false 保持非流式兼容，服务端按配置透传） */
   streamingAsrEnabled?: boolean;
   /** 是否在说话中途按标点/短停顿提前拆分为多条句子下发（默认 false：等整段话说完后再一起发给 Pi Agent） */
   streamingSentenceSplit?: boolean;
-  /** 语音前端方案：legacy（原方案）或 clearvoice（新方案 ClearVoice GPU 准实时切片 -> Qwen3-ASR） */
+  /** 语音前端方案：legacy（本地原方案）或 xfyun（讯飞语音听写大模型 2.0 原始直推） */
   voicePipelineMode?: VoicePipelineMode;
-  /** ClearVoice 切片参数覆写（默认 280ms 静音增量降噪切片 / 2000ms 超时切分 / 300ms 历史上下文 / 20ms 交叉淡入淡出） */
-  clearVoiceSilenceMs?: number;
-  /** ClearVoice 整句结束静音判停阈值（ms，默认继承 vadSilenceMs / vadSensitivity，绝不用 280ms 切片停顿提前断句） */
-  clearVoiceUtteranceSilenceMs?: number;
-  /** ClearVoice 单条连续话语安全上限（ms，默认 30000ms = 30s，保障慢语速长语音不被提前切段） */
-  clearVoiceMaxUtteranceMs?: number;
-  clearVoiceMaxChunkMs?: number;
-  clearVoiceLookbackMs?: number;
-  clearVoiceCrossfadeMs?: number;
-  /** 待机期 ClearVoice GPU 降噪/分轨重叠滑窗步进（ms，默认 1200ms + 950ms 前导重叠 = 2150ms 窗，消除跨边界盲区且实时率 < 1） */
-  standbyClearVoiceStepMs?: number;
-  /** 待机期短突发语音后提前刷出 ClearVoice 切片的静音时长（ms，默认 300ms） */
-  standbyClearVoicePauseMs?: number;
-  /** 待机期触发 ClearVoice GPU 降噪/分轨的最小信号 RMS 门限（默认 0.0055，安静环境零 GPU 开销） */
-  standbyClearVoiceActiveRms?: number;
   /** 长语音额外停顿宽限（ms，说话累计 >= 3.0s 后自动放宽句中停顿，默认 350ms） */
   longUtteranceExtraSilenceMs?: number;
   /** 语义未闭合额外停顿宽限（ms，如句中停在“然后/把客厅灯”等未说完处，默认 650ms） */
   incompleteGraceMs?: number;
   /** 实时流式字幕增量更新回调 */
   onPartialTranscript?: (ev: StreamingPartialUpdate) => void;
-  /** 流式假设刷新最小新音频步进（ms，默认 GPU 360ms / CPU 850ms） */
+  /** 流式假设刷新最小新音频步进（ms，默认 850ms） */
   streamingPollIntervalMs?: number;
   /** 句末标点+短停顿快速断句静音阈值（ms，仅在显式开启 streamingSentenceSplit 时生效，默认 320ms） */
   streamingPunctuationPauseMs?: number;
-  /** 可选多轨背景音/电视屏蔽管理器（通常与 VoiceListenerController 共享；未传入时会话内部独立维护） */
-  trackMuteManager?: ConversationTrackMuteManager;
-  /** 可选 SystemOne 客户端获取器（供多轨流式预览超 20 字时实时识别并屏蔽背景音/旁白/噪音/电视音轨） */
-  getSystemOneClient?: () => SystemOneClient | null;
-  /** 可选近期对话历史获取器（供 SystemOne 多轨噪音判别使用） */
-  getRecentHistory?: () => ReadonlyArray<SystemOneHistoryEntry>;
-  /** 可选对话轮次号获取器（防异步 SystemOne 返回前对话已退出导致陈旧屏蔽） */
-  getDialogEpoch?: () => number;
   onWakeWordSpot?: (hit: WakeWordAcousticHit) => void;
   onSpeechActivity?: (speaking: boolean) => void;
   onSegmentReady: (
@@ -200,32 +132,6 @@ interface HeldLegacySegment {
   timer: ReturnType<typeof setTimeout> | null;
 }
 
-interface ClearVoiceUtteranceMeta {
-  wakeAnchored: boolean;
-  acousticWake: WakeWordAcousticHit | null;
-  endGlobalSample: number;
-  duringTtsPlayback?: boolean;
-}
-
-interface ClearVoiceQueuedSlice {
-  chunk: ClearVoiceChunkDescriptor;
-  startGlobalSample: number;
-  wakeAuthorized: boolean;
-  wakeAnchored: boolean;
-  acousticWake: WakeWordAcousticHit | null;
-  duringTtsPlayback?: boolean;
-  utteranceMeta?: ClearVoiceUtteranceMeta;
-}
-
-interface StandbyClearVoiceSlice {
-  ctxStartGlobalSample: number;
-  startGlobalSample: number;
-  endGlobalSample: number;
-  lookbackSamples: number;
-  newSamples: number;
-  rawWithContext: Float32Array;
-}
-
 const TARGET_SR = 16000;
 const RAW_RING_CAPACITY = TARGET_SR * 35; // 35 秒对齐环形缓冲（完整容纳 30s 慢语速长语音）
 const PRE_ROLL_SAMPLES = Math.round(TARGET_SR * 0.32);
@@ -240,23 +146,12 @@ const CONV_AMBIENT_PROBE_STEP_SEC = 1.5; // 对话态连续无停顿时的 CED �
 const LONG_UTTERANCE_THRESHOLD_SEC = 3.0;
 const DEFAULT_LONG_UTTERANCE_EXTRA_MS = 350;
 const DEFAULT_INCOMPLETE_GRACE_MS = 650;
-const DEFAULT_CLEARVOICE_MAX_UTTERANCE_MS = 30_000;
-const DEFAULT_STANDBY_CV_STEP_MS = 1200;
-const DEFAULT_STANDBY_CV_PAUSE_MS = 300;
-const DEFAULT_STANDBY_CV_ACTIVE_RMS = 0.0055;
-const STANDBY_CV_LOOKBACK_SAMPLES = Math.round(TARGET_SR * 0.95); // 0.95s 重叠前导 + 1.2s 步进 = 2.15s 滑窗，完整覆盖 <= 0.9s 唤醒词彻底消除跨边界盲区
-const STANDBY_CV_PRE_ROLL_SAMPLES = Math.round(TARGET_SR * 0.25);
-const STANDBY_CV_MIN_BURST_SAMPLES = Math.round(TARGET_SR * 0.45);
-const STANDBY_CV_MAX_QUEUE = 8;
 const OWW_WARMUP_SEED_SAMPLES = 5 * 1280; // 400ms (openWakeWord WARMUP_SUPPRESS_FRAMES=5)
-const OWW_TAIL_FLUSH_SAMPLES = 2 * 1280; // 160ms (冲刷滑窗右边缘唤醒词的末尾嵌入帧)
 const STANDBY_DPDF_ENGAGE_RMS = 0.014;
 const STANDBY_DPDF_RELEASE_RMS = 0.008;
 const STANDBY_DPDF_ENGAGE_SAMPLES = Math.round(TARGET_SR * 0.25);
 const STANDBY_DPDF_RELEASE_SAMPLES = Math.round(TARGET_SR * 1.5);
 const STANDBY_DPDF_PREROLL_SAMPLES = Math.round(TARGET_SR * 0.48);
-/** TTS 播报/尾音期间仅由单字拟声/失真碎片构成的流式预览过滤，避免 UI 闪现“呀。”等无效预览 */
-const TTS_FILLER_PREVIEW_RE = /^[呀啊哦喔噢呃额哈呵啦呢嘛哎唉哟咦呜嘿哇哒啪咔咚嗡哼嘶嘘噗]$/;
 
 /**
  * 将浏览器发送的 Little-Endian Int16 PCM 二进制帧解码为 Float32Array（[-1, 1]）。
@@ -290,25 +185,7 @@ export class VoiceStreamSession {
   private readonly _wakeRingLookbackSamples: number;
   private _wasAwake = false;
 
-  // 待机期 ClearVoice GPU 降噪与多轨盲源分离（零 ASR，专供抗电视/强噪环境下的独立分轨 openWakeWord 声学唤醒）
-  private readonly _standbyCvStepSamples: number;
-  private readonly _standbyCvPauseSamples: number;
-  private readonly _standbyCvActiveRms: number;
-  private _standbyCvQueue: StandbyClearVoiceSlice[] = [];
-  private _standbyCvInFlight = false;
-  private _standbyCvAbort: AbortController | null = null;
-  private _standbyCvGen = 0;
-  private _standbyCvIdleResolvers: Array<() => void> = [];
-  private _standbyCvHasActive = false;
-  private _standbyCvWindowStartSample = 0;
-  private _standbyCvActiveSamples = 0;
-  private _standbyCvTrailingSilentSamples = 0;
-  private _standbyCvLastQueuedEndSample = 0;
-  private _standbyScanOww: OpenWakeWordStreamSession | null = null;
-  private _standbyActiveSpotCapture: ((hit: WakeWordAcousticHit) => void) | null = null;
-  private _standbyCvProcessedSlices = 0;
-
-  // Legacy / 无 ClearVoice GPU 场景下的待机强噪 DPDFNet4 按需增强通道（安静房间零开销，仅高环境噪时介入）
+  // Legacy 模式下的待机强噪 DPDFNet4 按需增强通道（安静房间零开销，仅高环境噪时介入）
   private _standbyDpdfDenoiser: OnlineDenoiserHandleLike | null = null;
   private _standbyDpdfOww: OpenWakeWordStreamSession | null = null;
   private _standbyDpdfInitAttempted = false;
@@ -321,38 +198,11 @@ export class VoiceStreamSession {
   private readonly _streamingSentenceSplit: boolean;
   private _voicePipelineMode: VoicePipelineMode;
   private _utteranceSilenceMs: number;
-  private readonly _clearVoiceMaxUtteranceSamples: number;
   private readonly _longUtteranceExtraSilenceMs: number;
   private readonly _incompleteGraceMs: number;
-  private readonly _streamTracker: Qwen3StreamingHypothesisTracker;
+  private readonly _streamTracker: StreamingAsrHypothesisTracker;
   private _heldSegment: HeldLegacySegment | null = null;
   private _streamLastDecodeFullWindow = true;
-
-  // ClearVoice GPU 多轨盲源分离 + 分轨降噪准实时切片管线状态（按需惰性初始化，支持运行期无缝热切换）
-  private _cvChunker: ClearVoiceRealtimeChunker | null = null;
-  private _cvAssembler: ClearVoiceMultiTrackAssembler | null = null;
-  private _cvTrackTracker: ClearVoiceMultiTrackEndpointTracker | null = null;
-  private _cvAnyTrackDrainedInUtterance = false;
-  private readonly _trackMuteManager: ConversationTrackMuteManager;
-  private readonly _ownsTrackMuteManager: boolean;
-  private _cvSliceQueue: ClearVoiceQueuedSlice[] = [];
-  private _cvInFlight = false;
-  private _cvIdleResolvers: Array<() => void> = [];
-  private _cvRawChunks: Float32Array[] = [];
-  private _cvTotalDenoiseMs = 0;
-  private _cvTotalSsMs = 0;
-  private _cvTotalSeMs = 0;
-  private _cvBssUsed = false;
-  private _cvServerSwaps = 0;
-  private _cvLastEngine = "clearvoice-mossformer2-remote";
-  private _cvLastGpuName: string | null = null;
-  private _cvUtteranceStartSample: number | null = null;
-  private _cvWakeAnchored = false;
-  private _cvWakeHit: WakeWordAcousticHit | null = null;
-  private _cvBaseGlobalSample = 0;
-  private _cvFedUpToGlobalSample = 0;
-  private _cvPendingEmitCount = 0;
-  private _cvGen = 0;
   private _legacyFedUpToGlobalSample = 0;
   private _streamSpeechOriginSample: number | null = null;
   private _streamLastDecodedEndSample = 0;
@@ -377,7 +227,7 @@ export class VoiceStreamSession {
   private _xfyunFinishing = false;
   private _xfyunIdleResolvers: Array<() => void> = [];
 
-  // 双轨时间对齐环形缓冲（Raw + Denoised 同步保留 20 秒，支撑唤醒词锚定极速切段与零重复降噪）
+  // 双轨时间对齐环形缓冲（Raw + Denoised 同步保留 35 秒，支撑唤醒词锚定极速切段与零重复降噪）
   private readonly _rawRing = new Float32Array(RAW_RING_CAPACITY);
   private readonly _denRing = new Float32Array(RAW_RING_CAPACITY);
   private _rawTotalSamples = 0;
@@ -396,11 +246,9 @@ export class VoiceStreamSession {
   private _lastDenOverlap = new Float32Array(0);
   private _lastMatchedStartSec = -1;
   private _lastMatchedEndSec = -1;
-  private _lastMatchedBySlot = new Map<number, { startSec: number; endSec: number }>();
   private _ttsSpeaking = false;
   private _ttsLastEndedAt = 0;
-  /** 采集时刻级 TTS 重叠锁存（避免 1.2s 尾静音判停后 _isDuringTtsWindow() 过期丢失回声标记） */
-  private _cvUtteranceDuringTts = false;
+  /** 采集时刻级 TTS 重叠锁存（避免尾静音判停后 _isDuringTtsWindow() 过期丢失回声标记） */
   private _legacyUtteranceDuringTts = false;
 
   // 无 Silero VAD 时的纯 TS 兜底窗口缓冲
@@ -418,8 +266,6 @@ export class VoiceStreamSession {
 
   constructor(options: VoiceStreamSessionOptions) {
     this._opts = options;
-    this._ownsTrackMuteManager = !options.trackMuteManager;
-    this._trackMuteManager = options.trackMuteManager ?? new ConversationTrackMuteManager();
     this._inputRate = options.sampleRate ?? TARGET_SR;
     this._wakeWords = [...(options.wakeWords ?? [])];
     this._owwThreshold = options.owwThreshold;
@@ -436,26 +282,7 @@ export class VoiceStreamSession {
     this._wakeRingLookbackSamples = Math.round((TARGET_SR * lookbackMs) / 1000);
     this._streamingAsrEnabled = options.streamingAsrEnabled === true;
     this._streamingSentenceSplit = options.streamingSentenceSplit === true;
-    this._voicePipelineMode =
-      options.voicePipelineMode === "clearvoice"
-        ? "clearvoice"
-        : options.voicePipelineMode === "xfyun"
-          ? "xfyun"
-          : "legacy";
-    const standbyStepMs = Math.max(
-      600,
-      Math.min(2200, Math.round(options.standbyClearVoiceStepMs ?? DEFAULT_STANDBY_CV_STEP_MS)),
-    );
-    const standbyPauseMs = Math.max(
-      120,
-      Math.min(1000, Math.round(options.standbyClearVoicePauseMs ?? DEFAULT_STANDBY_CV_PAUSE_MS)),
-    );
-    this._standbyCvStepSamples = Math.round((TARGET_SR * standbyStepMs) / 1000);
-    this._standbyCvPauseSamples = Math.round((TARGET_SR * standbyPauseMs) / 1000);
-    this._standbyCvActiveRms = Math.max(
-      0.001,
-      Math.min(0.1, options.standbyClearVoiceActiveRms ?? DEFAULT_STANDBY_CV_ACTIVE_RMS),
-    );
+    this._voicePipelineMode = options.voicePipelineMode === "xfyun" ? "xfyun" : "legacy";
     this._longUtteranceExtraSilenceMs =
       options.vadSensitivity === "aggressive"
         ? 0
@@ -467,12 +294,7 @@ export class VoiceStreamSession {
       options.vadSensitivity === "aggressive"
         ? 0
         : Math.max(0, Math.min(1800, options.incompleteGraceMs ?? DEFAULT_INCOMPLETE_GRACE_MS));
-    this._clearVoiceMaxUtteranceSamples = Math.round(
-      TARGET_SR *
-        (Math.max(5000, Math.min(60_000, options.clearVoiceMaxUtteranceMs ?? DEFAULT_CLEARVOICE_MAX_UTTERANCE_MS)) /
-          1000),
-    );
-    this._streamTracker = new Qwen3StreamingHypothesisTracker({
+    this._streamTracker = new StreamingAsrHypothesisTracker({
       wakeWords: this._wakeWords,
       punctuationPauseMs: options.streamingPunctuationPauseMs ?? 320,
       splitMidUtterance: this._streamingSentenceSplit,
@@ -522,7 +344,6 @@ export class VoiceStreamSession {
     if (!this._wakeWordEnabled) return true;
     if (this._opts.isInConversation?.()) return true;
     if (this._wakeAnchorSample !== null) return true;
-    if (this._cvWakeAnchored) return true;
     if (this._xfyunWakeAnchored) return true;
     if (this._xfyunSession !== null) return true;
     if (this._heldSegment !== null) return true;
@@ -551,7 +372,7 @@ export class VoiceStreamSession {
 
   /**
    * 当前是否处于“未唤醒仅循环录制缓冲 + 声学唤醒检测”待机态：
-   * 该状态下完全跳过 ClearVoice GPU 切片、实时流式转写与分段 ASR，待唤醒后再回放循环录制缓冲区及后续音频。
+   * 该状态下完全跳过实时流式转写与分段 ASR，待唤醒后再回放循环录制缓冲区及后续音频。
    */
   get isWakeGatedStandby(): boolean {
     if (!this._wakeGatedAsr) return false;
@@ -607,8 +428,7 @@ export class VoiceStreamSession {
 
   private _activateWakeCapture(hit: WakeWordAcousticHit | null, replayMs?: number): void {
     if (this._disposed) return;
-    // 唤醒瞬间立刻中止任何在途待机 ClearVoice / DPDFNet4 切片，释放 GPU/CPU 给已唤醒转写管线
-    this._resetStandbyClearVoiceState(true);
+    // 唤醒瞬间立刻重置待机 DPDFNet4 通道，释放 CPU 给已唤醒转写管线
     this._resetStandbyDpdfState();
 
     if (this._voicePipelineMode === "xfyun") {
@@ -621,18 +441,6 @@ export class VoiceStreamSession {
         return;
       }
       this._activateXfyunFromWake(hit, replayMs);
-      return;
-    }
-
-    if (this._voicePipelineMode === "clearvoice") {
-      if (this._cvWakeAnchored && !this._opts.isInConversation?.()) {
-        if (hit && (!this._cvWakeHit || hit.score > this._cvWakeHit.score)) {
-          this._cvWakeHit = hit;
-          this._wakeAnchorHit = hit;
-        }
-        return;
-      }
-      this._activateClearVoiceFromWake(hit, replayMs);
       return;
     }
 
@@ -803,12 +611,6 @@ export class VoiceStreamSession {
     );
     this._utteranceSilenceMs = Math.round(nextSec * 1000);
     this._segmenter.setSilenceSeconds(nextSec);
-    if (this._cvChunker && this._opts.clearVoiceUtteranceSilenceMs === undefined) {
-      this._cvChunker.setUtteranceSilenceMs(this._utteranceSilenceMs);
-    }
-    if (this._cvTrackTracker && this._opts.clearVoiceUtteranceSilenceMs === undefined) {
-      this._cvTrackTracker.setUtteranceSilenceMs(this._utteranceSilenceMs);
-    }
   }
 
   /**
@@ -833,14 +635,6 @@ export class VoiceStreamSession {
     return this._noiseMode;
   }
 
-  get standbyClearVoiceProcessedSlices(): number {
-    return this._standbyCvProcessedSlices;
-  }
-
-  get mutedTracks(): MutedTrackRecord[] {
-    return this._trackMuteManager.getMutedTracks();
-  }
-
   /**
    * 运行期热切换环境降噪模式（auto / neural / dpdfnet / voxlock / dsp / off），无需重连 WebSocket。
    */
@@ -850,44 +644,30 @@ export class VoiceStreamSession {
     const online = this._opts.localEngine.createOnlineDenoiser(mode);
     this._onlineDenoiser = online?.denoiser ?? null;
     this._denoiseEngine = online?.engine ?? (mode === "off" ? "off" : "dsp");
-    this._resetStandbyClearVoiceState(true);
     this._resetStandbyDpdfState(true);
   }
 
   /**
-   * 运行期无缝热切换语音方案（原方案 legacy <-> 在线 ClearVoice 多轨方案 clearvoice <-> 讯飞听写大模型 2.0 方案 xfyun），
+   * 运行期无缝热切换语音方案（原方案 legacy <-> 讯飞听写大模型 2.0 方案 xfyun），
    * 切换后立即清理挂起缓冲，无需断开或重连 WebSocket。
    */
   setVoicePipelineMode(mode: VoicePipelineMode): void {
-    const next: VoicePipelineMode =
-      mode === "clearvoice" ? "clearvoice" : mode === "xfyun" ? "xfyun" : "legacy";
+    const next: VoicePipelineMode = mode === "xfyun" ? "xfyun" : "legacy";
     if (this._voicePipelineMode === next) return;
     this._voicePipelineMode = next;
     this._clearHeldLegacySegment();
     this._abortXfyunSession(true);
-    this._resetClearVoiceState();
-    this._resetStandbyClearVoiceState(true);
     this._resetStandbyDpdfState();
-    if (this._ownsTrackMuteManager) {
-      this._trackMuteManager.reset();
-    }
     this._resetVadState();
     this._resetStreamingState(true);
     this._wakeAnchorSample = null;
     this._wakeAnchorHit = null;
-    this._cvWakeAnchored = false;
-    this._cvWakeHit = null;
-    this._cvUtteranceDuringTts = false;
     this._legacyUtteranceDuringTts = false;
     this._activeSegmentStartSample = null;
     this._denoisedPending = new Float32Array(0);
     this._segmenter.reset();
-    this._cvFedUpToGlobalSample = this._rawTotalSamples;
     this._xfyunFedUpToGlobalSample = this._rawTotalSamples;
     this._wasAwake = this.isAwake;
-    if (next === "clearvoice" && !this.isWakeGatedStandby) {
-      this._prepareClearVoiceForLiveInput();
-    }
   }
 
   /**
@@ -904,13 +684,10 @@ export class VoiceStreamSession {
       this._onEnterStandby();
     } else if (awakeNow && !this._wasAwake) {
       this._wasAwake = true;
-      this._resetStandbyClearVoiceState(true);
       this._resetStandbyDpdfState();
       if (this._voicePipelineMode === "xfyun") {
         this._xfyunFedUpToGlobalSample = this._rawTotalSamples;
         this._xfyunOnsetFrames = 0;
-      } else if (this._voicePipelineMode === "clearvoice") {
-        this._prepareClearVoiceForLiveInput();
       } else {
         this._denoisedPending = new Float32Array(0);
         this._resetVadState();
@@ -927,7 +704,6 @@ export class VoiceStreamSession {
     if (this._owwEnabled === next) return;
     this._owwEnabled = next;
     if (!next) {
-      this._resetStandbyClearVoiceState(true, true);
       this._resetStandbyDpdfState(true);
       try {
         this._oww?.reset();
@@ -957,7 +733,6 @@ export class VoiceStreamSession {
         this._opts.bypassWakeWord ||
         !this._wakeWordEnabled ||
         this._wakeAnchorSample !== null ||
-        this._cvWakeAnchored ||
         this._xfyunWakeAnchored ||
         Boolean(this._heldSegment?.payload.wakeAnchored);
       if (!keepActiveWake && (this._wasAwake || this._heldSegment !== null)) {
@@ -974,7 +749,6 @@ export class VoiceStreamSession {
     }
     if (inConversation && !this._wasAwake) {
       this._wasAwake = true;
-      this._resetStandbyClearVoiceState(true);
       this._resetStandbyDpdfState();
       const isManualEnter = reason === "ws_control" || reason === "manual";
       if (this._voicePipelineMode === "xfyun") {
@@ -983,20 +757,6 @@ export class VoiceStreamSession {
           this._xfyunFedUpToGlobalSample = this._rawTotalSamples;
         } else {
           this._replayPostWakeGapIfNeeded();
-        }
-      } else if (this._voicePipelineMode === "clearvoice") {
-        const isPostWakeTransition =
-          !isManualEnter &&
-          (reason === "wake_only" ||
-            reason === "command_dispatched_async" ||
-            reason === "command_running" ||
-            reason === "command_done" ||
-            (this._lastEmittedEndSample > 0 &&
-              this._rawTotalSamples - this._lastEmittedEndSample <= POST_WAKE_GAP_REPLAY_MAX_SAMPLES));
-        if (isPostWakeTransition) {
-          this._replayPostWakeGapIfNeeded();
-        } else {
-          this._prepareClearVoiceForLiveInput();
         }
       } else {
         this._denoisedPending = new Float32Array(0);
@@ -1013,16 +773,12 @@ export class VoiceStreamSession {
   }
 
   private _onEnterStandby(explicitExit = false): void {
-    if (explicitExit && this._ownsTrackMuteManager) {
-      this._trackMuteManager.reset();
-    }
     if (!explicitExit && this._heldSegment) {
       this._flushHeldLegacySegment();
     } else {
       this._clearHeldLegacySegment();
     }
     this._resetStreamingState(true);
-    this._resetStandbyClearVoiceState(true);
     this._resetStandbyDpdfState();
     if (explicitExit) {
       this._abortXfyunSession(true);
@@ -1032,12 +788,8 @@ export class VoiceStreamSession {
       this._xfyunUtteranceDuringTts = false;
       this._xfyunOnsetFrames = 0;
     }
-    this._standbyCvLastQueuedEndSample = this._rawTotalSamples;
     this._wakeAnchorSample = null;
     this._wakeAnchorHit = null;
-    this._cvWakeAnchored = false;
-    this._cvWakeHit = null;
-    this._cvUtteranceDuringTts = false;
     this._legacyUtteranceDuringTts = false;
     this._activeSegmentStartSample = null;
     this._denoisedPending = new Float32Array(0);
@@ -1050,29 +802,17 @@ export class VoiceStreamSession {
     this._resetVadState();
     const hasPendingWakeWork =
       !explicitExit &&
-      (this._cvPendingEmitCount > 0 ||
-        this._xfyunSession !== null ||
+      (this._xfyunSession !== null ||
         this._inFlight ||
         this._pendingWake.length > 0);
     if (!hasPendingWakeWork) {
-      this._cvFedUpToGlobalSample = this._rawTotalSamples;
       this._legacyFedUpToGlobalSample = this._rawTotalSamples;
       this._xfyunFedUpToGlobalSample = this._rawTotalSamples;
       if (explicitExit) {
         this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, this._rawTotalSamples);
-        this._lastMatchedBySlot.clear();
       }
     }
-    if (this._cvPendingEmitCount === 0) {
-      this._resetClearVoiceState();
-    } else {
-      this._cvChunker?.setIncompleteUtteranceHint(false);
-      this._cvChunker?.reset();
-    }
     if (
-      this._cvPendingEmitCount === 0 &&
-      !this._cvInFlight &&
-      this._cvSliceQueue.length === 0 &&
       !this._inFlight &&
       this._pendingWake.length === 0 &&
       this._pendingNormalQueue.length === 0
@@ -1398,136 +1138,6 @@ export class VoiceStreamSession {
     }
   }
 
-  private _prepareClearVoiceForLiveInput(): void {
-    this._ensureClearVoicePipeline();
-    const chunker = this._cvChunker!;
-    if (this._cvPendingEmitCount === 0 && !this._cvInFlight && this._cvSliceQueue.length === 0) {
-      this._resetClearVoiceState();
-    } else if (!chunker.inUtterance) {
-      chunker.setIncompleteUtteranceHint(false);
-      chunker.reset();
-    } else {
-      return;
-    }
-    const lookbackCtxSamples = Math.round(
-      TARGET_SR * ((this._opts.clearVoiceLookbackMs ?? 300) / 1000),
-    );
-    const earliest = Math.max(0, this._rawTotalSamples - RAW_RING_CAPACITY);
-    const preStart = Math.max(earliest, this._rawTotalSamples - lookbackCtxSamples);
-    const preContext =
-      preStart < this._rawTotalSamples
-        ? this._readRingRange(this._rawRing, this._rawTotalSamples, preStart, this._rawTotalSamples)
-        : new Float32Array(0);
-    this._cvBaseGlobalSample = this._rawTotalSamples - preContext.length - chunker.totalSamples;
-    if (preContext.length > 0) {
-      chunker.seedContext(preContext);
-    }
-    this._cvFedUpToGlobalSample = this._rawTotalSamples;
-  }
-
-  private _activateClearVoiceFromWake(
-    hit: WakeWordAcousticHit | null,
-    replayMs?: number,
-  ): void {
-    this._ensureClearVoicePipeline();
-    const chunker = this._cvChunker!;
-    const anchorEnd = hit && hit.sampleOffset > 0 ? hit.sampleOffset : this._rawTotalSamples;
-    const replayStart = this._computeWakeReplayStartSample(anchorEnd, replayMs);
-
-    // 若已处于连续对话态且 ClearVoice 正在持续收音同一话语，仅附加唤醒元数据，不打断已积累切片
-    if (this._opts.isInConversation?.() && chunker.inUtterance) {
-      this._cvWakeAnchored = true;
-      if (hit) this._cvWakeHit = hit;
-      this._wakeAnchorSample = this._wakeAnchorSample ?? replayStart;
-      if (hit) this._wakeAnchorHit = hit;
-      return;
-    }
-
-    if (this._cvPendingEmitCount === 0 && !this._cvInFlight && this._cvSliceQueue.length === 0) {
-      this._resetClearVoiceState();
-    } else {
-      chunker.setIncompleteUtteranceHint(false);
-      chunker.reset();
-    }
-
-    this._cvWakeAnchored = true;
-    this._cvWakeHit = hit;
-    this._wakeAnchorSample = replayStart;
-    this._wakeAnchorHit = hit;
-    this._wasAwake = true;
-
-    const lookbackCtxSamples = Math.round(
-      TARGET_SR * ((this._opts.clearVoiceLookbackMs ?? 300) / 1000),
-    );
-    const earliestAvailable = Math.max(0, this._rawTotalSamples - RAW_RING_CAPACITY);
-    const preContextStart = Math.max(earliestAvailable, replayStart - lookbackCtxSamples);
-    const preContext =
-      preContextStart < replayStart
-        ? this._readRingRange(this._rawRing, this._rawTotalSamples, preContextStart, replayStart)
-        : new Float32Array(0);
-
-    this._cvBaseGlobalSample = replayStart - preContext.length - chunker.totalSamples;
-    if (preContext.length > 0) {
-      chunker.seedContext(preContext);
-    }
-
-    const bufferedAudio = this._readRingRange(
-      this._rawRing,
-      this._rawTotalSamples,
-      replayStart,
-      this._rawTotalSamples,
-    );
-    this._cvFedUpToGlobalSample = this._rawTotalSamples;
-
-    let emittedCount = 0;
-    if (bufferedAudio.length > 0) {
-      const chunks = chunker.pushSamples(bufferedAudio);
-      emittedCount = chunks.length;
-      this._handleClearVoiceChunks(chunks);
-    }
-
-    if (emittedCount === 0 && !chunker.inUtterance && bufferedAudio.length > 0) {
-      chunker.ensureUtteranceActive(bufferedAudio.length);
-    }
-  }
-
-  private _handleClearVoiceChunks(chunks: ClearVoiceChunkDescriptor[]): void {
-    for (const ch of chunks) {
-      if (ch.rawNewSamples.length > 0 && this._isDuringTtsWindow()) {
-        this._cvUtteranceDuringTts = true;
-      }
-      const startGlobalSample = Math.max(0, this._cvBaseGlobalSample + ch.startSample);
-      const endGlobalSample = Math.max(startGlobalSample, this._cvBaseGlobalSample + ch.endSample);
-      const sliceWakeAnchored = this._cvWakeAnchored || this._wakeAnchorSample !== null;
-      const sliceAcousticWake = this._cvWakeHit ?? this._wakeAnchorHit ?? null;
-      const sliceDuringTts = this._cvUtteranceDuringTts;
-      let utteranceMeta: ClearVoiceUtteranceMeta | undefined;
-      if (ch.utteranceEnded) {
-        utteranceMeta = {
-          wakeAnchored: sliceWakeAnchored,
-          acousticWake: sliceAcousticWake,
-          endGlobalSample,
-          duringTtsPlayback: sliceDuringTts,
-        };
-        this._cvPendingEmitCount += 1;
-        this._cvWakeAnchored = false;
-        this._cvWakeHit = null;
-        this._cvUtteranceDuringTts = false;
-        this._wakeAnchorSample = null;
-        this._wakeAnchorHit = null;
-      }
-      this._enqueueClearVoiceSlice({
-        chunk: ch,
-        startGlobalSample,
-        wakeAuthorized: this.isAwake || sliceWakeAnchored,
-        wakeAnchored: sliceWakeAnchored,
-        acousticWake: sliceAcousticWake,
-        duringTtsPlayback: sliceDuringTts,
-        utteranceMeta,
-      });
-    }
-  }
-
   private _replayPostWakeGapIfNeeded(): void {
     if (this._disposed || !this._opts.isInConversation?.()) return;
     if (this._lastEmittedEndSample <= 0 || this._rawTotalSamples <= this._lastEmittedEndSample) {
@@ -1560,39 +1170,6 @@ export class VoiceStreamSession {
       }
       return;
     }
-    if (this._voicePipelineMode === "clearvoice") {
-      const effectiveStart = Math.max(gapStart, this._cvFedUpToGlobalSample);
-      if (this._rawTotalSamples - effectiveStart < 512) return;
-      this._ensureClearVoicePipeline();
-      const chunker = this._cvChunker!;
-      if (!chunker.inUtterance) {
-        const lookbackCtxSamples = Math.round(
-          TARGET_SR * ((this._opts.clearVoiceLookbackMs ?? 300) / 1000),
-        );
-        const earliest = Math.max(0, this._rawTotalSamples - RAW_RING_CAPACITY);
-        const preStart = Math.max(earliest, effectiveStart - lookbackCtxSamples);
-        const preCtx =
-          preStart < effectiveStart
-            ? this._readRingRange(this._rawRing, this._rawTotalSamples, preStart, effectiveStart)
-            : new Float32Array(0);
-        this._cvBaseGlobalSample = effectiveStart - preCtx.length - chunker.totalSamples;
-        if (preCtx.length > 0) {
-          chunker.seedContext(preCtx);
-        }
-      }
-      const gapAudio = this._readRingRange(
-        this._rawRing,
-        this._rawTotalSamples,
-        effectiveStart,
-        this._rawTotalSamples,
-      );
-      this._cvFedUpToGlobalSample = this._rawTotalSamples;
-      if (gapAudio.length > 0) {
-        const chunks = chunker.pushSamples(gapAudio);
-        this._handleClearVoiceChunks(chunks);
-      }
-      return;
-    }
 
     if (this._vad && !this._vadDetected && this._wakeAnchorSample === null) {
       const effectiveStart = Math.max(gapStart, this._legacyFedUpToGlobalSample);
@@ -1607,942 +1184,6 @@ export class VoiceStreamSession {
         this._legacyFedUpToGlobalSample = this._rawTotalSamples;
       }
     }
-  }
-
-  private _ensureClearVoicePipeline(): void {
-    if (!this._cvChunker) {
-      // ClearVoice 专用 Silero VAD：极短 minSilenceDuration (64ms) 使 isDetected() 实时反映帧级语音/静音，
-      // 由 ClearVoiceRealtimeChunker 的解耦双触发状态机分别把控：
-      // - 280ms 短停顿 / 2.0s 上限触发 GPU MossFormer2 增量切片降噪；
-      // - 完整 utteranceSilenceMs（默认继承 vadSilenceMs，含长语音与未闭合语义宽限）才结束整句并交付 ASR -> Pi Agent！
-      const cvVad = this._opts.localEngine.createStreamingVad({
-        threshold: this._opts.vadThreshold ?? 0.4,
-        minSilenceDuration: 0.064,
-        minSpeechDuration: 0.064,
-        maxSpeechDuration: MAX_UTTERANCE_SEC,
-      });
-      const sliceSilenceMs = this._opts.clearVoiceSilenceMs ?? 280;
-      const utteranceSilenceMs = Math.max(
-        sliceSilenceMs,
-        this._opts.clearVoiceUtteranceSilenceMs ?? this._utteranceSilenceMs,
-      );
-      this._cvChunker = new ClearVoiceRealtimeChunker({
-        sampleRate: TARGET_SR,
-        inputSampleRate: TARGET_SR,
-        frameSizeMs: 32,
-        silenceTriggerMs: sliceSilenceMs,
-        utteranceSilenceMs,
-        longUtteranceThresholdMs: Math.round(LONG_UTTERANCE_THRESHOLD_SEC * 1000),
-        longUtteranceExtraSilenceMs: this._longUtteranceExtraSilenceMs,
-        incompleteGraceMs: this._incompleteGraceMs,
-        maxChunkMs: this._opts.clearVoiceMaxChunkMs ?? 2000,
-        lookbackMs: this._opts.clearVoiceLookbackMs ?? 300,
-        crossfadeMs: this._opts.clearVoiceCrossfadeMs ?? 20,
-        vad: cvVad,
-        onSpeechActivity: (speaking) => {
-          this._opts.onSpeechActivity?.(speaking);
-        },
-      });
-    }
-    if (!this._cvAssembler) {
-      this._cvAssembler = new ClearVoiceMultiTrackAssembler({
-        sampleRate: TARGET_SR,
-        crossfadeMs: this._opts.clearVoiceCrossfadeMs ?? 20,
-        lookbackMs: this._opts.clearVoiceLookbackMs ?? 300,
-      });
-    }
-    if (!this._cvTrackTracker) {
-      const sliceSilenceMs = this._opts.clearVoiceSilenceMs ?? 280;
-      const utteranceSilenceMs = Math.max(
-        sliceSilenceMs,
-        this._opts.clearVoiceUtteranceSilenceMs ?? this._utteranceSilenceMs,
-      );
-      this._cvTrackTracker = new ClearVoiceMultiTrackEndpointTracker({
-        sampleRate: TARGET_SR,
-        frameSizeMs: 32,
-        utteranceSilenceMs,
-        longUtteranceThresholdMs: Math.round(LONG_UTTERANCE_THRESHOLD_SEC * 1000),
-        longUtteranceExtraSilenceMs: this._longUtteranceExtraSilenceMs,
-        incompleteGraceMs: this._incompleteGraceMs,
-        maxTrackUtteranceMs: Math.round((this._clearVoiceMaxUtteranceSamples / TARGET_SR) * 1000),
-        maxChunkMs: this._opts.clearVoiceMaxChunkMs ?? 2000,
-        vadFactory: () =>
-          this._opts.localEngine.createStreamingVad({
-            threshold: this._opts.vadThreshold ?? 0.4,
-            minSilenceDuration: 0.064,
-            minSpeechDuration: 0.064,
-            maxSpeechDuration: MAX_UTTERANCE_SEC,
-          }),
-      });
-    }
-  }
-
-  private _resetClearVoiceState(): void {
-    this._cvGen += 1;
-    this._cvSliceQueue = [];
-    this._cvRawChunks = [];
-    this._cvTotalDenoiseMs = 0;
-    this._cvTotalSsMs = 0;
-    this._cvTotalSeMs = 0;
-    this._cvBssUsed = false;
-    this._cvServerSwaps = 0;
-    this._cvUtteranceStartSample = null;
-    this._cvUtteranceDuringTts = false;
-    this._cvPendingEmitCount = 0;
-    this._cvAnyTrackDrainedInUtterance = false;
-    this._cvChunker?.setIncompleteUtteranceHint(false);
-    this._cvChunker?.setAdaptiveMaxChunkMs(null);
-    this._cvChunker?.reset();
-    this._cvAssembler?.reset();
-    this._cvTrackTracker?.reset();
-    if (!this._cvInFlight) {
-      const resolvers = this._cvIdleResolvers;
-      this._cvIdleResolvers = [];
-      for (const r of resolvers) r();
-    }
-  }
-
-  private _enqueueClearVoiceSlice(item: ClearVoiceQueuedSlice): void {
-    if (this._disposed) return;
-    if (this._cvSliceQueue.length >= 16) {
-      const dropped = this._cvSliceQueue.shift();
-      if (dropped?.chunk.utteranceEnded) {
-        this._cvPendingEmitCount = Math.max(0, this._cvPendingEmitCount - 1);
-      }
-      this._droppedStaleCount += 1;
-    }
-    this._cvSliceQueue.push(item);
-    this._pumpClearVoiceQueue();
-  }
-
-  private _pumpClearVoiceQueue(): void {
-    if (this._cvInFlight || this._disposed) return;
-    const item = this._cvSliceQueue.shift();
-    if (!item) {
-      const resolvers = this._cvIdleResolvers;
-      this._cvIdleResolvers = [];
-      for (const r of resolvers) r();
-      return;
-    }
-    const next = item.chunk;
-
-    this._cvInFlight = true;
-    const gen = this._cvGen;
-    void Promise.resolve()
-      .then(async () => {
-        if (this._disposed || gen !== this._cvGen) return;
-        this._ensureClearVoicePipeline();
-        const assembler = this._cvAssembler!;
-
-        // 整句静默观察期结束信号（音频已在 280ms 切片时完成 GPU 盲源分离与分轨降噪拼接，零额外 GPU 推理开销直接交付）
-        if (next.rawNewSamples.length === 0 && next.utteranceEnded) {
-          this._emitClearVoiceUtterance(next.triggerReason, item.utteranceMeta);
-          return;
-        }
-
-        // 首片可听能量早退：防止极微弱底噪/气音/电底噪浪费远端 ClearVoice GPU 往返并被远端增强后诱导 ASR 幻觉
-        if (
-          assembler.sliceCount === 0 &&
-          next.rawNewSamples.length >= 800 &&
-          !hasAudibleAudioEnergy(next.rawNewSamples, TARGET_SR)
-        ) {
-          if (next.utteranceEnded) {
-            this._emitClearVoiceUtterance(next.triggerReason, item.utteranceMeta);
-          }
-          return;
-        }
-
-        if (this._cvUtteranceStartSample === null) {
-          this._cvUtteranceStartSample = item.startGlobalSample;
-        }
-
-        // 阶段 3：带 0.3s 历史上下文送入 GPU ClearVoice（MossFormer2_SS_16K 多轨盲源分离 + 分轨 MossFormer2_SE_48K 降噪去背景音）
-        // 绝不将多轨音轨混回单轨！流式切片阶段保留全部槽位（pruneTracks=false），由多轨装配器执行 PIT 置换对齐。
-        let separatedSliceTracks: Float32Array[];
-        let sliceDenoiseMs = 0;
-        let sliceSsMs = 0;
-        let sliceSeMs = 0;
-        let sliceSwaps = 0;
-        const cvGpu = this._opts.localEngine.clearVoiceGpu;
-        const canUseCvGpu = cvGpu.getStatus().ready && !cvGpu.isInFailureCooldown();
-
-        if (canUseCvGpu) {
-          try {
-            const res = await cvGpu.separateSlice(next.rawWithContext, {
-              inputSampleRate: TARGET_SR,
-              outputSampleRate: TARGET_SR,
-              pruneTracks: false,
-              applyDenoise: true,
-            });
-            separatedSliceTracks =
-              res.tracks.length > 0 ? res.tracks.map((t) => t.samples) : [next.rawWithContext];
-            sliceDenoiseMs = res.durationMs;
-            sliceSsMs = res.ssMs;
-            sliceSeMs = res.seMs;
-            sliceSwaps = res.swaps;
-            if (res.ssUsed) {
-              this._cvBssUsed = true;
-              this._cvLastEngine = "clearvoice-mossformer2-bss-se-remote";
-            } else {
-              this._cvLastEngine = "clearvoice-mossformer2-remote";
-            }
-            this._cvLastGpuName = res.gpuName;
-          } catch {
-            // 在线 ClearVoice 服务临时失败时优雅回退本地降噪，保证语音链路不断流
-            const fb = this._opts.localEngine.denoise(
-              next.rawWithContext,
-              TARGET_SR,
-              this._noiseMode,
-            );
-            separatedSliceTracks = [fb.samples];
-            sliceDenoiseMs = fb.durationMs;
-            this._cvLastEngine = `clearvoice-fallback-${fb.engine}`;
-          }
-        } else {
-          const fb = this._opts.localEngine.denoise(
-            next.rawWithContext,
-            TARGET_SR,
-            this._noiseMode,
-          );
-          separatedSliceTracks = [fb.samples];
-          sliceDenoiseMs = fb.durationMs;
-          this._cvLastEngine = `clearvoice-fallback-${fb.engine}`;
-        }
-
-        if (this._disposed || gen !== this._cvGen) return;
-        this._cvTotalDenoiseMs += sliceDenoiseMs;
-        this._cvTotalSsMs += sliceSsMs;
-        this._cvTotalSeMs += sliceSeMs;
-        this._cvServerSwaps += sliceSwaps;
-        this._cvRawChunks.push(next.rawNewSamples);
-        // 持续电视长时段播放期间限制原始混音分片缓冲上限，避免内存随播放时长无限增长
-        const maxRawBufferedSamples = this._clearVoiceMaxUtteranceSamples + TARGET_SR * 4;
-        let rawBuffered = 0;
-        for (const chunk of this._cvRawChunks) {
-          rawBuffered += chunk.length;
-        }
-        while (rawBuffered > maxRawBufferedSamples && this._cvRawChunks.length > 1) {
-          const removed = this._cvRawChunks.shift()!;
-          rawBuffered -= removed.length;
-        }
-
-        // 阶段 3（跨切片 PIT 置换对齐 + 裁掉前 0.3s 历史输出）+ 阶段 4（每轨独立 20ms 线性交叉淡入淡出 Overlap-Add）
-        const appendRes = assembler.appendSeparatedSlice({
-          tracksWithContext: separatedSliceTracks,
-          lookbackSamples: next.lookbackSamples,
-          newSamples: next.rawNewSamples.length,
-          applyCrossfade: next.needsCrossfade && assembler.sliceCount > 0,
-        });
-
-        const tracker = this._cvTrackTracker!;
-        const slotStartLocalSamples = appendRes.trimmedSlices.map((sl, idx) =>
-          Math.max(0, assembler.getSlotLength(idx) - sl.length),
-        );
-
-        // 若话语仍在继续（2.0s 增量切片或 280ms 短停顿增量降噪切片）：
-        // 1) 推进分轨独立端点检测状态机：一旦某条音轨（如用户真实命令）已说完并达到尾静音判停，
-        //    即便另一条音轨（如电视）仍在持续发声导致混合音频 VAD 无法结束，也立刻独立出段执行！
-        // 2) 仅在已唤醒/授权态且无切片积压时，对仍在说话的分离音轨独立做实时流式字幕预览与分轨未闭合宽限提示；
-        // 3) 单轨达到 30s 安全上限时兜底提交；多轨由分轨独立 30s 上限各自提交，绝不连带腰斩另一条活跃音轨。
-        if (!next.utteranceEnded) {
-          const trackStep = tracker.ingestAlignedSlices(appendRes.trimmedSlices, {
-            sliceStartGlobalSample: item.startGlobalSample,
-            slotStartLocalSamples,
-          });
-
-          // 多轨场景下另一条新说话人音轨刚刚开声（如持续电视背景中用户突然开始说指令）时，
-          // 刷新说话活动通知，避免混合 VAD 长期常亮触发对话超时防截断过期。
-          if (
-            appendRes.trackCount > 1 &&
-            assembler.sliceCount > 1 &&
-            trackStep.newlyStartedSlots.some((slotIdx) => tracker.hasOtherActiveSpeech(slotIdx))
-          ) {
-            this._opts.onSpeechActivity?.(false);
-            this._opts.onSpeechActivity?.(true);
-          }
-
-          // 分轨独立提前出段：先基于未 drain 的对齐多轨音频完成同时间窗反镜像串音校验，再逐轨独立 drain 并派发！
-          if (trackStep.readySlots.length > 0) {
-            const pendingEmitItems: Array<{
-              ready: ClearVoiceReadyTrackSlot;
-              audio: Float32Array;
-              otherEnergySum: number;
-              isGhost: boolean;
-            }> = [];
-
-            for (const ready of trackStep.readySlots) {
-              const slotAudio = assembler.getSlotAudio(ready.slotIndex);
-              const safeStart = Math.max(0, Math.min(slotAudio.length, ready.trimStartLocalSample));
-              const safeEnd = Math.max(safeStart, Math.min(slotAudio.length, ready.trimEndLocalSample));
-              const candidateAudio = slotAudio.slice(safeStart, safeEnd);
-              const distFromEndStart = slotAudio.length - safeStart;
-              const distFromEndEnd = slotAudio.length - safeEnd;
-              let isGhost = false;
-              let otherEnergySum = 0;
-
-              for (let j = 0; j < assembler.trackSlotCount; j += 1) {
-                if (j === ready.slotIndex) continue;
-                const otherAudio = assembler.getSlotAudio(j);
-                const jStart = otherAudio.length - distFromEndStart;
-                const jEnd = otherAudio.length - distFromEndEnd;
-                const clampedJStart = Math.max(0, jStart);
-                const clampedJEnd = Math.min(otherAudio.length, jEnd);
-                const overlapLen = clampedJEnd - clampedJStart;
-                if (overlapLen >= 1600) {
-                  const candOffset = clampedJStart - jStart;
-                  const candOverlap = candidateAudio.subarray(
-                    Math.max(0, candOffset),
-                    Math.min(candidateAudio.length, candOffset + overlapLen),
-                  );
-                  const otherOverlap = otherAudio.subarray(
-                    clampedJStart,
-                    Math.min(clampedJEnd, clampedJStart + candOverlap.length),
-                  );
-                  if (candOverlap.length >= 1600 && otherOverlap.length >= 1600) {
-                    const otherRms = computeRms(otherOverlap);
-                    otherEnergySum += otherRms * otherRms;
-                    const check = pruneInactiveOrDuplicateTracks([otherOverlap, candOverlap]);
-                    const keptCandidate = check.tracks.some((t) => t.sourceSlot === 1);
-                    if (!keptCandidate) {
-                      isGhost = true;
-                      break;
-                    }
-                  }
-                }
-              }
-
-              pendingEmitItems.push({
-                ready,
-                audio: candidateAudio,
-                otherEnergySum,
-                isGhost,
-              });
-            }
-
-            for (const em of pendingEmitItems) {
-              assembler.drainTrackSlot(em.ready.slotIndex);
-              tracker.resetSlot(em.ready.slotIndex);
-              this._cvAnyTrackDrainedInUtterance = true;
-              if (!em.isGhost && em.audio.length >= Math.round(TARGET_SR * 0.14)) {
-                this._emitClearVoiceSingleTrack(
-                  em.ready,
-                  em.audio,
-                  em.otherEnergySum,
-                  item.wakeAnchored,
-                  item.acousticWake,
-                  Boolean(item.duringTtsPlayback),
-                );
-              }
-            }
-          }
-
-          // 压缩长期空闲静音的槽位（仅保留 160ms pre-roll），防止持续电视期间空闲槽位堆积死静音
-          if (appendRes.trackCount > 1) {
-            const maxIdleSamples = tracker.preRollSamples * 4;
-            for (let i = 0; i < assembler.trackSlotCount; i += 1) {
-              const snap = tracker.getSlotSnapshot(i);
-              if (snap && !snap.hasSpeech && assembler.getSlotLength(i) > maxIdleSamples) {
-                const compactedLen = assembler.compactIdleSlot(i, tracker.preRollSamples);
-                tracker.syncSlotLocalLength(i, compactedLen);
-              }
-            }
-          }
-
-          const previewAllowed =
-            this._streamingAsrEnabled &&
-            (!this._wakeGatedAsr || item.wakeAuthorized || this.isAwake);
-          if (previewAllowed && assembler.totalSamples >= TARGET_SR * 0.4) {
-            try {
-              const status = this._opts.localEngine.getStatus();
-              const allowPreview =
-                status.readyForLocalAsr &&
-                this._cvSliceQueue.length < 2 &&
-                (status.activeQwen3Device === "remote" || this._cvSliceQueue.length === 0);
-              if (allowPreview) {
-                const prunedPreview = assembler.getTracks({ prune: true });
-                const totalPreviewTracks = prunedPreview.tracks.length;
-                const rawPreviewEntries: Array<{
-                  trackId: string;
-                  trackIndex: number;
-                  sourceSlot: number;
-                  text: string;
-                  energyRatio: number;
-                  engine: string;
-                  durationMs: number;
-                  acousticEvent: string;
-                }> = [];
-                let previewEngine = "qwen3-asr-remote-stream";
-                let previewLatencyMs = 0;
-                const maxPreviewSamples = TARGET_SR * 8;
-
-                const effectivePreviewTrackCount = Math.max(
-                  totalPreviewTracks,
-                  assembler.trackSlotCount,
-                );
-
-                for (const tr of prunedPreview.tracks) {
-                  const displayIndex =
-                    this._cvAnyTrackDrainedInUtterance || assembler.trackSlotCount > 1
-                      ? tr.sourceSlot + 1
-                      : tr.trackIndex;
-                  const trackId = `cv_track_${displayIndex}`;
-                  // 当前对话内已被屏蔽的背景音/旁白/噪音/电视音轨：直接跳过语音转文字（零 ASR 开销）
-                  if (
-                    effectivePreviewTrackCount > 1 &&
-                    this._trackMuteManager.isTrackMuted(
-                      { trackId, trackIndex: displayIndex, sourceSlot: tr.sourceSlot },
-                      effectivePreviewTrackCount,
-                    )
-                  ) {
-                    tracker.setSlotIncompleteHint(tr.sourceSlot, false);
-                    continue;
-                  }
-                  const slotSnap = tracker.getSlotSnapshot(tr.sourceSlot);
-                  if (
-                    this._cvAnyTrackDrainedInUtterance &&
-                    slotSnap &&
-                    !slotSnap.hasSpeech
-                  ) {
-                    continue;
-                  }
-                  const activeStart =
-                    slotSnap?.hasSpeech && slotSnap.utteranceStartLocalSample !== null
-                      ? Math.max(0, Math.min(tr.samples.length, slotSnap.utteranceStartLocalSample))
-                      : 0;
-                  const activeView = activeStart > 0 ? tr.samples.subarray(activeStart) : tr.samples;
-                  if (activeView.length < TARGET_SR * 0.35) continue;
-                  // 预览字幕限制至近 8 秒尾窗，避免 20s+ 持续电视轨拖慢实时切片队列
-                  const previewAudio =
-                    activeView.length > maxPreviewSamples
-                      ? activeView.subarray(activeView.length - maxPreviewSamples)
-                      : activeView;
-                  if (!hasAudibleAudioEnergy(previewAudio, TARGET_SR)) continue;
-                  const asrRes = await this._opts.localEngine.transcribeLocal(
-                    previewAudio,
-                    TARGET_SR,
-                    this.lang,
-                    {
-                      hotwords: this._wakeWords.length > 0 ? this._wakeWords : undefined,
-                    },
-                  );
-                  if (this._disposed || gen !== this._cvGen) return;
-                  previewEngine = asrRes.engine;
-                  previewLatencyMs += asrRes.durationMs;
-                  const cleanedText = sanitizeAsrTranscript(asrRes.text, {
-                    wakeWords: this._wakeWords,
-                  });
-                  if (!cleanedText) continue;
-                  if (this._cvUtteranceDuringTts || item.duringTtsPlayback) {
-                    const barePreview = cleanedText.replace(/[\s,，。．.、!！?？:：;；~～…]+/g, "");
-                    if (TTS_FILLER_PREVIEW_RE.test(barePreview)) {
-                      continue;
-                    }
-                  }
-                  rawPreviewEntries.push({
-                    trackId,
-                    trackIndex: displayIndex,
-                    sourceSlot: tr.sourceSlot,
-                    text: cleanedText,
-                    energyRatio: tr.energyRatio,
-                    engine: asrRes.engine,
-                    durationMs: asrRes.durationMs,
-                    acousticEvent: asrRes.event,
-                  });
-                }
-
-                // 多轨场景下转换出来的文字超出 20 字后，由 SystemOne 判别背景音/旁白/噪音/电视并即时在当前对话内屏蔽该音轨
-                if (effectivePreviewTrackCount > 1 && rawPreviewEntries.length > 0) {
-                  const preEpoch = this._opts.getDialogEpoch?.();
-                  await this._trackMuteManager.evaluateTracks(
-                    rawPreviewEntries.map((e) => ({
-                      trackId: e.trackId,
-                      trackIndex: e.trackIndex,
-                      sourceSlot: e.sourceSlot,
-                      text: e.text,
-                      acousticEvent: e.acousticEvent,
-                    })),
-                    {
-                      totalTracksInBatch: effectivePreviewTrackCount,
-                      mode: "preview",
-                      systemOneClient: this._opts.getSystemOneClient?.() ?? null,
-                      wakeWords: this._wakeWords,
-                      recentHistory: this._opts.getRecentHistory?.(),
-                      isStale: () =>
-                        this._disposed ||
-                        gen !== this._cvGen ||
-                        (preEpoch !== undefined && this._opts.getDialogEpoch?.() !== preEpoch),
-                    },
-                  );
-                  if (this._disposed || gen !== this._cvGen) return;
-                }
-
-                const previewTracks: Array<{
-                  trackId: string;
-                  trackIndex: number;
-                  text: string;
-                  energyRatio?: number;
-                }> = [];
-                let primaryPartial: StreamingPartialUpdate | null = null;
-                let anyIncomplete = false;
-
-                for (const entry of rawPreviewEntries) {
-                  if (
-                    effectivePreviewTrackCount > 1 &&
-                    this._trackMuteManager.isTrackMuted(
-                      {
-                        trackId: entry.trackId,
-                        trackIndex: entry.trackIndex,
-                        sourceSlot: entry.sourceSlot,
-                      },
-                      effectivePreviewTrackCount,
-                    )
-                  ) {
-                    tracker.setSlotIncompleteHint(entry.sourceSlot, false);
-                    continue;
-                  }
-                  previewTracks.push({
-                    trackId: entry.trackId,
-                    trackIndex: entry.trackIndex,
-                    text: entry.text,
-                    energyRatio: entry.energyRatio,
-                  });
-                  const trackIncomplete = looksLikeIncompleteUtterance(entry.text, this._wakeWords);
-                  tracker.setSlotIncompleteHint(entry.sourceSlot, trackIncomplete);
-                  if (trackIncomplete) {
-                    anyIncomplete = true;
-                  }
-                  if (primaryPartial === null) {
-                    const ingested = this._streamTracker.ingestHypothesis(entry.text, {
-                      engine: entry.engine,
-                      latencyMs: entry.durationMs,
-                    });
-                    if (this._streamTracker.isLatestIncomplete) {
-                      tracker.setSlotIncompleteHint(entry.sourceSlot, true);
-                      anyIncomplete = true;
-                    }
-                    if (ingested.partial) {
-                      primaryPartial = ingested.partial;
-                    }
-                  }
-                }
-
-                // 单轨时保持原未闭合整句宽限；多轨时仅由各轨独立 incompleteHint 控制，防止电视未闭合语段拖延用户轨！
-                this._cvChunker?.setIncompleteUtteranceHint(
-                  assembler.trackSlotCount <= 1 ? anyIncomplete : false,
-                );
-                if (previewTracks.length > 0) {
-                  const lead = previewTracks[0]!;
-                  const partialPayload: StreamingPartialUpdate = primaryPartial
-                    ? {
-                        ...primaryPartial,
-                        latencyMs: previewLatencyMs || primaryPartial.latencyMs,
-                        tracks: previewTracks,
-                      }
-                    : {
-                        text: lead.text,
-                        stableText: "",
-                        unstableText: lead.text,
-                        engine: previewEngine,
-                        latencyMs: previewLatencyMs,
-                        tracks: previewTracks,
-                      };
-                  this._opts.onPartialTranscript?.(partialPayload);
-                }
-              }
-            } catch {
-              // 句中预览识别失败忽略，交由话语收尾完整转写兜底
-            }
-          }
-
-          // 若已有某轨停说进入静默倒计时而另一条电视轨仍在发声，动态缩短下一切片步进以降低用户命令执行延迟
-          this._cvChunker?.setAdaptiveMaxChunkMs(tracker.computeAdaptiveNextChunkMs());
-
-          // 单轨安全上限：连续话语达到上限（默认 30s）时自动提交（多轨已由分轨独立 track_timeout 单独处理，绝不误斩另一轨）
-          if (
-            assembler.trackSlotCount <= 1 &&
-            assembler.totalSamples >= this._clearVoiceMaxUtteranceSamples
-          ) {
-            const timeoutMeta: ClearVoiceUtteranceMeta = {
-              wakeAnchored: this._cvWakeAnchored || this._wakeAnchorSample !== null,
-              acousticWake: this._cvWakeHit ?? this._wakeAnchorHit ?? null,
-              endGlobalSample: this._rawTotalSamples,
-              duringTtsPlayback: this._cvUtteranceDuringTts || Boolean(item.duringTtsPlayback),
-            };
-            this._cvWakeAnchored = false;
-            this._cvWakeHit = null;
-            this._cvUtteranceDuringTts = false;
-            this._wakeAnchorSample = null;
-            this._wakeAnchorHit = null;
-            this._emitClearVoiceUtterance("timeout", timeoutMeta, false);
-          }
-          return;
-        }
-
-        // 整句静音判停或 flush：若此前曾有分轨独立出段，也推进本尾片分轨状态确保只提交尚未出段的有效音轨
-        if (this._cvAnyTrackDrainedInUtterance) {
-          tracker.ingestAlignedSlices(appendRes.trimmedSlices, {
-            sliceStartGlobalSample: item.startGlobalSample,
-            slotStartLocalSamples,
-          });
-        }
-        this._emitClearVoiceUtterance(next.triggerReason, item.utteranceMeta);
-      })
-      .catch(() => {
-        if (next.utteranceEnded) {
-          this._cvPendingEmitCount = Math.max(0, this._cvPendingEmitCount - 1);
-        }
-        // 单个切片异常不中断连续流会话
-      })
-      .finally(() => {
-        this._cvInFlight = false;
-        this._pumpClearVoiceQueue();
-      });
-  }
-
-  /**
-   * 多轨场景下独立提交单条已说完（或达单轨上限）的分离音轨：
-   * - 不重置 ClearVoiceMultiTrackAssembler 与其余仍在发声的音轨（如持续电视）；
-   * - 保留待机唤醒锚定上下文，由 _pumpQueue 在命中有效指令或超时后统一清理。
-   */
-  private _emitClearVoiceSingleTrack(
-    ready: ClearVoiceReadyTrackSlot,
-    trackAudio: Float32Array,
-    otherAlignedEnergySum: number,
-    sliceWakeAnchored = false,
-    sliceAcousticWake: WakeWordAcousticHit | null = null,
-    duringTtsPlayback = false,
-  ): void {
-    if (this._disposed || trackAudio.length < Math.round(TARGET_SR * 0.14)) {
-      return;
-    }
-    if (!hasAudibleAudioEnergy(trackAudio, TARGET_SR)) {
-      return;
-    }
-    const assembler = this._cvAssembler;
-    const rawFromRing =
-      ready.endGlobalSample > ready.startGlobalSample
-        ? this._readRingRange(
-            this._rawRing,
-            this._rawTotalSamples,
-            ready.startGlobalSample,
-            ready.endGlobalSample,
-          )
-        : new Float32Array(0);
-    if (rawFromRing.length >= 800 && !hasAudibleAudioEnergy(rawFromRing, TARGET_SR)) {
-      return;
-    }
-    const rawSlice =
-      rawFromRing.length >= Math.round(TARGET_SR * 0.14) ? rawFromRing : trackAudio;
-
-    const inputSnrDb = estimateSnrDb(rawSlice, TARGET_SR);
-    const outSnr = estimateSnrDb(trackAudio, TARGET_SR);
-    const rms = computeRms(trackAudio);
-    const trEnergy = rms * rms;
-    const totalEnergy = trEnergy + Math.max(0, otherAlignedEnergySum);
-    const energyRatio = totalEnergy > 1e-12 ? trEnergy / totalEnergy : 1;
-    const trackIndex = ready.slotIndex + 1;
-    const trackId = `cv_track_${trackIndex}`;
-
-    const separatedTrack: VoiceStreamSeparatedTrack = {
-      trackId,
-      trackIndex,
-      sourceSlot: ready.slotIndex,
-      samples: trackAudio,
-      sampleRate: TARGET_SR,
-      rms: Number(rms.toFixed(5)),
-      energyRatio: Number(energyRatio.toFixed(4)),
-      outputSnrDb: outSnr,
-      snrGainDb: Number((outSnr - inputSnrDb).toFixed(2)),
-    };
-
-    const wakeAnchored = Boolean(
-      sliceWakeAnchored || this._cvWakeAnchored || this._wakeAnchorSample !== null,
-    );
-    const acousticWake = sliceAcousticWake ?? this._cvWakeHit ?? this._wakeAnchorHit ?? null;
-    const triggerReason: ClearVoiceTriggerReason =
-      ready.reason === "track_timeout" ? "timeout" : "silence";
-
-    this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, ready.endGlobalSample);
-
-    const payload: VoiceStreamSegmentPayload = {
-      rawSamples: rawSlice,
-      denoisedSamples: trackAudio,
-      separatedTracks: [separatedTrack],
-      denoiseEngine: this._cvLastEngine,
-      inputSnrDb,
-      outputSnrDb: outSnr,
-      snrGainDb: separatedTrack.snrGainDb,
-      startSec: Number((ready.startGlobalSample / TARGET_SR).toFixed(2)),
-      durationSec: Number((trackAudio.length / TARGET_SR).toFixed(2)),
-      forcedRoll: ready.reason === "track_timeout",
-      acousticWake,
-      wakeAnchored,
-      duringTtsPlayback: Boolean(duringTtsPlayback || this._isDuringTtsWindow()),
-      commitReason: ready.reason === "track_timeout" ? "max_duration" : "vad_silence",
-      pipelineMode: "clearvoice",
-      clearVoiceMeta: {
-        sliceCount: assembler?.sliceCount ?? 1,
-        crossfadeCount: assembler?.crossfadeCount ?? 0,
-        triggerReason,
-        denoiseMs: Math.round(this._cvTotalDenoiseMs),
-        ssMs: Math.round(this._cvTotalSsMs),
-        seMs: Math.round(this._cvTotalSeMs),
-        trackCount: 1,
-        bssUsed: this._cvBssUsed,
-        permutationSwaps: (assembler?.permutationSwaps ?? 0) + this._cvServerSwaps,
-        gpuName: this._cvLastGpuName,
-        independentTrackEmit: true,
-        sourceSlot: ready.slotIndex,
-      },
-    };
-    this._enqueueSegment(payload);
-  }
-
-  private _emitClearVoiceUtterance(
-    triggerReason: ClearVoiceTriggerReason,
-    utteranceMeta?: ClearVoiceUtteranceMeta,
-    decrementPendingCount = true,
-  ): void {
-    if (decrementPendingCount && utteranceMeta) {
-      this._cvPendingEmitCount = Math.max(0, this._cvPendingEmitCount - 1);
-    }
-    const assembler = this._cvAssembler;
-    const tracker = this._cvTrackTracker;
-    const anyDrained = this._cvAnyTrackDrainedInUtterance;
-    this._cvChunker?.setIncompleteUtteranceHint(false);
-    this._cvChunker?.setAdaptiveMaxChunkMs(null);
-    if (!assembler || assembler.totalSamples < Math.round(TARGET_SR * 0.14)) {
-      this._cvAssembler?.reset();
-      this._cvTrackTracker?.reset();
-      this._cvAnyTrackDrainedInUtterance = false;
-      this._cvRawChunks = [];
-      this._cvTotalDenoiseMs = 0;
-      this._cvTotalSsMs = 0;
-      this._cvTotalSeMs = 0;
-      this._cvBssUsed = false;
-      this._cvServerSwaps = 0;
-      this._cvUtteranceStartSample = null;
-      this._streamTracker.reset();
-      return;
-    }
-
-    const sliceCount = assembler.sliceCount;
-    const crossfadeCount = assembler.crossfadeCount;
-    const permutationSwaps = assembler.permutationSwaps + this._cvServerSwaps;
-    const denoiseMs = Math.round(this._cvTotalDenoiseMs);
-    const ssMs = Math.round(this._cvTotalSsMs);
-    const seMs = Math.round(this._cvTotalSeMs);
-    const bssUsed = this._cvBssUsed;
-    let startSample = this._cvUtteranceStartSample ?? 0;
-
-    interface FinalTrackDraft {
-      trackIndex: number;
-      sourceSlot: number;
-      samples: Float32Array;
-      rms: number;
-      energyRatio: number;
-    }
-    let finalTracks: FinalTrackDraft[] = [];
-
-    if (anyDrained && tracker) {
-      // 已有音轨在本轮提前独立出段：仅提交剩余尚未出段且包含有效语音的音轨，彻底避免已执行音轨被重复触发！
-      const minEmitSamples = Math.round(TARGET_SR * 0.14);
-      const snapshots = tracker.getAllSlotSnapshots();
-      const candidates: Array<{
-        slotIndex: number;
-        samples: Float32Array;
-        startGlobalSample: number | null;
-      }> = [];
-      for (const snap of snapshots) {
-        if (!snap.hasSpeech || snap.speechSamples < tracker.minSpeechSamples) {
-          continue;
-        }
-        const slotAudio = assembler.getSlotAudio(snap.slotIndex);
-        if (slotAudio.length < minEmitSamples) {
-          continue;
-        }
-        const trimStart = Math.max(0, Math.min(slotAudio.length, snap.utteranceStartLocalSample ?? 0));
-        const trimEnd = Math.max(
-          trimStart,
-          Math.min(
-            slotAudio.length,
-            triggerReason === "silence"
-              ? snap.lastSpeechEndLocalSample + tracker.tailPadSamples
-              : slotAudio.length,
-          ),
-        );
-        const sliced = slotAudio.slice(trimStart, trimEnd);
-        if (sliced.length >= minEmitSamples) {
-          candidates.push({
-            slotIndex: snap.slotIndex,
-            samples: sliced,
-            startGlobalSample: snap.utteranceStartGlobalSample,
-          });
-        }
-      }
-
-      if (candidates.length === 1) {
-        const c = candidates[0]!;
-        const r = computeRms(c.samples);
-        finalTracks = [
-          {
-            trackIndex: c.slotIndex + 1,
-            sourceSlot: c.slotIndex,
-            samples: c.samples,
-            rms: Number(r.toFixed(5)),
-            energyRatio: 1,
-          },
-        ];
-        if (c.startGlobalSample !== null) {
-          startSample = c.startGlobalSample;
-        }
-      } else if (candidates.length >= 2) {
-        const prunedRem = pruneInactiveOrDuplicateTracks(candidates.map((c) => c.samples));
-        let earliestGlobal: number | null = null;
-        finalTracks = prunedRem.tracks.map((tr) => {
-          const orig = candidates[tr.sourceSlot]!;
-          if (
-            orig.startGlobalSample !== null &&
-            (earliestGlobal === null || orig.startGlobalSample < earliestGlobal)
-          ) {
-            earliestGlobal = orig.startGlobalSample;
-          }
-          return {
-            trackIndex: orig.slotIndex + 1,
-            sourceSlot: orig.slotIndex,
-            samples: tr.samples,
-            rms: tr.rms,
-            energyRatio: tr.energyRatio,
-          };
-        });
-        if (earliestGlobal !== null) {
-          startSample = earliestGlobal;
-        }
-      }
-    } else {
-      const pruned = assembler.getTracks({ prune: true });
-      finalTracks = pruned.tracks.map((tr) => ({
-        trackIndex: tr.trackIndex,
-        sourceSlot: tr.sourceSlot,
-        samples: tr.samples,
-        rms: tr.rms,
-        energyRatio: tr.energyRatio,
-      }));
-    }
-
-    const rawLen = this._cvRawChunks.reduce((acc, c) => acc + c.length, 0);
-    const endGlobalSample = utteranceMeta?.endGlobalSample ?? startSample + rawLen;
-    let rawSlice: Float32Array;
-    if (anyDrained && endGlobalSample > startSample) {
-      const ranged = this._readRingRange(
-        this._rawRing,
-        this._rawTotalSamples,
-        startSample,
-        endGlobalSample,
-      );
-      rawSlice =
-        ranged.length >= Math.round(TARGET_SR * 0.14)
-          ? ranged
-          : finalTracks[0]?.samples ?? new Float32Array(0);
-    } else {
-      rawSlice = new Float32Array(rawLen);
-      let rawOff = 0;
-      for (const c of this._cvRawChunks) {
-        rawSlice.set(c, rawOff);
-        rawOff += c.length;
-      }
-    }
-
-    assembler.reset();
-    tracker?.reset();
-    this._cvAnyTrackDrainedInUtterance = false;
-    this._cvRawChunks = [];
-    this._cvTotalDenoiseMs = 0;
-    this._cvTotalSsMs = 0;
-    this._cvTotalSeMs = 0;
-    this._cvBssUsed = false;
-    this._cvServerSwaps = 0;
-    this._cvUtteranceStartSample = null;
-    this._streamTracker.reset();
-    this._oww?.resetSegmentTracking();
-    this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, endGlobalSample);
-    if (this._ownsTrackMuteManager) {
-      this._trackMuteManager.commitActiveUtterance();
-    }
-
-    if (rawSlice.length >= 800 && !hasAudibleAudioEnergy(rawSlice, TARGET_SR)) {
-      return;
-    }
-    finalTracks = finalTracks.filter((tr) => hasAudibleAudioEnergy(tr.samples, TARGET_SR));
-    if (finalTracks.length === 0) {
-      return;
-    }
-
-    const inputSnrDb = estimateSnrDb(rawSlice, TARGET_SR);
-    const separatedTracks: VoiceStreamSeparatedTrack[] = finalTracks.map((tr) => {
-      const outSnr = estimateSnrDb(tr.samples, TARGET_SR);
-      return {
-        trackId: `cv_track_${tr.trackIndex}`,
-        trackIndex: tr.trackIndex,
-        sourceSlot: tr.sourceSlot,
-        samples: tr.samples,
-        sampleRate: TARGET_SR,
-        rms: tr.rms,
-        energyRatio: tr.energyRatio,
-        outputSnrDb: outSnr,
-        snrGainDb: Number((outSnr - inputSnrDb).toFixed(2)),
-      };
-    });
-
-    // denoisedSamples 严格仅指向第 1 条独立音轨以兼容单轨消费者，绝不将多轨音轨相加混杂！
-    const primaryTrack = separatedTracks[0]!;
-    const payload: VoiceStreamSegmentPayload = {
-      rawSamples: rawSlice,
-      denoisedSamples: primaryTrack.samples,
-      separatedTracks,
-      denoiseEngine: this._cvLastEngine,
-      inputSnrDb,
-      outputSnrDb: primaryTrack.outputSnrDb,
-      snrGainDb: primaryTrack.snrGainDb,
-      startSec: Number((startSample / TARGET_SR).toFixed(2)),
-      durationSec: Number((primaryTrack.samples.length / TARGET_SR).toFixed(2)),
-      forcedRoll: triggerReason === "timeout",
-      acousticWake: utteranceMeta?.acousticWake ?? null,
-      wakeAnchored: Boolean(utteranceMeta?.wakeAnchored),
-      duringTtsPlayback: Boolean(utteranceMeta?.duringTtsPlayback || this._isDuringTtsWindow()),
-      commitReason:
-        triggerReason === "flush"
-          ? "manual_flush"
-          : triggerReason === "timeout"
-            ? "max_duration"
-            : "vad_silence",
-      pipelineMode: "clearvoice",
-      clearVoiceMeta: {
-        sliceCount,
-        crossfadeCount,
-        triggerReason,
-        denoiseMs,
-        ssMs,
-        seMs,
-        trackCount: separatedTracks.length,
-        bssUsed,
-        permutationSwaps,
-        gpuName: this._cvLastGpuName,
-        ...(anyDrained && separatedTracks.length === 1
-          ? { sourceSlot: primaryTrack.sourceSlot }
-          : {}),
-      },
-    };
-    this._enqueueSegment(payload);
-  }
-
-  private async _waitForClearVoiceIdle(): Promise<void> {
-    if (!this._cvInFlight && this._cvSliceQueue.length === 0) {
-      return;
-    }
-    await new Promise<void>((resolve) => {
-      this._cvIdleResolvers.push(resolve);
-    });
   }
 
   /**
@@ -2586,9 +1227,6 @@ export class VoiceStreamSession {
     this._clearHeldLegacySegment();
     this._wakeAnchorSample = null;
     this._wakeAnchorHit = null;
-    this._cvWakeAnchored = false;
-    this._cvWakeHit = null;
-    this._cvUtteranceDuringTts = false;
     this._legacyUtteranceDuringTts = false;
     this._activeSegmentStartSample = null;
     this._denoisedPending = new Float32Array(0);
@@ -2597,9 +1235,7 @@ export class VoiceStreamSession {
     this._segmenter.reset();
     this._resetVadState();
     this._resetStreamingState(true);
-    this._resetClearVoiceState();
     this._abortXfyunSession(true);
-    this._cvFedUpToGlobalSample = this._rawTotalSamples;
     this._xfyunFedUpToGlobalSample = this._rawTotalSamples;
     this._oww?.resetSegmentTracking();
     this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, this._rawTotalSamples);
@@ -2617,9 +1253,6 @@ export class VoiceStreamSession {
     if (!speaking) {
       this._ttsLastEndedAt = now;
     } else {
-      if (this._cvChunker?.inUtterance && !this._cvChunker.waitingUtteranceEnd) {
-        this._cvUtteranceDuringTts = true;
-      }
       if (this._vadDetected || this._activeSegmentStartSample !== null) {
         this._legacyUtteranceDuringTts = true;
       }
@@ -2630,10 +1263,8 @@ export class VoiceStreamSession {
     const userCurrentlySpeaking =
       this._vadDetected ||
       this._wakeAnchorSample !== null ||
-      this._cvWakeAnchored ||
       this._xfyunWakeAnchored ||
-      Boolean(this._xfyunSession && !this._xfyunFinishing) ||
-      Boolean(this._cvChunker?.inUtterance && !this._cvChunker.waitingUtteranceEnd);
+      Boolean(this._xfyunSession && !this._xfyunFinishing);
     if (!userCurrentlySpeaking) {
       this._lastRawOverlap = new Float32Array(0);
       this._lastDenOverlap = new Float32Array(0);
@@ -2646,309 +1277,8 @@ export class VoiceStreamSession {
   }
 
   // ---------------------------------------------------------------------------
-  // 待机期降噪与多轨盲源分离唤醒前端（零 ASR：仅送入分轨 openWakeWord，绝不跑语音转文字）
+  // 待机期降噪唤醒前端（零 ASR：仅送入 openWakeWord，绝不跑语音转文字）
   // ---------------------------------------------------------------------------
-
-  private _isStandbyClearVoiceEligible(): boolean {
-    if (this._disposed) return false;
-    if (this._voicePipelineMode !== "clearvoice") return false;
-    if (this._noiseMode === "off") return false;
-    if (!this._oww) return false;
-    const cvGpu = this._opts.localEngine.clearVoiceGpu;
-    if (!cvGpu) return false;
-    const st = cvGpu.getStatus();
-    if (!st.ready || cvGpu.isInFailureCooldown()) return false;
-    // 仅在在线 ClearVoice 服务就绪时启用待机实时降噪/分轨
-    return st.provider === "remote";
-  }
-
-  private _abortStandbyClearVoice(): void {
-    const abort = this._standbyCvAbort;
-    this._standbyCvAbort = null;
-    if (abort) {
-      try {
-        abort.abort();
-      } catch {
-        // ignore
-      }
-    }
-  }
-
-  private _resetStandbyClearVoiceState(abortInFlight = true, clearOwwSessions = false): void {
-    this._standbyCvGen += 1;
-    if (abortInFlight) {
-      this._abortStandbyClearVoice();
-    }
-    this._standbyCvQueue = [];
-    this._standbyCvHasActive = false;
-    this._standbyCvActiveSamples = 0;
-    this._standbyCvTrailingSilentSamples = 0;
-    this._standbyCvWindowStartSample = this._rawTotalSamples;
-    if (clearOwwSessions) {
-      try {
-        this._standbyScanOww?.reset();
-      } catch {
-        // ignore
-      }
-      this._standbyScanOww = null;
-    } else {
-      try {
-        this._standbyScanOww?.reset();
-      } catch {
-        // ignore
-      }
-    }
-    if (!this._standbyCvInFlight) {
-      const resolvers = this._standbyCvIdleResolvers;
-      this._standbyCvIdleResolvers = [];
-      for (const r of resolvers) r();
-    }
-  }
-
-  private async _waitForStandbyClearVoiceIdle(): Promise<void> {
-    if (!this._standbyCvInFlight && this._standbyCvQueue.length === 0) {
-      return;
-    }
-    await new Promise<void>((resolve) => {
-      this._standbyCvIdleResolvers.push(resolve);
-    });
-  }
-
-  private _ensureStandbyScanOww(): OpenWakeWordStreamSession | null {
-    if (this._standbyScanOww) return this._standbyScanOww;
-    if (!this._owwEnabled) return null;
-    const created = this._opts.localEngine.createWakeWordStream(this._wakeWords, {
-      threshold: this._owwThreshold,
-      onSpot: (hit) => {
-        if (this._standbyActiveSpotCapture) {
-          this._standbyActiveSpotCapture(hit);
-        } else {
-          this._handleWakeSpot(hit);
-        }
-      },
-    });
-    if (!created) return null;
-    this._standbyScanOww = created;
-    return created;
-  }
-
-  private _feedStandbyClearVoice(pcm16k: Float32Array, chunkStartGlobalSample: number): void {
-    const rawRms = computeRms(pcm16k);
-    const isActive = rawRms >= this._standbyCvActiveRms;
-    const earliestAvailable = Math.max(0, this._rawTotalSamples - RAW_RING_CAPACITY);
-
-    if (!this._standbyCvHasActive) {
-      if (!isActive) {
-        return;
-      }
-      this._standbyCvHasActive = true;
-      this._standbyCvActiveSamples = pcm16k.length;
-      this._standbyCvTrailingSilentSamples = 0;
-      const preRollStart = Math.max(
-        earliestAvailable,
-        this._standbyCvLastQueuedEndSample,
-        chunkStartGlobalSample - STANDBY_CV_PRE_ROLL_SAMPLES,
-      );
-      this._standbyCvWindowStartSample = Math.min(chunkStartGlobalSample, preRollStart);
-    } else if (isActive) {
-      this._standbyCvActiveSamples += pcm16k.length;
-      this._standbyCvTrailingSilentSamples = 0;
-    } else {
-      this._standbyCvTrailingSilentSamples += pcm16k.length;
-    }
-
-    const pendingSamples = this._rawTotalSamples - this._standbyCvWindowStartSample;
-    const hitStep = pendingSamples >= this._standbyCvStepSamples;
-    const hitPauseFlush =
-      this._standbyCvActiveSamples >= Math.round(TARGET_SR * 0.12) &&
-      pendingSamples >= STANDBY_CV_MIN_BURST_SAMPLES &&
-      this._standbyCvTrailingSilentSamples >= this._standbyCvPauseSamples;
-
-    if (hitStep || hitPauseFlush) {
-      this._enqueueStandbyClearVoiceRange(this._standbyCvWindowStartSample, this._rawTotalSamples);
-      this._standbyCvHasActive = false;
-      this._standbyCvActiveSamples = 0;
-      this._standbyCvTrailingSilentSamples = 0;
-      this._standbyCvLastQueuedEndSample = this._rawTotalSamples;
-      this._standbyCvWindowStartSample = this._rawTotalSamples;
-    }
-  }
-
-  private _enqueueStandbyClearVoiceRange(startGlobalSample: number, endGlobalSample: number): void {
-    if (this._disposed || endGlobalSample <= startGlobalSample) return;
-    const earliestAvailable = Math.max(0, this._rawTotalSamples - RAW_RING_CAPACITY);
-    const safeStart = Math.max(earliestAvailable, startGlobalSample);
-    const safeEnd = Math.min(this._rawTotalSamples, endGlobalSample);
-    const newSamples = safeEnd - safeStart;
-    if (newSamples < 1600) return;
-
-    const ctxStart = Math.max(earliestAvailable, safeStart - STANDBY_CV_LOOKBACK_SAMPLES);
-    const lookbackSamples = safeStart - ctxStart;
-    const rawWithContext = this._readRingRange(this._rawRing, this._rawTotalSamples, ctxStart, safeEnd);
-    if (rawWithContext.length < 1600) return;
-
-    if (this._standbyCvQueue.length >= STANDBY_CV_MAX_QUEUE) {
-      this._standbyCvQueue.shift();
-      this._droppedStaleCount += 1;
-    }
-    this._standbyCvQueue.push({
-      ctxStartGlobalSample: ctxStart,
-      startGlobalSample: safeStart,
-      endGlobalSample: safeEnd,
-      lookbackSamples,
-      newSamples,
-      rawWithContext,
-    });
-    this._pumpStandbyClearVoiceQueue();
-  }
-
-  private _pumpStandbyClearVoiceQueue(): void {
-    if (this._standbyCvInFlight || this._disposed) return;
-    const slice = this._standbyCvQueue.shift();
-    if (!slice) {
-      const resolvers = this._standbyCvIdleResolvers;
-      this._standbyCvIdleResolvers = [];
-      for (const r of resolvers) r();
-      return;
-    }
-    if (!this.isWakeGatedStandby || !this._isStandbyClearVoiceEligible()) {
-      this._standbyCvQueue = [];
-      const resolvers = this._standbyCvIdleResolvers;
-      this._standbyCvIdleResolvers = [];
-      for (const r of resolvers) r();
-      return;
-    }
-
-    this._standbyCvInFlight = true;
-    const gen = this._standbyCvGen;
-    const abort = new AbortController();
-    this._standbyCvAbort = abort;
-
-    void Promise.resolve()
-      .then(async () => {
-        if (this._disposed || gen !== this._standbyCvGen || !this.isWakeGatedStandby) return;
-        const cvGpu = this._opts.localEngine.clearVoiceGpu;
-        if (!cvGpu) return;
-        const st = cvGpu.getStatus();
-        if (!st.ready || cvGpu.isInFailureCooldown()) return;
-
-        // 待机声学唤醒路径采用重叠滑窗（1.2s 步进 + 0.95s 前导重叠 = 2.15s 窗）：
-        // - 多轨 BSS 启用时仅跑 MossFormer2_SS_16K（跳过每轨 48kHz SE 重采样，实测 GPU 实时率 ~0.86 < 1.0，
-        //   且 0.95s 重叠完整覆盖 <= 0.9s 唤醒词彻底消除切片边界盲区；命中唤醒后再交由完整 BSS+SE_48K 管线精修转写）；
-        // - 仅 SE_48K 就绪时走单轨 ClearVoice 降噪切片。
-        const useBss =
-          st.multiTrackReady && st.ssProvider === "remote";
-        let tracksWithContext: Float32Array[];
-        if (useBss) {
-          const res = await cvGpu.separateSlice(slice.rawWithContext, {
-            inputSampleRate: TARGET_SR,
-            outputSampleRate: TARGET_SR,
-            pruneTracks: false,
-            applyDenoise: false,
-            signal: abort.signal,
-          });
-          tracksWithContext = res.tracks.map((t) => t.samples);
-        } else {
-          const res = await cvGpu.denoiseSlice(slice.rawWithContext, {
-            inputSampleRate: TARGET_SR,
-            outputSampleRate: TARGET_SR,
-            signal: abort.signal,
-          });
-          tracksWithContext = [res.samples];
-        }
-
-        if (
-          this._disposed ||
-          gen !== this._standbyCvGen ||
-          abort.signal.aborted ||
-          !this.isWakeGatedStandby
-        ) {
-          return;
-        }
-        if (tracksWithContext.length === 0) return;
-
-        this._standbyCvProcessedSlices += 1;
-
-        const scanOww = this._ensureStandbyScanOww();
-        if (!scanOww) return;
-        const isRealOww = typeof (scanOww as { frameIndex?: number }).frameIndex === "number";
-        const seedZeros = isRealOww ? new Float32Array(OWW_WARMUP_SEED_SAMPLES) : null;
-        const tailZeros = isRealOww ? new Float32Array(OWW_TAIL_FLUSH_SAMPLES) : null;
-
-        let bestHit: WakeWordAcousticHit | null = null;
-        let currentTrackLen = 0;
-        const captureHit = (hit: WakeWordAcousticHit | null | undefined) => {
-          if (!hit?.matched) return;
-          const mappedOffset = isRealOww
-            ? Math.min(
-                this._rawTotalSamples,
-                slice.ctxStartGlobalSample +
-                  Math.max(0, Math.min(currentTrackLen, hit.sampleOffset - OWW_WARMUP_SEED_SAMPLES)),
-              )
-            : Math.min(
-                this._rawTotalSamples,
-                hit.sampleOffset > 0 ? hit.sampleOffset : slice.endGlobalSample,
-              );
-          const mapped: WakeWordAcousticHit = {
-            ...hit,
-            sampleOffset: mappedOffset,
-          };
-          if (!bestHit || mapped.score > bestHit.score) {
-            bestHit = mapped;
-          }
-        };
-
-        this._standbyActiveSpotCapture = captureHit;
-        try {
-          // 对每条分离出的完整重叠滑窗轨独立扫描 openWakeWord（包含 0.7s 前导上下文），
-          // 彻底避免唤醒词落在切片边界处被切碎或受跨片置换切换影响。
-          for (let s = 0; s < tracksWithContext.length; s += 1) {
-            const tr = tracksWithContext[s]!;
-            if (tr.length === 0) continue;
-            currentTrackLen = tr.length;
-            try {
-              scanOww.reset();
-              if (isRealOww && seedZeros && tailZeros) {
-                scanOww.pushSamples(seedZeros, OWW_WARMUP_SEED_SAMPLES);
-                scanOww.resetSegmentTracking();
-                const ret1 = scanOww.pushSamples(tr, OWW_WARMUP_SEED_SAMPLES + tr.length);
-                captureHit(ret1);
-                const ret2 = scanOww.pushSamples(
-                  tailZeros,
-                  OWW_WARMUP_SEED_SAMPLES + tr.length + OWW_TAIL_FLUSH_SAMPLES,
-                );
-                captureHit(ret2);
-                const peak = scanOww.getPeakHit();
-                if (peak?.matched) {
-                  captureHit(peak);
-                }
-              } else {
-                const retHit = scanOww.pushSamples(tr, slice.endGlobalSample);
-                captureHit(retHit);
-              }
-            } catch {
-              // 单轨声学唤醒异常不得中断待机降噪流
-            }
-          }
-        } finally {
-          this._standbyActiveSpotCapture = null;
-        }
-
-        if (bestHit && !this._disposed && gen === this._standbyCvGen && this.isWakeGatedStandby) {
-          this._handleWakeSpot(bestHit);
-        }
-      })
-      .catch(() => {
-        // 待机 ClearVoice 切片取消或临时失败时静默忽略，由基础在线降噪轨兜底不断流
-      })
-      .finally(() => {
-        if (this._standbyCvAbort === abort) {
-          this._standbyCvAbort = null;
-        }
-        this._standbyCvInFlight = false;
-        this._pumpStandbyClearVoiceQueue();
-      });
-  }
 
   private _resetStandbyDpdfState(disposeInstances = false): void {
     this._standbyDpdfActive = false;
@@ -2978,10 +1308,10 @@ export class VoiceStreamSession {
   }
 
   /**
-   * Legacy / 无 ClearVoice GPU 模式下的待机强噪 DPDFNet4 按需增强通道：
+   * Legacy 模式下的待机强噪 DPDFNet4 按需增强通道：
    * - 安静环境完全不启用（零 CPU 开销）；
    * - 当环境噪声/音乐底噪持续偏高（RMS >= 0.014 持续 >= 250ms）时，自动启用 DPDFNet4 + 独立 OWW 流，
-   *   在无 GPU 环境下显著提升强噪/伴奏场景唤醒召回率，仍保持待机零 ASR。
+   *   显著提升强噪/伴奏场景唤醒召回率，仍保持待机零 ASR。
    */
   private _feedStandbyDpdfFallback(pcm16k: Float32Array, chunkStartGlobalSample: number): void {
     if (this._disposed || !this._oww || !this._owwEnabled) return;
@@ -3094,7 +1424,6 @@ export class VoiceStreamSession {
     }
     if (!this._owwEnabled) {
       this._oww = null;
-      this._resetStandbyClearVoiceState(true, true);
       this._resetStandbyDpdfState(true);
       return;
     }
@@ -3103,16 +1432,10 @@ export class VoiceStreamSession {
         threshold: this._owwThreshold,
         onSpot: (hit) => this._handleWakeSpot(hit),
       });
-      this._resetStandbyClearVoiceState(true, true);
       this._resetStandbyDpdfState(true);
       return;
     }
     this._oww.reloadPrototypes(this._wakeWords);
-    try {
-      this._standbyScanOww?.reloadPrototypes(this._wakeWords);
-    } catch {
-      // ignore
-    }
     try {
       this._standbyDpdfOww?.reloadPrototypes(this._wakeWords);
     } catch {
@@ -3134,7 +1457,7 @@ export class VoiceStreamSession {
 
   get denoiseEngine(): string {
     if (this._voicePipelineMode === "xfyun") return "xfyun-raw-direct";
-    return this._voicePipelineMode === "clearvoice" ? this._cvLastEngine : this._denoiseEngine;
+    return this._denoiseEngine;
   }
 
   get droppedStaleCount(): number {
@@ -3155,10 +1478,9 @@ export class VoiceStreamSession {
   }
 
   /**
-   * 写入 Float32 PCM 样本并实时驱动循环录制缓冲区 + 双层待机降噪/分轨声学唤醒检测（openWakeWord）：
+   * 写入 Float32 PCM 样本并实时驱动循环录制缓冲区 + 双层待机降噪唤醒检测（openWakeWord）：
    * - 第一层（极速快路径）：先降噪（GTCRN / DPDFNet4 / VoxLock / 流式 DSP）再 AGC -> 80ms 步进 openWakeWord，安静环境毫秒级响应；
-   * - 第二层（强噪/电视抗干扰路径，零 ASR）：ClearVoice 模式下对非静音待机音频运行 GPU 盲源分离 + 分轨降噪（MossFormer2_SS_16K + SE_48K）
-   *   并按 PIT 跨片对齐送入每轨独立 openWakeWord；无 GPU 的 Legacy 模式高噪时自动介入 DPDFNet4 增强通道；
+   * - 第二层（强噪抗干扰路径，零 ASR）：Legacy 模式高噪时自动介入 DPDFNet4 增强通道 + 独立 openWakeWord；
    * - 未唤醒待机期绝不执行实时语音转文字（零流式预览、零分段 ASR），命中唤醒后再回放循环录制缓冲区与后续音频进入完整识别管线！
    */
   pushFloat32Samples(samples: Float32Array): void {
@@ -3180,13 +1502,8 @@ export class VoiceStreamSession {
       (this._oww !== null && (this._voicePipelineMode !== "xfyun" || this.isWakeGatedStandby));
     let denoisedChunk: Float32Array = pcm16k;
     if (needLightweightFrontEnd) {
-      const standbyCvActive = this.isWakeGatedStandby && this._isStandbyClearVoiceEligible();
-      // 先在原始自然电平上运行在线降噪（避免先 AGC 把电视/环境底噪放大破坏降噪统计），再对干净语音做平滑 AGC；
-      // ClearVoice GPU 待机激活时快路径仅跑轻量 GTCRN/DSP，若 GPU 不可用则尊重用户配置的全部在线降噪器（含 DPDFNet4/VoxLock）。
-      const allowOnlineDenoiser =
-        this._onlineDenoiser !== null &&
-        this._noiseMode !== "off" &&
-        (!standbyCvActive || this._denoiseEngine === "gtcrn" || this._denoiseEngine === "dsp");
+      // 先在原始自然电平上运行在线降噪（避免先 AGC 把电视/环境底噪放大破坏降噪统计），再对干净语音做平滑 AGC
+      const allowOnlineDenoiser = this._onlineDenoiser !== null && this._noiseMode !== "off";
       let postDenoise: Float32Array = pcm16k;
       if (allowOnlineDenoiser) {
         try {
@@ -3207,7 +1524,7 @@ export class VoiceStreamSession {
       this._denTotalSamples += denoisedChunk.length;
 
       // 实时流式 openWakeWord 声学唤醒检测（80ms 步进，静音自动快路径跳过，零 ASR 开销）
-      // 注意：若本帧内命中唤醒词，_handleWakeSpot 会同步回放循环录制缓冲区并更新 _cvFedUpToGlobalSample / _wakeAnchorSample
+      // 注意：若本帧内命中唤醒词，_handleWakeSpot 会同步回放循环录制缓冲区并更新 _xfyunFedUpToGlobalSample / _wakeAnchorSample
       if (this._oww) {
         try {
           this._oww.pushSamples(denoisedChunk, this._rawTotalSamples);
@@ -3217,21 +1534,18 @@ export class VoiceStreamSession {
       }
     }
 
-    // 3. 同步待机/唤醒状态跃迁，并在未唤醒门控待机期运行深度降噪/分轨唤醒通道后直接返回（零实时转写、零分段 ASR）
+    // 3. 同步待机/唤醒状态跃迁，并在未唤醒门控待机期运行深度降噪唤醒通道后直接返回（零实时转写、零分段 ASR）
     const awakeNow = this.isAwake;
     if (!awakeNow && this._wasAwake) {
       this._wasAwake = false;
       this._onEnterStandby();
     } else if (awakeNow && !this._wasAwake) {
       this._wasAwake = true;
-      this._resetStandbyClearVoiceState(true);
       this._resetStandbyDpdfState();
       if (this._opts.isInConversation?.()) {
         if (this._voicePipelineMode === "xfyun") {
           this._xfyunFedUpToGlobalSample = chunkStartGlobalSample;
           this._xfyunOnsetFrames = 0;
-        } else if (this._voicePipelineMode === "clearvoice") {
-          this._prepareClearVoiceForLiveInput();
         } else {
           this._denoisedPending = new Float32Array(0);
           this._resetVadState(denoisedChunk.length);
@@ -3245,16 +1559,14 @@ export class VoiceStreamSession {
       this._lastFrameRms = frameRms;
       this._segmenter.process(denoisedChunk.length / TARGET_SR, 0, frameRms);
 
-      // 抗电视/强噪待机深度降噪唤醒通道（严格零 ASR、零 UI 闪烁，仅喂入独立声学唤醒器）
-      if (this._isStandbyClearVoiceEligible()) {
-        this._feedStandbyClearVoice(pcm16k, chunkStartGlobalSample);
-      } else if (this._noiseMode !== "off") {
+      // 抗强噪待机深度降噪唤醒通道（严格零 ASR、零 UI 闪烁，仅喂入独立声学唤醒器）
+      if (this._noiseMode !== "off") {
         this._feedStandbyDpdfFallback(pcm16k, chunkStartGlobalSample);
       }
       return;
     }
 
-    // 4a. 讯飞语音听写大模型 2.0 方案：openWakeWord 唤醒后直接推送原始 16kHz PCM 至讯飞 WebSocket，不做额外降噪与特殊处理
+    // 4. 讯飞语音听写大模型 2.0 方案：openWakeWord 唤醒后直接推送原始 16kHz PCM 至讯飞 WebSocket，不做额外降噪与特殊处理
     if (this._voicePipelineMode === "xfyun") {
       if (this._xfyunFedUpToGlobalSample >= this._rawTotalSamples) {
         return;
@@ -3268,36 +1580,6 @@ export class VoiceStreamSession {
       }
       this._xfyunFedUpToGlobalSample = this._rawTotalSamples;
       this._feedXfyunAudio(feedSlice, sliceStartGlobal);
-      return;
-    }
-
-    // 4b. ClearVoice 方案（已唤醒或无声学唤醒兜底）：ClearVoice GPU 准实时切片 -> Qwen3-ASR
-    if (this._voicePipelineMode === "clearvoice") {
-      this._ensureClearVoicePipeline();
-      // 若本帧刚触发唤醒并已把循环录制缓冲区（含本帧）完整回放至 _rawTotalSamples，避免重复喂入本帧！
-      if (this._cvFedUpToGlobalSample >= this._rawTotalSamples) {
-        return;
-      }
-      let feedSlice = pcm16k;
-      if (this._cvFedUpToGlobalSample > chunkStartGlobalSample) {
-        feedSlice = pcm16k.subarray(this._cvFedUpToGlobalSample - chunkStartGlobalSample);
-      } else if (this._cvFedUpToGlobalSample === 0 && chunkStartGlobalSample === 0) {
-        this._cvBaseGlobalSample = 0;
-      } else if (this._cvFedUpToGlobalSample < chunkStartGlobalSample && !this._cvChunker!.inUtterance) {
-        this._cvBaseGlobalSample = chunkStartGlobalSample - this._cvChunker!.totalSamples;
-      }
-      this._cvFedUpToGlobalSample = this._rawTotalSamples;
-      if (feedSlice.length > 0) {
-        const chunks = this._cvChunker!.pushSamples(feedSlice);
-        if (
-          this._cvChunker!.inUtterance &&
-          !this._cvChunker!.waitingUtteranceEnd &&
-          this._isDuringTtsWindow()
-        ) {
-          this._cvUtteranceDuringTts = true;
-        }
-        this._handleClearVoiceChunks(chunks);
-      }
       return;
     }
 
@@ -3486,7 +1768,7 @@ export class VoiceStreamSession {
    */
   private _commitStreamingByPunctPause(unfedTailSamples = 0): void {
     const sentences = this._streamTracker.flush();
-    const lastEngine = this._streamLastEngine || "qwen3-asr-remote-stream";
+    const lastEngine = this._streamLastEngine || "sensevoice-stream";
     const lastLatencyMs = this._streamLastLatencyMs;
     const anchor = this._wakeAnchorSample;
     const anchorHit = this._wakeAnchorHit;
@@ -3498,9 +1780,6 @@ export class VoiceStreamSession {
 
     this._wakeAnchorSample = null;
     this._wakeAnchorHit = null;
-    this._cvWakeAnchored = false;
-    this._cvWakeHit = null;
-    this._cvUtteranceDuringTts = false;
     this._legacyUtteranceDuringTts = false;
     this._activeSegmentStartSample = null;
     this._segmenter.reset();
@@ -3549,8 +1828,8 @@ export class VoiceStreamSession {
   }
 
   /**
-   * 按自适应步进触发非阻塞流式假设解码（GPU ~360ms 步进 + SSE 逐 token，CPU ~850ms 步进），
-   * 实时推送字幕并在句中检测到多句标点边界时立即切分输出。
+   * 按自适应步进触发非阻塞流式假设解码（默认 ~850ms 步进），
+   * 实时推送字幕并在显式启用句中拆分时按标点边界切分输出。
    */
   private _maybeTriggerStreamingDecode(): void {
     if (!this._isStreamingAsrAllowed() || this._disposed || this._streamDecodeInFlight || this._inFlight) {
@@ -3563,7 +1842,7 @@ export class VoiceStreamSession {
     if (!status.readyForLocalAsr) {
       return;
     }
-    // 待机持续高音量背景音乐下跳过投机流式解码，防止无谓占满 GPU/CPU
+    // 待机持续高音量背景音乐下跳过投机流式解码，防止无谓占满 CPU
     if (
       !this._opts.bypassWakeWord &&
       !this._opts.isInConversation?.() &&
@@ -3577,14 +1856,11 @@ export class VoiceStreamSession {
       this._wakeAnchorSample ?? this._streamSpeechOriginSample ?? this._activeSegmentStartSample;
     if (origin === null) return;
 
-    const isRemote = status.activeQwen3Device === "remote";
-    const pollMs = this._opts.streamingPollIntervalMs ?? (isRemote ? 550 : 850);
+    const pollMs = this._opts.streamingPollIntervalMs ?? 850;
     const minAudioMs =
       this._opts.streamingPollIntervalMs !== undefined
         ? Math.min(320, pollMs)
-        : isRemote
-          ? 560
-          : 700;
+        : 700;
 
     const windowSamples = this._rawTotalSamples - origin;
     const newSamples = this._rawTotalSamples - this._streamLastDecodedEndSample;
@@ -3644,7 +1920,7 @@ export class VoiceStreamSession {
             text: clean,
             stableText: stablePrefix,
             unstableText: unstable,
-            engine: this._streamLastEngine || "qwen3-asr-remote-stream",
+            engine: this._streamLastEngine || "sensevoice-stream",
             latencyMs: Math.round(performance.now() - t0),
           });
         },
@@ -3754,7 +2030,7 @@ export class VoiceStreamSession {
             this._enqueueSegment({
               ...basePayload,
               precomputedTranscript: sentence,
-              precomputedAsrEngine: lastEngine || "qwen3-asr-remote-stream",
+              precomputedAsrEngine: lastEngine || "sensevoice-stream",
               precomputedAsrMs: lastLatencyMs,
               commitReason,
             });
@@ -3787,7 +2063,7 @@ export class VoiceStreamSession {
         candidatePayload = {
           ...candidatePayload,
           precomputedTranscript: latestText.trim(),
-          precomputedAsrEngine: lastEngine || "qwen3-asr-remote-stream",
+          precomputedAsrEngine: lastEngine || "sensevoice-stream",
           precomputedAsrMs: lastLatencyMs,
         };
       } else if (committedPrefix) {
@@ -3870,9 +2146,6 @@ export class VoiceStreamSession {
     const segDuringTts = this._legacyUtteranceDuringTts || this._isDuringTtsWindow();
     this._wakeAnchorSample = null;
     this._wakeAnchorHit = null;
-    this._cvWakeAnchored = false;
-    this._cvWakeHit = null;
-    this._cvUtteranceDuringTts = false;
     this._legacyUtteranceDuringTts = false;
     this._activeSegmentStartSample = null;
     this._segmenter.reset();
@@ -4009,28 +2282,13 @@ export class VoiceStreamSession {
 
   /**
    * 主动冲刷当前挂起尾音（用于单次说话松开/停止监听时立刻出结果）。
-   * 若处于未唤醒门控待机态，仅冲刷在途待机降噪唤醒切片，绝不将未唤醒环境音送入 ASR。
+   * 若处于未唤醒门控待机态，绝不将未唤醒环境音送入 ASR。
    */
   async flush(): Promise<void> {
     if (this._disposed) return;
     if (this.isWakeGatedStandby) {
-      if (
-        this._isStandbyClearVoiceEligible() &&
-        this._standbyCvHasActive &&
-        this._standbyCvActiveSamples >= Math.round(TARGET_SR * 0.1) &&
-        this._rawTotalSamples - this._standbyCvWindowStartSample >= Math.round(TARGET_SR * 0.25)
-      ) {
-        this._enqueueStandbyClearVoiceRange(this._standbyCvWindowStartSample, this._rawTotalSamples);
-        this._standbyCvHasActive = false;
-        this._standbyCvActiveSamples = 0;
-        this._standbyCvTrailingSilentSamples = 0;
-        this._standbyCvLastQueuedEndSample = this._rawTotalSamples;
-      }
-      await this._waitForStandbyClearVoiceIdle();
-      if (this.isWakeGatedStandby) {
-        await this.waitForIdle();
-        return;
-      }
+      await this.waitForIdle();
+      return;
     }
     if (this._voicePipelineMode === "xfyun") {
       if (this._xfyunSession) {
@@ -4038,31 +2296,6 @@ export class VoiceStreamSession {
         await this._xfyunSession.finish("client_finish");
       }
       await this._waitForXfyunIdle();
-      await this.waitForIdle();
-      return;
-    }
-    if (this._voicePipelineMode === "clearvoice") {
-      const fallbackMeta: ClearVoiceUtteranceMeta = {
-        wakeAnchored: this._cvWakeAnchored || this._wakeAnchorSample !== null,
-        acousticWake: this._cvWakeHit ?? this._wakeAnchorHit ?? null,
-        endGlobalSample: this._rawTotalSamples,
-        duringTtsPlayback: this._cvUtteranceDuringTts || this._isDuringTtsWindow(),
-      };
-      const tailChunk = this._cvChunker?.flush();
-      if (tailChunk) {
-        this._handleClearVoiceChunks([tailChunk]);
-      } else {
-        this._cvWakeAnchored = false;
-        this._cvWakeHit = null;
-        this._cvUtteranceDuringTts = false;
-        this._wakeAnchorSample = null;
-        this._wakeAnchorHit = null;
-      }
-      await this._waitForClearVoiceIdle();
-      // 若之前仅触发了超时切分或静音观察期未收尾，主动提交残余已降噪语音
-      if (this._cvAssembler && this._cvAssembler.totalSamples > 0) {
-        this._emitClearVoiceUtterance("flush", fallbackMeta, false);
-      }
       await this.waitForIdle();
       return;
     }
@@ -4398,18 +2631,7 @@ export class VoiceStreamSession {
       .then(async () => {
         if (this._disposed) return;
         // 若上一条刚成功命中并执行指令，跳过紧随其后的重叠残尾段/滚窗，彻底防止同一句话触发二次执行
-        // （流式断句产出的独立分句已由 Qwen3StreamingHypothesisTracker 严格去重，豁免时间重叠拦截；
-        // ClearVoice 多轨 BSS 仅在同槽位内做时间重叠拦截，严禁因音轨 1 命中而误杀时间重叠的音轨 2！）
-        const isCvBssSegment =
-          next.pipelineMode === "clearvoice" && Boolean(next.clearVoiceMeta?.bssUsed);
-        const cvSlots: number[] = isCvBssSegment
-          ? typeof next.clearVoiceMeta?.sourceSlot === "number"
-            ? [next.clearVoiceMeta.sourceSlot]
-            : next.separatedTracks && next.separatedTracks.length > 0
-              ? next.separatedTracks.map((t, idx) => t.sourceSlot ?? idx)
-              : [0]
-          : [];
-
+        // （流式断句产出的独立分句已由 StreamingAsrHypothesisTracker 严格去重，豁免时间重叠拦截）
         if (!next.wakeAnchored && !next.precomputedTranscript) {
           const nextStart = next.startSec;
           const nextEnd = next.startSec + next.durationSec;
@@ -4425,18 +2647,7 @@ export class VoiceStreamSession {
             );
           };
 
-          if (isCvBssSegment) {
-            if (
-              cvSlots.length > 0 &&
-              cvSlots.every((slot) => {
-                const prev = this._lastMatchedBySlot.get(slot);
-                return prev !== undefined && isOverlappingRange(prev.startSec, prev.endSec);
-              })
-            ) {
-              this._droppedStaleCount += 1;
-              return;
-            }
-          } else if (
+          if (
             this._lastMatchedEndSec >= 0 &&
             isOverlappingRange(this._lastMatchedStartSec, this._lastMatchedEndSec)
           ) {
@@ -4447,50 +2658,14 @@ export class VoiceStreamSession {
 
         const res = await this._opts.onSegmentReady(next);
         if (res?.matched) {
-          if (isCvBssSegment) {
-            const range = { startSec: next.startSec, endSec: next.startSec + next.durationSec };
-            for (const slot of cvSlots) {
-              this._lastMatchedBySlot.set(slot, range);
-            }
-          }
-          if (!next.clearVoiceMeta?.independentTrackEmit) {
-            this._lastMatchedStartSec = next.startSec;
-            this._lastMatchedEndSec = next.startSec + next.durationSec;
-          }
+          this._lastMatchedStartSec = next.startSec;
+          this._lastMatchedEndSec = next.startSec + next.durationSec;
           this._lastRawOverlap = new Float32Array(0);
           this._lastDenOverlap = new Float32Array(0);
-          // 独立分轨唤醒命中后释放待机唤醒锚定（若已切入连续对话则继续保持唤醒，若首句即退出则平稳回归待机）
-          if (next.clearVoiceMeta?.independentTrackEmit && this._cvWakeAnchored) {
-            this._cvWakeAnchored = false;
-            this._cvWakeHit = null;
-            this._wakeAnchorSample = null;
-            this._wakeAnchorHit = null;
-            if (!this.isAwake && this._wasAwake) {
-              this._wasAwake = false;
-              this._onEnterStandby(true);
-            }
-          }
           // 唤醒段命中并切入连续对话后，立即回放在异步 ASR 间隙内写入循环录制缓冲区的续说音频，防止首字丢失
           if (this._opts.isInConversation?.()) {
             this._wasAwake = true;
             this._replayPostWakeGapIfNeeded();
-          }
-        } else if (
-          next.clearVoiceMeta?.independentTrackEmit &&
-          this._cvWakeAnchored &&
-          !this._opts.isInConversation?.() &&
-          (next.forcedRoll ||
-            (this._wakeAnchorSample !== null &&
-              this._rawTotalSamples - this._wakeAnchorSample >= TARGET_SR * 10))
-        ) {
-          // 持续电视期间若待机声学误唤醒且超过 10s（或达单轨上限）仍无任何音轨命中指令，释放锚定回归待机
-          this._cvWakeAnchored = false;
-          this._cvWakeHit = null;
-          this._wakeAnchorSample = null;
-          this._wakeAnchorHit = null;
-          if (!this.isAwake && this._wasAwake) {
-            this._wasAwake = false;
-            this._onEnterStandby(true);
           }
         }
       })
@@ -4504,12 +2679,8 @@ export class VoiceStreamSession {
   }
 
   async waitForIdle(): Promise<void> {
-    await this._waitForStandbyClearVoiceIdle();
     if (this._voicePipelineMode === "xfyun") {
       await this._waitForXfyunIdle();
-    }
-    if (this._voicePipelineMode === "clearvoice") {
-      await this._waitForClearVoiceIdle();
     }
     if (
       !this._inFlight &&
@@ -4528,24 +2699,12 @@ export class VoiceStreamSession {
     this._disposed = true;
     this._clearHeldLegacySegment();
     this._abortXfyunSession(true);
-    this._resetStandbyClearVoiceState(true, true);
     this._resetStandbyDpdfState(true);
-    this._resetClearVoiceState();
-    if (this._ownsTrackMuteManager) {
-      this._trackMuteManager.reset();
-    }
-    this._cvChunker = null;
-    this._cvAssembler = null;
-    this._cvTrackTracker = null;
-    this._lastMatchedBySlot.clear();
     this._resetStreamingState(true);
     this._pendingWake = [];
     this._pendingNormalQueue = [];
     this._wakeAnchorSample = null;
     this._wakeAnchorHit = null;
-    this._cvWakeAnchored = false;
-    this._cvWakeHit = null;
-    this._cvUtteranceDuringTts = false;
     this._legacyUtteranceDuringTts = false;
     this._activeSegmentStartSample = null;
     this._resetVadState();

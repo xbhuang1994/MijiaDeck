@@ -10,15 +10,12 @@ import {
   fauxAssistantMessage,
   fauxProvider,
 } from "@earendil-works/pi-ai";
-import { decodeWavPcm, encodeWavPcm16 } from "../src/agent/audioPcm.ts";
-import { ClearVoiceRealtimeChunker } from "../src/agent/clearVoiceChunker.ts";
-import { ClearVoiceGpuRuntime } from "../src/agent/clearVoiceGpuRuntime.ts";
 import type { LocalAsrOutput, LocalVoiceEngine, StreamingVadHandleLike } from "../src/agent/localVoiceEngine.ts";
 import { PiAgentService } from "../src/agent/piAgentService.ts";
 import {
   joinUtteranceFragments,
   looksLikeIncompleteUtterance,
-} from "../src/agent/qwen3StreamingTranscriber.ts";
+} from "../src/agent/streamingAsrTracker.ts";
 import { VoiceCommandSegmenter } from "../src/agent/voiceCommandSegmenter.ts";
 import { VoiceListenerController } from "../src/agent/voiceListenerController.ts";
 import {
@@ -38,7 +35,6 @@ import { MainWindowController } from "../src/ui/controllers/mainWindowController
 import { applyTheme, ThemeController } from "../src/ui/theme.ts";
 
 let tmpDir = "";
-let mockCvServer: ReturnType<typeof Bun.serve> | null = null;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(path.join(os.tmpdir(), "mijiadeck-long-speech-"));
@@ -47,10 +43,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  if (mockCvServer) {
-    mockCvServer.stop(true);
-    mockCvServer = null;
-  }
   setDataPathOverrides(null);
   if (tmpDir) {
     rmSync(tmpDir, { recursive: true, force: true });
@@ -69,31 +61,6 @@ function makeSine(durationSec: number, amp = 0.22, freqHz = 440, sr = 16000): Fl
 
 function makeSilence(durationSec: number, sr = 16000): Float32Array {
   return new Float32Array(Math.round(durationSec * sr));
-}
-
-function createEnergyMockVad(threshold = 0.02): StreamingVadHandleLike {
-  let detected = false;
-  return {
-    acceptWaveform(samples: Float32Array) {
-      let sum = 0;
-      for (let i = 0; i < samples.length; i += 1) {
-        const s = samples[i]!;
-        sum += s * s;
-      }
-      detected = Math.sqrt(sum / Math.max(1, samples.length)) >= threshold;
-    },
-    isEmpty: () => true,
-    isDetected: () => detected,
-    front: () => ({ start: 0, samples: new Float32Array(0) }),
-    pop: () => {},
-    flush: () => {},
-    reset: () => {
-      detected = false;
-    },
-    clear: () => {
-      detected = false;
-    },
-  };
 }
 
 function createSileroLikeMockVad(minSilenceSec = 1.0, threshold = 0.02): StreamingVadHandleLike {
@@ -205,187 +172,6 @@ describe("Slow & Long Speech Anti-Splitting Heuristics", () => {
   });
 });
 
-describe("ClearVoice Pipeline Slow & Long Utterance Continuity", () => {
-  test("ClearVoiceRealtimeChunker decouples 280ms denoising slices from 1200ms utterance end so slow multi-pause speech stays 1 utterance", () => {
-    const vad = createEnergyMockVad(0.02);
-    const activityLog: boolean[] = [];
-    const chunker = new ClearVoiceRealtimeChunker({
-      sampleRate: 16000,
-      frameSizeMs: 32,
-      silenceTriggerMs: 280,
-      utteranceSilenceMs: 1200,
-      longUtteranceThresholdMs: 3000,
-      longUtteranceExtraSilenceMs: 350,
-      incompleteGraceMs: 700,
-      maxChunkMs: 2000,
-      lookbackMs: 300,
-      crossfadeMs: 20,
-      vad,
-      onSpeechActivity: (speaking) => activityLog.push(speaking),
-    });
-
-    const allChunks = [
-      ...chunker.pushSamples(makeSilence(0.4)),
-      // Clause 1 (1.5s) + slow pause (650ms > 280ms, < 1200ms)
-      ...chunker.pushSamples(makeSine(1.5)),
-      ...chunker.pushSamples(makeSilence(0.65)),
-      // Clause 2 (2.2s) + slow pause (900ms > 280ms, < 1550ms long-utterance patience)
-      ...chunker.pushSamples(makeSine(2.2)),
-      ...chunker.pushSamples(makeSilence(0.9)),
-      // Clause 3 (1.4s) + true end-of-utterance silence (1.7s >= 1550ms)
-      ...chunker.pushSamples(makeSine(1.4)),
-      ...chunker.pushSamples(makeSilence(1.7)),
-    ];
-
-    const endedChunks = allChunks.filter((c) => c.utteranceEnded);
-    const denoiseSlices = allChunks.filter((c) => c.rawNewSamples.length > 0);
-    // Incremental denoising slices were emitted promptly on 280ms pauses & 2.0s timeout...
-    expect(denoiseSlices.length).toBeGreaterThanOrEqual(4);
-    // ...yet ONLY ONE utterance end happened at the very end!
-    expect(endedChunks.length).toBe(1);
-    expect(endedChunks[0]!.rawNewSamples.length).toBe(0);
-    expect(activityLog).toEqual([true, false]);
-  });
-
-  test("VoiceStreamSession in ClearVoice mode keeps an 11-second slow multi-pause utterance intact and extends pause on incomplete clause", async () => {
-    const receivedSliceLengths: number[] = [];
-    mockCvServer = Bun.serve({
-      port: 0,
-      hostname: "127.0.0.1",
-      async fetch(req) {
-        const u = new URL(req.url);
-        if (u.pathname === "/health") {
-          return Response.json({
-            status: "ok",
-            upstreams: {
-              clearvoice: {
-                status: "ok",
-                details: {
-                  status: "ok",
-                  gpu_name: "Mock Online GPU",
-                  loaded_models: [{ name: "MossFormer2_SE_48K", task: "speech_enhancement" }],
-                },
-              },
-            },
-          });
-        }
-        if (u.pathname === "/clearvoice/v1/enhance") {
-          const form = await req.formData();
-          const file = form.get("file") as Blob;
-          const decoded = decodeWavPcm(new Uint8Array(await file.arrayBuffer()));
-          receivedSliceLengths.push(decoded.samples.length);
-          const wav = encodeWavPcm16(decoded.samples, decoded.sampleRate);
-          return new Response(new Uint8Array(wav), {
-            status: 200,
-            headers: {
-              "Content-Type": "audio/wav",
-              "X-ClearVoice-Model": "MossFormer2_SE_48K",
-              "X-Elapsed-Ms": "18",
-            },
-          });
-        }
-        return new Response("not found", { status: 404 });
-      },
-    });
-
-    const cvRuntime = new ClearVoiceGpuRuntime({
-      serviceUrl: `http://127.0.0.1:${mockCvServer.port}`,
-    });
-
-    let asrCalls = 0;
-    const previews = [
-      "Neo，帮我把客厅的吸顶灯",
-      "Neo，帮我把客厅的吸顶灯",
-      "Neo，帮我把客厅的吸顶灯调暗到百分之五十，然后",
-      "Neo，帮我把客厅的吸顶灯调暗到百分之五十，然后再把卧室空调打开调到26度。",
-    ];
-    const fakeEngine = {
-      createOnlineDenoiser: () => null,
-      createStreamingVad: () => createEnergyMockVad(0.02),
-      createWakeWordStream: () => null,
-      clearVoiceGpu: cvRuntime,
-      getStatus: () => ({
-        readyForLocalAsr: true,
-        activeQwen3Device: "remote" as const,
-        readyForClearVoiceGpu: true,
-        clearVoice: cvRuntime.getStatus(),
-      }),
-      denoise: (s: Float32Array) => ({
-        samples: s,
-        sampleRate: 16000,
-        engine: "dsp" as const,
-        inputSnrDb: 12,
-        outputSnrDb: 16,
-        snrGainDb: 4,
-        durationMs: 2,
-      }),
-      transcribeLocal: async (): Promise<LocalAsrOutput> => {
-        const text = previews[Math.min(asrCalls, previews.length - 1)]!;
-        asrCalls += 1;
-        return {
-          text,
-          rawText: text,
-          lang: "zh",
-          emotion: "",
-          event: "",
-          engine: "qwen3-asr-remote",
-          durationMs: 35,
-          computeDevice: "remote",
-        };
-      },
-    } as unknown as LocalVoiceEngine;
-
-    const emitted: VoiceStreamSegmentPayload[] = [];
-    let resolveFirstPartial!: () => void;
-    const firstPartialReady = new Promise<void>((resolve) => {
-      resolveFirstPartial = resolve;
-    });
-    const session = new VoiceStreamSession({
-      localEngine: fakeEngine,
-      noiseMode: "auto",
-      voicePipelineMode: "clearvoice",
-      streamingAsrEnabled: true,
-      isInConversation: () => true,
-      vadSilenceMs: 1200,
-      vadSensitivity: "default",
-      wakeWords: ["Neo"],
-      onPartialTranscript: () => {
-        resolveFirstPartial();
-      },
-      onSegmentReady: async (seg) => {
-        emitted.push(seg);
-        return null;
-      },
-    });
-
-    // Part 1: 2.2s speech + 0.35s silence; wait deterministically for preview ASR to flag incomplete clause ("Neo，帮我把客厅的吸顶灯")
-    session.pushFloat32Samples(makeSine(2.2));
-    session.pushFloat32Samples(makeSilence(0.35));
-    await firstPartialReady;
-    // Slow thinking pause extends to 1.45s total (> 1200ms base vadSilenceMs, inside 1200 + 700ms incomplete grace!)
-    session.pushFloat32Samples(makeSilence(1.1));
-    await Bun.sleep(40);
-    expect(emitted.length).toBe(0);
-
-    // Part 2: 4.5s speech + 0.8s slow pause (exceeds old 8.0s hard cap!)
-    session.pushFloat32Samples(makeSine(4.5));
-    session.pushFloat32Samples(makeSilence(0.8));
-    await Bun.sleep(60);
-    expect(emitted.length).toBe(0);
-
-    // Part 3: 3.5s speech + 2.1s true final silence -> commits ONCE!
-    session.pushFloat32Samples(makeSine(3.5));
-    session.pushFloat32Samples(makeSilence(2.1));
-    await session.waitForIdle();
-
-    expect(receivedSliceLengths.length).toBeGreaterThanOrEqual(5);
-    expect(emitted.length).toBe(1);
-    expect(emitted[0]!.durationSec).toBeGreaterThan(10.0);
-    expect(emitted[0]!.clearVoiceMeta?.crossfadeCount).toBeGreaterThanOrEqual(4);
-    session.dispose();
-  });
-});
-
 describe("Legacy Pipeline Long Speech, Wake-Anchored & Audio Stitching", () => {
   test("allows 10-second continuous slow speech and 7-second wake-anchored speech without 3.8s/4.0s forced chop", async () => {
     // 1. VoiceCommandSegmenter forceStartCommand does NOT chop at 4.0s
@@ -406,7 +192,7 @@ describe("Legacy Pipeline Long Speech, Wake-Anchored & Audio Stitching", () => {
       createStreamingVad: (opts?: { minSilenceDuration?: number }) =>
         createSileroLikeMockVad(opts?.minSilenceDuration ?? 1.2, 0.02),
       createWakeWordStream: () => null,
-      getStatus: () => ({ readyForLocalAsr: true, activeQwen3Device: "remote" as const }),
+      getStatus: () => ({ readyForLocalAsr: true }),
       sourceSeparator: {
         analyzeAudioScene: () => ({
           tags: [],
@@ -463,7 +249,7 @@ describe("Legacy Pipeline Long Speech, Wake-Anchored & Audio Stitching", () => {
       createStreamingVad: (opts?: { minSilenceDuration?: number }) =>
         createSileroLikeMockVad(opts?.minSilenceDuration ?? 1.0, 0.02),
       createWakeWordStream: () => null,
-      getStatus: () => ({ readyForLocalAsr: true, activeQwen3Device: "remote" as const }),
+      getStatus: () => ({ readyForLocalAsr: true }),
       transcribeLocal: async (): Promise<LocalAsrOutput> => {
         const text = hyps[Math.min(callIdx, hyps.length - 1)]!;
         callIdx += 1;
@@ -473,9 +259,8 @@ describe("Legacy Pipeline Long Speech, Wake-Anchored & Audio Stitching", () => {
           lang: "zh",
           emotion: "",
           event: "",
-          engine: "qwen3-asr-remote-stream",
+          engine: "sensevoice-local",
           durationMs: 25,
-          computeDevice: "remote",
         };
       },
     } as unknown as LocalVoiceEngine;
@@ -583,8 +368,6 @@ describe("End-to-End VoiceListenerController -> PiAgentService Single Combined D
     const fullLongTranscript =
       "Neo，我等下要洗深色衣服。这批里面有棉质衬衫不能高温洗。你先帮我拟定两个可选方案看看。";
     const fakeLocalEngine = {
-      setPreferredAsrEngine: () => {},
-      setClearVoiceServiceUrl: () => {},
       getStatus: () => ({
         readyForLocalAsr: true,
         readyForSourceSeparation: false,
@@ -593,21 +376,19 @@ describe("End-to-End VoiceListenerController -> PiAgentService Single Combined D
         readyForVoiceprint: false,
         readyForWakeWord: false,
         readyForLocalTts: false,
-        readyForClearVoiceGpu: true,
       }),
       openWakeWord: {
         isReady: false,
         getStatus: () => ({ ready: false, prototypeCount: 0, enrolledCount: 0, ttsCount: 0 }),
       },
-      transcribeLocal: async (): Promise<LocalAsrOutput> => ({
+      transcribeDualTrack: async (): Promise<LocalAsrOutput> => ({
         text: fullLongTranscript,
         rawText: fullLongTranscript,
         lang: "zh",
         emotion: "",
         event: "",
-        engine: "qwen3-asr-remote",
+        engine: "sensevoice-local",
         durationMs: 120,
-        computeDevice: "remote",
       }),
       dispose: () => {},
     } as unknown as LocalVoiceEngine;
@@ -619,8 +400,8 @@ describe("End-to-End VoiceListenerController -> PiAgentService Single Combined D
       wakeWords: ["Neo"],
       wakeWindowSec: 5,
       conversationWindowSec: 0,
-      qwen3StreamingEnabled: true,
-      voicePipelineMode: "clearvoice",
+      streamingAsrEnabled: true,
+      voicePipelineMode: "legacy",
       asyncVoicePipeline: true,
       preferLocalIntents: false,
       autoSpeakReply: false,
@@ -637,19 +418,19 @@ describe("End-to-End VoiceListenerController -> PiAgentService Single Combined D
     const vl = new VoiceListenerController(agent, { localEngine: fakeLocalEngine });
 
     try {
-      // 1. Multi-sentence ClearVoice segment with qwen3StreamingEnabled=true MUST fire ONLY 1 Pi Agent prompt!
+      // 1. Multi-sentence segment with streamingAsrEnabled=true MUST fire ONLY 1 Pi Agent prompt!
       const res = await vl.processDualTrackSegment(
         {
           rawSamples: makeSine(11.5),
           denoisedSamples: makeSine(11.5),
-          denoiseEngine: "clearvoice-mossformer2-remote",
+          denoiseEngine: "gtcrn",
           inputSnrDb: 18,
           outputSnrDb: 24,
           snrGainDb: 6,
           startSec: 0,
           durationSec: 11.5,
           forcedRoll: false,
-          pipelineMode: "clearvoice",
+          pipelineMode: "legacy",
         },
         { asyncDispatch: false },
       );
@@ -688,43 +469,51 @@ describe("End-to-End VoiceListenerController -> PiAgentService Single Combined D
     }
   });
 
-  test("VoiceStreamSession.updateVadTiming hot-updates ClearVoice utteranceSilenceMs without reconnecting", async () => {
+  test("VoiceStreamSession.updateVadTiming hot-updates segmenter silence duration without reconnecting", async () => {
+    // Use an always-empty mock VAD so segmenter-driven wake-anchored timing governs end-of-utterance
+    let detected = false;
+    const fakeVad: StreamingVadHandleLike = {
+      acceptWaveform(frame: Float32Array) {
+        let sum = 0;
+        for (let i = 0; i < frame.length; i += 1) sum += frame[i]! * frame[i]!;
+        detected = Math.sqrt(sum / Math.max(1, frame.length)) >= 0.02;
+      },
+      isEmpty: () => true,
+      isDetected: () => detected,
+      front: () => ({ start: 0, samples: new Float32Array(0) }),
+      pop: () => {},
+      flush: () => {},
+      reset: () => {
+        detected = false;
+      },
+      clear: () => {},
+    };
+
     const fakeEngine = {
       createOnlineDenoiser: () => null,
-      createStreamingVad: () => createEnergyMockVad(0.02),
+      createStreamingVad: () => fakeVad,
       createWakeWordStream: () => null,
-      clearVoiceGpu: {
-        getStatus: () => ({ ready: false }),
-        isInFailureCooldown: () => false,
-      },
-      getStatus: () => ({ readyForLocalAsr: false, readyForClearVoiceGpu: false }),
-      denoise: (s: Float32Array) => ({
-        samples: s,
-        sampleRate: 16000,
-        engine: "dsp" as const,
-        inputSnrDb: 12,
-        outputSnrDb: 15,
-        snrGainDb: 3,
-        durationMs: 1,
-      }),
+      getStatus: () => ({ readyForLocalAsr: false }),
     } as unknown as LocalVoiceEngine;
 
     const emitted: VoiceStreamSegmentPayload[] = [];
     const session = new VoiceStreamSession({
       localEngine: fakeEngine,
-      noiseMode: "dsp",
-      voicePipelineMode: "clearvoice",
+      noiseMode: "off",
+      voicePipelineMode: "legacy",
       vadSilenceMs: 700,
       vadSensitivity: "default",
+      owwEnabled: false,
       onSegmentReady: async (s) => {
         emitted.push(s);
         return null;
       },
     });
 
-    // Initialize chunker, then hot-update vadSilenceMs to 1600ms
+    // Hot-update vadSilenceMs to 1600ms, then anchor a wake utterance
     session.pushFloat32Samples(makeSilence(0.1));
     session.updateVadTiming({ vadSilenceMs: 1600 });
+    session.triggerWake({ replayMs: 200 });
 
     // Speak 1.0s + pause 1.1s (> old 700ms, < new 1600ms!) -> MUST NOT split!
     session.pushFloat32Samples(makeSine(1.0));

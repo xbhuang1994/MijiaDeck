@@ -121,7 +121,6 @@ export interface AttentionDecision {
     | "pragmatic-reject"
     | "systemone-attention"
     | "llm-attention"
-    | "noise-track-muted"
     | "no-wake";
   reason: string;
   wakeWord: string | null;
@@ -1329,7 +1328,7 @@ export async function evaluateVoiceAttention(
     });
   }
 
-  // 0. 静音/热词 Prompt 回显幻觉拦截（如 Qwen3-ASR 静音复读“嘿Neo 尼奥 鸟 嘿6 Neo”或“感谢观看”字幕幻觉）
+  // 0. 静音/热词 Prompt 回显幻觉拦截（如静音复读唤醒词列表或“感谢观看”字幕幻觉）
   if (isAsrHallucinationText(cleaned, input.wakeWords)) {
     return wrap({
       accept: false,

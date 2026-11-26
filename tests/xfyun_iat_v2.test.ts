@@ -364,13 +364,14 @@ describe("讯飞语音听写大模型 2.0 协议与工具函数", () => {
 });
 
 describe("agentConfigStore 讯飞 2.0 配置持久化、切换与密钥脱敏", () => {
-  test("voicePipelineMode 支持 legacy / clearvoice / xfyun 切换，且 apiKey/apiSecret 绝不明文暴露", () => {
+  test("voicePipelineMode 支持 legacy / xfyun 切换（历史 clearvoice 自动归一化为 legacy），且 apiKey/apiSecret 绝不明文暴露", () => {
     useTempDataDir();
     expect(defaultAgentVoiceConfig().voicePipelineMode).toBe("legacy");
     expect(normalizeVoicePipelineMode("xfyun")).toBe("xfyun");
     expect(normalizeVoicePipelineMode("xfyun-iat-v2")).toBe("xfyun");
     expect(normalizeVoicePipelineMode("spark_asr_v2")).toBe("xfyun");
     expect(normalizeVoicePipelineMode("xunfei")).toBe("xfyun");
+    expect(normalizeVoicePipelineMode("clearvoice")).toBe("legacy");
 
     const updated = updateAgentVoiceConfig({
       voicePipelineMode: "xfyun",
@@ -397,13 +398,13 @@ describe("agentConfigStore 讯飞 2.0 配置持久化、切换与密钥脱敏", 
     expect(String(pub.xfyunApiKeyPreview)).toContain("••••");
     expect(String(pub.xfyunApiSecretPreview)).toContain("••••");
 
-    // 留空不覆盖已有密钥
+    // 留空不覆盖已有密钥；切回 legacy 保持密钥完整
     const keepSecrets = updateAgentVoiceConfig({
       xfyunApiKey: "",
       xfyunApiSecret: "",
-      voicePipelineMode: "clearvoice",
+      voicePipelineMode: "legacy",
     });
-    expect(keepSecrets.voicePipelineMode).toBe("clearvoice");
+    expect(keepSecrets.voicePipelineMode).toBe("legacy");
     expect(keepSecrets.xfyunApiKey).toBe("test_xfyun_apikey_abcdef123456");
     expect(keepSecrets.xfyunApiSecret).toBe("test_xfyun_secret_9876543210ab");
 
@@ -439,7 +440,6 @@ describe("VoiceStreamSession 讯飞听写大模型 2.0 端到端直推原始音�
     const mockOww = createMockOwwController();
     let localAsrCalls = 0;
     let denoiseCalls = 0;
-    let cvCalls = 0;
     (engine as unknown as { createWakeWordStream: typeof engine.createWakeWordStream }).createWakeWordStream =
       (words, opts) => mockOww.factory(words, opts);
     (engine as unknown as { createOnlineDenoiser: typeof engine.createOnlineDenoiser }).createOnlineDenoiser =
@@ -463,10 +463,6 @@ describe("VoiceStreamSession 讯飞听写大模型 2.0 端到端直推原始音�
         localAsrCalls += 1;
         return { text: "should-not-be-called", rawText: "", lang: "zh", emotion: "", event: "", engine: "sensevoice-local", durationMs: 1 };
       };
-    (engine.clearVoiceGpu as unknown as { separateSlice: unknown }).separateSlice = async () => {
-      cvCalls += 1;
-      throw new Error("should not call clearvoice in xfyun mode");
-    };
 
     const partials: string[] = [];
     const emitted: VoiceStreamSegmentPayload[] = [];
@@ -546,13 +542,10 @@ describe("VoiceStreamSession 讯飞听写大模型 2.0 端到端直推原始音�
     expect(emitted[0]!.wakeAnchored).toBe(true);
     expect(emitted[0]!.acousticWake?.wakeWord).toBe("Neo");
 
-    // 严禁调用本地 ASR 与 ClearVoice
+    // 严禁调用本地 ASR
     expect(localAsrCalls).toBe(0);
-    expect(cvCalls).toBe(0);
 
-    // 5. 运行期热切换至 clearvoice 与 legacy 再切回 xfyun
-    session.setVoicePipelineMode("clearvoice");
-    expect(session.voicePipelineMode).toBe("clearvoice");
+    // 5. 运行期热切换至 legacy 再切回 xfyun
     session.setVoicePipelineMode("legacy");
     expect(session.voicePipelineMode).toBe("legacy");
     session.setVoicePipelineMode("xfyun");
@@ -638,7 +631,7 @@ describe("VoiceListenerController 与 HTTP API 端到端集成（含切换、直
       cacheSaver: () => {},
     });
     const piAgent = new PiAgentService({
-      deps: { service, jobs, mainWindow: mainWin, settingsStore },
+      deps: { service, jobs, mainWindow: mainWin, settingsStore, broadcastState: () => {} },
     });
     updateAgentVoiceConfig({
       voicePipelineMode: "xfyun",
@@ -725,14 +718,7 @@ describe("VoiceListenerController 与 HTTP API 端到端集成（含切换、直
     expect(testJson.ok).toBe(true);
     expect(testJson.sid).toBe("mock_sid_ok");
 
-    // 切回 clearvoice 与 legacy
-    const toCvRes = await fetch(`${runningServer.url}/api/agent/config`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ voicePipelineMode: "clearvoice" }),
-    });
-    expect(((await toCvRes.json()) as { voice: { voicePipelineMode: string } }).voice.voicePipelineMode).toBe("clearvoice");
-
+    // 切回 legacy
     const toLegacyRes = await fetch(`${runningServer.url}/api/agent/config`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -740,14 +726,16 @@ describe("VoiceListenerController 与 HTTP API 端到端集成（含切换、直
     });
     expect(((await toLegacyRes.json()) as { voice: { voicePipelineMode: string } }).voice.voicePipelineMode).toBe("legacy");
 
-    // 校验前端 HTML 包含讯飞 2.0 设置项与兼容的方案切换按钮
+    // 校验前端 HTML 包含讯飞 2.0 设置项与方案切换按钮，且已完全移除 ClearVoice / Qwen3-ASR 控件
     const html = await (await fetch(`${runningServer.url}/`)).text();
     expect(html).toContain("pi-voice-pipeline-toggle-btn");
     expect(html).toContain("set-voice-pipeline-mode");
-    expect(html).toContain("set-voice-clearvoice-enabled");
     expect(html).toContain("setting-row-xfyun-iat");
     expect(html).toContain("badge-model-xfyun-iat");
     expect(html).toContain("set-xfyun-test-btn");
+    expect(html).not.toContain("set-voice-clearvoice-enabled");
+    expect(html).not.toContain("setting-row-voice-gateway");
+    expect(html).not.toContain("pi-voice-tracks-panel");
   });
 
   test("XfyunIatV2Runtime.testConnection 在服务端返回错误码时准确返回失败且脱敏", async () => {

@@ -460,7 +460,6 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
         forceDual: true,
         acousticWake: makeAcousticHit("Neo", 0.78),
         systemOneClient: mockClient,
-        localAsrEngine: "sensevoice",
       });
       // Must NOT invoke SystemOne selectDualTrackAsr during wake-triggered stage
       expect(systemOneCalls).toBe(0);
@@ -477,7 +476,7 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
     }));
 
     const fakeEngine = {
-      getStatus: () => ({ readyForSenseVoice: false, primaryAsrEngine: "qwen3-asr" }),
+      getStatus: () => ({ readyForSenseVoice: true, primaryAsrEngine: "sensevoice" }),
       scoreWakeWordAudio: () => null,
       transcribeLocal: async () => ({
         text: "Neo，晚饭吃什么",
@@ -485,7 +484,7 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
         lang: "zh",
         emotion: "",
         event: "<|Speech|>",
-        engine: "qwen3-asr-remote",
+        engine: "sensevoice-local",
         durationMs: 10,
       }),
     } as unknown as LocalVoiceEngine;
@@ -506,7 +505,7 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
         lang: "zh",
         emotion: "",
         event: "<|Speech|>",
-        engine: "qwen3-asr-remote",
+        engine: "sensevoice-local",
         durationMs: 10,
       },
       altZhRes: null,
@@ -691,9 +690,9 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
     expect(offlineRecovery.wakeWord).toBe("Neo");
     expect(offlineRecovery.command).toBe("我觉得客厅有点暗呢");
 
-    // 4. ClearVoice multi-track segment where ClearVoice +35.5dB denoising drops per-track OWW score below 0.60:
-    //    streamAcousticWake Neo 0.70 is preserved on the winning track and routes through SystemOne -> Pi Agent!
-    const { client: cvS1, calls: cvCalls } = makeMockSystemOneClient(() => ({
+    // 4. End-to-end VoiceListenerController.processDualTrackSegment with acousticWake Neo 0.70 + ASR '六，我觉得客厅有点暗呢。'
+    //    routes through SystemOne -> Pi Agent cleanly!
+    const { client: segS1, calls: segCalls } = makeMockSystemOneClient(() => ({
       choice: "valid_wake",
       confidence: 0.92,
     }));
@@ -718,13 +717,9 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
       await Bun.sleep(10);
     }
 
-    let asrTrackCall = 0;
     const fakeLocalEngine = {
-      setPreferredAsrEngine: () => {},
-      setClearVoiceServiceUrl: () => {},
       getStatus: () => ({
         readyForLocalAsr: true,
-        readyForClearVoiceGpu: true,
         readyForSourceSeparation: false,
         readyForDenoise: true,
         readyForVad: true,
@@ -743,40 +738,23 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
         engine: "silero",
         durationMs: 3,
       }),
-      scoreWakeWordAudio: (_samples: Float32Array) => {
-        // Simulate ClearVoice SE +35.5dB altering timbre so per-track re-score drops below 0.60
-        const idx = asrTrackCall;
-        return {
-          wakeWord: "Neo",
-          score: idx === 0 ? 0.48 : 0.08,
-          rawScore: idx === 0 ? 0.48 : 0.08,
-          threshold: 0.6,
-          matched: false,
-          source: "enrolled" as const,
-          frameIndex: 1,
-          sampleOffset: 4000,
-          latencyMs: 3,
-        };
-      },
-      transcribeLocal: async (): Promise<LocalAsrOutput> => {
-        asrTrackCall += 1;
-        return {
-          text: asrTrackCall === 1 ? "六，我觉得客厅有点暗呢。" : "今天晚上看什么电影",
-          rawText: asrTrackCall === 1 ? "六，我觉得客厅有点暗呢。" : "今天晚上看什么电影",
-          lang: "zh",
-          emotion: "",
-          event: "<|Speech|>",
-          engine: "qwen3-asr-remote",
-          durationMs: 25,
-        };
-      },
+      scoreWakeWordAudio: () => null,
+      transcribeDualTrack: async (): Promise<LocalAsrOutput> => ({
+        text: "六，我觉得客厅有点暗呢。",
+        rawText: "六，我觉得客厅有点暗呢。",
+        lang: "zh",
+        emotion: "",
+        event: "<|Speech|>",
+        engine: "sensevoice-local",
+        durationMs: 25,
+      }),
       dispose: () => {},
     } as unknown as LocalVoiceEngine;
 
     const cfg = normalizeAgentVoiceConfig({
       ...defaultAgentVoiceConfig(),
       provider: "local",
-      voicePipelineMode: "clearvoice",
+      voicePipelineMode: "legacy",
       wakeWords: ["Neo"],
       owwEnabled: true,
       owwThreshold: 0.6,
@@ -784,49 +762,25 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
       sourceSeparationMode: "off",
       systemOneMode: "on",
       systemOneBaseUrl: "https://systemone.local.test/v1",
-      systemOneApiKey: "sk-cv-wake",
+      systemOneApiKey: "sk-wake-legacy",
       conversationWindowSec: 25,
     });
     const agent = new PiAgentService({
       deps: { mainWindow: mw, service: demo, jobs, settingsStore, broadcastState: () => {} },
       initialConfig: cfg,
     });
-    (agent as unknown as { _systemOne: SystemOneClient })._systemOne = cvS1;
+    (agent as unknown as { _systemOne: SystemOneClient })._systemOne = segS1;
     const vl = new VoiceListenerController(agent, { localEngine: fakeLocalEngine });
 
     try {
       const segRes = await vl.processDualTrackSegment({
         rawSamples: new Float32Array(32000).fill(0.08),
         denoisedSamples: new Float32Array(32000).fill(0.08),
-        separatedTracks: [
-          {
-            trackId: "cv_track_1",
-            trackIndex: 1,
-            sourceSlot: 0,
-            samples: new Float32Array(32000).fill(0.08),
-            sampleRate: 16000,
-            rms: 0.08,
-            energyRatio: 0.7,
-            outputSnrDb: 35.5,
-            snrGainDb: 35.5,
-          },
-          {
-            trackId: "cv_track_2",
-            trackIndex: 2,
-            sourceSlot: 1,
-            samples: new Float32Array(32000).fill(0.04),
-            sampleRate: 16000,
-            rms: 0.04,
-            energyRatio: 0.3,
-            outputSnrDb: 18,
-            snrGainDb: 18,
-          },
-        ],
-        denoiseEngine: "clearvoice-mossformer2-bss-se-remote",
-        pipelineMode: "clearvoice",
-        inputSnrDb: 0,
-        outputSnrDb: 35.5,
-        snrGainDb: 35.5,
+        denoiseEngine: "gtcrn",
+        pipelineMode: "legacy",
+        inputSnrDb: 12,
+        outputSnrDb: 20,
+        snrGainDb: 8,
         startSec: 0,
         durationSec: 2,
         forcedRoll: false,
@@ -834,14 +788,10 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
         acousticWake: makeAcousticHit("Neo", 0.7),
       });
 
-      expect(cvCalls.filter((c) => Boolean(c.questions.decision))).toHaveLength(1);
+      expect(segCalls.filter((c) => Boolean(c.questions.decision))).toHaveLength(1);
       expect(segRes.matched).toBe(true);
       expect(segRes.command).toBe("我觉得客厅有点暗呢");
-      expect(segRes.tracks).toHaveLength(2);
-      // Track 1 accepted via SystemOne pure wake check; Track 2 remains strictly isolated & rejected
-      expect(segRes.tracks![0]!.matched).toBe(true);
-      expect(segRes.tracks![0]!.attention?.stage).toBe("systemone-attention");
-      expect(segRes.tracks![1]!.matched).toBe(false);
+      expect(segRes.attention?.stage).toBe("systemone-attention");
     } finally {
       vl.dispose();
       agent.dispose();

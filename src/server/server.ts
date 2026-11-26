@@ -182,12 +182,8 @@ function handleWsMessage(
         wakeWords: cfg.wakeWords,
         owwEnabled: cfg.owwEnabled,
         owwThreshold: cfg.owwThreshold,
-        streamingAsrEnabled: cfg.qwen3StreamingEnabled,
+        streamingAsrEnabled: cfg.streamingAsrEnabled,
         voicePipelineMode: cfg.voicePipelineMode,
-        trackMuteManager: vl.trackMuteManager,
-        getSystemOneClient: () => vl.systemOneClient,
-        getRecentHistory: () => vl.getRecentHistoryForSystemOne(5),
-        getDialogEpoch: () => vl.dialogEpoch,
         onPartialTranscript: (partial) => {
           try {
             ws.send(
@@ -199,7 +195,6 @@ function handleWsMessage(
                 unstableText: partial.unstableText,
                 engine: partial.engine,
                 latencyMs: partial.latencyMs,
-                ...(partial.tracks && partial.tracks.length > 0 ? { tracks: partial.tracks } : {}),
               }),
             );
           } catch {
@@ -269,8 +264,6 @@ function handleWsMessage(
                 detectedSoundTypes: result.detectedSoundTypes,
                 detectedSpeakerCount: result.detectedSpeakerCount,
                 separatedStreams: result.separatedStreams,
-                ...(result.tracks ? { tracks: result.tracks } : {}),
-                ...(result.trackBatch ? { trackBatch: result.trackBatch } : {}),
                 timings: result.timings,
                 agent: runtime.piAgent ? runtime.piAgent.snapshot() : null,
                 voiceState: result.voiceState,
@@ -493,7 +486,6 @@ export async function startMijiaDeckServer(
         }
         if (
           streamOpts?.voicePipelineMode === "legacy" ||
-          streamOpts?.voicePipelineMode === "clearvoice" ||
           streamOpts?.voicePipelineMode === "xfyun"
         ) {
           stream.setVoicePipelineMode(streamOpts.voicePipelineMode);
