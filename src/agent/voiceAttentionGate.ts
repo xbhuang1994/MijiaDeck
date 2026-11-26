@@ -377,6 +377,109 @@ export function stripLeadingVocativeOrFragment(text: string): string {
 
 const PURE_WAKE_FILLER_RE = /^(?:[你呢啊嗯哦喔哈嘿喂哟20oO]+|ok|hi|hey|yo)$/i;
 
+export interface SuspectedWakeAliasHint {
+  matchedSurface: string;
+  targetWakeWord: string;
+  substitutedUtterance: string;
+}
+
+const PAUSED_ACOUSTIC_WAKE_PREFIX_RE =
+  /^(六|流|留|刘|溜|柳|略|呢|那|那哦|那我|你呀|您)[\s,，。!！?？:：、]+/;
+const STANDALONE_ACOUSTIC_WAKE_SLIP_RE =
+  /^(?:六|流|留|刘|溜|柳|略|呢|那|那哦|你呀|尼|妮|牛|妞|钮|纽)$/;
+const MANGLED_ACOUSTIC_WAKE_PREFIX_RE =
+  /^(你好|您好|你有|你又|你给|你欧|你哦|你奥|你o|你0|尼奥|尼欧|妮奥|妮欧|尼哦|呢哦|里奥|利奥|米奥|尼|妮|牛|妞|钮|纽|new|near|neil|neal|nio|no|ne)(?![a-z])[\s,，。!！?？:：、]*/i;
+
+/**
+ * 为唤醒词纯误听校验构造句首谐音/近音替换候选（如“你有播放点音乐吧”->“Neo，播放点音乐吧”、“六，我觉得客厅有点暗呢”->“Neo，我觉得客厅有点暗呢”），
+ * 仅用于 SystemOne 对比“原句字面语义 vs 替换回触发词后的语义”，绝不引入对话上下文或背景环境信息。
+ */
+export function buildSuspectedWakeAliasHint(
+  cleaned: string,
+  wakeSpan: WakeSpanMatch | null,
+  acousticWake?: WakeWordAcousticHit | null,
+): SuspectedWakeAliasHint | null {
+  if (wakeSpan) {
+    if (!wakeSpan.fuzzy) return null;
+    const prefix = wakeSpan.beforeText ? `${wakeSpan.beforeText} ` : "";
+    const substitutedUtterance = wakeSpan.afterText
+      ? `${prefix}${wakeSpan.wakeWord}，${wakeSpan.afterText}`
+      : `${prefix}${wakeSpan.wakeWord}`;
+    return {
+      matchedSurface: wakeSpan.matchedSurface,
+      targetWakeWord: wakeSpan.wakeWord,
+      substitutedUtterance,
+    };
+  }
+
+  if (!acousticWake?.matched) return null;
+  const target = acousticWake.wakeWord.trim();
+  const trimmed = cleaned.replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
+  if (!target || !trimmed) return null;
+
+  const aliases = [
+    ...(WAKE_HOMOPHONES[target] ?? WAKE_HOMOPHONES[target.toLowerCase()] ?? []),
+    ...(NOISE_ONLY_WAKE_ALIASES[target] ?? NOISE_ONLY_WAKE_ALIASES[target.toLowerCase()] ?? []),
+  ].sort((a, b) => b.length - a.length);
+
+  for (const alias of aliases) {
+    const isAscii = /^[a-z0-9\s-]+$/i.test(alias);
+    const re = isAscii
+      ? new RegExp(`^(${escapeRegExp(alias)})(?![a-z])[\\s,，。!！?？:：、]*`, "i")
+      : new RegExp(`^(${escapeRegExp(alias)})[\\s,，。!！?？:：、]*`, "i");
+    const m = re.exec(trimmed);
+    if (!m) continue;
+    const rest = trimmed
+      .slice(m[0].length)
+      .replace(LEADING_PUNCT_RE, "")
+      .replace(TRAILING_PUNCT_RE, "")
+      .trim();
+    return {
+      matchedSurface: m[1] ?? alias,
+      targetWakeWord: target,
+      substitutedUtterance: rest ? `${target}，${rest}` : target,
+    };
+  }
+
+  const pm = PAUSED_ACOUSTIC_WAKE_PREFIX_RE.exec(trimmed);
+  if (pm && pm[1]) {
+    const rest = trimmed
+      .slice(pm[0].length)
+      .replace(LEADING_PUNCT_RE, "")
+      .replace(TRAILING_PUNCT_RE, "")
+      .trim();
+    return {
+      matchedSurface: pm[1],
+      targetWakeWord: target,
+      substitutedUtterance: rest ? `${target}，${rest}` : target,
+    };
+  }
+
+  if (STANDALONE_ACOUSTIC_WAKE_SLIP_RE.test(trimmed)) {
+    return {
+      matchedSurface: trimmed,
+      targetWakeWord: target,
+      substitutedUtterance: target,
+    };
+  }
+
+  const mm = MANGLED_ACOUSTIC_WAKE_PREFIX_RE.exec(trimmed);
+  if (mm && mm[1]) {
+    const rest = trimmed
+      .slice(mm[0].length)
+      .replace(LEADING_PUNCT_RE, "")
+      .replace(TRAILING_PUNCT_RE, "")
+      .trim();
+    return {
+      matchedSurface: mm[1],
+      targetWakeWord: target,
+      substitutedUtterance: rest ? `${target}，${rest}` : target,
+    };
+  }
+
+  return null;
+}
+
 /**
  * 当 openWakeWord 声学引擎或 en-head 英文句首探针已确认本段语音开头包含唤醒词（如快速说的 "Neo关灯"）时，
  * 从 SenseVoice 中文轨中精准剥离被误听的句首唤醒词残片（如 "你好关灯" / "你有关灯" / "你给开灯" / "钮关灯" / "new关灯"），
@@ -702,6 +805,58 @@ export function isNoiseOrGarbledFragment(rawText: string, acousticEvent?: string
 // 明显是家庭/旁白聊天的负向模式（纯语气词必须整句锚定 `$`，避免误杀“嗯，用右筒”/“好的，开启袜子筒”）
 const OBVIOUS_SIDETALK_RE =
   /^(?:(?:嗯+|啊+|哦+|呃+|哈哈+|呵呵+)[\s,，。！!？?]*$|(?:晚饭|午饭|早饭|吃什么|吃饭|喝水|拿一下|递一下|我去|你去|他去|待会出去|出门|快递|外卖|睡觉了吗|几点回来|明天上班))/i;
+
+// 助手回复中包含待用户作答的开放问题/选项/澄清请求（用于 SystemOne 离线或不可用时的兜底判定）
+const OPEN_ASSISTANT_QUESTION_RE =
+  /(?:[?？]\s*$|请问|选哪个|选哪一个|选哪种|方案一[\s\S]{0,40}方案二|哪一台|哪个房间|哪个设备|要开吗|要关吗|需要我.{0,16}吗|是否需要|要不要|想选|你想.{0,12}吗|你希望|请确认|确认一下|告诉我|which\s+one|would\s+you\s+like|do\s+you\s+want|please\s+confirm)/i;
+
+const POLITE_CLOSING_PROMPT_RE =
+  /^(?:还有(?:什么|其他|别的)?(?:需要|可以)?(?:帮|协助).{0,10}[?？]?|还需要(?:什么|别的)吗[?？]?|anything\s+else\??)$/i;
+
+const SHORT_QUESTION_REPLY_RE =
+  /^(?:好|嗯|对|是|行|要|开|关|一|二|三|1|2|3|ok|yes|no)$/i;
+
+/**
+ * 判断助手最新一句回复是否明确包含等待用户作答的问题/选项/澄清。
+ */
+export function assistantReplyExpectsUserResponse(reply: string | undefined): boolean {
+  const trimmed = (reply ?? "").trim();
+  if (!trimmed) return false;
+  const clauses = trimmed
+    .split(/[。！!\n]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const tailClause = clauses[clauses.length - 1] ?? trimmed;
+  if (POLITE_CLOSING_PROMPT_RE.test(tailClause)) {
+    return false;
+  }
+  return OPEN_ASSISTANT_QUESTION_RE.test(trimmed);
+}
+
+/**
+ * 当 SystemOne 不可用或被关闭时的确定性对话结束兜底判定：
+ * - 存在未完成任务或待确认槽位 -> continue
+ * - 助手刚提出需要用户作答的明确问题且静默未超时 -> continue
+ * - 其余闭环回复或静默完成 -> ready_to_end（可开始退出倒计时）
+ */
+export function inferConversationEndFallback(input: {
+  lastAssistantReply?: string;
+  silentCompleted?: boolean;
+  hasPendingConfirmation?: boolean;
+  activeTaskCount?: number;
+  idleSeconds?: number;
+}): "continue" | "ready_to_end" {
+  if ((input.activeTaskCount ?? 0) > 0) return "continue";
+  if (input.hasPendingConfirmation) return "continue";
+  if (typeof input.idleSeconds === "number" && input.idleSeconds >= 30) {
+    return "ready_to_end";
+  }
+  if (input.silentCompleted) return "ready_to_end";
+  if (assistantReplyExpectsUserResponse(input.lastAssistantReply)) {
+    return "continue";
+  }
+  return "ready_to_end";
+}
 
 function escapeRegExp(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1445,13 +1600,60 @@ export async function evaluateVoiceAttention(
       });
     }
 
+    // A2-bis. 强声学唤醒 + 句首谐音别名 + 明确非疑问智能家居指令双重确认（如 openWakeWord「Neo」0.80 + “你有播放点音乐吧。”）-> 0ms 直通
+    const strongAcousticMatchForWake = Boolean(
+      input.acousticWake?.matched &&
+        input.acousticWake.wakeWord.toLowerCase() === wakeSpan.wakeWord.toLowerCase() &&
+        input.acousticWake.score >= Math.max(0.72, input.acousticWake.threshold + 0.08),
+    );
+    const rawTailAfterWake = cleaned.slice(wakeSpan.endIndex).trim();
+    const endsLikeQuestion = /[吗嘛么呢？?][\s。!！]*$/.test(rawTailAfterWake);
+    if (
+      wakeSpan.fuzzy &&
+      strongAcousticMatchForWake &&
+      input.attentionMode === "smart" &&
+      hasVocativeStart &&
+      !hasReferentialBefore &&
+      !hasReferentialAfter &&
+      !endsLikeQuestion &&
+      cleanAfter.length >= 2 &&
+      (looksDirectCommand || Boolean(wakeCapMatch)) &&
+      (hasSmartHomeDomainIntent(trimmedCmd) || Boolean(wakeCapMatch))
+    ) {
+      return wrap({
+        accept: true,
+        wokeOnly: false,
+        addressed: true,
+        inConversation: true,
+        confidence: Math.max(0.9, input.acousticWake!.score),
+        stage: "fast-wake",
+        passSource: wakeCapMatch && !looksDirectCommand ? "implicit_capability" : "acoustic_wake_recovery",
+        matchedCapability: wakeCapMatch?.matchedCapabilityLabel,
+        reason: `声学唤醒「${wakeSpan.wakeWord}」(${input.acousticWake!.score.toFixed(2)})与句首近音「${wakeSpan.matchedSurface}」双重确认，直接进入下一流程`,
+        wakeWord: wakeSpan.wakeWord,
+        command: trimmedCmd,
+        usedLlm: false,
+      });
+    }
+
     // A3-1. 主通道：SystemOne 纯误唤醒校验（仅判断是不是误听有人在叫触发词，不做上下文/背景/意图/双轨等其它判断）
     let sysOneTransientFailure = false;
     if (input.systemOneClient?.enabled) {
+      const aliasHint = buildSuspectedWakeAliasHint(cleaned, wakeSpan, input.acousticWake);
+      const acousticSignal =
+        aliasHint && input.acousticWake?.matched
+          ? {
+              wakeWord: input.acousticWake.wakeWord,
+              score: input.acousticWake.score,
+              matched: true,
+            }
+          : null;
       const s1 = await input.systemOneClient.evaluateWakeAttention(
         {
           utterance: cleaned,
           wakeWords: input.wakeWords,
+          ...(aliasHint ? { suspectedWakeAlias: aliasHint } : {}),
+          ...(acousticSignal ? { acousticWake: acousticSignal } : {}),
         },
         {
           strict: input.attentionMode === "strict",
@@ -1631,8 +1833,19 @@ export async function evaluateVoiceAttention(
     }
 
     // B2. 明显是旁白/噪声幻觉碎片 -> 0ms 忽略并保留剩余对话窗口
+    // 注意：若助手上一句刚刚向用户提出明确问题/选项，允许“好/嗯/对/一/二”等极短作答进入后续决策（绝不误杀为噪声）
     const isBgmConv = Boolean(input.acousticEvent?.toUpperCase().includes("BGM"));
-    if (isNoiseOrGarbledFragment(cmd, input.acousticEvent)) {
+    const latestTurn =
+      input.recentTurns && input.recentTurns.length > 0
+        ? input.recentTurns[input.recentTurns.length - 1]
+        : null;
+    const isShortReplyToAssistantQuestion = Boolean(
+      !isBgmConv &&
+        latestTurn?.role === "assistant" &&
+        assistantReplyExpectsUserResponse(latestTurn.text) &&
+        SHORT_QUESTION_REPLY_RE.test(cmd),
+    );
+    if (!isShortReplyToAssistantQuestion && isNoiseOrGarbledFragment(cmd, input.acousticEvent)) {
       return wrap({
         accept: false,
         wokeOnly: false,
@@ -1646,7 +1859,7 @@ export async function evaluateVoiceAttention(
         usedLlm: false,
       });
     }
-    if (OBVIOUS_SIDETALK_RE.test(cmd)) {
+    if (!isShortReplyToAssistantQuestion && OBVIOUS_SIDETALK_RE.test(cmd)) {
       return wrap({
         accept: false,
         wokeOnly: false,
@@ -1917,8 +2130,8 @@ export async function evaluateVoiceAttention(
       }
     }
 
-    // 离线降级：严禁在无云端语义判别时因 awakeActive 盲目放行歌词/电视/咖啡馆杂音，仅放行明确设备/助手指令或家庭专能能力指令
-    if (isClearDeviceCmd || strongImplicitCap) {
+    // 离线降级：严禁在无云端语义判别时因 awakeActive 盲目放行歌词/电视/咖啡馆杂音，仅放行明确设备/助手指令、家庭专能能力指令或对助手提问的直接短答
+    if (isClearDeviceCmd || strongImplicitCap || isShortReplyToAssistantQuestion) {
       return wrap({
         accept: true,
         wokeOnly: false,
@@ -1930,9 +2143,11 @@ export async function evaluateVoiceAttention(
         matchedCapability: convCapMatch?.matchedCapabilityLabel,
         reason: strongImplicitCap && convCapMatch
           ? `命中设备能力「${convCapMatch.matchedCapabilityLabel}」`
-          : input.awakeActive
-            ? "唤醒窗口内明确控制指令"
-            : "连续对话续聊指令",
+          : isShortReplyToAssistantQuestion
+            ? "对助手提问的简短回复"
+            : input.awakeActive
+              ? "唤醒窗口内明确控制指令"
+              : "连续对话续聊指令",
         wakeWord: input.acousticWake?.matched ? input.acousticWake.wakeWord : null,
         command: cmd,
         usedLlm: false,
@@ -1960,10 +2175,16 @@ export async function evaluateVoiceAttention(
     const cmd = cleaned.replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
     const extractedCmd = extractCommandAfterAcousticWake(cleaned, input.acousticWake.wakeWord);
     const effectiveCmd = extractedCmd || cmd;
-    const standbyCapMatch = effectiveCmd
-      ? probeImplicitCapabilities(effectiveCmd, input.capabilityDigest)
-      : null;
+    const isAmbiguousInterrogative =
+      /^(?:你有|你又|你好|你给)/.test(cmd) &&
+      /[吗嘛么呢？?][\s。!！]*$/.test(cleaned) &&
+      !isWakeQueryText(extractedCmd);
+    const standbyCapMatch =
+      !isAmbiguousInterrogative && effectiveCmd
+        ? probeImplicitCapabilities(effectiveCmd, input.capabilityDigest)
+        : null;
     const standbyDirect =
+      !isAmbiguousInterrogative &&
       effectiveCmd.length > 0 &&
       (looksLikeDirectDeviceCommand(effectiveCmd) ||
         isCustomInstructionVoiceCommand(effectiveCmd) ||
@@ -1991,10 +2212,21 @@ export async function evaluateVoiceAttention(
     if (input.systemOneClient?.enabled) {
       const wakeWordsForCheck =
         input.wakeWords.length > 0 ? input.wakeWords : [input.acousticWake.wakeWord];
+      const aliasHint = buildSuspectedWakeAliasHint(cleaned, null, input.acousticWake);
       const s1 = await input.systemOneClient.evaluateWakeAttention(
         {
           utterance: cleaned,
           wakeWords: wakeWordsForCheck,
+          ...(aliasHint
+            ? {
+                suspectedWakeAlias: aliasHint,
+                acousticWake: {
+                  wakeWord: input.acousticWake.wakeWord,
+                  score: input.acousticWake.score,
+                  matched: true,
+                },
+              }
+            : {}),
         },
         {
           strict: input.attentionMode === "strict",
@@ -2051,8 +2283,8 @@ export async function evaluateVoiceAttention(
       }
     }
 
-    // 声学唤醒已命中但 SystemOne 未启用或暂不可用时的兜底：绝不再按“有效对话上下文”误拒，除明显第三人称提及外直接放行进入下一流程
-    if (isThirdPersonNeoMention(cleaned)) {
+    // 声学唤醒已命中但 SystemOne 未启用或暂不可用时的兜底：绝不再按“有效对话上下文”误拒，除明显第三人称提及或日常疑问句外直接放行进入下一流程
+    if (isThirdPersonNeoMention(cleaned) || isAmbiguousInterrogative) {
       return wrap({
         accept: false,
         wokeOnly: false,
@@ -2060,7 +2292,9 @@ export async function evaluateVoiceAttention(
         inConversation: false,
         confidence: 0.85,
         stage: "pragmatic-reject",
-        reason: `检测到对「${input.acousticWake.wakeWord}」的第三人称提及或讨论，判定为误唤醒`,
+        reason: isAmbiguousInterrogative
+          ? "判定为日常疑问句同音误触，非呼叫触发词"
+          : `检测到对「${input.acousticWake.wakeWord}」的第三人称提及或讨论，判定为误唤醒`,
         wakeWord: input.acousticWake.wakeWord,
         command: "",
         usedLlm: false,
