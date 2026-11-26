@@ -507,17 +507,6 @@ export interface UiVoiceSnapshot {
   dialogState?: "standby" | "conversation";
   conversationWindowSec?: number;
   conversationRemainingMs?: number;
-  conversationExitPhase?: "idle" | "holding" | "evaluating" | "countdown";
-  conversationEndDecision?: "continue" | "ready_to_end" | null;
-  conversationHoldReason?:
-    | "user_speaking"
-    | "audio_processing"
-    | "task_running"
-    | "tts_speaking"
-    | "pending_confirmation"
-    | "systemone_continue"
-    | "evaluating_end"
-    | null;
   serverNow?: number;
   timerPaused?: boolean;
   consecutiveSidetalkCount?: number;
@@ -1620,27 +1609,8 @@ export class PiAgentPanelController {
 
   private isDialogTimerPaused(): boolean {
     if (this.voiceState?.timerPaused === true) return true;
-    const phase = this.voiceState?.conversationExitPhase;
-    if (phase === "holding" || phase === "evaluating") return true;
-    if (this.voiceState?.lanes?.conversation.speechActive === true) return true;
     const mode = this.effectiveMode();
     return mode === "processing" || mode === "speaking" || this.activeTaskCount() > 0 || this.isSpeakingNow();
-  }
-
-  private getConversationHoldReason(): NonNullable<UiVoiceSnapshot["conversationHoldReason"]> | null {
-    if (this.voiceState?.conversationHoldReason) {
-      return this.voiceState.conversationHoldReason;
-    }
-    if (this.voiceState?.lanes?.conversation.speechActive) {
-      return "user_speaking";
-    }
-    if (this.voiceState?.conversationExitPhase === "evaluating") {
-      return "evaluating_end";
-    }
-    if (this.voiceState?.conversationExitPhase === "holding") {
-      return "systemone_continue";
-    }
-    return null;
   }
 
   private getRemainingDialogMs(): number {
@@ -1687,7 +1657,6 @@ export class PiAgentPanelController {
     const dialogState = this.effectiveDialogState();
     const execCount = this.activeTaskCount();
     const speaking = this.isSpeakingNow();
-    const holdReason = this.getConversationHoldReason();
     if (dialogState !== "conversation") {
       return "待唤醒";
     }
@@ -1697,23 +1666,8 @@ export class PiAgentPanelController {
     if (speaking) {
       return "对话中 · 播报";
     }
-    if (execCount > 0) {
+    if (execCount > 0 || this.isDialogTimerPaused()) {
       return execCount > 1 ? `对话中 · 并行${execCount}` : "对话中 · 执行";
-    }
-    if (holdReason === "user_speaking") {
-      return "对话中 · 聆听";
-    }
-    if (holdReason === "audio_processing") {
-      return "对话中 · 识别";
-    }
-    if (holdReason === "evaluating_end") {
-      return "对话中 · 判定";
-    }
-    if (holdReason === "pending_confirmation" || holdReason === "systemone_continue") {
-      return "对话中 · 持续";
-    }
-    if (this.isDialogTimerPaused()) {
-      return "对话中 · 持续";
     }
     if (!this.isWakeWordEnabled() || this.getConversationWindowSec() === 0) {
       return "对话中";
@@ -1727,7 +1681,6 @@ export class PiAgentPanelController {
     const wakeEnabled = this.isWakeWordEnabled();
     const execCount = this.activeTaskCount();
     const speaking = this.isSpeakingNow();
-    const holdReason = this.getConversationHoldReason();
 
     if (!isListening && dialogState !== "conversation") {
       return "非对话模式 · 未开启监听";
@@ -1744,25 +1697,10 @@ export class PiAgentPanelController {
     if (speaking) {
       return this.localClientState.ducked ? "对话模式 · 播报降音避让" : "对话模式 · 播报中（可随时说话）";
     }
-    if (execCount > 0) {
+    if (execCount > 0 || this.isDialogTimerPaused()) {
       return execCount > 1
         ? `对话模式 · 后台并行 ${execCount} 项（可继续对话）`
         : "对话模式 · 后台执行中（可继续对话）";
-    }
-    if (holdReason === "user_speaking") {
-      return "对话模式 · 正在聆听（保持对话态）";
-    }
-    if (holdReason === "audio_processing") {
-      return "对话模式 · 语音识别中（保持对话态）";
-    }
-    if (holdReason === "evaluating_end") {
-      return "对话模式 · SystemOne 判定对话状态中";
-    }
-    if (holdReason === "pending_confirmation") {
-      return "对话模式 · 等待确认回复";
-    }
-    if (holdReason === "systemone_continue" || this.isDialogTimerPaused()) {
-      return "对话模式 · 持续对话中（等待继续说话）";
     }
     const windowSec = this.getConversationWindowSec();
     if (windowSec === 0) {
@@ -1774,18 +1712,10 @@ export class PiAgentPanelController {
   private formatLivePillConversationText(): string {
     const execCount = this.activeTaskCount();
     const speaking = this.isSpeakingNow();
-    const holdReason = this.getConversationHoldReason();
     if (execCount > 0 && speaking) return `对话中 · 执行(${execCount}) · 播报中`;
     if (speaking) return "对话模式 · 播报中（可随时插话）";
-    if (execCount > 0) {
+    if (execCount > 0 || this.isDialogTimerPaused()) {
       return execCount > 1 ? `对话模式 · 并行执行 ${execCount} 项` : "对话模式 · 后台执行中";
-    }
-    if (holdReason === "user_speaking") return "对话模式 · 正在聆听";
-    if (holdReason === "audio_processing") return "对话模式 · 语音识别中";
-    if (holdReason === "evaluating_end") return "对话模式 · 判定对话状态中";
-    if (holdReason === "pending_confirmation") return "对话模式 · 等待确认回复";
-    if (holdReason === "systemone_continue" || this.isDialogTimerPaused()) {
-      return "对话模式 · 持续对话中";
     }
     if (!this.isWakeWordEnabled() || this.getConversationWindowSec() === 0) {
       return "免唤醒直达 · 持续对话";
