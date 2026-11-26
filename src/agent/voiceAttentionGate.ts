@@ -140,6 +140,10 @@ export interface AttentionDecision {
   passSource?: AttentionPassSource;
   /** 命中的家庭设备能力标签（例如 `美的可爱多·左筒 · 袜子筒`） */
   matchedCapability?: string;
+  /** 本次注意力判定是否实际调用了 SystemOne（用于下游避免串行二次等待） */
+  usedSystemOne?: boolean;
+  /** 本次注意力判定中 SystemOne 调用实际耗时（毫秒） */
+  systemOneLatencyMs?: number;
 }
 
 export interface WakeSpanMatch {
@@ -1775,16 +1779,16 @@ export async function evaluateVoiceAttention(
       });
     }
 
-    // A2. 精确非模糊句首呼唤 + 清晰控制指令或命中家庭设备隐式能力（smart 模式、无第三人称语境）-> 0ms 快速通道
+    // A2. 精确非模糊句首呼唤 + 清晰控制指令、显式设备控制指令或命中家庭设备隐式能力（smart 模式、无第三人称语境）-> 0ms 快速通道
     // 背景音乐下若后半句本身已命中明确智能家居域指令（如“Neo，停止播放音乐”），也 0ms 直通免等待云端往返
     if (
       !wakeSpan.fuzzy &&
       input.attentionMode === "smart" &&
       !hasReferentialBefore &&
       !hasReferentialAfter &&
-      (looksDirectCommand || Boolean(wakeCapMatch)) &&
+      (looksDirectCommand || Boolean(wakeCapMatch) || hasExplicitDeviceCmd) &&
       hasVocativeStart &&
-      (!isBgmContext || hasSmartHomeDomainIntent(trimmedCmd) || Boolean(wakeCapMatch))
+      (!isBgmContext || hasSmartHomeDomainIntent(trimmedCmd) || Boolean(wakeCapMatch) || hasExplicitDeviceCmd)
     ) {
       return wrap({
         accept: true,
@@ -1793,14 +1797,19 @@ export async function evaluateVoiceAttention(
         inConversation: true,
         confidence: isBgmContext ? 0.91 : 0.94,
         stage: "fast-wake",
-        passSource: wakeCapMatch && !looksDirectCommand ? "implicit_capability" : "explicit_command",
+        passSource:
+          wakeCapMatch && !looksDirectCommand
+            ? "implicit_capability"
+            : !looksDirectCommand && hasExplicitDeviceCmd
+              ? "device_command"
+              : "explicit_command",
         matchedCapability: wakeCapMatch?.matchedCapabilityLabel,
         reason:
           wakeCapMatch && !looksDirectCommand
             ? `句首呼唤「${wakeSpan.wakeWord}」并命中设备能力「${wakeCapMatch.matchedCapabilityLabel}」`
             : `句首明确呼唤「${wakeSpan.wakeWord}」并下达操作指令`,
         wakeWord: wakeSpan.wakeWord,
-        command: trimmedCmd,
+        command: !looksDirectCommand && hasExplicitDeviceCmd ? extractedDeviceCmd || trimmedCmd : trimmedCmd,
         usedLlm: false,
       });
     }
@@ -1916,6 +1925,8 @@ export async function evaluateVoiceAttention(
           wakeWord: wakeSpan.wakeWord,
           command: extractedCmd,
           usedLlm: true,
+          usedSystemOne: true,
+          systemOneLatencyMs: s1.latencyMs,
         });
       }
       const fk = input.systemOneClient.lastFailureKind;
@@ -2106,9 +2117,9 @@ export async function evaluateVoiceAttention(
       });
     }
 
-    // B2.5. 连续对话中的明确直接智能家居控制指令、语音附加指令规则或命中家庭设备隐式能力（smart 模式、非 BGM）：
+    // B2.5. 连续对话中的明确直接智能家居控制指令、显式续聊调节、语音附加指令规则或命中家庭设备隐式能力（smart 模式、非 BGM）：
     // 借鉴 Home Assistant 本地确定性意图优先原则，0ms 直通免等待云端 SystemOne 往返；
-    // 隐式情感/无设备匹配语句与家庭闲聊仍交由 SystemOne 语义决策。
+    // 隐式情感/无设备匹配语句（如“有点暗”“有点刺眼”）与家庭闲聊仍交由 SystemOne 语义决策。
     const isClearDeviceCmd = isClearConversationCommand(cmd);
     const isCustomRuleCmd = isCustomInstructionVoiceCommand(cmd) && cmd.length <= 160;
     const convCapMatch = probeImplicitCapabilities(cmd, input.capabilityDigest);
@@ -2118,12 +2129,17 @@ export async function evaluateVoiceAttention(
           /^(?:请|帮我|给我|替我|麻烦|开启|启动|打开|关|停|洗|烘|扫|拖|浇|喂)/.test(cmd) ||
           input.learnedTriggers?.some((t) => t && cmd.includes(t))),
     );
+    const isClearFollowupFastCmd =
+      (cmd.length <= 36 &&
+        isClearDeviceCmd &&
+        (DIRECT_COMMAND_START_RE.test(cmd) ||
+          CLEAR_FOLLOWUP_RE.test(cmd) ||
+          STANDALONE_CONVERSATION_CMD_RE.test(cmd))) ||
+      hasExplicitDeviceControlCommand(cmd, input.capabilityDigest);
     if (
       input.attentionMode === "smart" &&
       !isBgmConv &&
-      ((cmd.length <= 18 && DIRECT_COMMAND_START_RE.test(cmd) && isClearDeviceCmd) ||
-        isCustomRuleCmd ||
-        strongImplicitCap)
+      (isClearFollowupFastCmd || isCustomRuleCmd || strongImplicitCap)
     ) {
       return wrap({
         accept: true,
@@ -2152,6 +2168,7 @@ export async function evaluateVoiceAttention(
     }
 
     // B3. 主通道：SystemOne 5 轮连续对话决策（karpo/karpo-decision-31b）
+    // 优化：不额外附带未用于路由的 intent 问题，将单次请求从 2 个问题精简为 1 个核心问题（conv_action）以显著降低 31B 推理延迟
     let sysOneTransientFailure = false;
     if (input.systemOneClient?.enabled) {
       const recentHistory = (input.recentTurns ?? []).slice(-5).map((t) => ({
@@ -2194,7 +2211,7 @@ export async function evaluateVoiceAttention(
           capabilityDigestHash: input.capabilityDigest?.topologyHash,
         },
         {
-          includeIntent: true,
+          includeIntent: false,
           strict: input.attentionMode === "strict",
         },
       );
@@ -2260,6 +2277,8 @@ export async function evaluateVoiceAttention(
             wakeWord: null,
             command: effectiveCmd,
             usedLlm: true,
+            usedSystemOne: true,
+            systemOneLatencyMs: s1.latencyMs,
             ...intentFields,
             ...selectedFields,
           });
@@ -2280,6 +2299,8 @@ export async function evaluateVoiceAttention(
             wakeWord: input.acousticWake.wakeWord,
             command: effectiveCmd,
             usedLlm: true,
+            usedSystemOne: true,
+            systemOneLatencyMs: s1.latencyMs,
             ...intentFields,
             ...selectedFields,
           });
@@ -2352,6 +2373,8 @@ export async function evaluateVoiceAttention(
               wakeWord: null,
               command: effectiveCmd,
               usedLlm: true,
+              usedSystemOne: true,
+              systemOneLatencyMs: s1.latencyMs,
               ...intentFields,
               ...selectedFields,
             });
@@ -2602,6 +2625,8 @@ export async function evaluateVoiceAttention(
           wakeWord: input.acousticWake.wakeWord,
           command: finalCmd,
           usedLlm: true,
+          usedSystemOne: true,
+          systemOneLatencyMs: s1.latencyMs,
         });
       }
       if (input.attentionMode === "strict") {
@@ -2690,6 +2715,8 @@ export async function evaluateVoiceAttention(
           wakeWord: null,
           command: cleanDeviceCmd || standbyText,
           usedLlm: true,
+          usedSystemOne: true,
+          systemOneLatencyMs: s1.latencyMs,
         });
       }
       return wrap({
@@ -2758,6 +2785,8 @@ export async function evaluateVoiceAttention(
         wakeWord: null,
         command: stripLeadingControlFiller(standbyText),
         usedLlm: true,
+        usedSystemOne: true,
+        systemOneLatencyMs: s1.latencyMs,
       });
     }
   }

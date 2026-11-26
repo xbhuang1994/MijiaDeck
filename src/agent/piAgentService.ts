@@ -171,6 +171,7 @@ import {
   evaluateSilentControlReply,
 } from "./silentControlReplyPolicy.ts";
 import {
+  classifyDeterministicTaskAck,
   inferFallbackTaskAckScenario,
   resolveTaskAckPhrase,
   stripDuplicatedAckPrefix,
@@ -378,6 +379,8 @@ export interface VoicePromptMeta {
   wakeWord?: string | null;
   attentionReason?: string;
   intent?: CommandIntentChoice;
+  /** 若注意力门控阶段已调用过 SystemOne，记录其耗时以便应答阶段避免二次串行阻塞 */
+  attentionSystemOneMs?: number;
 }
 
 export interface PiAgentRunResult {
@@ -458,6 +461,9 @@ export interface PiAgentServiceOptions {
 }
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+const TASK_ACK_AUTO_TIMEOUT_MS = 650;
+const TASK_ACK_POST_ATTENTION_SKIP_MS = 450;
+const LLM_PRECONNECT_MIN_INTERVAL_MS = 15_000;
 
 function createErrorStream(model: Model<Api>, message: string): ReturnType<typeof createAssistantMessageEventStream> {
   const stream = createAssistantMessageEventStream();
@@ -933,6 +939,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   private _systemPromptRefreshes = 0;
   private _historyCompactions = 0;
   private _lastError: string | null = null;
+  private _lastLlmPreconnectAtMs = 0;
   private _entrySeq = 0;
   private _taskSeq = 0;
 
@@ -2573,14 +2580,45 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   }
 
   /**
-   * Step 0：调用 SystemOne（karpo/karpo-decision-31b）快速判断用户输入所属场景并匹配简短应答词；
-   * 若 SystemOne 未启用、离线、熔断、超时或置信度不足，平滑降级为轻量规则兜底，绝不阻塞主流程。
+   * 预热 SystemOne 与主云端 LLM 网关的 TCP/TLS 连接（带节流保护），在唤醒命中、开口说话与任务提交前提前握手。
+   */
+  preconnectEndpoints(): void {
+    this._systemOne?.preconnect();
+    this._preconnectMainLlm();
+  }
+
+  private _preconnectMainLlm(): void {
+    if (this._config.provider === "local" || this._customStreamFn) return;
+    const baseUrl = this._currentModel.baseUrl?.trim();
+    if (!baseUrl) return;
+    const nowMs = Date.now();
+    if (nowMs - this._lastLlmPreconnectAtMs < LLM_PRECONNECT_MIN_INTERVAL_MS) {
+      return;
+    }
+    this._lastLlmPreconnectAtMs = nowMs;
+    try {
+      const origin = new URL(baseUrl).origin;
+      globalThis.fetch.preconnect?.(origin);
+    } catch {
+      // 忽略预连接异常
+    }
+  }
+
+  /**
+   * Step 0：判断用户输入所属场景并匹配简短应答词：
+   * - `systemOneMode === "auto"`（默认）：
+   *   1) 明确无歧义的指令/查询/创作/场景/排错/紧急停止/记规则/安全确认/问候走 0ms 本地确定性快路径；
+   *   2) 已沉淀 Skill 命中或开启 `preferLocalIntents` 命中本地规划器时免云端往返；
+   *   3) 若注意力门控刚消耗了显著 SystemOne 延迟（>=450ms）或网关处于拥塞窗口，直接 0ms 本地兜底避免二次串行阻塞；
+   *   4) 仅对真正语义含糊的表达调用 SystemOne，并启用有界软超时（<=650ms）与 5 分钟正结果缓存；
+   * - `systemOneMode === "on"`（强制模式）：始终优先调用 SystemOne（共享精简 Prompt、5 分钟缓存与在途合并）。
    */
   private async _resolveTaskAck(
     text: string,
     source: "text" | "voice",
     recentHistory: ReadonlyArray<{ role: "user" | "assistant"; text: string }>,
     signal: AbortSignal,
+    voiceMeta?: VoicePromptMeta | null,
   ): Promise<{
     scenario: TaskAckScenario;
     text: string;
@@ -2588,26 +2626,83 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
     confidence?: number;
     latencyMs?: number;
   }> {
-    // 当用户显式开启 preferLocalIntents（0ms 本地快路径）且 systemOneMode 并非强制 "on" 时，
-    // 若本地确定性规划器已直接命中，免去云端 SystemOne 往返以维持零云端调用承诺
-    const skipSystemOneForLocalFastPath =
-      this._config.preferLocalIntents === true &&
-      this._config.systemOneMode !== "on" &&
-      Boolean(
-        planDeterministicLocalCalls(
-          text,
-          {
-            getDevices: () => this._deps.mainWindow.activeDevices(),
-            getScenes: () => (SCENES_FEATURE_ENABLED ? (this._deps.mainWindow.scenes ?? []) : []),
-            getCustomInstructions: () => loadEnabledCustomInstructions(),
-            getLegacySystemPromptExtra: () => this._config.systemPromptExtra,
-          },
-          findRecentDeviceFromMessages(this._agent.state.messages),
-        ),
+    this._preconnectMainLlm();
+
+    const isForcedSystemOne = this._config.systemOneMode === "on";
+    const activeDevices = this._deps.mainWindow.activeDevices();
+
+    if (!isForcedSystemOne) {
+      // 1) 0ms 本地高置信场景快路径（覆盖绝大多数清晰设备控制/查询/问候/场景/创作/排错/紧急停止/安全指令）
+      const deterministic = classifyDeterministicTaskAck(text);
+      if (deterministic) {
+        return {
+          scenario: deterministic.scenario,
+          text: resolveTaskAckPhrase(deterministic.scenario, text),
+          source: "fallback",
+          confidence: deterministic.confidence,
+          latencyMs: 0,
+        };
+      }
+
+      // 2) 当用户显式开启 preferLocalIntents 且本地规划器已命中，或已命中可复用 Skill 时，免去云端应答往返
+      const hasMatchedSkill = Boolean(
+        matchAgentSkill(text, activeDevices) &&
+          !hasApplicableCustomInstructions(text, loadEnabledCustomInstructions(), ""),
       );
+      if (hasMatchedSkill) {
+        const fallbackScenario = inferFallbackTaskAckScenario(text);
+        return {
+          scenario: fallbackScenario,
+          text: resolveTaskAckPhrase(fallbackScenario, text),
+          source: "fallback",
+          latencyMs: 0,
+        };
+      }
+
+      if (
+        this._config.preferLocalIntents === true &&
+        Boolean(
+          planDeterministicLocalCalls(
+            text,
+            {
+              getDevices: () => activeDevices,
+              getScenes: () => (SCENES_FEATURE_ENABLED ? (this._deps.mainWindow.scenes ?? []) : []),
+              getCustomInstructions: () => loadEnabledCustomInstructions(),
+              getLegacySystemPromptExtra: () => this._config.systemPromptExtra,
+            },
+            findRecentDeviceFromMessages(this._agent.state.messages),
+          ),
+        )
+      ) {
+        const fallbackScenario = inferFallbackTaskAckScenario(text);
+        return {
+          scenario: fallbackScenario,
+          text: resolveTaskAckPhrase(fallbackScenario, text),
+          source: "fallback",
+          latencyMs: 0,
+        };
+      }
+    }
 
     const client = this._systemOne;
-    if (client?.enabled && !skipSystemOneForLocalFastPath && !signal.aborted) {
+    const attentionSpentMs =
+      typeof voiceMeta?.attentionSystemOneMs === "number" &&
+      Number.isFinite(voiceMeta.attentionSystemOneMs)
+        ? Math.max(0, voiceMeta.attentionSystemOneMs)
+        : 0;
+    const skipForBudgetOrCongestion =
+      !isForcedSystemOne &&
+      Boolean(
+        client &&
+          (client.isCongestedForNonCritical ||
+            attentionSpentMs >= TASK_ACK_POST_ATTENTION_SKIP_MS),
+      );
+
+    if (client?.enabled && !skipForBudgetOrCongestion && !signal.aborted) {
+      const autoBudgetMs = Math.min(
+        this._config.systemOneTimeoutMs || 2000,
+        Math.max(250, TASK_ACK_AUTO_TIMEOUT_MS - Math.round(attentionSpentMs * 0.5)),
+      );
       try {
         const classified = await client.classifyTaskAck(
           {
@@ -2615,7 +2710,9 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
             recentHistory,
             source,
           },
-          { signal },
+          isForcedSystemOne
+            ? { signal }
+            : { signal, timeoutMs: autoBudgetMs, softTimeout: true },
         );
         if (classified && classified.confident) {
           return {
@@ -3678,7 +3775,13 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
         ctx.ackText = "";
         assistantEntry.ackText = "";
       } else {
-        const ackDecision = await this._resolveTaskAck(text, source, ctx.priorHistory, signal);
+        const ackDecision = await this._resolveTaskAck(
+          text,
+          source,
+          ctx.priorHistory,
+          signal,
+          ctx.voiceMeta,
+        );
         if (signal.aborted) {
           assistantEntry.status = "aborted";
           assistantEntry.text = "已中断当前操作。";

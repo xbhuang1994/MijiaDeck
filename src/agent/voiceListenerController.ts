@@ -833,6 +833,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     if (speaking) {
       if (!wasSpeaking) {
         this._speechActivityStartedAt = now;
+        // 开口瞬间提前预热 SystemOne 与主 LLM 的 TCP/TLS 连接，消除语音识别结束后的冷连接握手延迟
+        this._agent.preconnectEndpoints();
       }
     } else {
       this._speechActivityStartedAt = null;
@@ -869,6 +871,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
 
   recordWakeWordSpot(hit: WakeWordAcousticHit): void {
     this._lastWakeHit = { ...hit, timestamp: Date.now() };
+    // 声学唤醒词命中的瞬间（比整句 ASR 结束早 1~3 秒）提前预热 SystemOne 与主 LLM 的 TCP/TLS 连接
+    this._agent.preconnectEndpoints();
   }
 
   /**
@@ -1013,8 +1017,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         this._error = null;
       }
       if (this._active) {
-        // 开启监听时预连接 SystemOne 网关，并异步分片预热本地 ONNX 模型（含主声纹 VoxLock）、温柔女声 TTS 与 openWakeWord 零样本原型
-        this._agent.systemOneClient?.preconnect();
+        // 开启监听时预连接 SystemOne 与主 LLM 网关，并异步分片预热本地 ONNX 模型（含主声纹 VoxLock）、温柔女声 TTS 与 openWakeWord 零样本原型
+        this._agent.preconnectEndpoints();
         const hasAsciiWake = this.config.wakeWords.some((w) => /^[a-z][a-z0-9\s-]*$/i.test(w.trim()));
         void this._localEngine.warmup({
           preloadEnglish: hasAsciiWake,
@@ -1500,6 +1504,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         wakeWord: decision.wakeWord,
         attentionReason: decision.reason,
         ...(decision.intent ? { intent: decision.intent } : {}),
+        ...(decision.usedSystemOne
+          ? { attentionSystemOneMs: decision.systemOneLatencyMs ?? decision.latencyMs }
+          : {}),
       },
     });
     this.emit("stateChanged", this.snapshot());

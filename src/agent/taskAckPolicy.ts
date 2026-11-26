@@ -43,7 +43,7 @@ export const TASK_ACK_SCENARIO_CATALOG: Readonly<Record<TaskAckScenario, TaskAck
     zh: TASK_ACK_TEXT,
     en: "Okay",
     criteria:
-      "明确且直接的常规设备控制或家电执行指令（如打开/关闭灯光、调亮度/色温/音量、调空调温度或模式、开关窗帘、帮我洗一下衣服/启动洗衣机、宠物喂食、播放或切歌、设闹钟、删除已有规则等），以及隐式体感调节需求（如太暗了、太刺眼、太热了、太吵了）。",
+      "直接或隐式设备控制调节（开关/亮度/色温/温度/音量/洗衣/喂食/播放/删规则/太暗太热太吵）。",
   },
   query_status: {
     id: "query_status",
@@ -51,7 +51,7 @@ export const TASK_ACK_SCENARIO_CATALOG: Readonly<Record<TaskAckScenario, TaskAck
     zh: "稍等我看一下",
     en: "Let me check",
     criteria:
-      "仅查询或询问信息、不要求立即修改设备状态（如空调设置的多少度、客厅现在温湿度多少、某设备是否开着、洗衣机还剩多久、哪些灯开着/离线、全屋设备盘点、天气查询、或查看已保存的偏好规则）。",
+      "仅查状态或信息不改设备（温湿度/设定温度/开关状态/剩余时间/离线盘点/天气/查规则）。",
   },
   think_creative: {
     id: "think_creative",
@@ -59,7 +59,7 @@ export const TASK_ACK_SCENARIO_CATALOG: Readonly<Record<TaskAckScenario, TaskAck
     zh: "让我想想",
     en: "Let me think",
     criteria:
-      "需要动脑思考、创意生成、知识科普、出主意或趣味互动的请求（如给我讲个笑话、讲个故事、写诗、脑筋急转弯、百科原理提问、晚上吃什么、生活建议、方案推荐或比较不同模式区别）。",
+      "需思考创意或科普问答（笑话/故事/写诗/原理提问/吃什么/建议推荐/方案对比）。",
   },
   scene_routine: {
     id: "scene_routine",
@@ -67,7 +67,7 @@ export const TASK_ACK_SCENARIO_CATALOG: Readonly<Record<TaskAckScenario, TaskAck
     zh: "马上安排",
     en: "On it",
     criteria:
-      "涉及多设备联动编排、生活作息模式或整屋场景切换（如回家模式、离家、准备睡觉、起床、观影模式、会客、午休、下雨联动、全屋准备休息等需统筹多台设备的安排）；单台常规家电控制（如打开灯光、帮我洗一下衣服）归入 execute_control。",
+      "多设备联动场景或作息模式（回家/离家/睡觉/起床/观影/全屋关灯）；单台家电归 execute_control。",
   },
   troubleshoot: {
     id: "troubleshoot",
@@ -75,7 +75,7 @@ export const TASK_ACK_SCENARIO_CATALOG: Readonly<Record<TaskAckScenario, TaskAck
     zh: "我来排查一下",
     en: "Let me look into it",
     criteria:
-      "反馈设备故障、质疑上次控制未生效或询问异常原因（如灯怎么打不开、为什么空调没反应、洗衣机报错了、刚才好像没关掉、设备是不是离线或断网了）。",
+      "反馈设备故障、质疑未生效或查异常原因（打不开/没反应/报错/刚才没关掉/离线）。",
   },
   urgent_cancel: {
     id: "urgent_cancel",
@@ -83,7 +83,7 @@ export const TASK_ACK_SCENARIO_CATALOG: Readonly<Record<TaskAckScenario, TaskAck
     zh: "马上处理",
     en: "Right away",
     criteria:
-      "要求紧急停止、立即中止播放或出水、撤销或纠正刚发生的误操作（如快停下、别放了、赶紧关掉、不对我说的是卧室的灯、搞错了撤回刚才的操作）。",
+      "紧急停止、中止播放或撤销纠正刚发生的误操作（快停下/别放了/搞错了/撤回操作）。",
   },
   remember_rule: {
     id: "remember_rule",
@@ -91,7 +91,7 @@ export const TASK_ACK_SCENARIO_CATALOG: Readonly<Record<TaskAckScenario, TaskAck
     zh: "明白，我记一下",
     en: "Got it, noting that",
     criteria:
-      "用户明确交代以后要长期记住的个人习惯、默认参数或条件规则（如“以后记得洗衣默认用智洗烘模式”“记住以后开空调先看室外温度”）；仅查询规则归入 query_status，删除规则归入 execute_control。",
+      "交代记住长期个人习惯或默认条件规则（以后记得.../记住默认...）；查规则归 query_status。",
   },
   safety_confirm: {
     id: "safety_confirm",
@@ -99,7 +99,7 @@ export const TASK_ACK_SCENARIO_CATALOG: Readonly<Record<TaskAckScenario, TaskAck
     zh: "先确认一下",
     en: "Let's check first",
     criteria:
-      "涉及安防隐私或破坏性高风险操作，需谨慎核实后再执行（如智能门锁开锁/改密、关闭监控摄像头、设备恢复出厂设置/格式化/重置、解除童锁、全屋总电源断电等）；普通开关灯、调空调、洗衣服不属于此类。",
+      "安防隐私或破坏性高危操作（门锁开锁改密/关摄像头/恢复出厂/解童锁/断总电）。",
   },
   greeting_chat: {
     id: "greeting_chat",
@@ -107,7 +107,7 @@ export const TASK_ACK_SCENARIO_CATALOG: Readonly<Record<TaskAckScenario, TaskAck
     zh: "在呢",
     en: "I'm here",
     criteria:
-      "单纯打招呼、寒暄问候、表达感谢或确认助手是否在线（如你好、早上好、晚安、在吗、辛苦了、谢谢你），不包含具体设备指令、状态查询或需要思考解答的问题。",
+      "单纯打招呼、寒暄问候、道谢或问在吗，不含具体设备指令或问答。",
   },
 };
 
@@ -123,7 +123,7 @@ export const TASK_ACK_QUESTION: {
 } = {
   type: "choice",
   instructions:
-    "你是智能家居语音与对话助手。收到用户输入后、开始执行工具或组织正式回复之前，请快速判断该输入属于哪一类场景，以便立刻给出最自然贴切的简短首次应答词（例如：打开灯光/帮我洗一下衣服->execute_control，空调设置的多少度->query_status，给我讲个笑话->think_creative）。支持中英文，可结合 history 理解省略主语的追问。",
+    "智能家居助手首次简短应答场景分类（中英文，结合 history 理解省略主语追问），选最贴切场景。",
   criteria: {
     execute_control: TASK_ACK_SCENARIO_CATALOG.execute_control.criteria,
     query_status: TASK_ACK_SCENARIO_CATALOG.query_status.criteria,
@@ -178,6 +178,68 @@ const RE_FALLBACK_SCENE_ROUTINE =
 
 const RE_FALLBACK_GREETING =
   /^(?:你好|您好|早上好|早安|上午好|中午好|下午好|晚上好|晚安|嗨|哈喽|嘿|在吗|在不在|辛苦了|辛苦啦|谢谢你?|多谢|陪我聊聊天|hi|hello|hey|good\s+(?:morning|afternoon|evening|night)|thanks?|thank\s+you)[呀啊哦呢啦吧吗!！?？。.\s~～]*$/i;
+
+const RE_CLEAR_CONTROL_INTERROGATIVE_GUARD =
+  /(?:[?？吗嘛么]\s*$|为什么|为啥|怎么(?:办|样|选|弄)|是不是|有没有|能不能|可不可以|好不好|适合.*吗|还是.*好)/;
+
+// 自包含、无需额外设备名词即可确定属于 execute_control 的明确控制动作
+const RE_SELF_CONTAINED_EXECUTE_CONTROL =
+  /(?:开灯|关灯|熄灯|灭灯|亮灯|开空调|关空调|开风扇|关风扇|开电视|关电视|开窗帘|关窗帘|拉上?窗帘|拉开窗帘|开音箱|关音箱|开加湿器|关加湿器|开净化器|关净化器|开除湿机|关除湿机|开浴霸|关浴霸|开洗衣机|关洗衣机|开扫地机|关扫地机|开插座|关插座|放歌|放音乐|播音乐|播放(?:一点|点|一首|首|一下)?(?:音乐|歌)|切歌|换歌|换一首|换首歌|下一首|上一首|下一曲|上一曲|暂停播放|继续播放|停止播放|^(?:请|帮我|给我|麻烦)?(?:暂停|继续|静音|取消静音|解除静音|恢复声音|闭麦|开麦|关了吧|开一下|打开吧|大声一点|小声一点|大声点|小声点|调亮一点|调暗一点|亮一点|暗一点|再亮一点|再暗一点|稍微亮一点|稍微暗一点)(?:吧|一下)?$|调高音量|调低音量|调大音量|调小音量|调大声音|调小声音|声音大一点|声音小一点|大声一点|小声一点|大声点|小声点|调亮|调暗|洗(?:一下|个)?(?:衣服|袜子|内裤)|扫地|拖地|回充|出粮|投喂|喂猫|喂狗|浇花|删除.*(?:规则|指令)|(?:太暗|有点暗|太亮|有点亮|太刺眼|有点刺眼|太热|有点热|太冷|有点冷|太吵|有点吵|声音太大|声音太小|听不清)|\b(?:turn\s+(?:on|off)|switch\s+(?:on|off)|set\s+(?:the\s+)?(?:temp|temperature|brightness|volume|ac|light)|dim|brighten|play\s+(?:some\s+)?music|pause\s+music|mute|unmute|next\s+song|previous\s+song|too\s+(?:dark|bright|loud|hot|cold))\b)/i;
+
+const RE_GENERAL_CONTROL_VERB =
+  /(?:打开|关闭|关掉|关上|开启|启动|暂停|继续|停止|调高|调低|调大|调小|调到|调成|调为|调至|设为|设成|设到|设定|亮一点|暗一点|大一点|小一点|高一点|低一点|暖一点|冷一点|烘干|脱水)/i;
+
+const RE_EXECUTE_CONTROL_DOMAIN =
+  /(?:灯|照明|空调|风扇|窗帘|电视|投影|音箱|音响|小爱|音量|声音|音乐|歌|播放|静音|亮度|色温|暖光|冷光|洗衣|洗烘|烘干|袜子|内裤|扫地|拖地|加湿|除湿|净化|浴霸|热水器|插座|开关|喂食|出粮|喂猫|喂狗|浇花|规则|指令|\b(?:lights?|lamps?|ac|air\s*conditioner|fan|curtains?|tv|speaker|volume|music|washer|vacuum|brightness|temp|temperature)\b)/i;
+
+const RE_CONTEXT_DEPENDENT_ACK_START =
+  /^(?:那|这|它|再|还|也|刚才|刚刚|上面|上一个|那个|这个|为什么|为啥|怎么|那以后|以后|下次|但是|不过|可是|所以|对了|顺便|嗯+|好吧|行吧|算了|and\b|then\b|also\b|what\s+about\b|how\s+about\b|it\b|that\b)/i;
+
+export interface DeterministicTaskAckMatch {
+  scenario: TaskAckScenario;
+  confidence: number;
+}
+
+/**
+ * 0ms 高置信本地场景分类器（用于 `systemOneMode === "auto"` 跳过清晰明确指令的云端 SystemOne 往返）：
+ * - 命中明确无歧义的常规控制/查询/创作/场景/排错/紧急停止/记规则/高危安全/问候时直接返回高置信场景；
+ * - 对含糊、开放式或依赖上文语境的口语表达返回 `null`，交由 SystemOne 语义判定。
+ */
+export function classifyDeterministicTaskAck(utterance: string): DeterministicTaskAckMatch | null {
+  const clean = utterance.trim();
+  if (!clean) return null;
+
+  if (RE_FALLBACK_SAFETY.test(clean)) return { scenario: "safety_confirm", confidence: 0.96 };
+  if (RE_FALLBACK_URGENT_CANCEL.test(clean)) return { scenario: "urgent_cancel", confidence: 0.95 };
+  if (RE_FALLBACK_REMEMBER_RULE.test(clean)) return { scenario: "remember_rule", confidence: 0.95 };
+  if (RE_FALLBACK_TROUBLESHOOT.test(clean)) return { scenario: "troubleshoot", confidence: 0.92 };
+  if (RE_FALLBACK_THINK_CREATIVE.test(clean)) return { scenario: "think_creative", confidence: 0.92 };
+  if (RE_FALLBACK_QUERY_STATUS.test(clean)) return { scenario: "query_status", confidence: 0.92 };
+  if (RE_FALLBACK_SCENE_ROUTINE.test(clean)) return { scenario: "scene_routine", confidence: 0.92 };
+  if (RE_FALLBACK_GREETING.test(clean)) return { scenario: "greeting_chat", confidence: 0.95 };
+
+  if (!RE_CLEAR_CONTROL_INTERROGATIVE_GUARD.test(clean)) {
+    if (RE_SELF_CONTAINED_EXECUTE_CONTROL.test(clean)) {
+      return { scenario: "execute_control", confidence: 0.92 };
+    }
+    if (RE_GENERAL_CONTROL_VERB.test(clean) && RE_EXECUTE_CONTROL_DOMAIN.test(clean)) {
+      return { scenario: "execute_control", confidence: 0.92 };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * 判断该输入用于 `classifyTaskAck` 缓存时是否语义自包含（不依赖上文历史），
+ * 自包含指令可跨对话轮次共享短 TTL 缓存以消除重复 SystemOne 调用。
+ */
+export function isSelfContainedTaskAckUtterance(utterance: string): boolean {
+  const clean = utterance.trim();
+  if (clean.length < 4) return false;
+  if (RE_CONTEXT_DEPENDENT_ACK_START.test(clean)) return false;
+  return true;
+}
 
 /**
  * 当 SystemOne 不可用、关闭或置信度不足时的轻量离线兜底场景推断（<0.1ms）。
