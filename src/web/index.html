@@ -818,12 +818,13 @@
 
           <div class="setting-card setting-card-wrap" id="voice-pipeline-status-card">
             <div class="setting-info">
-              <div class="setting-label">语音 AI 引擎状态（本地 Sherpa-ONNX · 讯飞听写大模型 2.0）</div>
-              <div class="setting-desc" id="voice-pipeline-status-desc">本机轻量运行 SenseVoice 识别、GTCRN / DPDFNet4 降噪、Silero VAD、3D-Speaker 声纹、openWakeWord 唤醒与 Matcha TTS，可选切换讯飞语音听写大模型 2.0 在线识别</div>
+              <div class="setting-label">语音 AI 引擎状态（本地 Sherpa-ONNX · 讯飞听写 2.0 · 统一流式听写网关）</div>
+              <div class="setting-desc" id="voice-pipeline-status-desc">本机轻量运行 SenseVoice 识别、GTCRN / DPDFNet4 降噪、Silero VAD、3D-Speaker 声纹、openWakeWord 唤醒与 Matcha TTS，可选切换讯飞语音听写大模型 2.0 或统一流式语音听写 WebSocket 网关</div>
             </div>
             <div class="voice-status-row">
               <div class="voice-status-badges" id="voice-model-badges">
                 <span class="voice-badge-pill" id="badge-model-xfyun-iat">讯飞听写 2.0 (在线)</span>
+                <span class="voice-badge-pill" id="badge-model-voice-ws-asr">统一流式听写 (在线)</span>
                 <span class="voice-badge-pill" id="badge-model-asr">SenseVoice 识别</span>
                 <span class="voice-badge-pill" id="badge-model-gtcrn">GTCRN 降噪</span>
                 <span class="voice-badge-pill" id="badge-model-dpdfnet">DPDFNet4 强噪</span>
@@ -864,12 +865,44 @@
           <div class="setting-card" id="setting-row-voice-pipeline">
             <div class="setting-info">
               <div class="setting-label">语音前端与识别方案</div>
-              <div class="setting-desc" id="set-voice-pipeline-desc">可在原方案（GTCRN / 声源分离 + 本地 SenseVoice）与讯飞语音听写大模型 2.0 方案（openWakeWord 唤醒后直接推送原始音频至讯飞 WebSocket，不做额外处理）间自由切换</div>
+              <div class="setting-desc" id="set-voice-pipeline-desc">可在原方案（GTCRN / 声源分离 + 本地 SenseVoice）、讯飞语音听写大模型 2.0 与统一流式语音听写网关（openWakeWord 唤醒后直推 16kHz 原始音频至 WebSocket 网关）间自由切换</div>
             </div>
             <select id="set-voice-pipeline-mode" class="md-select" aria-label="语音前端与识别方案">
               <option value="legacy">原方案（GTCRN / 声源分离 + 本地 SenseVoice）</option>
               <option value="xfyun">讯飞语音听写大模型 2.0（openWakeWord 唤醒后直推原始音频）</option>
+              <option value="voice-ws">统一流式语音听写网关（openWakeWord 唤醒后直推原始音频）</option>
             </select>
+          </div>
+
+          <div class="setting-card setting-card-wrap" id="setting-row-voice-ws-asr">
+            <div class="setting-info">
+              <div class="setting-label">统一流式语音听写网关配置（Unified Streaming WS ASR）</div>
+              <div class="setting-desc" id="set-voice-ws-asr-desc">切换至「统一流式语音听写网关」方案后，openWakeWord 命中唤醒词即刻以 Binary Frame 直推 16kHz 原始 PCM 至 WebSocket 网关，由服务端 CPU ONNX（GTCRN 降噪 + Silero VAD v5）过滤静音并增量流式识别；授权码仅保存于本机配置文件</div>
+            </div>
+            <div class="systemone-grid">
+              <div class="systemone-row">
+                <input type="text" id="set-voice-ws-asr-endpoint-url" class="md-text-input" placeholder="WebSocket 地址（默认 wss://voice.1inch.cn:18443/v1/ws/asr）" spellcheck="false" aria-label="统一流式语音听写网关地址">
+                <select id="set-voice-ws-asr-language" class="md-select" aria-label="统一流式听写识别语言">
+                  <option value="">自动识别语言（默认 · 支持 30 种语言）</option>
+                  <option value="zh">中文（zh）</option>
+                  <option value="en">英文（en）</option>
+                  <option value="ja">日语（ja）</option>
+                  <option value="yue">粤语（yue）</option>
+                </select>
+              </div>
+              <div class="systemone-row">
+                <select id="set-voice-ws-asr-denoise" class="md-select" aria-label="服务端 GTCRN 降噪开关">
+                  <option value="true">服务端 GTCRN 降噪：开启（推荐）</option>
+                  <option value="false">服务端 GTCRN 降噪：关闭（直通原始音频）</option>
+                </select>
+              </div>
+              <div class="agent-key-row">
+                <input type="password" id="set-voice-ws-asr-auth-code" class="md-text-input" placeholder="网关授权码（留空保持不变）" autocomplete="off" aria-label="统一流式语音听写网关授权码">
+                <button type="button" id="set-voice-ws-asr-clear-code-btn" class="secondary-button btn-compact" hidden>清除</button>
+                <button type="button" id="set-voice-ws-asr-test-btn" class="secondary-button btn-compact" title="测试统一流式语音听写 WebSocket 网关鉴权与连通性">测试连接</button>
+              </div>
+              <div id="set-voice-ws-asr-test-result" class="agent-inst-status" hidden></div>
+            </div>
           </div>
 
           <div class="setting-card setting-card-wrap" id="setting-row-xfyun-iat">

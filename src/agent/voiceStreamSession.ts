@@ -17,9 +17,14 @@
  *   -> 双轨 SenseVoice 融合识别 + 3D-Speaker 声纹 + 抗歌词唤醒词注意力门控 -> Pi Agent
  */
 
-import type { VadSensitivityMode, VoicePipelineMode } from "../core/agentConfigStore.ts";
+import type {
+  EchoCancellationMode,
+  VadSensitivityMode,
+  VoicePipelineMode,
+} from "../core/agentConfigStore.ts";
 import { sanitizeAsrTranscript } from "./asrHallucinationGuard.ts";
 import { computeRms, estimateSnrDb, hasAudibleAudioEnergy, resampleLinear } from "./audioPcm.ts";
+import { AcousticEchoCanceller } from "./echoCanceller.ts";
 import type {
   LocalVoiceEngine,
   OnlineDenoiserHandleLike,
@@ -43,6 +48,7 @@ import {
 } from "./voiceCommandSegmenter.ts";
 import type { ProcessAudioUploadResult } from "./voiceListenerController.ts";
 import { listVoiceprintRefWavPaths } from "./voiceprintStore.ts";
+import type { VoiceWsAsrStreamSession } from "./voiceWsAsrRuntime.ts";
 import type { XfyunIatV2StreamSession } from "./xfyunIatV2Runtime.ts";
 
 export interface VoiceStreamSegmentPayload {
@@ -116,6 +122,19 @@ export interface VoiceStreamSessionOptions {
   streamingPollIntervalMs?: number;
   /** 句末标点+短停顿快速断句静音阈值（ms，仅在显式开启 streamingSentenceSplit 时生效，默认 320ms） */
   streamingPunctuationPauseMs?: number;
+  /** 回声消除模式：auto / aggressive（启用服务端兜底参考 AEC）/ standard / off */
+  echoCancellationMode?: EchoCancellationMode;
+  /** 客户端浏览器 AudioWorklet 是否已启用实时参考信号 AEC（true 时服务端跳过重复声学消除，保留语义防回声） */
+  clientAecActive?: boolean;
+  /** 服务端兜底 AEC 实时遥测回调 */
+  onAecTelemetry?: (telemetry: {
+    active: boolean;
+    erleDb: number;
+    linearErleDb: number;
+    estimatedDelayMs: number;
+    doubleTalk: boolean;
+    farEndActive: boolean;
+  }) => void;
   onWakeWordSpot?: (hit: WakeWordAcousticHit) => void;
   onSpeechActivity?: (speaking: boolean) => void;
   onSegmentReady: (
@@ -227,6 +246,21 @@ export class VoiceStreamSession {
   private _xfyunFinishing = false;
   private _xfyunIdleResolvers: Array<() => void> = [];
 
+  // 统一流式语音听写 WebSocket 网关方案状态（openWakeWord 唤醒后直推原始 16kHz PCM Binary 帧，服务端 CPU ONNX GTCRN+Silero VAD -> 流式 ASR）
+  private _voiceWsSession: VoiceWsAsrStreamSession | null = null;
+  private _voiceWsGen = 0;
+  private _voiceWsWakeAnchored = false;
+  private _voiceWsWakeHit: WakeWordAcousticHit | null = null;
+  private _voiceWsStartGlobalSample = 0;
+  private _voiceWsFedUpToGlobalSample = 0;
+  private _voiceWsUtteranceDuringTts = false;
+  private _voiceWsRawChunks: Float32Array[] = [];
+  private _voiceWsRawBufferedSamples = 0;
+  private _voiceWsIdleNoiseFloor = 0.004;
+  private _voiceWsOnsetFrames = 0;
+  private _voiceWsFinishing = false;
+  private _voiceWsIdleResolvers: Array<() => void> = [];
+
   // 双轨时间对齐环形缓冲（Raw + Denoised 同步保留 35 秒，支撑唤醒词锚定极速切段与零重复降噪）
   private readonly _rawRing = new Float32Array(RAW_RING_CAPACITY);
   private readonly _denRing = new Float32Array(RAW_RING_CAPACITY);
@@ -250,6 +284,19 @@ export class VoiceStreamSession {
   private _ttsLastEndedAt = 0;
   /** 采集时刻级 TTS 重叠锁存（避免尾静音判停后 _isDuringTtsWindow() 过期丢失回声标记） */
   private _legacyUtteranceDuringTts = false;
+
+  // 服务端兜底实时声学回声消除（仅当客户端 AudioWorklet AEC 未激活且有参考音频输入时介入，绝不与客户端重复消除）
+  private _echoCancellationMode: EchoCancellationMode;
+  private _clientAecActive: boolean;
+  private _serverAec: AcousticEchoCanceller | null = null;
+  private _serverAecRefQueue: Float32Array[] = [];
+  private _serverAecRefHeadOffset = 0;
+  private _serverAecRefQueuedSamples = 0;
+  private _serverAecTailActive = false;
+  private _serverAecTelemetryTick = 0;
+  private _serverAecLastErleDb = 0;
+  private _serverAecLastLinearErleDb = 0;
+  private _serverAecLastDelayMs = 0;
 
   // 无 Silero VAD 时的纯 TS 兜底窗口缓冲
   private _fallbackChunks: Float32Array[] = [];
@@ -275,6 +322,8 @@ export class VoiceStreamSession {
         : this._wakeWords.length > 0;
     this._owwEnabled = options.owwEnabled !== false;
     this._wakeGatedAsr = options.wakeGatedAsr !== false;
+    this._echoCancellationMode = options.echoCancellationMode ?? "auto";
+    this._clientAecActive = options.clientAecActive === true;
     const lookbackMs = Math.max(
       600,
       Math.min(6000, Math.round(options.wakeRingLookbackMs ?? DEFAULT_WAKE_RING_LOOKBACK_MS)),
@@ -282,7 +331,12 @@ export class VoiceStreamSession {
     this._wakeRingLookbackSamples = Math.round((TARGET_SR * lookbackMs) / 1000);
     this._streamingAsrEnabled = options.streamingAsrEnabled === true;
     this._streamingSentenceSplit = options.streamingSentenceSplit === true;
-    this._voicePipelineMode = options.voicePipelineMode === "xfyun" ? "xfyun" : "legacy";
+    this._voicePipelineMode =
+      options.voicePipelineMode === "xfyun"
+        ? "xfyun"
+        : options.voicePipelineMode === "voice-ws"
+          ? "voice-ws"
+          : "legacy";
     this._longUtteranceExtraSilenceMs =
       options.vadSensitivity === "aggressive"
         ? 0
@@ -346,6 +400,8 @@ export class VoiceStreamSession {
     if (this._wakeAnchorSample !== null) return true;
     if (this._xfyunWakeAnchored) return true;
     if (this._xfyunSession !== null) return true;
+    if (this._voiceWsWakeAnchored) return true;
+    if (this._voiceWsSession !== null) return true;
     if (this._heldSegment !== null) return true;
     return false;
   }
@@ -444,6 +500,18 @@ export class VoiceStreamSession {
       return;
     }
 
+    if (this._voicePipelineMode === "voice-ws") {
+      if (this._voiceWsSession && !this._voiceWsFinishing) {
+        this._voiceWsWakeAnchored = true;
+        if (hit && (!this._voiceWsWakeHit || hit.score > this._voiceWsWakeHit.score)) {
+          this._voiceWsWakeHit = hit;
+          this._wakeAnchorHit = hit;
+        }
+        return;
+      }
+      this._activateVoiceWsFromWake(hit, replayMs);
+      return;
+    }
     // Legacy 方案：命中唤醒后立即从循环录制缓冲区锚定回溯起点、激活滞回分段器，并立刻对缓冲区内容启动流式转写
     if (this._wakeAnchorSample !== null) {
       if (hit && (!this._wakeAnchorHit || hit.score > this._wakeAnchorHit.score)) {
@@ -648,15 +716,17 @@ export class VoiceStreamSession {
   }
 
   /**
-   * 运行期无缝热切换语音方案（原方案 legacy <-> 讯飞听写大模型 2.0 方案 xfyun），
+   * 运行期无缝热切换语音方案（原方案 legacy <-> 讯飞听写大模型 2.0 方案 xfyun <-> 统一流式语音听写网关 voice-ws），
    * 切换后立即清理挂起缓冲，无需断开或重连 WebSocket。
    */
   setVoicePipelineMode(mode: VoicePipelineMode): void {
-    const next: VoicePipelineMode = mode === "xfyun" ? "xfyun" : "legacy";
+    const next: VoicePipelineMode =
+      mode === "xfyun" ? "xfyun" : mode === "voice-ws" ? "voice-ws" : "legacy";
     if (this._voicePipelineMode === next) return;
     this._voicePipelineMode = next;
     this._clearHeldLegacySegment();
     this._abortXfyunSession(true);
+    this._abortVoiceWsSession(true);
     this._resetStandbyDpdfState();
     this._resetVadState();
     this._resetStreamingState(true);
@@ -667,6 +737,7 @@ export class VoiceStreamSession {
     this._denoisedPending = new Float32Array(0);
     this._segmenter.reset();
     this._xfyunFedUpToGlobalSample = this._rawTotalSamples;
+    this._voiceWsFedUpToGlobalSample = this._rawTotalSamples;
     this._wasAwake = this.isAwake;
   }
 
@@ -688,6 +759,9 @@ export class VoiceStreamSession {
       if (this._voicePipelineMode === "xfyun") {
         this._xfyunFedUpToGlobalSample = this._rawTotalSamples;
         this._xfyunOnsetFrames = 0;
+      } else if (this._voicePipelineMode === "voice-ws") {
+        this._voiceWsFedUpToGlobalSample = this._rawTotalSamples;
+        this._voiceWsOnsetFrames = 0;
       } else {
         this._denoisedPending = new Float32Array(0);
         this._resetVadState();
@@ -734,6 +808,7 @@ export class VoiceStreamSession {
         !this._wakeWordEnabled ||
         this._wakeAnchorSample !== null ||
         this._xfyunWakeAnchored ||
+        this._voiceWsWakeAnchored ||
         Boolean(this._heldSegment?.payload.wakeAnchored);
       if (!keepActiveWake && (this._wasAwake || this._heldSegment !== null)) {
         this._wasAwake = false;
@@ -755,6 +830,13 @@ export class VoiceStreamSession {
         this._xfyunOnsetFrames = 0;
         if (isManualEnter) {
           this._xfyunFedUpToGlobalSample = this._rawTotalSamples;
+        } else {
+          this._replayPostWakeGapIfNeeded();
+        }
+      } else if (this._voicePipelineMode === "voice-ws") {
+        this._voiceWsOnsetFrames = 0;
+        if (isManualEnter) {
+          this._voiceWsFedUpToGlobalSample = this._rawTotalSamples;
         } else {
           this._replayPostWakeGapIfNeeded();
         }
@@ -782,11 +864,20 @@ export class VoiceStreamSession {
     this._resetStandbyDpdfState();
     if (explicitExit) {
       this._abortXfyunSession(true);
-    } else if (!this._xfyunSession) {
-      this._xfyunWakeAnchored = false;
-      this._xfyunWakeHit = null;
-      this._xfyunUtteranceDuringTts = false;
-      this._xfyunOnsetFrames = 0;
+      this._abortVoiceWsSession(true);
+    } else {
+      if (!this._xfyunSession) {
+        this._xfyunWakeAnchored = false;
+        this._xfyunWakeHit = null;
+        this._xfyunUtteranceDuringTts = false;
+        this._xfyunOnsetFrames = 0;
+      }
+      if (!this._voiceWsSession) {
+        this._voiceWsWakeAnchored = false;
+        this._voiceWsWakeHit = null;
+        this._voiceWsUtteranceDuringTts = false;
+        this._voiceWsOnsetFrames = 0;
+      }
     }
     this._wakeAnchorSample = null;
     this._wakeAnchorHit = null;
@@ -803,11 +894,13 @@ export class VoiceStreamSession {
     const hasPendingWakeWork =
       !explicitExit &&
       (this._xfyunSession !== null ||
+        this._voiceWsSession !== null ||
         this._inFlight ||
         this._pendingWake.length > 0);
     if (!hasPendingWakeWork) {
       this._legacyFedUpToGlobalSample = this._rawTotalSamples;
       this._xfyunFedUpToGlobalSample = this._rawTotalSamples;
+      this._voiceWsFedUpToGlobalSample = this._rawTotalSamples;
       if (explicitExit) {
         this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, this._rawTotalSamples);
       }
@@ -1138,6 +1231,321 @@ export class VoiceStreamSession {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // 统一流式语音听写 WebSocket 网关直推管线（openWakeWord 唤醒后直推原始 16kHz PCM Binary 帧，服务端 CPU GTCRN+Silero VAD -> 流式 ASR）
+  // ---------------------------------------------------------------------------
+
+  private _resolveVoiceWsIdle(): void {
+    const resolvers = this._voiceWsIdleResolvers;
+    this._voiceWsIdleResolvers = [];
+    for (const r of resolvers) r();
+  }
+
+  private async _waitForVoiceWsIdle(): Promise<void> {
+    if (!this._voiceWsSession && !this._voiceWsFinishing) {
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      this._voiceWsIdleResolvers.push(resolve);
+    });
+  }
+
+  private _abortVoiceWsSession(clearWakeAnchor = true): void {
+    this._voiceWsGen += 1;
+    const prev = this._voiceWsSession;
+    this._voiceWsSession = null;
+    this._voiceWsFinishing = false;
+    this._voiceWsRawChunks = [];
+    this._voiceWsRawBufferedSamples = 0;
+    this._voiceWsUtteranceDuringTts = false;
+    this._voiceWsOnsetFrames = 0;
+    if (clearWakeAnchor) {
+      this._voiceWsWakeAnchored = false;
+      this._voiceWsWakeHit = null;
+    }
+    if (prev) {
+      try {
+        prev.abort();
+      } catch {
+        // ignore
+      }
+      this._opts.onSpeechActivity?.(false);
+    }
+    this._resolveVoiceWsIdle();
+  }
+
+  private _activateVoiceWsFromWake(
+    hit: WakeWordAcousticHit | null,
+    replayMs?: number,
+  ): void {
+    const anchorEnd = hit && hit.sampleOffset > 0 ? hit.sampleOffset : this._rawTotalSamples;
+    const replayStart = this._computeWakeReplayStartSample(anchorEnd, replayMs);
+
+    this._voiceWsWakeAnchored = true;
+    this._voiceWsWakeHit = hit;
+    this._wakeAnchorSample = replayStart;
+    this._wakeAnchorHit = hit;
+    this._wasAwake = true;
+    this._voiceWsOnsetFrames = 0;
+
+    const bufferedRaw = this._readRingRange(
+      this._rawRing,
+      this._rawTotalSamples,
+      replayStart,
+      this._rawTotalSamples,
+    );
+    this._voiceWsFedUpToGlobalSample = this._rawTotalSamples;
+
+    this._startVoiceWsStreamSession({
+      startGlobalSample: replayStart,
+      initialRawSamples: bufferedRaw,
+      wakeAnchored: true,
+      acousticWake: hit,
+    });
+  }
+
+  private _startVoiceWsStreamSession(params: {
+    startGlobalSample: number;
+    initialRawSamples: Float32Array;
+    wakeAnchored: boolean;
+    acousticWake: WakeWordAcousticHit | null;
+  }): void {
+    if (this._disposed) return;
+    const voiceWs = this._opts.localEngine.voiceWsAsr;
+    if (!voiceWs || !voiceWs.isConfigured()) {
+      this._voiceWsWakeAnchored = false;
+      this._voiceWsWakeHit = null;
+      this._wakeAnchorSample = null;
+      this._wakeAnchorHit = null;
+      if (!this.isAwake) {
+        this._wasAwake = false;
+      }
+      this._resolveVoiceWsIdle();
+      return;
+    }
+
+    if (this._voiceWsSession) {
+      this._abortVoiceWsSession(false);
+    }
+
+    const gen = ++this._voiceWsGen;
+    this._voiceWsStartGlobalSample = params.startGlobalSample;
+    this._voiceWsRawChunks = [];
+    this._voiceWsRawBufferedSamples = 0;
+    this._voiceWsFinishing = false;
+    this._voiceWsUtteranceDuringTts = this._isDuringTtsWindow();
+    const minSilenceMs = Math.max(320, Math.min(5000, Math.round(this._utteranceSilenceMs || 640)));
+
+    this._opts.onSpeechActivity?.(true);
+
+    let session: VoiceWsAsrStreamSession;
+    try {
+      session = voiceWs.createStreamSession({
+        stopOnFinal: true,
+        vad: { minSilenceMs },
+        onPartial: (ev) => {
+          if (this._disposed || gen !== this._voiceWsGen) return;
+          const clean = sanitizeAsrTranscript(ev.text, { wakeWords: this._wakeWords });
+          if (!clean) return;
+          this._opts.onPartialTranscript?.({
+            text: clean,
+            stableText: ev.stableText,
+            unstableText: ev.unstableText,
+            engine: "voice-ws-asr",
+            latencyMs: ev.latencyMs,
+          });
+        },
+        onFinal: (ev) => {
+          if (this._disposed || gen !== this._voiceWsGen) return;
+          const startGlobalSample = this._voiceWsStartGlobalSample;
+          const isWakeAnchored = Boolean(params.wakeAnchored || this._voiceWsWakeAnchored);
+          const wakeHit = this._voiceWsWakeHit ?? params.acousticWake ?? this._wakeAnchorHit ?? null;
+          const duringTts = this._voiceWsUtteranceDuringTts || this._isDuringTtsWindow();
+
+          const mergedRaw = new Float32Array(this._voiceWsRawBufferedSamples);
+          let off = 0;
+          for (const chunk of this._voiceWsRawChunks) {
+            mergedRaw.set(chunk, off);
+            off += chunk.length;
+          }
+
+          this._voiceWsSession = null;
+          this._voiceWsFinishing = false;
+          this._voiceWsRawChunks = [];
+          this._voiceWsRawBufferedSamples = 0;
+          this._voiceWsWakeAnchored = false;
+          this._voiceWsWakeHit = null;
+          this._voiceWsUtteranceDuringTts = false;
+          this._wakeAnchorSample = null;
+          this._wakeAnchorHit = null;
+          this._oww?.resetSegmentTracking();
+          this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, this._rawTotalSamples);
+          this._opts.onSpeechActivity?.(false);
+          this._resolveVoiceWsIdle();
+
+          const cleanedText = sanitizeAsrTranscript(ev.text, { wakeWords: this._wakeWords });
+          if (!cleanedText) {
+            if (!this.isAwake) {
+              this._wasAwake = false;
+            }
+            return;
+          }
+
+          const inputSnrDb = mergedRaw.length > 0 ? estimateSnrDb(mergedRaw, TARGET_SR) : 0;
+          const denoiseTag = ev.denoiseEnabled ? "voice-ws-gtcrn" : "voice-ws-raw";
+          const payload: VoiceStreamSegmentPayload = {
+            rawSamples: mergedRaw,
+            denoisedSamples: mergedRaw,
+            denoiseEngine: denoiseTag,
+            inputSnrDb,
+            outputSnrDb: inputSnrDb,
+            snrGainDb: 0,
+            startSec: Number((startGlobalSample / TARGET_SR).toFixed(2)),
+            durationSec: Number((mergedRaw.length / TARGET_SR).toFixed(2)),
+            forcedRoll: ev.reason === "max_duration" || ev.reason === "max_utterance_sec",
+            acousticWake: wakeHit,
+            wakeAnchored: isWakeAnchored,
+            duringTtsPlayback: duringTts,
+            precomputedTranscript: cleanedText,
+            precomputedAsrEngine: "voice-ws-asr",
+            precomputedAsrMs: ev.asrMs || ev.durationMs,
+            commitReason:
+              ev.reason === "client_finish" || ev.reason === "commit"
+                ? "manual_flush"
+                : ev.reason === "max_duration" || ev.reason === "max_utterance_sec"
+                  ? "max_duration"
+                  : "vad_silence",
+            pipelineMode: "voice-ws",
+          };
+          this._enqueueSegment(payload);
+        },
+        onError: () => {
+          if (this._disposed || gen !== this._voiceWsGen) return;
+          this._voiceWsSession = null;
+          this._voiceWsFinishing = false;
+          this._voiceWsRawChunks = [];
+          this._voiceWsRawBufferedSamples = 0;
+          this._voiceWsWakeAnchored = false;
+          this._voiceWsWakeHit = null;
+          this._voiceWsUtteranceDuringTts = false;
+          this._wakeAnchorSample = null;
+          this._wakeAnchorHit = null;
+          this._oww?.resetSegmentTracking();
+          this._opts.onSpeechActivity?.(false);
+          if (!this.isAwake) {
+            this._wasAwake = false;
+          }
+          this._resolveVoiceWsIdle();
+        },
+      });
+    } catch {
+      this._voiceWsSession = null;
+      this._voiceWsFinishing = false;
+      this._voiceWsWakeAnchored = false;
+      this._voiceWsWakeHit = null;
+      this._wakeAnchorSample = null;
+      this._wakeAnchorHit = null;
+      this._opts.onSpeechActivity?.(false);
+      if (!this.isAwake) {
+        this._wasAwake = false;
+      }
+      this._resolveVoiceWsIdle();
+      return;
+    }
+
+    this._voiceWsSession = session;
+    if (params.initialRawSamples.length > 0) {
+      this._appendVoiceWsRawChunk(params.initialRawSamples);
+      session.pushFloat32Samples(params.initialRawSamples);
+    }
+  }
+
+  private _appendVoiceWsRawChunk(samples: Float32Array): void {
+    const copy = new Float32Array(samples);
+    this._voiceWsRawChunks.push(copy);
+    this._voiceWsRawBufferedSamples += copy.length;
+    const maxSamples = TARGET_SR * 60;
+    while (this._voiceWsRawBufferedSamples > maxSamples && this._voiceWsRawChunks.length > 1) {
+      const dropped = this._voiceWsRawChunks.shift()!;
+      this._voiceWsRawBufferedSamples -= dropped.length;
+    }
+  }
+
+  private _feedVoiceWsAudio(feedSlice: Float32Array, sliceStartGlobalSample: number): void {
+    if (feedSlice.length === 0) return;
+
+    if (this._voiceWsSession && !this._voiceWsFinishing) {
+      if (this._isDuringTtsWindow() && computeRms(feedSlice) >= 0.005) {
+        this._voiceWsUtteranceDuringTts = true;
+      }
+      this._appendVoiceWsRawChunk(feedSlice);
+      this._voiceWsSession.pushFloat32Samples(feedSlice);
+      return;
+    }
+
+    if (this._voiceWsFinishing) {
+      return;
+    }
+
+    // 单次说话（bypassWakeWord）直接建立统一流式网关连接直推原始音频，不等待能量门限
+    if (this._opts.bypassWakeWord) {
+      const earliestAvailable = Math.max(0, this._rawTotalSamples - RAW_RING_CAPACITY);
+      const preStart = Math.max(
+        earliestAvailable,
+        this._lastEmittedEndSample > 0 ? this._lastEmittedEndSample : 0,
+        sliceStartGlobalSample - PRE_ROLL_SAMPLES,
+      );
+      const initialRaw = this._readRingRange(
+        this._rawRing,
+        this._rawTotalSamples,
+        preStart,
+        this._rawTotalSamples,
+      );
+      this._startVoiceWsStreamSession({
+        startGlobalSample: preStart,
+        initialRawSamples: initialRaw.length > 0 ? initialRaw : feedSlice,
+        wakeAnchored: false,
+        acousticWake: null,
+      });
+      return;
+    }
+
+    // 连续对话或免唤醒态：轻量原始音量起声检测触发新一轮统一流式直推（仅用于按需建连，推送给网关的始终是原始 PCM）
+    const rawRms = computeRms(feedSlice);
+    const threshold = Math.max(0.008, this._voiceWsIdleNoiseFloor * 2.2);
+    if (rawRms >= threshold) {
+      this._voiceWsOnsetFrames += 1;
+      const enoughOnset = this._voiceWsOnsetFrames >= 2 || feedSlice.length >= 1600;
+      if (enoughOnset) {
+        this._voiceWsOnsetFrames = 0;
+        const earliestAvailable = Math.max(0, this._rawTotalSamples - RAW_RING_CAPACITY);
+        const preStart = Math.max(
+          earliestAvailable,
+          this._lastEmittedEndSample > 0 ? this._lastEmittedEndSample : 0,
+          sliceStartGlobalSample - PRE_ROLL_SAMPLES,
+        );
+        const initialRaw = this._readRingRange(
+          this._rawRing,
+          this._rawTotalSamples,
+          preStart,
+          this._rawTotalSamples,
+        );
+        this._startVoiceWsStreamSession({
+          startGlobalSample: preStart,
+          initialRawSamples: initialRaw.length > 0 ? initialRaw : feedSlice,
+          wakeAnchored: false,
+          acousticWake: null,
+        });
+      }
+    } else {
+      this._voiceWsOnsetFrames = 0;
+      const rate = rawRms < this._voiceWsIdleNoiseFloor ? 0.08 : 0.015;
+      this._voiceWsIdleNoiseFloor = Math.max(
+        0.002,
+        Math.min(0.025, this._voiceWsIdleNoiseFloor * (1 - rate) + rawRms * rate),
+      );
+    }
+  }
   private _replayPostWakeGapIfNeeded(): void {
     if (this._disposed || !this._opts.isInConversation?.()) return;
     if (this._lastEmittedEndSample <= 0 || this._rawTotalSamples <= this._lastEmittedEndSample) {
@@ -1162,6 +1570,29 @@ export class VoiceStreamSession {
       this._xfyunFedUpToGlobalSample = this._rawTotalSamples;
       if (gapAudio.length >= 512 && hasAudibleAudioEnergy(gapAudio, TARGET_SR)) {
         this._startXfyunStreamSession({
+          startGlobalSample: effectiveStart,
+          initialRawSamples: gapAudio,
+          wakeAnchored: false,
+          acousticWake: null,
+        });
+      }
+      return;
+    }
+    if (this._voicePipelineMode === "voice-ws") {
+      const effectiveStart = Math.max(gapStart, this._voiceWsFedUpToGlobalSample);
+      if (this._voiceWsSession || this._rawTotalSamples - effectiveStart < 512) {
+        this._voiceWsFedUpToGlobalSample = this._rawTotalSamples;
+        return;
+      }
+      const gapAudio = this._readRingRange(
+        this._rawRing,
+        this._rawTotalSamples,
+        effectiveStart,
+        this._rawTotalSamples,
+      );
+      this._voiceWsFedUpToGlobalSample = this._rawTotalSamples;
+      if (gapAudio.length >= 512 && hasAudibleAudioEnergy(gapAudio, TARGET_SR)) {
+        this._startVoiceWsStreamSession({
           startGlobalSample: effectiveStart,
           initialRawSamples: gapAudio,
           wakeAnchored: false,
@@ -1236,7 +1667,9 @@ export class VoiceStreamSession {
     this._resetVadState();
     this._resetStreamingState(true);
     this._abortXfyunSession(true);
+    this._abortVoiceWsSession(true);
     this._xfyunFedUpToGlobalSample = this._rawTotalSamples;
+    this._voiceWsFedUpToGlobalSample = this._rawTotalSamples;
     this._oww?.resetSegmentTracking();
     this._lastEmittedEndSample = Math.max(this._lastEmittedEndSample, this._rawTotalSamples);
   }
@@ -1259,12 +1692,17 @@ export class VoiceStreamSession {
       if (this._xfyunSession && !this._xfyunFinishing) {
         this._xfyunUtteranceDuringTts = true;
       }
+      if (this._voiceWsSession && !this._voiceWsFinishing) {
+        this._voiceWsUtteranceDuringTts = true;
+      }
     }
     const userCurrentlySpeaking =
       this._vadDetected ||
       this._wakeAnchorSample !== null ||
       this._xfyunWakeAnchored ||
-      Boolean(this._xfyunSession && !this._xfyunFinishing);
+      Boolean(this._xfyunSession && !this._xfyunFinishing) ||
+      this._voiceWsWakeAnchored ||
+      Boolean(this._voiceWsSession && !this._voiceWsFinishing);
     if (!userCurrentlySpeaking) {
       this._lastRawOverlap = new Float32Array(0);
       this._lastDenOverlap = new Float32Array(0);
@@ -1457,6 +1895,11 @@ export class VoiceStreamSession {
 
   get denoiseEngine(): string {
     if (this._voicePipelineMode === "xfyun") return "xfyun-raw-direct";
+    if (this._voicePipelineMode === "voice-ws") {
+      return this._opts.localEngine.voiceWsAsr.getStatus().denoiseEnabled
+        ? "voice-ws-gtcrn"
+        : "voice-ws-raw";
+    }
     return this._denoiseEngine;
   }
 
@@ -1466,6 +1909,175 @@ export class VoiceStreamSession {
 
   get droppedPureMusicCount(): number {
     return this._droppedPureMusicCount;
+  }
+
+  get clientAecActive(): boolean {
+    return this._clientAecActive;
+  }
+
+  get serverAecActive(): boolean {
+    return (
+      !this._clientAecActive &&
+      (this._echoCancellationMode === "auto" || this._echoCancellationMode === "aggressive") &&
+      (this._serverAecRefQueuedSamples > 0 || this._serverAecTailActive)
+    );
+  }
+
+  get serverAecErleDb(): number {
+    return this._serverAecLastErleDb;
+  }
+
+  get serverAecEstimatedDelayMs(): number {
+    return this._serverAecLastDelayMs;
+  }
+
+  setEchoCancellationMode(mode: EchoCancellationMode): void {
+    this._echoCancellationMode = mode;
+    if (this._serverAec) {
+      this._serverAec.setAggressive(mode === "aggressive");
+    }
+    if (mode === "off" || mode === "standard") {
+      this.clearFarEndReference();
+    }
+  }
+
+  setClientAecActive(active: boolean): void {
+    const next = Boolean(active);
+    if (this._clientAecActive === next) return;
+    this._clientAecActive = next;
+    if (next) {
+      // 客户端 AudioWorklet AEC 已接管，清空服务端兜底参考队列避免重复回声处理
+      this.clearFarEndReference();
+    }
+  }
+
+  /**
+   * 推入服务端兜底 AEC 的 TTS 远端参考音频（16kHz 或任意采样率 Mono Float32 PCM）。
+   * 仅在客户端未启用 AudioWorklet AEC 且 echoCancellationMode 为 auto / aggressive 时生效。
+   */
+  pushFarEndReference(samples: Float32Array, sampleRate = TARGET_SR): void {
+    if (this._disposed || samples.length === 0) return;
+    if (this._clientAecActive) return;
+    if (this._echoCancellationMode === "off" || this._echoCancellationMode === "standard") return;
+
+    const pcm16 = sampleRate === TARGET_SR ? samples.slice() : resampleLinear(samples, sampleRate, TARGET_SR);
+    if (pcm16.length === 0) return;
+    this._serverAecRefQueue.push(pcm16);
+    this._serverAecRefQueuedSamples += pcm16.length;
+
+    // 有界队列保护（最多保留最近 20 秒参考音频，防异常断流无限增长）
+    const maxRefSamples = TARGET_SR * 20;
+    while (this._serverAecRefQueuedSamples > maxRefSamples && this._serverAecRefQueue.length > 0) {
+      const head = this._serverAecRefQueue[0]!;
+      const avail = head.length - this._serverAecRefHeadOffset;
+      const excess = this._serverAecRefQueuedSamples - maxRefSamples;
+      if (avail <= excess) {
+        this._serverAecRefQueue.shift();
+        this._serverAecRefHeadOffset = 0;
+        this._serverAecRefQueuedSamples -= avail;
+      } else {
+        this._serverAecRefHeadOffset += excess;
+        this._serverAecRefQueuedSamples -= excess;
+      }
+    }
+  }
+
+  clearFarEndReference(): void {
+    this._serverAecRefQueue = [];
+    this._serverAecRefHeadOffset = 0;
+    this._serverAecRefQueuedSamples = 0;
+    this._serverAecTailActive = false;
+  }
+
+  private _dequeueServerAecReference(count: number): Float32Array {
+    const out = new Float32Array(count);
+    let written = 0;
+    while (written < count && this._serverAecRefQueue.length > 0) {
+      const head = this._serverAecRefQueue[0]!;
+      const avail = head.length - this._serverAecRefHeadOffset;
+      const take = Math.min(count - written, avail);
+      out.set(
+        head.subarray(this._serverAecRefHeadOffset, this._serverAecRefHeadOffset + take),
+        written,
+      );
+      written += take;
+      this._serverAecRefHeadOffset += take;
+      this._serverAecRefQueuedSamples -= take;
+      if (this._serverAecRefHeadOffset >= head.length) {
+        this._serverAecRefQueue.shift();
+        this._serverAecRefHeadOffset = 0;
+      }
+    }
+    return out;
+  }
+
+  private _applyServerAecIfNeeded(mic16k: Float32Array, explicitRef16k?: Float32Array): Float32Array {
+    if (this._echoCancellationMode === "off" || this._echoCancellationMode === "standard") {
+      return mic16k;
+    }
+    if (!explicitRef16k) {
+      if (this._clientAecActive) return mic16k;
+      if (this._serverAecRefQueuedSamples === 0 && !this._serverAecTailActive) {
+        return mic16k;
+      }
+    }
+
+    if (!this._serverAec) {
+      this._serverAec = new AcousticEchoCanceller({
+        sampleRate: TARGET_SR,
+        blockSize: 256,
+        numPartitions: 16,
+        aggressive: this._echoCancellationMode === "aggressive",
+      });
+    } else {
+      this._serverAec.setAggressive(this._echoCancellationMode === "aggressive");
+    }
+
+    const refChunk = explicitRef16k ?? this._dequeueServerAecReference(mic16k.length);
+    const res = this._serverAec.processStream(mic16k, refChunk);
+    this._serverAecTailActive = res.farEndActive;
+    this._serverAecLastErleDb = res.erleDb;
+    this._serverAecLastLinearErleDb = res.linearErleDb ?? 0;
+    this._serverAecLastDelayMs = res.estimatedDelayMs ?? 0;
+
+    this._serverAecTelemetryTick += 1;
+    if (res.farEndActive && this._serverAecTelemetryTick % 4 === 0) {
+      this._opts.onAecTelemetry?.({
+        active: true,
+        erleDb: res.erleDb,
+        linearErleDb: res.linearErleDb ?? 0,
+        estimatedDelayMs: res.estimatedDelayMs ?? 0,
+        doubleTalk: res.doubleTalk,
+        farEndActive: res.farEndActive,
+      });
+    }
+
+    return res.output;
+  }
+
+  /**
+   * 同步双通道音频入口（麦克风 + 远端播报参考信号）：在送入 openWakeWord / VAD / ASR 之前
+   * 直接执行实时延迟对齐双路径 PBFDAF + Hann-OLA RES 声学回声消除。
+   */
+  pushFrameWithReference(
+    micSamples: Float32Array,
+    refSamples: Float32Array,
+    sampleRate = this._inputRate,
+  ): void {
+    if (this._disposed || micSamples.length === 0) return;
+    const mic16k =
+      sampleRate === TARGET_SR ? micSamples : resampleLinear(micSamples, sampleRate, TARGET_SR);
+    const ref16kRaw =
+      sampleRate === TARGET_SR ? refSamples : resampleLinear(refSamples, sampleRate, TARGET_SR);
+    let ref16k = ref16kRaw;
+    if (ref16kRaw.length !== mic16k.length) {
+      ref16k = new Float32Array(mic16k.length);
+      ref16k.set(ref16kRaw.subarray(0, Math.min(ref16kRaw.length, mic16k.length)), 0);
+    }
+    const cleaned = this._applyServerAecIfNeeded(mic16k, ref16k);
+    if (cleaned.length > 0) {
+      this._ingestPcm16k(cleaned);
+    }
   }
 
   /**
@@ -1485,8 +2097,14 @@ export class VoiceStreamSession {
    */
   pushFloat32Samples(samples: Float32Array): void {
     if (this._disposed || samples.length === 0) return;
-    const pcm16k =
+    const resampled =
       this._inputRate === TARGET_SR ? samples : resampleLinear(samples, this._inputRate, TARGET_SR);
+    const pcm16k = this._applyServerAecIfNeeded(resampled);
+    if (pcm16k.length === 0) return;
+    this._ingestPcm16k(pcm16k);
+  }
+
+  private _ingestPcm16k(pcm16k: Float32Array): void {
 
     // 1. 无论新旧方案，始终持续写入时间对齐的 16kHz 原始循环录制缓冲区（零失真、供唤醒后完整回放）
     const chunkStartGlobalSample = this._rawTotalSamples;
@@ -1496,10 +2114,12 @@ export class VoiceStreamSession {
     this._rawTotalSamples += pcm16k.length;
 
     // 2. Legacy 方案或启用了 openWakeWord 时，维护先降噪后 AGC 的实时快路径与声学唤醒检测
-    // 注意：讯飞 2.0 方案在已唤醒/对话态完全跳过本地降噪与 AGC，原始 16kHz PCM 直推讯飞 WebSocket
+    // 注意：讯飞 2.0 / 统一流式语音听写网关方案在已唤醒/对话态完全跳过本地降噪与 AGC，原始 16kHz PCM 直推 WebSocket
+    const isDirectWsPipeline =
+      this._voicePipelineMode === "xfyun" || this._voicePipelineMode === "voice-ws";
     const needLightweightFrontEnd =
       this._voicePipelineMode === "legacy" ||
-      (this._oww !== null && (this._voicePipelineMode !== "xfyun" || this.isWakeGatedStandby));
+      (this._oww !== null && (!isDirectWsPipeline || this.isWakeGatedStandby));
     let denoisedChunk: Float32Array = pcm16k;
     if (needLightweightFrontEnd) {
       // 先在原始自然电平上运行在线降噪（避免先 AGC 把电视/环境底噪放大破坏降噪统计），再对干净语音做平滑 AGC
@@ -1546,6 +2166,9 @@ export class VoiceStreamSession {
         if (this._voicePipelineMode === "xfyun") {
           this._xfyunFedUpToGlobalSample = chunkStartGlobalSample;
           this._xfyunOnsetFrames = 0;
+        } else if (this._voicePipelineMode === "voice-ws") {
+          this._voiceWsFedUpToGlobalSample = chunkStartGlobalSample;
+          this._voiceWsOnsetFrames = 0;
         } else {
           this._denoisedPending = new Float32Array(0);
           this._resetVadState(denoisedChunk.length);
@@ -1583,6 +2206,22 @@ export class VoiceStreamSession {
       return;
     }
 
+    // 4a2. 统一流式语音听写 WebSocket 网关方案：openWakeWord 唤醒后直接推送原始 16kHz PCM Binary 帧，服务端 CPU ONNX 降噪+VAD -> 流式 ASR
+    if (this._voicePipelineMode === "voice-ws") {
+      if (this._voiceWsFedUpToGlobalSample >= this._rawTotalSamples) {
+        return;
+      }
+      let feedSlice = pcm16k;
+      let sliceStartGlobal = chunkStartGlobalSample;
+      if (this._voiceWsFedUpToGlobalSample > chunkStartGlobalSample) {
+        const skip = this._voiceWsFedUpToGlobalSample - chunkStartGlobalSample;
+        feedSlice = pcm16k.subarray(skip);
+        sliceStartGlobal = this._voiceWsFedUpToGlobalSample;
+      }
+      this._voiceWsFedUpToGlobalSample = this._rawTotalSamples;
+      this._feedVoiceWsAudio(feedSlice, sliceStartGlobal);
+      return;
+    }
     // 5. 原方案（已唤醒或无声学唤醒兜底）：流式 Silero VAD + Home Assistant 滞回分段器 + 流式字幕
     if (this._vad) {
       this._legacyFedUpToGlobalSample = this._rawTotalSamples;
@@ -2299,6 +2938,15 @@ export class VoiceStreamSession {
       await this.waitForIdle();
       return;
     }
+    if (this._voicePipelineMode === "voice-ws") {
+      if (this._voiceWsSession) {
+        this._voiceWsFinishing = true;
+        await this._voiceWsSession.finish("client_finish");
+      }
+      await this._waitForVoiceWsIdle();
+      await this.waitForIdle();
+      return;
+    }
     if (this._streamingAsrEnabled) {
       this._abortStreamingDecode();
     }
@@ -2682,6 +3330,9 @@ export class VoiceStreamSession {
     if (this._voicePipelineMode === "xfyun") {
       await this._waitForXfyunIdle();
     }
+    if (this._voicePipelineMode === "voice-ws") {
+      await this._waitForVoiceWsIdle();
+    }
     if (
       !this._inFlight &&
       this._pendingWake.length === 0 &&
@@ -2697,8 +3348,12 @@ export class VoiceStreamSession {
 
   dispose(): void {
     this._disposed = true;
+    this.clearFarEndReference();
+    this._serverAec?.reset();
+    this._serverAec = null;
     this._clearHeldLegacySegment();
     this._abortXfyunSession(true);
+    this._abortVoiceWsSession(true);
     this._resetStandbyDpdfState(true);
     this._resetStreamingState(true);
     this._pendingWake = [];

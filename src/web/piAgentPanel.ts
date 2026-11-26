@@ -240,6 +240,12 @@ export interface UiPublicAgentConfig extends ClientVoiceConfig {
   hasXfyunApiSecret?: boolean;
   xfyunApiSecretPreview?: string;
   effectiveXfyunConfigured?: boolean;
+  voiceWsAsrEndpointUrl?: string;
+  voiceWsAsrDenoise?: boolean;
+  voiceWsAsrLanguage?: string;
+  hasVoiceWsAsrAuthCode?: boolean;
+  voiceWsAsrAuthCodePreview?: string;
+  effectiveVoiceWsAsrConfigured?: boolean;
   systemOneMode?: UiSystemOneMode;
   systemOneBaseUrl?: string;
   systemOneModel?: string;
@@ -334,6 +340,21 @@ export interface UiLocalVoiceStatus {
     lastSid: string | null;
     lastError: string | null;
   };
+  readyForVoiceWsAsr?: boolean;
+  voiceWsAsr?: {
+    configured: boolean;
+    ready: boolean;
+    endpointUrl: string;
+    hasAuthCode: boolean;
+    denoiseEnabled: boolean;
+    language: string | null;
+    denoiseModel: string | null;
+    vadModel: string | null;
+    asrModel: string | null;
+    lastLatencyMs: number | null;
+    lastSessionId: string | null;
+    lastError: string | null;
+  };
   readyForVad: boolean;
   readyForVoiceprint: boolean;
   readyForSenseVoice?: boolean;
@@ -364,6 +385,7 @@ export interface UiLocalVoiceStatus {
     openWakeWord?: boolean;
     localTts?: boolean;
     xfyunIat?: boolean;
+    voiceWsAsr?: boolean;
   };
 }
 
@@ -380,10 +402,14 @@ export interface UiVoiceSnapshot {
   active: boolean;
   mode: ClientVoiceMode;
   engine: "local" | "browser" | "whisper" | "manual";
-  voicePipelineMode?: "legacy" | "xfyun";
+  voicePipelineMode?: "legacy" | "xfyun" | "voice-ws";
   xfyunEndpointUrl?: string;
   xfyunAppId?: string;
   effectiveXfyunConfigured?: boolean;
+  voiceWsAsrEndpointUrl?: string;
+  voiceWsAsrDenoise?: boolean;
+  voiceWsAsrLanguage?: string;
+  effectiveVoiceWsAsrConfigured?: boolean;
   streamingAsrEnabled?: boolean;
   interimTranscript: string;
   lastTranscript: string;
@@ -1098,7 +1124,13 @@ export class PiAgentPanelController {
   async toggleVoicePipelineMode(): Promise<void> {
     const current =
       this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy";
-    const next: "legacy" | "xfyun" = current === "xfyun" ? "legacy" : "xfyun";
+    const order: ReadonlyArray<"legacy" | "xfyun" | "voice-ws"> = [
+      "legacy",
+      "xfyun",
+      "voice-ws",
+    ];
+    const idx = order.indexOf(current);
+    const next = order[(idx + 1) % order.length] ?? "legacy";
     try {
       const res = await this.deps.apiPost<{
         agent?: UiPiAgentSnapshot;
@@ -1107,9 +1139,11 @@ export class PiAgentPanelController {
       if (res.agent) this.applyAgentSnapshot(res.agent);
       if (res.voice) this.applyVoiceSnapshot(res.voice);
       this.deps.showToast(
-        next === "xfyun"
-          ? "已切换方案：讯飞语音听写大模型 2.0（openWakeWord 唤醒后直推原始音频）"
-          : "已切回原方案（GTCRN + 声源分离 + 本地 SenseVoice）",
+        next === "voice-ws"
+          ? "已切换方案：统一流式语音听写网关（openWakeWord 唤醒后直推原始音频）"
+          : next === "xfyun"
+            ? "已切换方案：讯飞语音听写大模型 2.0（openWakeWord 唤醒后直推原始音频）"
+            : "已切回原方案（GTCRN + 声源分离 + 本地 SenseVoice）",
         2400,
       );
     } catch (err) {
@@ -1182,6 +1216,11 @@ export class PiAgentPanelController {
             this.voiceState?.effectiveXfyunConfigured ??
             this.agentState.config.effectiveXfyunConfigured,
         ),
+        voiceWsAsrReady: Boolean(
+          this.voiceState?.localEngine?.readyForVoiceWsAsr ??
+            this.voiceState?.effectiveVoiceWsAsrConfigured ??
+            this.agentState.config.effectiveVoiceWsAsrConfigured,
+        ),
         localTtsReady: this.voiceState?.localEngine?.readyForLocalTts,
       });
     }
@@ -1218,6 +1257,10 @@ export class PiAgentPanelController {
         localAsrReady: Boolean(this.voiceState.localEngine.readyForLocalAsr),
         xfyunIatReady: Boolean(
           this.voiceState.localEngine.readyForXfyunIat ?? this.voiceState.effectiveXfyunConfigured,
+        ),
+        voiceWsAsrReady: Boolean(
+          this.voiceState.localEngine.readyForVoiceWsAsr ??
+            this.voiceState.effectiveVoiceWsAsrConfigured,
         ),
         localTtsReady: Boolean(this.voiceState.localEngine.readyForLocalTts),
       });
@@ -2222,21 +2265,33 @@ export class PiAgentPanelController {
       const pipelineMode =
         this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy";
       const isXfyun = pipelineMode === "xfyun";
+      const isVoiceWs = pipelineMode === "voice-ws";
       const xfyunReady = Boolean(
         this.voiceState?.localEngine?.readyForXfyunIat ??
           this.voiceState?.effectiveXfyunConfigured ??
           this.agentState?.config.effectiveXfyunConfigured,
       );
-      pipelineBtn.textContent = isXfyun
-        ? xfyunReady
-          ? "讯飞 2.0(在线)"
-          : "讯飞 2.0(未配置)"
-        : "方案：原方案";
-      pipelineBtn.classList.toggle("active", isXfyun);
-      pipelineBtn.setAttribute("aria-pressed", String(isXfyun));
-      pipelineBtn.title = isXfyun
-        ? "当前方案：讯飞语音听写大模型 2.0（openWakeWord 唤醒后直接推送原始 16kHz PCM 至讯飞 WebSocket，点击切回原方案）"
-        : "当前方案：原方案（GTCRN + Silero VAD + 声源分离 + 本地 SenseVoice），点击切换为讯飞语音听写大模型 2.0";
+      const voiceWsReady = Boolean(
+        this.voiceState?.localEngine?.readyForVoiceWsAsr ??
+          this.voiceState?.effectiveVoiceWsAsrConfigured ??
+          this.agentState?.config.effectiveVoiceWsAsrConfigured,
+      );
+      pipelineBtn.textContent = isVoiceWs
+        ? voiceWsReady
+          ? "统一流式(在线)"
+          : "统一流式(未配置)"
+        : isXfyun
+          ? xfyunReady
+            ? "讯飞 2.0(在线)"
+            : "讯飞 2.0(未配置)"
+          : "方案：原方案";
+      pipelineBtn.classList.toggle("active", isXfyun || isVoiceWs);
+      pipelineBtn.setAttribute("aria-pressed", String(isXfyun || isVoiceWs));
+      pipelineBtn.title = isVoiceWs
+        ? "当前方案：统一流式语音听写网关（openWakeWord 唤醒后直推 16kHz PCM Binary 帧，服务端 GTCRN+Silero VAD 流式识别，点击切回原方案）"
+        : isXfyun
+          ? "当前方案：讯飞语音听写大模型 2.0（openWakeWord 唤醒后直接推送原始 16kHz PCM 至讯飞 WebSocket，点击切换为统一流式语音听写网关）"
+          : "当前方案：原方案（GTCRN + Silero VAD + 声源分离 + 本地 SenseVoice），点击切换为讯飞 2.0 / 统一流式网关";
     }
 
     if (cavemanBtn) {
@@ -2288,11 +2343,14 @@ export class PiAgentPanelController {
       const pipelineModeNow =
         this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy";
       const pipelineIsXfyun = pipelineModeNow === "xfyun";
-      const localAsrLabel = pipelineIsXfyun
-        ? "讯飞听写大模型 2.0 · 原始音频直推"
-        : localEngine?.primaryAsrEngine === "sensevoice"
-          ? `本地 SenseVoice${streamingOn ? " · 流式" : ""}`
-          : "语音识别";
+      const pipelineIsVoiceWs = pipelineModeNow === "voice-ws";
+      const localAsrLabel = pipelineIsVoiceWs
+        ? "统一流式听写网关 · WS 原始直推"
+        : pipelineIsXfyun
+          ? "讯飞听写大模型 2.0 · 原始音频直推"
+          : localEngine?.primaryAsrEngine === "sensevoice"
+            ? `本地 SenseVoice${streamingOn ? " · 流式" : ""}`
+            : "语音识别";
       const engineLabel =
         this.localClientState.engine === "local"
           ? localAsrLabel
@@ -2317,17 +2375,27 @@ export class PiAgentPanelController {
       const pipelineModeIdle =
         this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy";
       const pipelineIsXfyun = pipelineModeIdle === "xfyun";
+      const pipelineIsVoiceWs = pipelineModeIdle === "voice-ws";
       const xfyunReadyIdle = Boolean(
         le?.readyForXfyunIat ??
           this.voiceState?.effectiveXfyunConfigured ??
           this.agentState?.config.effectiveXfyunConfigured,
       );
-      const readyHint = pipelineIsXfyun
-        ? xfyunReadyIdle
-          ? "讯飞听写大模型 2.0（openWakeWord 唤醒后直推原始音频）已就绪"
-          : "讯飞听写大模型 2.0 尚未配置密钥，请在设置中填写 APPID / APIKey / APISecret"
-        : le?.readyForLocalAsr && asrReadyPrefix
-          ? `${asrReadyPrefix} · openWakeWord · 降噪已就绪`
+      const voiceWsReadyIdle = Boolean(
+        le?.readyForVoiceWsAsr ??
+          this.voiceState?.effectiveVoiceWsAsrConfigured ??
+          this.agentState?.config.effectiveVoiceWsAsrConfigured,
+      );
+      const readyHint = pipelineIsVoiceWs
+        ? voiceWsReadyIdle
+          ? "统一流式语音听写网关（openWakeWord 唤醒后直推原始 PCM，服务端 GTCRN+Silero VAD 流式识别）已就绪"
+          : "统一流式语音听写网关尚未配置授权码，请在设置中填写网关地址与授权码"
+        : pipelineIsXfyun
+          ? xfyunReadyIdle
+            ? "讯飞听写大模型 2.0（openWakeWord 唤醒后直推原始音频）已就绪"
+            : "讯飞听写大模型 2.0 尚未配置密钥，请在设置中填写 APPID / APIKey / APISecret"
+          : le?.readyForLocalAsr && asrReadyPrefix
+            ? `${asrReadyPrefix} · openWakeWord · 降噪已就绪`
           : wakeEnabled
             ? `点击「进入对话」或「开启持续监听」（唤醒词：${wakeWords.slice(0, 3).join(" / ")}）`
             : "点击「进入对话」或按 Alt+V 即可语音操控 Pi Agent";
@@ -2393,7 +2461,7 @@ export class PiAgentPanelController {
     const tags: Array<{ label: string; warn?: boolean; title?: string }> = [];
 
     const pipelineMode = vs?.voicePipelineMode ?? cfg?.voicePipelineMode ?? "legacy";
-    if (vs?.localEngine?.readyForLocalAsr && pipelineMode !== "xfyun") {
+    if (vs?.localEngine?.readyForLocalAsr && pipelineMode === "legacy") {
       const streamingOn =
         (vs?.streamingAsrEnabled ?? cfg?.streamingAsrEnabled ?? true) !== false;
       tags.push({
@@ -2412,7 +2480,22 @@ export class PiAgentPanelController {
     if (owwOn && owwReady) {
       tags.push({ label: "openWakeWord" });
     }
-    if (pipelineMode === "xfyun") {
+    if (pipelineMode === "voice-ws") {
+      const wsStatus = vs?.localEngine?.voiceWsAsr;
+      const wsReady = Boolean(
+        vs?.localEngine?.readyForVoiceWsAsr ??
+          wsStatus?.ready ??
+          vs?.effectiveVoiceWsAsrConfigured ??
+          cfg?.effectiveVoiceWsAsrConfigured,
+      );
+      tags.push({
+        label: wsReady ? "统一流式 · WS 直推" : "统一流式 · 未配置",
+        warn: !wsReady,
+        title: wsReady
+          ? `统一流式语音听写网关 (${wsStatus?.endpointUrl || "wss://voice.1inch.cn:18443/v1/ws/asr"}) · openWakeWord 唤醒后直推原始 16kHz PCM`
+          : wsStatus?.lastError || "请在设置中填写统一流式语音听写网关授权码",
+      });
+    } else if (pipelineMode === "xfyun") {
       const xfStatus = vs?.localEngine?.xfyunIat;
       const xfReady = Boolean(
         vs?.localEngine?.readyForXfyunIat ??

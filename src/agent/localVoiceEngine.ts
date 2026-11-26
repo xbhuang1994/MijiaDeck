@@ -65,16 +65,23 @@ import {
   type XfyunIatConfig,
   type XfyunIatStatus,
 } from "./xfyunIatV2Runtime.ts";
+import {
+  VoiceWsAsrRuntime,
+  type VoiceWsAsrConfig,
+  type VoiceWsAsrStatus,
+} from "./voiceWsAsrRuntime.ts";
 import { getPrimaryOwnerRefWavPath } from "./voiceprintStore.ts";
 
 export type {
   NoiseSuppressionMode,
   VadEngineMode,
   VoicePipelineMode,
+  VoiceWsAsrConfig,
+  VoiceWsAsrStatus,
   XfyunIatConfig,
   XfyunIatStatus,
 };
-export { XfyunIatV2Runtime };
+export { VoiceWsAsrRuntime, XfyunIatV2Runtime };
 
 export interface LocalVoiceModelPaths {
   modelsDir: string;
@@ -115,12 +122,15 @@ export interface LocalVoiceEngineStatus {
     spleeterSeparation?: boolean;
     localTts?: boolean;
     xfyunIat?: boolean;
+    voiceWsAsr?: boolean;
   };
   readyForDenoise: boolean;
   readyForDpdfnet: boolean;
   readyForVoxlock: boolean;
   readyForXfyunIat: boolean;
   xfyunIat: XfyunIatStatus;
+  readyForVoiceWsAsr: boolean;
+  voiceWsAsr: VoiceWsAsrStatus;
   readyForVad: boolean;
   readyForVoiceprint: boolean;
   readyForSenseVoice: boolean;
@@ -162,6 +172,7 @@ export interface SpeakerEmbeddingOutput {
 
 export type LocalAsrResultEngine =
   | "xfyun-iat-v2"
+  | "voice-ws-asr"
   | "sensevoice-local"
   | "sensevoice-dual-raw"
   | "sensevoice-dual-denoised";
@@ -426,6 +437,7 @@ export class LocalVoiceEngine {
   private readonly _oww: OpenWakeWordEngine;
   private readonly _tts: LocalTtsEngine;
   private readonly _xfyunIat: XfyunIatV2Runtime;
+  private readonly _voiceWsAsr: VoiceWsAsrRuntime;
   private _sourceSeparator: AudioSourceSeparator | null = null;
   private _gtcrnDenoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
   private _dpdfnetDenoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
@@ -452,6 +464,7 @@ export class LocalVoiceEngine {
     this._oww = new OpenWakeWordEngine({ modelsDir: p.modelsDir });
     this._tts = new LocalTtsEngine({ modelsDir: p.modelsDir });
     this._xfyunIat = new XfyunIatV2Runtime();
+    this._voiceWsAsr = new VoiceWsAsrRuntime();
   }
 
   get xfyunIat(): XfyunIatV2Runtime {
@@ -462,6 +475,13 @@ export class LocalVoiceEngine {
     this._xfyunIat.setConfig(config);
   }
 
+  get voiceWsAsr(): VoiceWsAsrRuntime {
+    return this._voiceWsAsr;
+  }
+
+  setVoiceWsAsrConfig(config: VoiceWsAsrConfig): void {
+    this._voiceWsAsr.setConfig(config);
+  }
   get paths(): LocalVoiceModelPaths {
     return resolveVoiceModelPaths(this._modelsDirOverride);
   }
@@ -515,6 +535,7 @@ export class LocalVoiceEngine {
     const sileroVad = existsSync(p.sileroVad);
     const speakerCampp = existsSync(p.speakerCampp);
     const xfyunStatus = this._xfyunIat.getStatus();
+    const voiceWsAsrStatus = this._voiceWsAsr.getStatus();
     const senseVoice = this._hasSenseVoiceModels(p);
     const openWakeWord = existsSync(p.openWakeWordMel) && existsSync(p.openWakeWordEmbedding);
     const cedAudioTagging = existsSync(p.cedModel) && existsSync(p.cedLabels);
@@ -542,12 +563,15 @@ export class LocalVoiceEngine {
         spleeterSeparation,
         localTts: ttsStatus.ready,
         xfyunIat: xfyunStatus.ready,
+        voiceWsAsr: voiceWsAsrStatus.ready,
       },
       readyForDenoise: addonAvailable && gtcrn,
       readyForDpdfnet: addonAvailable && dpdfnet4,
       readyForVoxlock: addonAvailable && voxlock,
       readyForXfyunIat: xfyunStatus.ready,
       xfyunIat: xfyunStatus,
+      readyForVoiceWsAsr: voiceWsAsrStatus.ready,
+      voiceWsAsr: voiceWsAsrStatus,
       readyForVad: addonAvailable && sileroVad,
       readyForVoiceprint: addonAvailable && speakerCampp,
       readyForSenseVoice,
@@ -589,8 +613,8 @@ export class LocalVoiceEngine {
     try {
       this._oww.ensureLoaded();
       await yieldTick();
-      if (options.voicePipelineMode === "xfyun") {
-        // 讯飞语音听写大模型 2.0 方案：仅需就绪 openWakeWord 与可选声纹提取器，跳过重型降噪/本地识别预热
+      if (options.voicePipelineMode === "xfyun" || options.voicePipelineMode === "voice-ws") {
+        // 讯飞听写 2.0 / 统一流式语音听写网关方案：仅需就绪 openWakeWord 与可选声纹提取器，跳过重型降噪/本地识别预热
         this._ensureSpeakerExtractor();
         return;
       }
@@ -1540,6 +1564,7 @@ export class LocalVoiceEngine {
     this._sourceSeparator?.dispose();
     this._sourceSeparator = null;
     this._xfyunIat.dispose();
+    this._voiceWsAsr.dispose();
     this._oww.dispose();
     this._tts.dispose();
     this._gtcrnDenoiser = null;

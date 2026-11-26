@@ -8,6 +8,7 @@
 
 import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
+import { VoiceWsAsrRuntime } from "../agent/voiceWsAsrRuntime.ts";
 import { XfyunIatV2Runtime } from "../agent/xfyunIatV2Runtime.ts";
 import {
   addCustomInstruction,
@@ -172,6 +173,7 @@ export interface AppRuntime {
       vadSensitivity?: agentConfigStoreModule.VadSensitivityMode;
       wakeWordEnabled?: boolean;
       owwEnabled?: boolean;
+      echoCancellationMode?: agentConfigStoreModule.EchoCancellationMode;
     },
   ) => void;
   speakerAudioProps?: Map<string, { volName: string; muteName: string }>;
@@ -195,8 +197,10 @@ export class HttpError extends Error {
 }
 
 const SECRET_PATTERNS: ReadonlyArray<RegExp> = [
-  /(serviceToken|ssecurity|passToken|cUserId|userId|p2p_id|init_string|authorization|cookie|api[_-]?key|api[_-]?secret|sttApiKey|systemOneApiKey|xfyunApiKey|xfyunApiSecret|x-auth-code|accessSecret|localKey|refreshToken|authToken|accessToken|password)\s*[:=]\s*[^\s,;'"&}]+/gi,
+  /(serviceToken|ssecurity|passToken|cUserId|userId|p2p_id|init_string|authorization|cookie|api[_-]?key|api[_-]?secret|sttApiKey|systemOneApiKey|xfyunApiKey|xfyunApiSecret|voiceWsAsrAuthCode|auth[_-]?code|x-auth-code|accessSecret|localKey|refreshToken|authToken|accessToken|password)\s*[:=]\s*[^\s,;'"&}]+/gi,
   /Bearer\s+[A-Za-z0-9._~+/=-]+/gi,
+  /bearer\.[A-Za-z0-9._~+/=-]+/gi,
+  /vgw_[A-Za-z0-9._~+/=-]{6,}/g,
   /JWT\s+[A-Za-z0-9._~+/=-]+/gi,
   /sk-[A-Za-z0-9_\-]{8,}/g,
   /vgw_[A-Za-z0-9_\-]{8,}/g,
@@ -2538,6 +2542,7 @@ export function createRequestHandler(
           vadSensitivity: updated.vadSensitivity,
           wakeWordEnabled: updated.wakeWordEnabled,
           owwEnabled: updated.owwEnabled,
+          echoCancellationMode: updated.echoCancellationMode,
         });
         emitBroadcast(runtime);
         return jsonResponse({
@@ -2810,6 +2815,55 @@ export function createRequestHandler(
           latencyMs: result.latencyMs,
           sid: result.sid,
           endpointUrl: result.endpointUrl,
+          ...(result.error ? { error: sanitizeErrorMessage(result.error) } : {}),
+        });
+      }
+
+      if (method === "POST" && pathname === "/api/voice/ws-asr/test") {
+        const cfgStore = runtime.agentConfigStore ?? agentConfigStoreModule;
+        const saved = runtime.piAgent ? runtime.piAgent.config : cfgStore.loadAgentVoiceConfig();
+        const body = await readJsonBody(req);
+        const tempCfg = cfgStore.normalizeAgentVoiceConfig({
+          ...saved,
+          voiceWsAsrEndpointUrl:
+            typeof body.voiceWsAsrEndpointUrl === "string" && body.voiceWsAsrEndpointUrl.trim()
+              ? body.voiceWsAsrEndpointUrl.trim()
+              : saved.voiceWsAsrEndpointUrl,
+          voiceWsAsrAuthCode:
+            body.clearVoiceWsAsrAuthCode === true
+              ? ""
+              : typeof body.voiceWsAsrAuthCode === "string" && body.voiceWsAsrAuthCode.trim()
+                ? body.voiceWsAsrAuthCode.trim()
+                : saved.voiceWsAsrAuthCode,
+          voiceWsAsrDenoise:
+            typeof body.voiceWsAsrDenoise === "boolean"
+              ? body.voiceWsAsrDenoise
+              : saved.voiceWsAsrDenoise,
+          voiceWsAsrLanguage:
+            typeof body.voiceWsAsrLanguage === "string"
+              ? body.voiceWsAsrLanguage.trim()
+              : saved.voiceWsAsrLanguage,
+        });
+        const wsAuth = cfgStore.resolveEffectiveVoiceWsAsrAuth(tempCfg);
+        if (!wsAuth.configured) {
+          throw new HttpError(400, "请先填写统一流式语音听写网关地址与授权码");
+        }
+        const probe = new VoiceWsAsrRuntime({
+          endpointUrl: wsAuth.endpointUrl,
+          authCode: wsAuth.authCode,
+          denoise: wsAuth.denoise,
+          language: wsAuth.language,
+        });
+        const result = await probe.testConnection({ timeoutMs: 8000 });
+        probe.dispose();
+        return jsonResponse({
+          ok: result.ok,
+          latencyMs: result.latencyMs,
+          sessionId: result.sessionId,
+          endpointUrl: result.endpointUrl,
+          denoiseModel: result.denoiseModel,
+          vadModel: result.vadModel,
+          asrModel: result.asrModel,
           ...(result.error ? { error: sanitizeErrorMessage(result.error) } : {}),
         });
       }
