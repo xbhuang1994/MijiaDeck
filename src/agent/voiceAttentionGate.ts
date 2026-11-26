@@ -833,31 +833,6 @@ export function assistantReplyExpectsUserResponse(reply: string | undefined): bo
   return OPEN_ASSISTANT_QUESTION_RE.test(trimmed);
 }
 
-/**
- * 当 SystemOne 不可用或被关闭时的确定性对话结束兜底判定：
- * - 存在未完成任务或待确认槽位 -> continue
- * - 助手刚提出需要用户作答的明确问题且静默未超时 -> continue
- * - 其余闭环回复或静默完成 -> ready_to_end（可开始退出倒计时）
- */
-export function inferConversationEndFallback(input: {
-  lastAssistantReply?: string;
-  silentCompleted?: boolean;
-  hasPendingConfirmation?: boolean;
-  activeTaskCount?: number;
-  idleSeconds?: number;
-}): "continue" | "ready_to_end" {
-  if ((input.activeTaskCount ?? 0) > 0) return "continue";
-  if (input.hasPendingConfirmation) return "continue";
-  if (typeof input.idleSeconds === "number" && input.idleSeconds >= 30) {
-    return "ready_to_end";
-  }
-  if (input.silentCompleted) return "ready_to_end";
-  if (assistantReplyExpectsUserResponse(input.lastAssistantReply)) {
-    return "continue";
-  }
-  return "ready_to_end";
-}
-
 function escapeRegExp(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

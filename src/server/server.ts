@@ -189,7 +189,6 @@ function handleWsMessage(
         getRecentHistory: () => vl.getRecentHistoryForSystemOne(5),
         getDialogEpoch: () => vl.dialogEpoch,
         onPartialTranscript: (partial) => {
-          vl.noteLiveSpeechActivity(partial.text);
           try {
             ws.send(
               JSON.stringify({

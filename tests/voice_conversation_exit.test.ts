@@ -199,44 +199,32 @@ describe("Conversation Mode Attention Rejection Under Noise & Background Music",
 });
 
 describe("Conversation Mode Reliable Exit Under Ambient Noise / Background Music", () => {
-  test("keeps conversation alive during continuous user speech (>5s) and only releases via stuck-VAD watchdog when no transcripts arrive", async () => {
+  test("continuous or flickering VAD speech activity cannot extend conversation window indefinitely", async () => {
     const h = await createIsolatedVoiceHarness({ conversationWindowSec: 1 });
     try {
-      // 1. Real user speaking continuously with brief clause pauses (6s > old 3.5s/5s BGM cap) MUST stay in conversation!
+      // 1. Continuous/flickering VAD (simulating constant background singing/music/TV)
       h.vl.enterConversation("wake_only", { speakAck: false });
       expect(h.vl.dialogState).toBe("conversation");
       h.vl.setSpeechInProgress(true);
-      expect(h.vl.snapshot().timerPaused).toBe(true);
-      expect(h.vl.snapshot().conversationHoldReason).toBe("user_speaking");
+      expect(h.vl.snapshot().timerPaused).toBe(false);
 
-      for (let i = 0; i < 6; i += 1) {
+      // Keep flickering VAD every 400ms as if music/noise keeps triggering Silero VAD
+      const start = Date.now();
+      let exited = false;
+      while (Date.now() - start < 6500) {
         await Bun.sleep(300);
-        expect(h.vl.dialogState).toBe("conversation");
+        if (h.vl.dialogState === "standby") {
+          exited = true;
+          break;
+        }
         h.vl.setSpeechInProgress(false);
         await Bun.sleep(100);
         h.vl.setSpeechInProgress(true);
       }
-      expect(h.vl.dialogState).toBe("conversation");
-      h.vl.setSpeechInProgress(false);
 
-      const follow = await h.vl.handleTranscript("关闭客厅吸顶灯", { isFinal: true });
-      expect(follow.matched).toBe(true);
-      expect(await h.demo.powerState("demo-light-living")).toBe(false);
-
-      // 2. Stuck-VAD hardware safety watchdog (injectable short threshold) prevents infinite deadlock when zero speech/segments arrive
-      const stuckVl = new VoiceListenerController(h.agent, { maxSpeechHoldMs: 700 });
-      try {
-        stuckVl.enterConversation("wake_only", { speakAck: false });
-        stuckVl.setSpeechInProgress(true);
-        const deadline = Date.now() + 3000;
-        while (Date.now() < deadline && stuckVl.dialogState === "conversation") {
-          await Bun.sleep(60);
-        }
-        expect(stuckVl.dialogState).toBe("standby");
-        expect(stuckVl.snapshot().lastTransitionReason).toBe("timeout");
-      } finally {
-        stuckVl.dispose();
-      }
+      expect(exited).toBe(true);
+      expect(h.vl.snapshot().dialogState).toBe("standby");
+      expect(h.vl.snapshot().lastTransitionReason).toBe("timeout");
     } finally {
       await h.cleanup();
     }
