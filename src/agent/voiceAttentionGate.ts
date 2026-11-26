@@ -82,6 +82,8 @@ export interface EvaluateAttentionInput {
   acousticEvent?: string;
   voiceprint?: VoiceprintIdentifyResult | null;
   voiceprintMode?: VoiceprintPolicyMode;
+  /** 当前连续对话中已确认的活跃说话人姓名（用于同说话人声纹连续性信号） */
+  conversationSpeakerName?: string | null;
   llmEvaluator?: AttentionLlmEvaluator;
   /** 当前家庭设备特殊能力摘要（支持袜子筒/内裤筒/扫地机/浇花/喂食器等隐式指令精准放行） */
   capabilityDigest?: HomeCapabilityDigest | null;
@@ -97,6 +99,7 @@ export type AttentionPassSource =
   | "implicit_capability"
   | "pending_confirmation"
   | "acoustic_wake_recovery"
+  | "conversation_followup_recovery"
   | "custom_instruction"
   | "systemone"
   | "llm"
@@ -857,6 +860,41 @@ export function isExplicitExitPhrase(text: string): boolean {
   return norm.length > 0 && EXPLICIT_EXIT_RE.test(norm);
 }
 
+// 连续对话中仅含极简敷衍/收尾语气词的短语（无实质内容，SystemOne 低置信度时不应误触发新一轮 Agent 调用）
+const BARE_WEAK_CLOSING_TOKEN_SRC =
+  "(?:嗯+|哦+|喔+|啊+|呃+|好吧|行吧|算了吧?|没事了?|没关系|不用了?|就这样吧?|先这样吧?|知道了?|明白了?|懂了|好的?|ok|okay|fine|alright|nevermind|forgetit)";
+const BARE_WEAK_CLOSING_RE = new RegExp(`^(?:那)?(?:${BARE_WEAK_CLOSING_TOKEN_SRC}){1,2}$`, "i");
+
+// 连续对话中面向助手的叮嘱、提醒、改进要求或纠错反馈（如“那以后不要出现这种情况了”“下次注意一点”“以后别再听错了”）
+const CONTEXTUAL_FOLLOWUP_ADMONISH_RE =
+  /(?:(?:那)?(?:以后|下次|下回|之后|今后|往后).{0,10}(?:不要|别|不能|别再|不要再|记得|注意|小心|听清|听清楚|反应|快一点|快点|准一点|准确|靠谱|改|改进|优化|解决|避免|记住|保持|尽量)|(?:不要|别|不能)(?:再)?(?:出现|发生|这样|那样|搞错|弄错|听错|漏掉|漏听|忘记|忘了|卡|延迟|没反应|忽略|无视)|(?:下次|下回|以后)注意|长点心|记住[了啊呀吧]|记好[了啊呀吧]|don'?t\s+(?:let\s+(?:this|that)|do\s+that)\s+happen\s+again|next\s+time\b|make\s+sure\s+you\b|be\s+more\s+careful)/i;
+
+// 连续对话中承接上文的回指/追问/反馈连接结构（如“那你刚才听到什么了”“刚刚为什么没反应”“这种问题怎么避免”“原来是这样”）
+const CONTEXTUAL_FOLLOWUP_DISCOURSE_RE =
+  /(?:^(?:那(?:你|以后|下次|刚才|刚刚|为什|为啥|怎么|是不是|岂不是|应该|可能|也|还|就|再|如果|要是|不是)|所以(?:你|刚才|刚刚|才|就|以后|下次)|但是(?:你|刚才|刚刚|它|现在|还是)|不过(?:你|刚才|刚刚|它|现在|还是)|可是(?:你|刚才|刚刚|它|现在|还是)|对了[，,\s]|顺便|另外|还有就是).{2,}|(?:你(?:刚才|刚刚|前面|上次|这次|现在|怎么|为什么|为啥|是不是|有没有|听清|听见|听到|没听|反应|记住|记得|明白|知道|能不|可以|搞错|弄错|确定))|(?:(?:刚才|刚刚|上一次|前两次|这次).{0,10}(?:为什么|为啥|怎么|没开|没关|没亮|没反应|没听清|听错|慢|快|不对|错了|成功|好了|情况|问题))|(?:(?:这种|这个|那个|刚才那个|上面那个)(?:情况|问题|错误|bug|现象|失误))|(?:为什么|为啥)(?:会|没|不|刚才|刚刚|这么|那么|还|又|要)|(?:难怪|怪不得|原来如此|原来是这样|这就对了|这就好多了|总算好了)|(?:怎么回事|怎么办|啥意思|什么意思|真的吗|确定吗|对不对|行不行|好了吗|成功了吗|听清了吗|听见了吗|听到了吗|明白了吗|记住了吗)[？?呀啊呢吗吧]*$)/i;
+
+/**
+ * 判断语句是否为无实质跟进内容的极简敷衍/收尾短语（如“嗯好吧”“行吧”“那算了”）。
+ */
+export function isBareWeakClosingPhrase(text: string): boolean {
+  const norm = normalizeForExit(text);
+  return norm.length > 0 && BARE_WEAK_CLOSING_RE.test(norm);
+}
+
+/**
+ * 判断语句在连续对话中是否包含清晰的承接上文跟进/叮嘱/反馈/追问语用特征
+ * （仅用于辅助化解 SystemOne 灰区低置信度判定，严禁用于绕过 BGM/旁白/明确退出护栏）。
+ */
+export function isContextualConversationFollowup(rawText: string, acousticEvent?: string): boolean {
+  const cmd = rawText.replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
+  if (cmd.length < 2 || cmd.length > 80) return false;
+  if (isExplicitExitPhrase(cmd) || isBareWeakClosingPhrase(cmd)) return false;
+  if (isNoiseOrGarbledFragment(cmd, acousticEvent)) return false;
+  if (OBVIOUS_SIDETALK_RE.test(cmd) || NON_COMMAND_CHAT_RE.test(cmd)) return false;
+  if (isThirdPersonNeoMention(cmd)) return false;
+  return CONTEXTUAL_FOLLOWUP_ADMONISH_RE.test(cmd) || CONTEXTUAL_FOLLOWUP_DISCOURSE_RE.test(cmd);
+}
+
 // 连续对话中可独立成立的简短设备/播放/喂食控制指令（无需再提设备名）
 const STANDALONE_CONVERSATION_CMD_RE =
   /^(?:(?:请|帮我|给我|麻烦|再|稍微|稍微再|还是|那就|帮我再|把它|把(?:它|这个|那个)?|先|快|赶紧|顺便)?(?:打开|开启|开一下|关掉|关闭|关上|关了吧|关一下|停一下|停掉|停止|暂停|继续|结束播放|(?:别|不要)(?:再)?(?:放|播)(?:了|歌|音乐)?|静音|取消静音|解除静音|恢复声音|闭麦|开麦|下一首|上一首|下一曲|上一曲|换一首|换首歌|切歌|换歌|再来一份|出粮|投喂|调大|调小|调亮|调暗|调高|调低|大一点|小一点|亮一点|暗一点|高一点|低一点|暖一点|冷一点|开灯|关灯|熄灯|灭灯|亮灯|全开|全关))(?:吧|呀|啊|哦|呢|一下|一点|一些|了)?$/i;
@@ -1230,7 +1268,7 @@ function buildAttentionPrompt(params: {
     `最新听到的语音文本："""${params.text}"""`,
     "",
     "判定准则：",
-    "- 若用户直接呼唤你执行设备控制/查询/提问或保存/管理长期附加指令规则（如“小派，关灯”、“帮我把音量调大一点”、“那卧室灯也关掉”、“以后记得洗衣默认用智洗烘模式”、“以后我说打开空调你要自己判断室外温度”），addressed=true。",
+    "- 若用户直接呼唤你执行设备控制/查询/提问或保存/管理长期附加指令规则（如“小派，关灯”、“帮我把音量调大一点”、“那卧室灯也关掉”、“以后记得洗衣默认用智洗烘模式”、“以后我说打开空调你要自己判断室外温度”），或在连续对话中承接上文对你进行叮嘱、提醒、批评、反馈或自然追问（如“那以后不要出现这种情况了”、“下次注意一点”、“刚刚为什么没反应”），addressed=true。",
     "- 唤醒词判定或条件：若句子中存在明确的控制智能家居设备指令（如开关或调节灯光、空调、风扇、窗帘、电视、音箱/音乐、洗衣机、扫地机、加湿器/净化器、插座、喂食器、场景模式等），即使唤醒词被误听、吞字或位于句中，也判定 addressed=true 放行不拦截，并在 command 字段中提取干净的控制设备指令。",
     "- 注意背景音乐/电视干扰：如果环境中正在放歌，唤醒词前后可能混入无关歌词碎片（例如“也甘愿赴汤蹈火去走小派打开客厅吸顶灯，间走过这世间”）。只要唤醒词后紧跟明确的设备控制/查询指令，就判定 addressed=true，并在 command 字段中只提取干净的用户指令（去掉前后无关歌词）！",
     "- 若用户只是提到你的名字讨论/夸奖/抱怨/叫别人别管你（如“我刚跟朋友聊到小派挺好用的”、“你觉得小派怎么样”、“别管小派了吃饭吧”、“有人叫小派吗”），addressed=false！",
@@ -2120,6 +2158,18 @@ export async function evaluateVoiceAttention(
         role: t.role,
         text: t.text,
       }));
+      const voiceprintMatched = Boolean(input.voiceprint?.evaluated && input.voiceprint.matched);
+      const voiceprintRejectedOther = Boolean(
+        input.voiceprint?.evaluated &&
+          input.voiceprint.enrolledCount > 0 &&
+          !input.voiceprint.matched,
+      );
+      const sameConversationSpeaker = Boolean(
+        voiceprintMatched &&
+          input.voiceprint?.speakerName &&
+          input.conversationSpeakerName &&
+          input.voiceprint.speakerName === input.conversationSpeakerName,
+      );
       const s1 = await input.systemOneClient.evaluateConversationTurn(
         {
           utterance: cleaned,
@@ -2129,6 +2179,7 @@ export async function evaluateVoiceAttention(
           lastSpokenReply: input.lastSpokenReply,
           acousticEvent: input.acousticEvent,
           speakerName: input.voiceprint?.speakerName ?? null,
+          ...(sameConversationSpeaker ? { sameSpeaker: true } : {}),
           acousticWake: input.acousticWake
             ? { wakeWord: input.acousticWake.wakeWord, score: input.acousticWake.score }
             : null,
@@ -2232,6 +2283,79 @@ export async function evaluateVoiceAttention(
             ...intentFields,
             ...selectedFields,
           });
+        }
+
+        // 连续对话低置信度跟进表达挽救（仅 smart 模式、非 BGM、非明确旁白/未匹配他人声纹，且存在活跃对话上下文）：
+        // 避免“那以后不要出现这种情况了”“下次注意一点”等自然跟进表达在 3 分类（followup/side_talk/goodbye）灰区被误拦。
+        const hasRecentTurns = recentHistory.length > 0;
+        const pFollowup = s1.probabilities.followup ?? 0;
+        const pSideTalk = s1.probabilities.side_talk ?? 0;
+        const pGoodbye = s1.probabilities.goodbye ?? 0;
+        const pDirected = pFollowup + pGoodbye;
+        const marginOverSideTalk = pFollowup - pSideTalk;
+        const contextualFollowup = isContextualConversationFollowup(
+          effectiveCmd,
+          input.acousticEvent,
+        );
+        const safeConversationFollowupCandidate =
+          effectiveCmd.length >= 2 &&
+          effectiveCmd.length <= 80 &&
+          !isBgmConv &&
+          !voiceprintRejectedOther &&
+          !isExplicitExitPhrase(effectiveCmd) &&
+          !isBareWeakClosingPhrase(effectiveCmd) &&
+          !NON_COMMAND_CHAT_RE.test(effectiveCmd) &&
+          !isThirdPersonNeoMention(effectiveCmd);
+
+        if (
+          input.attentionMode === "smart" &&
+          safeConversationFollowupCandidate &&
+          (hasRecentTurns || Boolean(input.awakeActive))
+        ) {
+          const recoverLowConfFollowup =
+            s1.action === "followup" &&
+            pSideTalk <= 0.38 &&
+            pFollowup >= 0.45 &&
+            marginOverSideTalk >= 0.12 &&
+            (contextualFollowup ||
+              (sameConversationSpeaker && pFollowup >= 0.5 && marginOverSideTalk >= 0.18) ||
+              (voiceprintMatched && pDirected >= 0.7 && marginOverSideTalk >= 0.2) ||
+              (hasRecentTurns &&
+                pDirected >= 0.72 &&
+                pSideTalk <= 0.28 &&
+                marginOverSideTalk >= 0.22));
+
+          const recoverSplitGoodbyeFollowup =
+            s1.action === "goodbye" &&
+            !s1.shouldExitConversation &&
+            hasRecentTurns &&
+            contextualFollowup &&
+            pSideTalk <= 0.25 &&
+            pDirected >= 0.72 &&
+            pFollowup >= 0.25 &&
+            marginOverSideTalk >= 0.1;
+
+          if (recoverLowConfFollowup || recoverSplitGoodbyeFollowup) {
+            return wrap({
+              accept: true,
+              wokeOnly: false,
+              addressed: true,
+              inConversation: true,
+              confidence: Math.max(s1.confidence, pFollowup),
+              stage: "systemone-attention",
+              passSource: "conversation_followup_recovery",
+              reason: recoverSplitGoodbyeFollowup
+                ? "连续对话跟进反馈表达（非告别意图），已放行继续对话"
+                : sameConversationSpeaker && !contextualFollowup
+                  ? `连续对话同说话人「${input.conversationSpeakerName}」跟进表达，已放行继续对话`
+                  : "连续对话上下文跟进表达，已放行继续对话",
+              wakeWord: null,
+              command: effectiveCmd,
+              usedLlm: true,
+              ...intentFields,
+              ...selectedFields,
+            });
+          }
         }
 
         return wrap({
