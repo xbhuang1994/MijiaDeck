@@ -19,10 +19,15 @@ import {
 import { TypedEmitter } from "../core/contracts.ts";
 import { createBoundedFetch, type FetchLike } from "../core/httpTimeout.ts";
 import {
+  isAsrHallucinationText,
+  sanitizeAsrTranscript,
+} from "./asrHallucinationGuard.ts";
+import {
   computeRms,
   decodeWavPcm,
   encodeWavPcm16,
   estimateSnrDb,
+  hasAudibleAudioEnergy,
   isWavBuffer,
   resampleLinear,
 } from "./audioPcm.ts";
@@ -1176,6 +1181,18 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       };
     }
 
+    // 静音/热词 Prompt 回显幻觉早退：不污染 lastTranscript，也不触发 Pi Agent 或“在呢”应答
+    if (isAsrHallucinationText(text, this.config.wakeWords)) {
+      this._noteNonConversationSegment("ambient_noise", now);
+      return {
+        ok: true,
+        matched: false,
+        wokeOnly: false,
+        command: "",
+        voiceState: this.snapshot(),
+      };
+    }
+
     this._lastTranscript = text;
     this._error = null;
 
@@ -2180,7 +2197,11 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       mode: cfg.vadMode,
     });
 
-    if (!vad.hasSpeech || vad.speechSamples.length < 1600) {
+    if (
+      !vad.hasSpeech ||
+      vad.speechSamples.length < 1600 ||
+      !hasAudibleAudioEnergy(vad.speechSamples, 16000)
+    ) {
       if (autoDispatch) {
         this._noteNonConversationSegment("ambient_noise");
       }
@@ -2473,11 +2494,16 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       );
     }
 
-    const precomputedText = (segment.precomputedTranscript ?? "").trim();
+    const precomputedText = sanitizeAsrTranscript(segment.precomputedTranscript ?? "", {
+      wakeWords: cfg.wakeWords,
+    });
+    const precomputedEnergyAudio =
+      segment.rawSamples.length >= 800 ? segment.rawSamples : segment.denoisedSamples;
     const canReuseStreamingPrecomputed =
       useLocal &&
       !isClearVoiceSegment &&
       precomputedText.length > 0 &&
+      hasAudibleAudioEnergy(precomputedEnergyAudio, 16000) &&
       (segment.commitReason === "punctuation_split" ||
         (!segment.forcedRoll && segment.inputSnrDb >= 14));
 
@@ -3056,7 +3082,11 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         }
       }
 
-      if (!speechDetected || speechSamples.length < 1600) {
+      if (
+        !speechDetected ||
+        speechSamples.length < 1600 ||
+        !hasAudibleAudioEnergy(speechSamples, 16000)
+      ) {
         prepared.push({
           trackId,
           trackIndex,
@@ -3842,12 +3872,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     try {
       const parsed = JSON.parse(rawText) as { text?: unknown };
       if (typeof parsed.text === "string") {
-        return parsed.text.trim();
+        return sanitizeAsrTranscript(parsed.text, { wakeWords: cfg.wakeWords });
       }
     } catch {
       // plain text response fallback
     }
-    return rawText.trim();
+    return sanitizeAsrTranscript(rawText, { wakeWords: cfg.wakeWords });
   }
 
   clearHistory(): void {

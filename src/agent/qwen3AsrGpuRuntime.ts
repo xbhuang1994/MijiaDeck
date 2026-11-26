@@ -7,12 +7,14 @@
  *
  * - 仅支持通过在线 Voice & ASR Gateway（OpenAI Whisper 兼容 /v1/audio/transcriptions 或 /v1/transcribe）
  *   调用远端 GPU 部署的 Qwen3-ASR-0.6B 模型；
- * - 支持多语言识别、热词上下文提示与静音防幻觉语言映射；
+ * - 支持多语言识别、静音/低能量前置拦截、静音防幻觉语言映射与后置幻觉清洗
+ *   （严禁将唤醒词/热词拼串注入 Qwen3-ASR 生成式 prompt，杜绝静音/弱音时原样吐出唤醒词列表）；
  * - 在线网关未配置或临时异常时进入短冷却窗口，由上层自动平滑回落至本地备用 SenseVoice 方案。
  */
 
 import { DEFAULT_QWEN3_ASR_MODEL, isLocalEndpointUrl } from "../core/agentConfigStore.ts";
-import { encodeWavPcm16 } from "./audioPcm.ts";
+import { sanitizeAsrTranscript } from "./asrHallucinationGuard.ts";
+import { encodeWavPcm16, hasAudibleAudioEnergy } from "./audioPcm.ts";
 
 export type GpuBackendKind = "remote" | "none";
 
@@ -377,16 +379,27 @@ export class Qwen3AsrGpuRuntime {
       throw new Error("未配置在线 Qwen3-ASR 服务地址或授权码（仅支持在线模式）");
     }
 
+    // 静音/极低能量前置拦截：避免无背景音/呼吸底噪送入远端 Qwen3-ASR 触发幻觉吐字并节省 GPU 往返
+    if (pcm16k.length < 800 || !hasAudibleAudioEnergy(pcm16k, 16000)) {
+      return {
+        text: "",
+        rawText: "",
+        lang: "",
+        durationMs: 0,
+        deviceId: "remote",
+        deviceName: this._remoteGpuName ?? "在线 Qwen3-ASR GPU",
+        backend: "remote",
+      };
+    }
+
     const t0 = performance.now();
     const endpoints = resolveQwen3AsrGatewayEndpoints(this._remoteServiceUrl);
     const wavBytes = encodeWavPcm16(pcm16k, 16000);
     const audioSec = pcm16k.length / 16000;
     const langHint = mapQwen3GatewayLang(options.voiceLang);
-    const hotwordPrompt = (options.hotwords ?? [])
-      .map((w) => w.replace(/,/g, " ").trim())
-      .filter((w) => w.length > 0)
-      .slice(0, 12)
-      .join(" ");
+    // 注意：绝不将 options.hotwords 拼串传入 Qwen3-ASR 的生成式 `prompt` 字段！
+    // 实测 Qwen3-ASR-0.6B 在静音/低信噪比/短呼吸声下会直接把 prompt（如“嘿Neo 尼奥 鸟 嘿6 Neo”）原样复读吐出；
+    // options.hotwords 仅保留用于下方后置幻觉清洗（防御自定义代理注入 prompt 导致的回显）。
 
     const defaultTimeoutMs = Math.max(15_000, Math.min(45_000, Math.round(audioSec * 1200) + 10_000));
     const timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
@@ -415,7 +428,6 @@ export class Qwen3AsrGpuRuntime {
             filename: "speech.wav",
             model: this._remoteModel,
             ...(langHint ? { language: langHint } : {}),
-            ...(hotwordPrompt ? { prompt: hotwordPrompt } : {}),
           }),
           signal: combinedSignal,
         });
@@ -430,9 +442,6 @@ export class Qwen3AsrGpuRuntime {
         form.append("response_format", "verbose_json");
         if (langHint) {
           form.append("language", langHint);
-        }
-        if (hotwordPrompt) {
-          form.append("prompt", hotwordPrompt);
         }
         res = await this._fetcher(endpoints.transcriptionsUrl, {
           method: "POST",
@@ -461,7 +470,9 @@ export class Qwen3AsrGpuRuntime {
         rawText = rawBody;
       }
 
-      const text = parseQwen3GpuResponseText(rawText);
+      const text = sanitizeAsrTranscript(parseQwen3GpuResponseText(rawText), {
+        wakeWords: options.hotwords,
+      });
       if (!options.signal?.aborted && text && typeof options.onPartial === "function") {
         options.onPartial(text);
       }

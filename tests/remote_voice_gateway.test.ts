@@ -446,7 +446,7 @@ describe("在线 Voice & ASR Gateway 协议联调（Mock Gateway 还原 README �
     expect(asrRes.deviceName).toBe("AMD Radeon AI PRO R9700");
     expect(asrMultipartCalls).toBe(1);
     expect(capturedAsr.language).toBeNull(); // zh-CN 不强制传 language，防静音幻觉并保持中英混说
-    expect(capturedAsr.prompt).toBe("Neo 小派");
+    expect(capturedAsr.prompt).toBeNull(); // 不向 Qwen3-ASR 注入 hotwords prompt，彻底杜绝静音/弱音复读唤醒词列表幻觉
     expect(partials).toEqual(["Neo，打开客厅吸顶灯。"]);
     qwen.dispose();
 
