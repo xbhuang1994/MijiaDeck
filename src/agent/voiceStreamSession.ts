@@ -203,6 +203,7 @@ interface ClearVoiceUtteranceMeta {
   wakeAnchored: boolean;
   acousticWake: WakeWordAcousticHit | null;
   endGlobalSample: number;
+  duringTtsPlayback?: boolean;
 }
 
 interface ClearVoiceQueuedSlice {
@@ -211,6 +212,7 @@ interface ClearVoiceQueuedSlice {
   wakeAuthorized: boolean;
   wakeAnchored: boolean;
   acousticWake: WakeWordAcousticHit | null;
+  duringTtsPlayback?: boolean;
   utteranceMeta?: ClearVoiceUtteranceMeta;
 }
 
@@ -252,6 +254,8 @@ const STANDBY_DPDF_RELEASE_RMS = 0.008;
 const STANDBY_DPDF_ENGAGE_SAMPLES = Math.round(TARGET_SR * 0.25);
 const STANDBY_DPDF_RELEASE_SAMPLES = Math.round(TARGET_SR * 1.5);
 const STANDBY_DPDF_PREROLL_SAMPLES = Math.round(TARGET_SR * 0.48);
+/** TTS 播报/尾音期间仅由单字拟声/失真碎片构成的流式预览过滤，避免 UI 闪现“呀。”等无效预览 */
+const TTS_FILLER_PREVIEW_RE = /^[呀啊哦喔噢呃额哈呵啦呢嘛哎唉哟咦呜嘿哇哒啪咔咚嗡哼嘶嘘噗]$/;
 
 /**
  * 将浏览器发送的 Little-Endian Int16 PCM 二进制帧解码为 Float32Array（[-1, 1]）。
@@ -379,6 +383,9 @@ export class VoiceStreamSession {
   private _lastMatchedBySlot = new Map<number, { startSec: number; endSec: number }>();
   private _ttsSpeaking = false;
   private _ttsLastEndedAt = 0;
+  /** 采集时刻级 TTS 重叠锁存（避免 1.2s 尾静音判停后 _isDuringTtsWindow() 过期丢失回声标记） */
+  private _cvUtteranceDuringTts = false;
+  private _legacyUtteranceDuringTts = false;
 
   // 无 Silero VAD 时的纯 TS 兜底窗口缓冲
   private _fallbackChunks: Float32Array[] = [];
@@ -832,6 +839,8 @@ export class VoiceStreamSession {
     this._wakeAnchorHit = null;
     this._cvWakeAnchored = false;
     this._cvWakeHit = null;
+    this._cvUtteranceDuringTts = false;
+    this._legacyUtteranceDuringTts = false;
     this._activeSegmentStartSample = null;
     this._denoisedPending = new Float32Array(0);
     this._segmenter.reset();
@@ -970,6 +979,8 @@ export class VoiceStreamSession {
     this._wakeAnchorHit = null;
     this._cvWakeAnchored = false;
     this._cvWakeHit = null;
+    this._cvUtteranceDuringTts = false;
+    this._legacyUtteranceDuringTts = false;
     this._activeSegmentStartSample = null;
     this._denoisedPending = new Float32Array(0);
     this._lastRawOverlap = new Float32Array(0);
@@ -1105,20 +1116,26 @@ export class VoiceStreamSession {
 
   private _handleClearVoiceChunks(chunks: ClearVoiceChunkDescriptor[]): void {
     for (const ch of chunks) {
+      if (ch.rawNewSamples.length > 0 && this._isDuringTtsWindow()) {
+        this._cvUtteranceDuringTts = true;
+      }
       const startGlobalSample = Math.max(0, this._cvBaseGlobalSample + ch.startSample);
       const endGlobalSample = Math.max(startGlobalSample, this._cvBaseGlobalSample + ch.endSample);
       const sliceWakeAnchored = this._cvWakeAnchored || this._wakeAnchorSample !== null;
       const sliceAcousticWake = this._cvWakeHit ?? this._wakeAnchorHit ?? null;
+      const sliceDuringTts = this._cvUtteranceDuringTts;
       let utteranceMeta: ClearVoiceUtteranceMeta | undefined;
       if (ch.utteranceEnded) {
         utteranceMeta = {
           wakeAnchored: sliceWakeAnchored,
           acousticWake: sliceAcousticWake,
           endGlobalSample,
+          duringTtsPlayback: sliceDuringTts,
         };
         this._cvPendingEmitCount += 1;
         this._cvWakeAnchored = false;
         this._cvWakeHit = null;
+        this._cvUtteranceDuringTts = false;
         this._wakeAnchorSample = null;
         this._wakeAnchorHit = null;
       }
@@ -1128,6 +1145,7 @@ export class VoiceStreamSession {
         wakeAuthorized: this.isAwake || sliceWakeAnchored,
         wakeAnchored: sliceWakeAnchored,
         acousticWake: sliceAcousticWake,
+        duringTtsPlayback: sliceDuringTts,
         utteranceMeta,
       });
     }
@@ -1269,6 +1287,7 @@ export class VoiceStreamSession {
     this._cvBssUsed = false;
     this._cvServerSwaps = 0;
     this._cvUtteranceStartSample = null;
+    this._cvUtteranceDuringTts = false;
     this._cvPendingEmitCount = 0;
     this._cvAnyTrackDrainedInUtterance = false;
     this._cvChunker?.setIncompleteUtteranceHint(false);
@@ -1318,6 +1337,18 @@ export class VoiceStreamSession {
         // 整句静默观察期结束信号（音频已在 280ms 切片时完成 GPU 盲源分离与分轨降噪拼接，零额外 GPU 推理开销直接交付）
         if (next.rawNewSamples.length === 0 && next.utteranceEnded) {
           this._emitClearVoiceUtterance(next.triggerReason, item.utteranceMeta);
+          return;
+        }
+
+        // 首片可听能量早退：防止极微弱底噪/气音/电底噪浪费远端 ClearVoice GPU 往返并被远端增强后诱导 ASR 幻觉
+        if (
+          assembler.sliceCount === 0 &&
+          next.rawNewSamples.length >= 800 &&
+          !hasAudibleAudioEnergy(next.rawNewSamples, TARGET_SR)
+        ) {
+          if (next.utteranceEnded) {
+            this._emitClearVoiceUtterance(next.triggerReason, item.utteranceMeta);
+          }
           return;
         }
 
@@ -1400,7 +1431,7 @@ export class VoiceStreamSession {
           tracksWithContext: separatedSliceTracks,
           lookbackSamples: next.lookbackSamples,
           newSamples: next.rawNewSamples.length,
-          applyCrossfade: next.needsCrossfade,
+          applyCrossfade: next.needsCrossfade && assembler.sliceCount > 0,
         });
 
         const tracker = this._cvTrackTracker!;
@@ -1499,6 +1530,7 @@ export class VoiceStreamSession {
                   em.otherEnergySum,
                   item.wakeAnchored,
                   item.acousticWake,
+                  Boolean(item.duringTtsPlayback),
                 );
               }
             }
@@ -1600,6 +1632,12 @@ export class VoiceStreamSession {
                     wakeWords: this._wakeWords,
                   });
                   if (!cleanedText) continue;
+                  if (this._cvUtteranceDuringTts || item.duringTtsPlayback) {
+                    const barePreview = cleanedText.replace(/[\s,，。．.、!！?？:：;；~～…]+/g, "");
+                    if (TTS_FILLER_PREVIEW_RE.test(barePreview)) {
+                      continue;
+                    }
+                  }
                   rawPreviewEntries.push({
                     trackId,
                     trackIndex: displayIndex,
@@ -1728,9 +1766,11 @@ export class VoiceStreamSession {
               wakeAnchored: this._cvWakeAnchored || this._wakeAnchorSample !== null,
               acousticWake: this._cvWakeHit ?? this._wakeAnchorHit ?? null,
               endGlobalSample: this._rawTotalSamples,
+              duringTtsPlayback: this._cvUtteranceDuringTts || Boolean(item.duringTtsPlayback),
             };
             this._cvWakeAnchored = false;
             this._cvWakeHit = null;
+            this._cvUtteranceDuringTts = false;
             this._wakeAnchorSample = null;
             this._wakeAnchorHit = null;
             this._emitClearVoiceUtterance("timeout", timeoutMeta, false);
@@ -1770,8 +1810,12 @@ export class VoiceStreamSession {
     otherAlignedEnergySum: number,
     sliceWakeAnchored = false,
     sliceAcousticWake: WakeWordAcousticHit | null = null,
+    duringTtsPlayback = false,
   ): void {
     if (this._disposed || trackAudio.length < Math.round(TARGET_SR * 0.14)) {
+      return;
+    }
+    if (!hasAudibleAudioEnergy(trackAudio, TARGET_SR)) {
       return;
     }
     const assembler = this._cvAssembler;
@@ -1784,6 +1828,9 @@ export class VoiceStreamSession {
             ready.endGlobalSample,
           )
         : new Float32Array(0);
+    if (rawFromRing.length >= 800 && !hasAudibleAudioEnergy(rawFromRing, TARGET_SR)) {
+      return;
+    }
     const rawSlice =
       rawFromRing.length >= Math.round(TARGET_SR * 0.14) ? rawFromRing : trackAudio;
 
@@ -1830,6 +1877,7 @@ export class VoiceStreamSession {
       forcedRoll: ready.reason === "track_timeout",
       acousticWake,
       wakeAnchored,
+      duringTtsPlayback: Boolean(duringTtsPlayback || this._isDuringTtsWindow()),
       commitReason: ready.reason === "track_timeout" ? "max_duration" : "vad_silence",
       pipelineMode: "clearvoice",
       clearVoiceMeta: {
@@ -2022,6 +2070,10 @@ export class VoiceStreamSession {
       this._trackMuteManager.commitActiveUtterance();
     }
 
+    if (rawSlice.length >= 800 && !hasAudibleAudioEnergy(rawSlice, TARGET_SR)) {
+      return;
+    }
+    finalTracks = finalTracks.filter((tr) => hasAudibleAudioEnergy(tr.samples, TARGET_SR));
     if (finalTracks.length === 0) {
       return;
     }
@@ -2057,6 +2109,7 @@ export class VoiceStreamSession {
       forcedRoll: triggerReason === "timeout",
       acousticWake: utteranceMeta?.acousticWake ?? null,
       wakeAnchored: Boolean(utteranceMeta?.wakeAnchored),
+      duringTtsPlayback: Boolean(utteranceMeta?.duringTtsPlayback || this._isDuringTtsWindow()),
       commitReason:
         triggerReason === "flush"
           ? "manual_flush"
@@ -2135,6 +2188,8 @@ export class VoiceStreamSession {
     this._wakeAnchorHit = null;
     this._cvWakeAnchored = false;
     this._cvWakeHit = null;
+    this._cvUtteranceDuringTts = false;
+    this._legacyUtteranceDuringTts = false;
     this._activeSegmentStartSample = null;
     this._denoisedPending = new Float32Array(0);
     this._lastRawOverlap = new Float32Array(0);
@@ -2159,9 +2214,19 @@ export class VoiceStreamSession {
     this._ttsSpeaking = Boolean(speaking);
     if (!speaking) {
       this._ttsLastEndedAt = now;
+    } else {
+      if (this._cvChunker?.inUtterance && !this._cvChunker.waitingUtteranceEnd) {
+        this._cvUtteranceDuringTts = true;
+      }
+      if (this._vadDetected || this._activeSegmentStartSample !== null) {
+        this._legacyUtteranceDuringTts = true;
+      }
     }
     const userCurrentlySpeaking =
-      this._vadDetected || this._wakeAnchorSample !== null || this._cvWakeAnchored;
+      this._vadDetected ||
+      this._wakeAnchorSample !== null ||
+      this._cvWakeAnchored ||
+      Boolean(this._cvChunker?.inUtterance && !this._cvChunker.waitingUtteranceEnd);
     if (!userCurrentlySpeaking) {
       this._lastRawOverlap = new Float32Array(0);
       this._lastDenOverlap = new Float32Array(0);
@@ -2170,7 +2235,7 @@ export class VoiceStreamSession {
 
   private _isDuringTtsWindow(): boolean {
     if (this._ttsSpeaking) return true;
-    return this._ttsLastEndedAt > 0 && Date.now() - this._ttsLastEndedAt <= 900;
+    return this._ttsLastEndedAt > 0 && Date.now() - this._ttsLastEndedAt <= 1000;
   }
 
   // ---------------------------------------------------------------------------
@@ -2793,6 +2858,13 @@ export class VoiceStreamSession {
       this._cvFedUpToGlobalSample = this._rawTotalSamples;
       if (feedSlice.length > 0) {
         const chunks = this._cvChunker!.pushSamples(feedSlice);
+        if (
+          this._cvChunker!.inUtterance &&
+          !this._cvChunker!.waitingUtteranceEnd &&
+          this._isDuringTtsWindow()
+        ) {
+          this._cvUtteranceDuringTts = true;
+        }
         this._handleClearVoiceChunks(chunks);
       }
       return;
@@ -2827,6 +2899,9 @@ export class VoiceStreamSession {
       this._vadSamplesFed += 512;
       const nowDetected = this._vad.isDetected();
       const remainingAfterFrame = merged.length - (offset + 512);
+      if (nowDetected && this._isDuringTtsWindow()) {
+        this._legacyUtteranceDuringTts = true;
+      }
 
       if (nowDetected !== this._vadDetected) {
         this._vadDetected = nowDetected;
@@ -2984,6 +3059,7 @@ export class VoiceStreamSession {
     const lastLatencyMs = this._streamLastLatencyMs;
     const anchor = this._wakeAnchorSample;
     const anchorHit = this._wakeAnchorHit;
+    const segDuringTts = this._legacyUtteranceDuringTts || this._isDuringTtsWindow();
     const origin =
       anchor ??
       this._streamSpeechOriginSample ??
@@ -2993,6 +3069,8 @@ export class VoiceStreamSession {
     this._wakeAnchorHit = null;
     this._cvWakeAnchored = false;
     this._cvWakeHit = null;
+    this._cvUtteranceDuringTts = false;
+    this._legacyUtteranceDuringTts = false;
     this._activeSegmentStartSample = null;
     this._segmenter.reset();
     this._resetVadState(unfedTailSamples);
@@ -3025,6 +3103,7 @@ export class VoiceStreamSession {
       forcedRoll: false,
       acousticWake: anchorHit,
       wakeAnchored: anchor !== null,
+      duringTtsPlayback: segDuringTts,
       precomputedAsrEngine: lastEngine,
       precomputedAsrMs: lastLatencyMs,
       commitReason: "punctuation_pause",
@@ -3357,10 +3436,13 @@ export class VoiceStreamSession {
   private _emitWakeAnchoredSegment(timedOut: boolean, unfedTailSamples = 0): void {
     const anchor = this._wakeAnchorSample;
     const anchorHit = this._wakeAnchorHit;
+    const segDuringTts = this._legacyUtteranceDuringTts || this._isDuringTtsWindow();
     this._wakeAnchorSample = null;
     this._wakeAnchorHit = null;
     this._cvWakeAnchored = false;
     this._cvWakeHit = null;
+    this._cvUtteranceDuringTts = false;
+    this._legacyUtteranceDuringTts = false;
     this._activeSegmentStartSample = null;
     this._segmenter.reset();
 
@@ -3403,6 +3485,7 @@ export class VoiceStreamSession {
         forcedRoll: timedOut,
         acousticWake: anchorHit,
         wakeAnchored: true,
+        duringTtsPlayback: segDuringTts,
       },
       rawStart,
       rawEnd,
@@ -3415,7 +3498,9 @@ export class VoiceStreamSession {
    */
   private _emitSegmenterWindow(timedOut: boolean, unfedTailSamples = 0): void {
     const segStart = this._activeSegmentStartSample;
+    const segDuringTts = this._legacyUtteranceDuringTts || this._isDuringTtsWindow();
     this._activeSegmentStartSample = null;
+    this._legacyUtteranceDuringTts = false;
     if (segStart === null) return;
 
     const rawStart = Math.max(0, segStart - PRE_ROLL_SAMPLES);
@@ -3483,6 +3568,7 @@ export class VoiceStreamSession {
         forcedRoll: timedOut,
         acousticWake,
         wakeAnchored: false,
+        duringTtsPlayback: segDuringTts,
       },
       rawStart,
       rawEnd,
@@ -3520,6 +3606,7 @@ export class VoiceStreamSession {
         wakeAnchored: this._cvWakeAnchored || this._wakeAnchorSample !== null,
         acousticWake: this._cvWakeHit ?? this._wakeAnchorHit ?? null,
         endGlobalSample: this._rawTotalSamples,
+        duringTtsPlayback: this._cvUtteranceDuringTts || this._isDuringTtsWindow(),
       };
       const tailChunk = this._cvChunker?.flush();
       if (tailChunk) {
@@ -3527,6 +3614,7 @@ export class VoiceStreamSession {
       } else {
         this._cvWakeAnchored = false;
         this._cvWakeHit = null;
+        this._cvUtteranceDuringTts = false;
         this._wakeAnchorSample = null;
         this._wakeAnchorHit = null;
       }
@@ -3763,6 +3851,10 @@ export class VoiceStreamSession {
 
       const inputSnrDb = estimateSnrDb(rawSlice, TARGET_SR);
       const outputSnrDb = estimateSnrDb(denSlice, TARGET_SR);
+      const segDuringTts = this._legacyUtteranceDuringTts || this._isDuringTtsWindow();
+      if (!this._vadDetected) {
+        this._legacyUtteranceDuringTts = false;
+      }
       const payload: VoiceStreamSegmentPayload = {
         rawSamples: rawSlice,
         denoisedSamples: denSlice,
@@ -3775,6 +3867,7 @@ export class VoiceStreamSession {
         forcedRoll,
         acousticWake,
         wakeAnchored: false,
+        duringTtsPlayback: segDuringTts,
       };
 
       this._enqueueWithStreamingHandoff(
@@ -4008,6 +4101,8 @@ export class VoiceStreamSession {
     this._wakeAnchorHit = null;
     this._cvWakeAnchored = false;
     this._cvWakeHit = null;
+    this._cvUtteranceDuringTts = false;
+    this._legacyUtteranceDuringTts = false;
     this._activeSegmentStartSample = null;
     this._resetVadState();
     try {

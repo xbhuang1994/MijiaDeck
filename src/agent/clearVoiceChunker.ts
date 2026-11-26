@@ -1883,6 +1883,7 @@ export class ClearVoiceRealtimeChunker {
   }
 
   private _detectVoiceInFrame(frame: Float32Array): boolean {
+    const rms = computeRms(frame);
     if (this._vad) {
       try {
         this._vad.acceptWaveform(frame);
@@ -1890,12 +1891,19 @@ export class ClearVoiceRealtimeChunker {
         while (!this._vad.isEmpty()) {
           this._vad.pop();
         }
-        return this._vad.isDetected();
+        if (!this._vad.isDetected()) {
+          return false;
+        }
+        // 新话语起音能量下限（-48 dBFS）：过滤极微弱底噪/吐气/系统尾音触发空话语，
+        // 已进入话语后的句尾轻声不设起音下限，避免截断自然轻声尾字。
+        if (!this._inUtterance && rms < 0.004) {
+          return false;
+        }
+        return true;
       } catch {
         // fallback to energy VAD
       }
     }
-    const rms = computeRms(frame);
     const thresh = Math.max(this._fallbackRmsThreshold, this._adaptiveNoiseFloor * 2.4);
     const voice = rms >= thresh;
     if (!voice) {

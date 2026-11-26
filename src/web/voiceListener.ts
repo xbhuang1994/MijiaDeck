@@ -395,7 +395,7 @@ class WorkletPbfdafAec {
     const micRms = Math.sqrt(micPow);
     const refRms = Math.sqrt(refPow);
     const refNow = refRms >= this.farEndThresh;
-    if (refNow) this.farEndHold = 14;
+    if (refNow) this.farEndHold = 18;
     else if (this.farEndHold > 0) this.farEndHold -= 1;
     const farEndActive = refNow || this.farEndHold > 0;
 
@@ -602,6 +602,7 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
     // 连续实时流模式 + 全双工 AEC 配置
     this.streamMode = Boolean(opts.streamMode);
     this.fullDuplex = opts.fullDuplex !== false;
+    this.bargeInEnabled = opts.bargeInEnabled !== false;
     this.echoMode = typeof opts.echoMode === "string" ? opts.echoMode : "auto";
     this.aecEnabled = this.echoMode !== "off" && this.echoMode !== "standard";
     this.aec = new WorkletPbfdafAec(this.echoMode === "aggressive");
@@ -641,6 +642,7 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
         if (typeof msg.vadSilenceMs === "number") this.vadSilenceMs = msg.vadSilenceMs;
         if (typeof msg.streamMode === "boolean") this.streamMode = msg.streamMode;
         if (typeof msg.fullDuplex === "boolean") this.fullDuplex = msg.fullDuplex;
+        if (typeof msg.bargeInEnabled === "boolean") this.bargeInEnabled = msg.bargeInEnabled;
         if (typeof msg.echoMode === "string") {
           this.echoMode = msg.echoMode;
           this.aecEnabled = this.echoMode !== "off" && this.echoMode !== "standard";
@@ -648,6 +650,9 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
         }
       } else if (msg.type === "tts_state") {
         this.ttsActive = Boolean(msg.active);
+        if (this.ttsActive && !this.bargeInEnabled) {
+          this.loudFrames = 0;
+        }
         if (!this.ttsActive) {
           this.noRefLoudFrames = 0;
           if (this.lastDoubleTalk) {
@@ -711,6 +716,46 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
   }
 
   pushToStreamOrVad(cleanSamples) {
+    // 关闭语音打断（bargeInEnabled=false）且正在 TTS 播报/尾音保护期：
+    // 在 Worklet 源头静音门控上行帧，保持流时钟连续但彻底阻断系统提示音/残余回声进入 VAD 与 ClearVoice！
+    const ttsMicGated = this.ttsActive && !this.bargeInEnabled;
+    if (ttsMicGated) {
+      this.levelAccumN += cleanSamples.length;
+      if (this.levelAccumN >= 640) {
+        this.port.postMessage({
+          type: "level",
+          rms: 0,
+          noiseFloor: this.noiseFloor,
+          speaking: false,
+        });
+        this.levelAccumSq = 0;
+        this.levelAccumN = 0;
+      }
+      if (this.streamMode) {
+        for (let i = 0; i < cleanSamples.length; i += 1) {
+          this.streamBuf[this.streamPos] = 0;
+          this.streamPos += 1;
+          if (this.streamPos >= this.streamFrameSize) {
+            const out = this.streamBuf;
+            this.streamBuf = new Int16Array(this.streamFrameSize);
+            this.streamPos = 0;
+            this.port.postMessage({ type: "pcm_frame", buffer: out.buffer }, [out.buffer]);
+          }
+        }
+        return;
+      }
+      if (this.speaking) {
+        this.silentSamples += cleanSamples.length;
+        const maxSilenceSamples = Math.round((this.vadSilenceMs / 1000) * this.targetRate);
+        if (this.silentSamples >= maxSilenceSamples) {
+          this.finishUtterance();
+        }
+      } else {
+        this.loudFrames = 0;
+      }
+      return;
+    }
+
     let sumSq = 0;
     let zcrCount = 0;
     let prev = 0;
@@ -846,8 +891,8 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
 
           // 有远端参考信号时，使用 AEC 双讲检测精准驱动降音/打断；
           // 若走浏览器原生 SpeechSynthesis（无 PCM 参考信号），则使用高门限近端人声检测兜底双讲
-          let dt = res.doubleTalk;
-          if (!res.farEndActive && this.ttsActive) {
+          let dt = this.bargeInEnabled ? res.doubleTalk : false;
+          if (this.bargeInEnabled && !res.farEndActive && this.ttsActive) {
             if (res.outputRms >= Math.max(this.vadThreshold * 2.5, this.noiseFloor * 4.0)) {
               this.noRefLoudFrames += 1;
               if (this.noRefLoudFrames >= 4) dt = true;
@@ -1115,7 +1160,7 @@ export class VoiceListenerClient {
     const prevEngine = this.config.voiceEngine;
     this.config = { ...this.config, ...next };
 
-    // 动态热更新 AudioWorklet 参数（含全双工开关与回声消除档位，无需重启麦克风）
+    // 动态热更新 AudioWorklet 参数（含全双工开关、语音打断与回声消除档位，无需重启麦克风）
     if (this.workletNode) {
       const echoMode = this.config.echoCancellationMode ?? "auto";
       this.workletNode.port.postMessage({
@@ -1123,6 +1168,7 @@ export class VoiceListenerClient {
         vadThreshold: this.config.vadThreshold,
         vadSilenceMs: this.config.vadSilenceMs,
         fullDuplex: this.isFullDuplexEnabled(),
+        bargeInEnabled: this.config.bargeInEnabled !== false,
         echoMode,
       });
       this.aecActive =
@@ -1588,8 +1634,9 @@ export class VoiceListenerClient {
     const fullDuplex = this.isFullDuplexEnabled();
 
     if (!next) {
-      // 所有分段播报结束：短尾音保护后通知服务端结束播报（全双工模式下全程未暂停麦克风）
-      const tailMs = fullDuplex ? 200 : 320;
+      // 所有分段播报结束：等待声学混响与系统音频输出缓冲泄放后再结束播报态、释放 Worklet 静音门控并通知服务端
+      const bargeIn = this.config.bargeInEnabled !== false;
+      const tailMs = fullDuplex && bargeIn ? 280 : 420;
       this.ttsReleaseTimer = window.setTimeout(() => {
         this.ttsReleaseTimer = null;
         this.speakingMuted = false;
@@ -1663,9 +1710,10 @@ export class VoiceListenerClient {
       this.cleanupActiveAudio();
       this.ttsSpeaking = false;
       this.activeTtsItem = null;
+      // 仅上报单条语段播放完毕（不提前置 speaking: false）：
+      // 保持服务端回声窗口与 Worklet 尾音门控持续至 ttsReleaseTimer 混响泄放结束！
       this.cb.sendVoiceStreamControl?.({
         type: "voice_tts_state",
-        speaking: this.ttsQueue.length > 0,
         phase: "end",
         utteranceId: next.utteranceId,
         text: next.text,
@@ -2160,6 +2208,7 @@ export class VoiceListenerClient {
             vadSilenceMs: this.config.vadSilenceMs,
             streamMode: this.streamingOverWs,
             fullDuplex,
+            bargeInEnabled: this.config.bargeInEnabled !== false,
             echoMode,
           },
         });
