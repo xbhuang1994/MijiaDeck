@@ -1181,11 +1181,9 @@ export class DeviceDetailModalController {
       "红外遥控面板",
       !data.online
         ? "设备离线"
-        : data.controlWarning
-          ? `共 ${irActions.length} 个红外按键 · 需配置涂鸦 OpenAPI 启用标准遥控器协议`
-          : hasWritableParams
-            ? `共 ${irActions.length} 个红外按键 · 支持下方参数精细调节`
-            : `共 ${irActions.length} 个红外按键 · 标准遥控器协议已就绪`,
+        : hasWritableParams
+          ? `共 ${irActions.length} 个红外按键 · 支持下方参数精细调节`
+          : `共 ${irActions.length} 个红外按键 · 点击即刻发射红外信号`,
     );
 
     const panel = document.createElement("div");

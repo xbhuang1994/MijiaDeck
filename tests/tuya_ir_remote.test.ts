@@ -2,7 +2,7 @@
 // MijiaDeck: 涂鸦智能红外遥控子设备（音响/空调/电视/DIY等）与红外网关端到端测试
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -903,7 +903,7 @@ describe("Tuya Infrared Remote — Provider OpenAPI v2.0 IR Control Hub", () => 
     });
   });
 
-  test("hybrid mode keeps Sharing working and surfaces clear warning when OpenAPI IR Control Hub subscription is missing (28841002)", async () => {
+  test("hybrid mode keeps Sharing working without emitting OpenAPI IR warning when IR Control Hub subscription is missing (28841002)", async () => {
     const { mockFetch: sharingFetch } = createSharingMockFetch();
 
     const hybridErrFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -949,8 +949,7 @@ describe("Tuya Infrared Remote — Provider OpenAPI v2.0 IR Control Hub", () => 
     expect(devices.map((d) => d.did)).toContain("amp_001");
 
     const ampDetail = await provider.deviceDetail("amp_001");
-    expect(ampDetail.control_warning).toContain("红外开放能力");
-    expect(ampDetail.control_warning).toContain("28841002");
+    expect(ampDetail.control_warning).toBeUndefined();
 
     const acDetail = await provider.deviceDetail("ac_001");
     expect(acDetail.control_warning).toBeUndefined();
@@ -1033,7 +1032,7 @@ describe("Tuya Infrared Remote — HTTP API, Pi Agent Tools & Local Planner Inte
 
       const ampDid = "tuya:amp_001";
 
-      // GET /api/devices/:did/detail returns ir-remote actions cleanly + controlWarning in Sharing-only mode
+      // GET /api/devices/:did/detail returns ir-remote actions cleanly with NO OpenAPI controlWarning
       const detailRes = await handler(
         new Request(`http://127.0.0.1/api/devices/${encodeURIComponent(ampDid)}/detail`),
       );
@@ -1042,8 +1041,7 @@ describe("Tuya Infrared Remote — HTTP API, Pi Agent Tools & Local Planner Inte
       expect(detailJson.ok).toBe(true);
       expect(detailJson.actions.map((a: any) => a.name)).toContain("Volume+");
       expect(detailJson.props.map((p: any) => p.name)).toEqual(["on"]);
-      expect(detailJson.controlWarning).toContain("OpenAPI");
-      expect(detailJson.controlWarning).toContain("标准遥控器协议");
+      expect(detailJson.controlWarning).toBeNull();
 
       // IR AC in Sharing-only mode has NO controlWarning
       const acDetailRes = await handler(
@@ -1084,14 +1082,16 @@ describe("Tuya Infrared Remote — HTTP API, Pi Agent Tools & Local Planner Inte
         volume_delta: 20,
       });
       expect(JSON.stringify(volRes.content)).toContain("音量调大（2次）");
-      expect(JSON.stringify(volRes.content)).toContain("涂鸦 OpenAPI");
+      expect(JSON.stringify(volRes.content)).not.toContain("OpenAPI");
+      expect(JSON.stringify(volRes.content)).not.toContain("扫码共享模式");
       expect(sentCommands).toHaveLength(2);
       expect(sentCommands.every((c) => c.commands[0]?.code === "Volume+")).toBe(true);
 
       const powerTool = tools.find((t) => t.name === "set_device_power")!;
       const pwrRes = await powerTool.execute("tc_pwr", { target: "音响", state: "on" });
       expect(JSON.stringify(pwrRes.content)).toContain("已开");
-      expect(JSON.stringify(pwrRes.content)).toContain("涂鸦 OpenAPI");
+      expect(JSON.stringify(pwrRes.content)).not.toContain("OpenAPI");
+      expect(JSON.stringify(pwrRes.content)).not.toContain("扫码共享模式");
 
       sentCommands.length = 0;
       const nextRes = await speakerTool.execute("tc2", {
@@ -1176,5 +1176,21 @@ describe("Tuya Infrared Remote — HTTP API, Pi Agent Tools & Local Planner Inte
       mainWindow.dispose();
       await jobs.shutdown();
     }
+  });
+
+  test("UI panels do not display obsolete Tuya OpenAPI IR warning hints", () => {
+    const platformsPanelSrc = readFileSync(
+      path.resolve(import.meta.dir, "../src/web/platformsPanel.ts"),
+      "utf-8",
+    );
+    const detailModalSrc = readFileSync(
+      path.resolve(import.meta.dir, "../src/web/deviceDetailModal.ts"),
+      "utf-8",
+    );
+
+    expect(platformsPanelSrc).not.toContain("不开放红外标准遥控器协议");
+    expect(platformsPanelSrc).not.toContain("补充涂鸦 OpenAPI 凭据");
+    expect(platformsPanelSrc).not.toContain("IR Control Hub");
+    expect(detailModalSrc).not.toContain("需配置涂鸦 OpenAPI");
   });
 });

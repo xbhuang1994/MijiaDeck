@@ -486,7 +486,7 @@ describe("SilentControlReplyPolicy — Pure 4-Gate Decision Engine", () => {
       }),
     ).toBe(false);
 
-    // Tuya QR sharing warning note in trace
+    // Device control warning note in trace
     expect(
       evaluateSilentControlReply({
         userText: "关闭电视",
@@ -497,7 +497,7 @@ describe("SilentControlReplyPolicy — Pure 4-Gate Decision Engine", () => {
             name: "set_device_power",
             args: { target: "tuya:tv1", state: "off" },
             isError: false,
-            text: "客厅电视 已关（提示：当前为涂鸦扫码共享模式，如设备无响应请在设置→多平台接入补充涂鸦 OpenAPI 凭据）",
+            text: "客厅电视 已关（提示：设备状态回读受限，请留意实际开关状态）",
             details: {
               ok: true,
               succeeded: [
@@ -505,7 +505,7 @@ describe("SilentControlReplyPolicy — Pure 4-Gate Decision Engine", () => {
                   did: "tuya:tv1",
                   name: "客厅电视",
                   state: false,
-                  note: "已关（提示：当前为涂鸦扫码共享模式，如设备无响应请在设置→多平台接入补充涂鸦 OpenAPI 凭据）",
+                  note: "已关（提示：设备状态回读受限，请留意实际开关状态）",
                 },
               ],
               failed: [],

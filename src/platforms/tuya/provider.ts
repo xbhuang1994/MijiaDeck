@@ -1185,7 +1185,7 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
         try {
           remotes = await client.listInfraredRemotes(hub.id);
         } catch (err) {
-          // 记录 IR Control Hub OpenAPI 失败原因（如未开通红外服务/试用期到期），供详情页告警与诊断报告展示
+          // 记录 IR Control Hub OpenAPI 失败原因（如未开通红外服务/试用期到期），供诊断报告排查
           this._lastIrOpenApiError = formatIrOpenApiErrorZh(err, (e) => this._sanitizeErrorText(e));
           return;
         }
@@ -1685,24 +1685,12 @@ export class TuyaPlatformProvider implements IDevicePlatformProvider {
 
   // ---------- 设备详情与属性读写 ----------
 
-  private _resolveIrControlWarning(profile: TuyaDeviceProfile): string | null {
-    if (!profile.isInfraredRemote || profile.irControlMode !== "sharing-limited") {
-      return null;
-    }
-    if (this._lastIrOpenApiError) {
-      return `涂鸦 OpenAPI 红外控制不可用（${this._lastIrOpenApiError}）；当前回退为扫码共享接口，非空调红外按键可能无法真实发射。`;
-    }
-    return "当前为涂鸦扫码共享模式，非空调红外遥控器（如音响/电视/DIY遥控）的按键无法通过共享接口可靠触发。请在「设置 → 多平台接入 → 涂鸦智能」切换为「云端+局域网混合」模式，保留扫码登录并补充 OpenAPI 凭据（需在涂鸦云项目开通 IR Control Hub 万能红外开放能力），以启用标准遥控器协议真实发射红外码。";
-  }
-
   async deviceDetail(nativeDid: string): Promise<DeviceDetail> {
     const profile = await this._ensureProfile(nativeDid);
-    const controlWarning = this._resolveIrControlWarning(profile);
     return {
       ...profile.detail,
       props: profile.detail.props.map((p) => ({ ...p })),
       actions: profile.detail.actions.map((a) => ({ ...a })),
-      ...(controlWarning ? { control_warning: controlWarning } : {}),
     };
   }
 

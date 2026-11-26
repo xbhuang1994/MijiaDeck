@@ -129,7 +129,7 @@ export interface DeviceDetail {
   model: string;
   props: PropInfo[];
   actions: ActionInfo[];
-  /** 可选的控制通道告警提示（例如涂鸦红外子设备在仅扫码共享模式下的协议受限说明）。 */
+  /** 可选的控制通道告警提示。 */
   control_warning?: string | null;
 }
 
