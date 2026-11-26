@@ -77,6 +77,11 @@ import {
   type XfyunIatConfig,
   type XfyunIatStatus,
 } from "./xfyunIatV2Runtime.ts";
+import {
+  VoiceWsAsrRuntime,
+  type VoiceWsAsrConfig,
+  type VoiceWsAsrStatus,
+} from "./voiceWsAsrRuntime.ts";
 import { getPrimaryOwnerRefWavPath } from "./voiceprintStore.ts";
 
 export type {
@@ -86,10 +91,12 @@ export type {
   Qwen3GpuStatus,
   VadEngineMode,
   VoicePipelineMode,
+  VoiceWsAsrConfig,
+  VoiceWsAsrStatus,
   XfyunIatConfig,
   XfyunIatStatus,
 };
-export { ClearVoiceGpuRuntime, Qwen3AsrGpuRuntime, XfyunIatV2Runtime };
+export { ClearVoiceGpuRuntime, Qwen3AsrGpuRuntime, VoiceWsAsrRuntime, XfyunIatV2Runtime };
 
 export interface LocalVoiceModelPaths {
   modelsDir: string;
@@ -134,6 +141,7 @@ export interface LocalVoiceEngineStatus {
     clearVoiceMossformer2?: boolean;
     clearVoiceMossformer2Ss?: boolean;
     xfyunIat?: boolean;
+    voiceWsAsr?: boolean;
   };
   readyForDenoise: boolean;
   readyForDpdfnet: boolean;
@@ -143,6 +151,8 @@ export interface LocalVoiceEngineStatus {
   clearVoice: ClearVoiceGpuStatus;
   readyForXfyunIat: boolean;
   xfyunIat: XfyunIatStatus;
+  readyForVoiceWsAsr: boolean;
+  voiceWsAsr: VoiceWsAsrStatus;
   readyForVad: boolean;
   readyForVoiceprint: boolean;
   readyForQwen3Asr: boolean;
@@ -191,6 +201,7 @@ export interface SpeakerEmbeddingOutput {
 
 export type LocalAsrResultEngine =
   | "xfyun-iat-v2"
+  | "voice-ws-asr"
   | "qwen3-asr-remote"
   | "qwen3-asr-remote-stream"
   | "qwen3-asr-remote-dual-raw"
@@ -500,6 +511,7 @@ export class LocalVoiceEngine {
   private readonly _qwen3Gpu: Qwen3AsrGpuRuntime;
   private readonly _clearVoiceGpu: ClearVoiceGpuRuntime;
   private readonly _xfyunIat: XfyunIatV2Runtime;
+  private readonly _voiceWsAsr: VoiceWsAsrRuntime;
   private _preferredAsrEngine: LocalAsrEngineMode = DEFAULT_LOCAL_ASR_ENGINE;
   private _sourceSeparator: AudioSourceSeparator | null = null;
   private _gtcrnDenoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
@@ -531,6 +543,7 @@ export class LocalVoiceEngine {
     this._qwen3Gpu = new Qwen3AsrGpuRuntime();
     this._clearVoiceGpu = new ClearVoiceGpuRuntime();
     this._xfyunIat = new XfyunIatV2Runtime();
+    this._voiceWsAsr = new VoiceWsAsrRuntime();
   }
 
   get preferredAsrEngine(): LocalAsrEngineMode {
@@ -563,6 +576,14 @@ export class LocalVoiceEngine {
 
   setXfyunIatConfig(config: XfyunIatConfig): void {
     this._xfyunIat.setConfig(config);
+  }
+
+  get voiceWsAsr(): VoiceWsAsrRuntime {
+    return this._voiceWsAsr;
+  }
+
+  setVoiceWsAsrConfig(config: VoiceWsAsrConfig): void {
+    this._voiceWsAsr.setConfig(config);
   }
 
   setClearVoiceServiceUrl(url: string): void {
@@ -632,6 +653,7 @@ export class LocalVoiceEngine {
     const gpuStatus = this._qwen3Gpu.getStatus();
     const clearVoiceStatus = this._clearVoiceGpu.getStatus();
     const xfyunStatus = this._xfyunIat.getStatus();
+    const voiceWsAsrStatus = this._voiceWsAsr.getStatus();
     const readyForQwen3Remote = Boolean(gpuStatus.remote && gpuStatus.ready);
     const readyForQwen3Gpu = readyForQwen3Remote;
     const readyForQwen3Asr = readyForQwen3Remote;
@@ -682,6 +704,7 @@ export class LocalVoiceEngine {
         clearVoiceMossformer2: clearVoiceStatus.modelReady,
         clearVoiceMossformer2Ss: clearVoiceStatus.ssModelReady,
         xfyunIat: xfyunStatus.ready,
+        voiceWsAsr: voiceWsAsrStatus.ready,
       },
       readyForDenoise: addonAvailable && gtcrn,
       readyForDpdfnet: addonAvailable && dpdfnet4,
@@ -691,6 +714,8 @@ export class LocalVoiceEngine {
       clearVoice: clearVoiceStatus,
       readyForXfyunIat: xfyunStatus.ready,
       xfyunIat: xfyunStatus,
+      readyForVoiceWsAsr: voiceWsAsrStatus.ready,
+      voiceWsAsr: voiceWsAsrStatus,
       readyForVad: addonAvailable && sileroVad,
       readyForVoiceprint: addonAvailable && speakerCampp,
       readyForQwen3Asr,
@@ -741,8 +766,8 @@ export class LocalVoiceEngine {
     try {
       this._oww.ensureLoaded();
       await yieldTick();
-      if (options.voicePipelineMode === "xfyun") {
-        // 讯飞语音听写大模型 2.0 方案：仅需就绪 openWakeWord 与可选声纹提取器，跳过重型降噪/本地识别预热
+      if (options.voicePipelineMode === "xfyun" || options.voicePipelineMode === "voice-ws") {
+        // 讯飞听写 2.0 / 统一流式语音听写网关方案：仅需就绪 openWakeWord 与可选声纹提取器，跳过重型降噪/本地识别预热
         this._ensureSpeakerExtractor();
         return;
       }
@@ -1866,6 +1891,7 @@ export class LocalVoiceEngine {
     this._clearVoiceGpu.dispose();
     this._qwen3Gpu.dispose();
     this._xfyunIat.dispose();
+    this._voiceWsAsr.dispose();
     this._oww.dispose();
     this._tts.dispose();
     this._gtcrnDenoiser = null;

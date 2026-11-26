@@ -526,7 +526,8 @@ export async function startMijiaDeckServer(
         if (
           streamOpts?.voicePipelineMode === "legacy" ||
           streamOpts?.voicePipelineMode === "clearvoice" ||
-          streamOpts?.voicePipelineMode === "xfyun"
+          streamOpts?.voicePipelineMode === "xfyun" ||
+          streamOpts?.voicePipelineMode === "voice-ws"
         ) {
           stream.setVoicePipelineMode(streamOpts.voicePipelineMode);
         }
