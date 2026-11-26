@@ -1124,4 +1124,182 @@ describe("洗衣机 HTTP 路由、状态摘要与 Pi Agent 工具集成", () => 
     // 无效控制指令返回 null
     expect(buildWasherLuaControlPayload(defaultWasherState(0xdb), "nonexistent")).toBeNull();
   });
+
+  test("11. 关机待机态与 38135636 左/右小筒上报 db_remote_control_flag=0 不误判为未开启远程控制，且关机启动自动附带开机", async () => {
+    // 1) 实机复现：38135636 关机态三筒均上报 db_remote_control_flag=0（含长期授权 db_authorization_mode=2）
+    let st = parseWasherLuaStatus(
+      0xd9,
+      {
+        bucket: "db",
+        db_location: 2,
+        db_position: 1,
+        db_power: "off",
+        db_running_status: "off",
+        db_program: 138,
+        db_remote_control_flag: 0,
+        db_authorization_mode: 2,
+      },
+      null,
+      { meta: { sn8: "38135636" }, bucket: "db", location: 2 },
+    )!;
+    st = parseWasherLuaStatus(
+      0xd9,
+      {
+        bucket: "db",
+        db_location: 3,
+        db_position: 0,
+        db_power: "off",
+        db_running_status: "off",
+        db_program: 148,
+        db_remote_control_flag: 0,
+        db_authorization_mode: 2,
+      },
+      st,
+      { meta: { sn8: "38135636" }, bucket: "db", location: 3 },
+    )!;
+    st = parseWasherLuaStatus(
+      0xd9,
+      {
+        bucket: "db",
+        db_location: 4,
+        db_position: 0,
+        db_power: "off",
+        db_running_status: "off",
+        db_program: 156,
+        db_remote_control_flag: 0,
+        db_authorization_mode: 2,
+      },
+      st,
+      { meta: { sn8: "38135636" }, bucket: "db", location: 4 },
+    )!;
+    expect(st.drums.bottom?.remoteControlEnabled).toBeNull();
+    expect(st.drums.left?.remoteControlEnabled).toBeNull();
+    expect(st.drums.right?.remoteControlEnabled).toBeNull();
+
+    // 2) 开机态：左/右小筒 supportRemoteControlAgree=false，db_remote_control_flag=0 仍归一为 null；下筒如实反映 false/true
+    st = parseWasherLuaStatus(
+      0xd9,
+      {
+        bucket: "db",
+        db_location: 3,
+        db_power: "on",
+        db_running_status: "standby",
+        db_program: 148,
+        db_remote_control_flag: 0,
+      },
+      st,
+      { meta: { sn8: "38135636" }, bucket: "db", location: 3 },
+    )!;
+    expect(st.drums.left?.remoteControlEnabled).toBeNull();
+
+    st = parseWasherLuaStatus(
+      0xd9,
+      {
+        bucket: "db",
+        db_location: 2,
+        db_power: "on",
+        db_running_status: "standby",
+        db_program: 138,
+        db_remote_control_flag: 0,
+      },
+      st,
+      { meta: { sn8: "38135636" }, bucket: "db", location: 2 },
+    )!;
+    expect(st.drums.bottom?.remoteControlEnabled).toBe(false);
+
+    // 3) 0xDB 滚筒关机态上报 remote_control_flag=0 同样不误判为 false
+    const dbOff = parseWasherLuaStatus(
+      0xdb,
+      { power: "off", running_status: "off", program: "cotton", remote_control_flag: 0 },
+      null,
+    )!;
+    expect(dbOff.remoteControlEnabled).toBeNull();
+
+    // 4) 端到端：关机态 0xD9 启动洗涤自动携带 db_power="on"，切至左筒时不暴露误导性 remote-control-flag
+    const cloud = createFakeMeijuWasherCloud({
+      appliances: [
+        {
+          applianceCode: "210006741790988",
+          name: "美的可爱多",
+          type: "0xD9",
+          sn8: "38135636",
+          modelNumber: "13363",
+          onlineStatus: "1",
+          masterId: "3",
+        },
+      ],
+      luaStateByKey: {
+        "210006741790988:db:2": {
+          bucket: "db",
+          db_location: 2,
+          db_position: 1,
+          db_power: "off",
+          db_running_status: "off",
+          db_program: 138,
+          db_remote_control_flag: 0,
+          db_authorization_mode: 1,
+          db_error_code: "0",
+        },
+        "210006741790988:db:3": {
+          bucket: "db",
+          db_location: 3,
+          db_position: 0,
+          db_power: "off",
+          db_running_status: "off",
+          db_program: 148,
+          db_remote_control_flag: 0,
+          db_authorization_mode: 1,
+          db_error_code: "0",
+        },
+        "210006741790988:db:4": {
+          bucket: "db",
+          db_location: 4,
+          db_position: 0,
+          db_power: "off",
+          db_running_status: "off",
+          db_program: 156,
+          db_remote_control_flag: 0,
+          db_authorization_mode: 1,
+          db_error_code: "0",
+        },
+      },
+    });
+    const provider = new MideaPlatformProvider({
+      httpFetch: cloud.fetchFn,
+      skipLoadConfig: true,
+      initialConfig: {
+        enabled: true,
+        mode: "cloud",
+        cloudBrand: "meiju",
+        account: "13800138000",
+        password: "Password!1",
+        useChinaServer: true,
+      },
+    });
+    await provider.listDevices();
+    const vals = await provider.readProps("210006741790988", [
+      "on",
+      "remote-control-flag",
+      "drum-left-remote-control-flag",
+      "drum-right-remote-control-flag",
+    ]);
+    expect(vals).toEqual({
+      on: false,
+      "remote-control-flag": null,
+      "drum-left-remote-control-flag": null,
+      "drum-right-remote-control-flag": null,
+    });
+
+    await provider.writeProp("210006741790988", "drum-location", "left");
+    const leftDetail = await provider.deviceDetail("210006741790988");
+    expect(leftDetail.props.some((p) => p.name === "remote-control-flag")).toBe(false);
+
+    await provider.runAction("210006741790988", "start-wash", ["left"]);
+    expect(cloud.luaControls.at(-1)?.control).toEqual({
+      bucket: "db",
+      db_location: 3,
+      db_control_status: "start",
+      db_power: "on",
+    });
+  });
 });

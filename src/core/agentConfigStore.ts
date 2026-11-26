@@ -249,6 +249,8 @@ export const DEFAULT_WAKE_WORDS = ["小派", "小湃", "小π", "派派", "pi", 
 export const DEFAULT_WAKE_ACK_PHRASE = "嗯?";
 export const DEFAULT_LOCAL_ASR_ENGINE: LocalAsrEngineMode = "auto";
 export const DEFAULT_VOICE_PIPELINE_MODE: VoicePipelineMode = "legacy";
+export const DEFAULT_CLEARVOICE_MODEL = "MossFormer2_SE_48K";
+export const DEFAULT_QWEN3_ASR_MODEL = "Qwen/Qwen3-ASR-0.6B";
 export const DEFAULT_QWEN3_COMPUTE_DEVICE: Qwen3ComputeDeviceMode = "auto";
 export const DEFAULT_QWEN3_STREAMING_ENABLED = true;
 export const DEFAULT_TTS_ENGINE: TtsEngineMode = "auto";
@@ -269,8 +271,18 @@ export interface AgentVoiceConfig {
   voiceEngine: VoiceEngineMode;
   /** 语音前端降噪与切片方案：legacy（原方案 GTCRN/声源分离）/ clearvoice（新方案 ClearVoice GPU 准实时切片 -> Qwen3-ASR） */
   voicePipelineMode: VoicePipelineMode;
-  /** 可选外部 ClearVoice GPU 服务地址（留空则自动在本地 GPU 启动内置 ClearVoice 服务） */
+  /** 可选外部/在线 ClearVoice GPU 服务地址（如 https://voice.1inch.cn:18443；留空则自动在本地 GPU 启动内置 ClearVoice 服务） */
   clearVoiceServiceUrl: string;
+  /** 可选在线 ClearVoice 服务授权码 / API Key（仅持久化于服务端配置文件，面向前端一律脱敏） */
+  clearVoiceApiKey: string;
+  /** ClearVoice 在线/远程语音增强模型名称（默认 MossFormer2_SE_48K，亦支持 FRCRN_SE_16K / MossFormerGAN_SE_16K） */
+  clearVoiceModel: string;
+  /** 可选在线 Qwen3-ASR 语音识别服务地址（如 https://voice.1inch.cn:18443；留空则使用本地 GPU/CPU Qwen3-ASR） */
+  qwen3AsrServiceUrl: string;
+  /** 可选在线 Qwen3-ASR 服务授权码 / API Key（与 ClearVoice 同源时留空可安全复用 ClearVoice 授权码） */
+  qwen3AsrApiKey: string;
+  /** 在线 Qwen3-ASR 模型 ID（默认 Qwen/Qwen3-ASR-0.6B） */
+  qwen3AsrModel: string;
   /** 本地离线语音转写策略：auto（主用 Qwen3-ASR-0.6B，备用 SenseVoice 自动兜底）/ qwen3-asr / sensevoice */
   localAsrEngine: LocalAsrEngineMode;
   /** Qwen3-ASR-0.6B 计算设备：auto（自动识别 GPU 优先，无 GPU 时回落 CPU）/ gpu / cpu */
@@ -330,7 +342,10 @@ export interface AgentVoiceConfig {
 }
 
 export interface PublicAgentVoiceConfig
-  extends Omit<AgentVoiceConfig, "apiKey" | "sttApiKey" | "systemOneApiKey"> {
+  extends Omit<
+    AgentVoiceConfig,
+    "apiKey" | "sttApiKey" | "systemOneApiKey" | "clearVoiceApiKey" | "qwen3AsrApiKey"
+  > {
   hasApiKey: boolean;
   apiKeyPreview: string;
   envApiKeyDetected: boolean;
@@ -341,6 +356,12 @@ export interface PublicAgentVoiceConfig
   systemOneApiKeyPreview: string;
   effectiveSystemOneBaseUrl: string;
   effectiveSystemOneConfigured: boolean;
+  hasClearVoiceApiKey: boolean;
+  clearVoiceApiKeyPreview: string;
+  effectiveClearVoiceRemoteConfigured: boolean;
+  hasQwen3AsrApiKey: boolean;
+  qwen3AsrApiKeyPreview: string;
+  effectiveQwen3AsrRemoteConfigured: boolean;
 }
 
 export interface AgentConfigPatch {
@@ -357,6 +378,13 @@ export interface AgentConfigPatch {
   voiceEngine?: unknown;
   voicePipelineMode?: unknown;
   clearVoiceServiceUrl?: unknown;
+  clearVoiceApiKey?: unknown;
+  clearClearVoiceApiKey?: unknown;
+  clearVoiceModel?: unknown;
+  qwen3AsrServiceUrl?: unknown;
+  qwen3AsrApiKey?: unknown;
+  clearQwen3AsrApiKey?: unknown;
+  qwen3AsrModel?: unknown;
   localAsrEngine?: unknown;
   qwen3ComputeDevice?: unknown;
   qwen3StreamingEnabled?: unknown;
@@ -419,6 +447,11 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     voiceEngine: "auto",
     voicePipelineMode: DEFAULT_VOICE_PIPELINE_MODE,
     clearVoiceServiceUrl: "",
+    clearVoiceApiKey: "",
+    clearVoiceModel: DEFAULT_CLEARVOICE_MODEL,
+    qwen3AsrServiceUrl: "",
+    qwen3AsrApiKey: "",
+    qwen3AsrModel: DEFAULT_QWEN3_ASR_MODEL,
     localAsrEngine: DEFAULT_LOCAL_ASR_ENGINE,
     qwen3ComputeDevice: DEFAULT_QWEN3_COMPUTE_DEVICE,
     qwen3StreamingEnabled: DEFAULT_QWEN3_STREAMING_ENABLED,
@@ -610,6 +643,15 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     defaults.voicePipelineMode,
   );
   const clearVoiceServiceUrl = normalizeUrl(raw.clearVoiceServiceUrl);
+  const clearVoiceApiKey = typeof raw.clearVoiceApiKey === "string" ? raw.clearVoiceApiKey.trim() : "";
+  const clearVoiceModelRaw =
+    typeof raw.clearVoiceModel === "string" ? raw.clearVoiceModel.trim().slice(0, 128) : "";
+  const clearVoiceModel = clearVoiceModelRaw || defaults.clearVoiceModel;
+  const qwen3AsrServiceUrl = normalizeUrl(raw.qwen3AsrServiceUrl);
+  const qwen3AsrApiKey = typeof raw.qwen3AsrApiKey === "string" ? raw.qwen3AsrApiKey.trim() : "";
+  const qwen3AsrModelRaw =
+    typeof raw.qwen3AsrModel === "string" ? raw.qwen3AsrModel.trim().slice(0, 128) : "";
+  const qwen3AsrModel = qwen3AsrModelRaw || defaults.qwen3AsrModel;
   const qwen3ComputeDevice = normalizeQwen3ComputeDevice(
     raw.qwen3ComputeDevice,
     defaults.qwen3ComputeDevice,
@@ -740,6 +782,11 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     voiceEngine,
     voicePipelineMode,
     clearVoiceServiceUrl,
+    clearVoiceApiKey,
+    clearVoiceModel,
+    qwen3AsrServiceUrl,
+    qwen3AsrApiKey,
+    qwen3AsrModel,
     localAsrEngine,
     qwen3ComputeDevice,
     qwen3StreamingEnabled,
@@ -934,6 +981,75 @@ export function resolveEffectiveSystemOneAuth(config: AgentVoiceConfig): {
   };
 }
 
+function hasSameUrlOrigin(urlA: string, urlB: string): boolean {
+  if (!urlA || !urlB) return false;
+  try {
+    return new URL(urlA).origin === new URL(urlB).origin;
+  } catch {
+    return false;
+  }
+}
+
+export function resolveEffectiveClearVoiceAuth(config: AgentVoiceConfig): {
+  serviceUrl: string;
+  apiKey: string | undefined;
+  model: string;
+  configured: boolean;
+} {
+  const serviceUrl =
+    normalizeUrl(config.clearVoiceServiceUrl) ||
+    normalizeUrl(process.env.CLEARVOICE_SERVICE_URL ?? "");
+  const explicitKey = config.clearVoiceApiKey.trim();
+  const qwenUrl =
+    normalizeUrl(config.qwen3AsrServiceUrl) ||
+    normalizeUrl(process.env.QWEN3_ASR_SERVICE_URL ?? "");
+  const sharedKey =
+    !explicitKey && hasSameUrlOrigin(serviceUrl, qwenUrl) ? config.qwen3AsrApiKey.trim() : "";
+  const envKey =
+    process.env.CLEARVOICE_API_KEY?.trim() ||
+    process.env.VOICE_GATEWAY_API_KEY?.trim() ||
+    "";
+  const apiKey = explicitKey || sharedKey || envKey || undefined;
+  const model = config.clearVoiceModel.trim() || DEFAULT_CLEARVOICE_MODEL;
+  const configured = Boolean(serviceUrl && (apiKey || isLocalEndpointUrl(serviceUrl)));
+  return {
+    serviceUrl,
+    apiKey,
+    model,
+    configured,
+  };
+}
+
+export function resolveEffectiveQwen3AsrAuth(config: AgentVoiceConfig): {
+  serviceUrl: string;
+  apiKey: string | undefined;
+  model: string;
+  configured: boolean;
+} {
+  const serviceUrl =
+    normalizeUrl(config.qwen3AsrServiceUrl) ||
+    normalizeUrl(process.env.QWEN3_ASR_SERVICE_URL ?? "");
+  const explicitKey = config.qwen3AsrApiKey.trim();
+  const cvUrl =
+    normalizeUrl(config.clearVoiceServiceUrl) ||
+    normalizeUrl(process.env.CLEARVOICE_SERVICE_URL ?? "");
+  const sharedKey =
+    !explicitKey && hasSameUrlOrigin(serviceUrl, cvUrl) ? config.clearVoiceApiKey.trim() : "";
+  const envKey =
+    process.env.QWEN3_ASR_API_KEY?.trim() ||
+    process.env.VOICE_GATEWAY_API_KEY?.trim() ||
+    "";
+  const apiKey = explicitKey || sharedKey || envKey || undefined;
+  const model = config.qwen3AsrModel.trim() || DEFAULT_QWEN3_ASR_MODEL;
+  const configured = Boolean(serviceUrl && (apiKey || isLocalEndpointUrl(serviceUrl)));
+  return {
+    serviceUrl,
+    apiKey,
+    model,
+    configured,
+  };
+}
+
 export function toPublicAgentVoiceConfig(config: AgentVoiceConfig): PublicAgentVoiceConfig {
   const envKey = resolveEnvApiKeyForProvider(config.provider);
   const stt = resolveEffectiveSttAuth(config);
@@ -941,7 +1057,9 @@ export function toPublicAgentVoiceConfig(config: AgentVoiceConfig): PublicAgentV
     stt.baseUrl && (stt.apiKey || isLocalEndpointUrl(stt.baseUrl)),
   );
   const sysOne = resolveEffectiveSystemOneAuth(config);
-  const { apiKey, sttApiKey, systemOneApiKey, ...rest } = config;
+  const cvAuth = resolveEffectiveClearVoiceAuth(config);
+  const qwenAuth = resolveEffectiveQwen3AsrAuth(config);
+  const { apiKey, sttApiKey, systemOneApiKey, clearVoiceApiKey, qwen3AsrApiKey, ...rest } = config;
   return {
     ...rest,
     hasApiKey: apiKey.trim().length > 0,
@@ -954,6 +1072,12 @@ export function toPublicAgentVoiceConfig(config: AgentVoiceConfig): PublicAgentV
     systemOneApiKeyPreview: maskSecret(systemOneApiKey),
     effectiveSystemOneBaseUrl: sysOne.baseUrl,
     effectiveSystemOneConfigured: sysOne.enabled,
+    hasClearVoiceApiKey: clearVoiceApiKey.trim().length > 0,
+    clearVoiceApiKeyPreview: maskSecret(clearVoiceApiKey),
+    effectiveClearVoiceRemoteConfigured: cvAuth.configured,
+    hasQwen3AsrApiKey: qwen3AsrApiKey.trim().length > 0,
+    qwen3AsrApiKeyPreview: maskSecret(qwen3AsrApiKey),
+    effectiveQwen3AsrRemoteConfigured: qwenAuth.configured,
   };
 }
 
@@ -1052,6 +1176,35 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
       throw new Error("ClearVoice GPU 服务地址必须是以 http:// 或 https:// 开头的有效地址");
     }
     nextRaw.clearVoiceServiceUrl = rawUrl;
+  }
+  if (patch.clearClearVoiceApiKey === true) {
+    nextRaw.clearVoiceApiKey = "";
+  } else if (typeof patch.clearVoiceApiKey === "string") {
+    const trimmed = patch.clearVoiceApiKey.trim();
+    if (trimmed.length > 0) {
+      nextRaw.clearVoiceApiKey = trimmed;
+    }
+  }
+  if (patch.clearVoiceModel !== undefined) {
+    nextRaw.clearVoiceModel = String(patch.clearVoiceModel).trim();
+  }
+  if (patch.qwen3AsrServiceUrl !== undefined) {
+    const rawUrl = String(patch.qwen3AsrServiceUrl).trim();
+    if (rawUrl && !normalizeUrl(rawUrl)) {
+      throw new Error("Qwen3-ASR 在线服务地址必须是以 http:// 或 https:// 开头的有效地址");
+    }
+    nextRaw.qwen3AsrServiceUrl = rawUrl;
+  }
+  if (patch.clearQwen3AsrApiKey === true) {
+    nextRaw.qwen3AsrApiKey = "";
+  } else if (typeof patch.qwen3AsrApiKey === "string") {
+    const trimmed = patch.qwen3AsrApiKey.trim();
+    if (trimmed.length > 0) {
+      nextRaw.qwen3AsrApiKey = trimmed;
+    }
+  }
+  if (patch.qwen3AsrModel !== undefined) {
+    nextRaw.qwen3AsrModel = String(patch.qwen3AsrModel).trim();
   }
   if (patch.localAsrEngine !== undefined) {
     const rawAsr = String(patch.localAsrEngine).trim().toLowerCase();

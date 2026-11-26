@@ -910,6 +910,37 @@
             </label>
           </div>
 
+          <div class="setting-card setting-card-wrap" id="setting-row-voice-gateway">
+            <div class="setting-info">
+              <div class="setting-label">在线 ClearVoice 与 Qwen3-ASR 模型网关（可选）</div>
+              <div class="setting-desc" id="set-voice-gateway-desc">接入远程 Voice &amp; ASR Gateway（如 https://voice.1inch.cn:18443）与授权码，将 ClearVoice（多轨分离 + 降噪）与 Qwen3-ASR-0.6B 托管至远端 GPU，留空则使用本机模型；远端异常时自动平滑回落本机兜底</div>
+            </div>
+            <div class="systemone-grid">
+              <div class="systemone-row">
+                <input type="text" id="set-clearvoice-service-url" class="md-text-input" placeholder="ClearVoice 在线服务地址（如 https://voice.1inch.cn:18443）" spellcheck="false" aria-label="ClearVoice 在线服务地址">
+                <select id="set-clearvoice-model" class="md-select" aria-label="ClearVoice 降噪模型">
+                  <option value="MossFormer2_SE_48K">MossFormer2_SE_48K（高保真 48kHz · 默认）</option>
+                  <option value="FRCRN_SE_16K">FRCRN_SE_16K（轻量 16kHz）</option>
+                  <option value="MossFormerGAN_SE_16K">MossFormerGAN_SE_16K（GAN 16kHz）</option>
+                </select>
+              </div>
+              <div class="agent-key-row">
+                <input type="password" id="set-clearvoice-api-key" class="md-text-input" placeholder="ClearVoice 授权码（留空保持不变）" autocomplete="off" aria-label="ClearVoice 授权码">
+                <button type="button" id="set-clearvoice-clear-key-btn" class="secondary-button btn-compact" hidden>清除</button>
+              </div>
+              <div class="systemone-row">
+                <input type="text" id="set-qwen3-asr-service-url" class="md-text-input" placeholder="Qwen3-ASR 在线服务地址（如 https://voice.1inch.cn:18443）" spellcheck="false" aria-label="Qwen3-ASR 在线服务地址">
+                <input type="text" id="set-qwen3-asr-model" class="md-text-input" placeholder="模型 ID（默认 Qwen/Qwen3-ASR-0.6B）" spellcheck="false" aria-label="Qwen3-ASR 在线模型 ID">
+              </div>
+              <div class="agent-key-row">
+                <input type="password" id="set-qwen3-asr-api-key" class="md-text-input" placeholder="Qwen3-ASR 授权码（同域名留空可复用 ClearVoice 密钥）" autocomplete="off" aria-label="Qwen3-ASR 授权码">
+                <button type="button" id="set-qwen3-asr-clear-key-btn" class="secondary-button btn-compact" hidden>清除</button>
+                <button type="button" id="set-voice-gateway-test-btn" class="secondary-button btn-compact" title="测试在线 ClearVoice 与 Qwen3-ASR 网关连通性与远端 GPU 状态">测试连接</button>
+              </div>
+              <div id="set-voice-gateway-test-result" class="agent-inst-status" hidden></div>
+            </div>
+          </div>
+
           <div class="setting-card">
             <div class="setting-info">
               <div class="setting-label">识别语言</div>

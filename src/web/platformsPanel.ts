@@ -2628,14 +2628,6 @@ export class PlatformsPanelController {
       userCodeField.append(codeRow, hint);
       qrSection.appendChild(userCodeField);
 
-      if (form.mode === "sharing") {
-        const irSharingHint = document.createElement("div");
-        irSharingHint.className = "pf-hint";
-        irSharingHint.textContent =
-          "提示：涂鸦扫码共享接口不开放红外标准遥控器协议。如需控制音响、电视、DIY 等非空调红外遥控设备，请切换为「云端 + 局域网混合」模式并补充涂鸦 OpenAPI 凭据。";
-        qrSection.appendChild(irSharingHint);
-      }
-
       // Active QR Panel
       if (this.activeTuyaQr) {
         const qrState = this.activeTuyaQr;
@@ -2765,14 +2757,6 @@ export class PlatformsPanelController {
 
       grid.append(regionField, accessIdField, secretField, uidField);
       openSection.appendChild(grid);
-
-      const irOpenApiHint = document.createElement("div");
-      irOpenApiHint.className = "pf-hint";
-      irOpenApiHint.textContent =
-        form.mode === "hybrid"
-          ? "红外标准遥控器协议：混合模式会保留上方扫码授权，仅需填写 Access ID 与 Access Secret（UID 可留空）并在涂鸦云开发平台开通「IR Control Hub（红外遥控）」服务，即可对音响、电视、DIY 等红外子设备读取真实按键并下发标准/配对/学习码指令。"
-          : "红外标准遥控器协议：音响、电视、DIY 等红外子设备将自动调用涂鸦 OpenAPI v2.0（IR Control Hub）标准命令与按键命令接口，请确保云项目已订阅「IR Control Hub」并关联涂鸦 App 账号。";
-      openSection.appendChild(irOpenApiHint);
 
       bodyEl.appendChild(openSection);
     }

@@ -370,8 +370,13 @@ export interface WasherRuntimeSafetyResult {
 /**
  * 洗衣机启动前实时安全探针：
  * 在 `start-wash` 或 `control-status=true` 执行前检查实时硬件状态，
- * 即使该记忆已处于 autonomous 状态，只要触发过热/故障/未开远程控制直接硬阻断，
+ * 即使该记忆已处于 autonomous 状态，只要触发过热/故障直接硬阻断，
  * 只要舱门未关/童锁开启/筒内残留高温或烘干程序则强制升级为二次确认。
+ *
+ * 注：不以 `remote-control-flag === false` 作为前置硬阻断条件——
+ * 美的 0xD9/0xDB 实机在关机待机态（即便已开启长期授权）、副筒
+ * （如 38135636 左/右筒 `supportRemoteControlAgree=false`）及部分固件上
+ * 均会上报 `0` 而实际可正常远程控制；真正未授权时由机身固件直接拒启，无物理安全风险。
  */
 export async function probeWasherRuntimeSafety(
   service: IMijiaService,
@@ -421,9 +426,6 @@ export async function probeWasherRuntimeSafety(
   const errorCode = String(getVal("error-code") ?? "").trim();
   if (errorCode && errorCode !== "0" && errorCode.toLowerCase() !== "none" && errorCode.toLowerCase() !== "ok") {
     hardReasons.push(`洗衣机报告硬件故障码（${errorCode}）`);
-  }
-  if (getVal("remote-control-flag") === false) {
-    hardReasons.push("洗衣机未开启远程控制权限（请先在机身面板开启远程控制）");
   }
 
   if (hardReasons.length > 0) {

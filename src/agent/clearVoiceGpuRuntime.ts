@@ -16,12 +16,20 @@
 import { existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { DEFAULT_CLEARVOICE_MODEL, isLocalEndpointUrl } from "../core/agentConfigStore.ts";
 import { projectRoot } from "../core/appMeta.ts";
-import { computeRms, estimateSnrDb, resampleLinear } from "./audioPcm.ts";
+import {
+  computeRms,
+  decodeWavPcm,
+  encodeWavPcm16,
+  estimateSnrDb,
+  resampleLinear,
+} from "./audioPcm.ts";
 import {
   ClearVoiceMultiTrackAssembler,
   ClearVoiceSliceAssembler,
   DEFAULT_CLEARVOICE_CHUNKER_CONFIG,
+  pruneInactiveOrDuplicateTracks,
 } from "./clearVoiceChunker.ts";
 
 export interface ClearVoiceGpuModelPaths {
@@ -47,6 +55,8 @@ export interface ClearVoiceGpuStatus {
   ssModelReady: boolean;
   scriptReady: boolean;
   customServiceUrl: string;
+  remote: boolean;
+  hasApiKey: boolean;
   ready: boolean;
   multiTrackReady: boolean;
   serverRunning: boolean;
@@ -59,6 +69,162 @@ export interface ClearVoiceGpuStatus {
   lastInferMs: number | null;
   lastSeparateMs: number | null;
   lastError: string | null;
+}
+
+export interface ClearVoiceGatewayEndpoints {
+  rootUrl: string;
+  healthUrl: string;
+  modelsUrl: string;
+  enhanceUrl: string;
+  separateUrl: string;
+  superResolutionUrl: string;
+}
+
+export interface ClearVoiceRemoteHealthResult {
+  ok: boolean;
+  protocol: "gateway" | "local-binary";
+  latencyMs: number;
+  gpuName: string | null;
+  loadedModels: string[];
+  ssSupported: boolean;
+  error?: string;
+}
+
+/**
+ * 规范化在线 Voice & ASR Gateway 的 ClearVoice 接口路径：
+ * 支持传入根地址（https://voice.1inch.cn:18443）或带子路径（/clearvoice、/clearvoice/v1、/v1 等）。
+ */
+export function resolveClearVoiceGatewayEndpoints(serviceUrl: string): ClearVoiceGatewayEndpoints {
+  const trimmed = serviceUrl.trim().replace(/\/+$/, "");
+  const rootUrl = trimmed
+    .replace(/\/clearvoice\/v1\/(?:enhance|separate|super-resolution)$/i, "")
+    .replace(/\/clearvoice\/v1$/i, "")
+    .replace(/\/clearvoice$/i, "")
+    .replace(/\/v1\/audio\/(?:enhance|separate|super-resolution)$/i, "")
+    .replace(/\/v1\/audio$/i, "")
+    .replace(/\/v1$/i, "")
+    .replace(/\/+$/, "");
+  return {
+    rootUrl,
+    healthUrl: `${rootUrl}/health`,
+    modelsUrl: `${rootUrl}/clearvoice/models`,
+    enhanceUrl: `${rootUrl}/clearvoice/v1/enhance`,
+    separateUrl: `${rootUrl}/clearvoice/v1/separate`,
+    superResolutionUrl: `${rootUrl}/clearvoice/v1/super-resolution`,
+  };
+}
+
+/**
+ * 将远程返回的音频采样长度精确对齐至目标样本数（防 STFT/编解码边界微差造成滑窗时间漂移）。
+ */
+export function fitAudioLength(samples: Float32Array, targetLength: number): Float32Array {
+  if (samples.length === targetLength) return samples;
+  if (samples.length > targetLength) return samples.slice(0, targetLength);
+  const out = new Float32Array(targetLength);
+  out.set(samples, 0);
+  return out;
+}
+
+/**
+ * 物理混合投影增益恢复（2x2 线性最小二乘）：
+ * 远程 ClearVoice MossFormer2_SS_16K 输出通常会对每条说话人音轨独立做 RMS/峰值归一化，
+ * 这会破坏真实物理响度并在单人说话场景下把微弱残影轨放大到与主轨同等音量。
+ * 通过求解 rawMix ≈ a0*s0 + a1*s1 恢复真实物理增益与相位符号：
+ * - 单人说话：主轨恢复真实响度，残影轨自动缩回真实微弱幅值供后续 prune 干净剔除；
+ * - 双人重叠：双轨均恢复各自真实物理响度与一致相位，提升 VAD 精度与跨片 PIT 对齐稳定性。
+ */
+export function recoverSeparatedTrackGains(
+  rawMix: Float32Array,
+  tracks: ReadonlyArray<Float32Array>,
+): Float32Array[] {
+  if (tracks.length === 0) return [];
+  const inRms = computeRms(rawMix);
+  if (inRms < 1e-7) {
+    return tracks.map((t) => new Float32Array(t.length));
+  }
+
+  if (tracks.length === 2) {
+    const t0 = tracks[0]!;
+    const t1 = tracks[1]!;
+    const n = Math.min(rawMix.length, t0.length, t1.length);
+    if (n >= 32) {
+      let s00 = 0;
+      let s11 = 0;
+      let s01 = 0;
+      let b0 = 0;
+      let b1 = 0;
+      for (let i = 0; i < n; i += 1) {
+        const x = rawMix[i]!;
+        const u = t0[i]!;
+        const v = t1[i]!;
+        s00 += u * u;
+        s11 += v * v;
+        s01 += u * v;
+        b0 += x * u;
+        b1 += x * v;
+      }
+      const det = s00 * s11 - s01 * s01;
+      if (s00 > 1e-10 && s11 > 1e-10 && det > s00 * s11 * 1e-4) {
+        let a0 = (s11 * b0 - s01 * b1) / det;
+        let a1 = (s00 * b1 - s01 * b0) / det;
+        const r0 = Math.sqrt(s00 / n);
+        const r1 = Math.sqrt(s11 / n);
+        const maxA0 = (inRms * 1.35) / Math.max(1e-6, r0);
+        const maxA1 = (inRms * 1.35) / Math.max(1e-6, r1);
+        a0 = Math.max(-maxA0, Math.min(maxA0, a0));
+        a1 = Math.max(-maxA1, Math.min(maxA1, a1));
+
+        let peak = 0;
+        for (let i = 0; i < t0.length; i += 1) {
+          const v = Math.abs(t0[i]! * a0);
+          if (v > peak) peak = v;
+        }
+        for (let i = 0; i < t1.length; i += 1) {
+          const v = Math.abs(t1[i]! * a1);
+          if (v > peak) peak = v;
+        }
+        const clipScale = peak > 0.96 ? 0.96 / peak : 1;
+        const g0 = a0 * clipScale;
+        const g1 = a1 * clipScale;
+
+        const out0 = new Float32Array(t0.length);
+        const out1 = new Float32Array(t1.length);
+        for (let i = 0; i < t0.length; i += 1) {
+          out0[i] = Math.max(-1, Math.min(1, t0[i]! * g0));
+        }
+        for (let i = 0; i < t1.length; i += 1) {
+          out1[i] = Math.max(-1, Math.min(1, t1[i]! * g1));
+        }
+        return [out0, out1];
+      }
+    }
+  }
+
+  // 退化/非双轨回退：能量守恒统一缩放
+  let sumSq = 0;
+  let maxPeak = 0;
+  for (const tr of tracks) {
+    const r = computeRms(tr);
+    sumSq += r * r;
+    for (let i = 0; i < tr.length; i += 1) {
+      const av = Math.abs(tr[i]!);
+      if (av > maxPeak) maxPeak = av;
+    }
+  }
+  if (sumSq < 1e-12) {
+    return tracks.map((t) => new Float32Array(t.length));
+  }
+  let gain = inRms / Math.sqrt(sumSq);
+  if (maxPeak * gain > 0.96) {
+    gain = 0.96 / maxPeak;
+  }
+  return tracks.map((tr) => {
+    const out = new Float32Array(tr.length);
+    for (let i = 0; i < tr.length; i += 1) {
+      out[i] = Math.max(-1, Math.min(1, tr[i]! * gain));
+    }
+    return out;
+  });
 }
 
 export interface ClearVoiceDenoiseSliceOptions {
@@ -278,7 +444,13 @@ function registerProcessExitCleanup(): void {
 export class ClearVoiceGpuRuntime {
   private readonly _modelsDir: string;
   private readonly _serverScriptOverride?: string;
+  private readonly _fetcher: typeof fetch;
   private _customServiceUrl = "";
+  private _customApiKey = "";
+  private _customModel = DEFAULT_CLEARVOICE_MODEL;
+  private _remoteProtocol: "auto" | "gateway" | "local-binary" = "auto";
+  private _remoteHealthy: boolean | null = null;
+  private _remoteLoadedModels: string[] = [];
   private _gpuProbeCache:
     | { detected: boolean; name: string | null; vramTotalMb: number | null; vramFreeMb: number | null }
     | null = null;
@@ -297,11 +469,23 @@ export class ClearVoiceGpuRuntime {
   private _lastSeparateMs: number | null = null;
   private _disposed = false;
 
-  constructor(options: { modelsDir: string; serviceUrl?: string; serverScript?: string }) {
+  constructor(options: {
+    modelsDir: string;
+    serviceUrl?: string;
+    apiKey?: string;
+    model?: string;
+    serverScript?: string;
+    fetcher?: typeof fetch;
+  }) {
     this._modelsDir = path.resolve(options.modelsDir);
     this._serverScriptOverride = options.serverScript;
-    if (options.serviceUrl) {
-      this.setCustomServiceUrl(options.serviceUrl);
+    this._fetcher = options.fetcher ?? globalThis.fetch;
+    if (options.serviceUrl || options.apiKey || options.model) {
+      this.setRemoteConfig({
+        serviceUrl: options.serviceUrl ?? "",
+        apiKey: options.apiKey ?? "",
+        model: options.model ?? DEFAULT_CLEARVOICE_MODEL,
+      });
     }
   }
 
@@ -313,13 +497,66 @@ export class ClearVoiceGpuRuntime {
     return this._customServiceUrl;
   }
 
-  setCustomServiceUrl(url: string): void {
-    const trimmed = url.trim().replace(/\/+$/, "");
-    if (trimmed !== this._customServiceUrl) {
-      this._customServiceUrl = trimmed;
+  get customModel(): string {
+    return this._customModel;
+  }
+
+  isRemoteConfigured(): boolean {
+    return (
+      this._customServiceUrl.length > 0 &&
+      (this._customApiKey.length > 0 || isLocalEndpointUrl(this._customServiceUrl))
+    );
+  }
+
+  private _isGatewayProtocol(): boolean {
+    if (!this._customServiceUrl) return false;
+    if (this._remoteProtocol === "gateway") return true;
+    if (this._remoteProtocol === "local-binary") return false;
+    return (
+      this._customApiKey.length > 0 ||
+      /\/(?:clearvoice|v1\/audio)(?:\/|$)/i.test(this._customServiceUrl) ||
+      !isLocalEndpointUrl(this._customServiceUrl)
+    );
+  }
+
+  private _buildAuthHeaders(): Record<string, string> {
+    if (!this._customApiKey) return {};
+    return {
+      Authorization: `Bearer ${this._customApiKey}`,
+      "X-Auth-Code": this._customApiKey,
+    };
+  }
+
+  setRemoteConfig(config: { serviceUrl?: string; apiKey?: string; model?: string }): void {
+    const nextUrl =
+      config.serviceUrl !== undefined
+        ? config.serviceUrl.trim().replace(/\/+$/, "")
+        : this._customServiceUrl;
+    const nextKey = config.apiKey !== undefined ? config.apiKey.trim() : this._customApiKey;
+    const nextModel =
+      config.model !== undefined
+        ? config.model.trim() || DEFAULT_CLEARVOICE_MODEL
+        : this._customModel;
+
+    const urlChanged = nextUrl !== this._customServiceUrl;
+    const keyChanged = nextKey !== this._customApiKey;
+    this._customServiceUrl = nextUrl;
+    this._customApiKey = nextKey;
+    this._customModel = nextModel;
+
+    if (urlChanged || keyChanged) {
+      this._remoteProtocol = "auto";
       this._remoteSeparateSupported = null;
+      this._remoteHealthy = null;
+      this._remoteLoadedModels = [];
+      this._warmedUp = false;
       this.resetFailureCooldown();
-      if (trimmed) {
+      if (urlChanged) {
+        this._activeGpuName = null;
+      }
+      if (this.isRemoteConfigured()) {
+        // 切至在线远程 ClearVoice 服务时立即释放本地 Python 子进程显存
+        this._killProcess();
         this._activeProvider = "remote";
         this._activeSsProvider = "remote";
       } else if (!this._proc) {
@@ -327,6 +564,10 @@ export class ClearVoiceGpuRuntime {
         this._activeSsProvider = "none";
       }
     }
+  }
+
+  setCustomServiceUrl(url: string): void {
+    this.setRemoteConfig({ serviceUrl: url });
   }
 
   hasRuntime(): boolean {
@@ -401,26 +642,28 @@ export class ClearVoiceGpuRuntime {
     const modelReady = this.hasModel();
     const ssModelReady = this.hasSsModel();
     const scriptReady = this.hasServerScript();
-    const hasCustom = this._customServiceUrl.length > 0;
-    const ready = hasCustom || (runtimeReady && modelReady && scriptReady);
-    const multiTrackReady = hasCustom
+    const hasCustomUrl = this._customServiceUrl.length > 0;
+    const remoteReady = this.isRemoteConfigured();
+    const missingRemoteKey = hasCustomUrl && !remoteReady;
+    const ready = remoteReady || (!hasCustomUrl && runtimeReady && modelReady && scriptReady);
+    const multiTrackReady = remoteReady
       ? this._remoteSeparateSupported !== false
-      : runtimeReady && modelReady && ssModelReady && scriptReady;
-    const serverRunning = hasCustom || (this._proc !== null && this._baseUrl !== null);
-    const provider: ClearVoiceGpuStatus["provider"] = hasCustom
+      : !hasCustomUrl && runtimeReady && modelReady && ssModelReady && scriptReady;
+    const serverRunning = remoteReady || (this._proc !== null && this._baseUrl !== null);
+    const provider: ClearVoiceGpuStatus["provider"] = remoteReady
       ? "remote"
-      : this._activeProvider !== "none"
+      : !hasCustomUrl && this._activeProvider !== "none"
         ? this._activeProvider
         : ready && gpu.detected
           ? "cuda"
           : ready
             ? "cpu"
             : "none";
-    const ssProvider: ClearVoiceGpuStatus["ssProvider"] = hasCustom
+    const ssProvider: ClearVoiceGpuStatus["ssProvider"] = remoteReady
       ? this._remoteSeparateSupported === false
         ? "none"
         : "remote"
-      : this._activeSsProvider !== "none"
+      : !hasCustomUrl && this._activeSsProvider !== "none"
         ? this._activeSsProvider
         : multiTrackReady && gpu.detected
           ? "cuda"
@@ -429,28 +672,179 @@ export class ClearVoiceGpuRuntime {
             : "none";
 
     return {
-      gpuDetected: gpu.detected,
-      gpuName: this._activeGpuName ?? gpu.name,
-      vramTotalMb: gpu.vramTotalMb,
-      vramFreeMb: gpu.vramFreeMb,
-      runtimeReady,
-      modelReady,
-      ssModelReady,
-      scriptReady,
+      gpuDetected: remoteReady ? true : gpu.detected,
+      gpuName: remoteReady ? (this._activeGpuName ?? "在线 ClearVoice GPU") : (this._activeGpuName ?? gpu.name),
+      vramTotalMb: remoteReady ? null : gpu.vramTotalMb,
+      vramFreeMb: remoteReady ? null : gpu.vramFreeMb,
+      runtimeReady: remoteReady ? true : runtimeReady,
+      modelReady: remoteReady ? true : modelReady,
+      ssModelReady: remoteReady ? this._remoteSeparateSupported !== false : ssModelReady,
+      scriptReady: remoteReady ? true : scriptReady,
       customServiceUrl: this._customServiceUrl,
+      remote: remoteReady,
+      hasApiKey: this._customApiKey.length > 0,
       ready,
       multiTrackReady,
       serverRunning,
       provider,
       ssProvider,
-      modelName: "MossFormer2_SE_48K",
+      modelName: this._customModel || DEFAULT_CLEARVOICE_MODEL,
       ssModelName: "MossFormer2_SS_16K",
-      serviceUrl: hasCustom ? this._customServiceUrl : this._baseUrl,
+      serviceUrl: hasCustomUrl ? this._customServiceUrl : this._baseUrl,
       lastLatencyMs: this._lastLatencyMs,
       lastInferMs: this._lastInferMs,
       lastSeparateMs: this._lastSeparateMs,
-      lastError: this._lastError,
+      lastError: missingRemoteKey ? "缺少在线 ClearVoice 授权码，请填写授权码" : this._lastError,
     };
+  }
+
+  /**
+   * 探测远程 ClearVoice / Voice & ASR Gateway 健康状态，自动识别协议并同步远程 GPU 与模型状态。
+   */
+  async probeRemoteHealth(options: { timeoutMs?: number } = {}): Promise<ClearVoiceRemoteHealthResult> {
+    if (!this._customServiceUrl) {
+      return {
+        ok: false,
+        protocol: "local-binary",
+        latencyMs: 0,
+        gpuName: null,
+        loadedModels: [],
+        ssSupported: false,
+        error: "未配置远程 ClearVoice 服务地址",
+      };
+    }
+    const t0 = performance.now();
+    const isGwHint = this._isGatewayProtocol();
+    const endpoints = resolveClearVoiceGatewayEndpoints(this._customServiceUrl);
+    const healthUrl = isGwHint ? endpoints.healthUrl : `${this._customServiceUrl}/health`;
+    const timeoutMs = options.timeoutMs ?? 8000;
+
+    try {
+      const res = await this._fetcher(healthUrl, {
+        method: "GET",
+        headers: this._buildAuthHeaders(),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      const latencyMs = Math.round(performance.now() - t0);
+      if (!res.ok) {
+        const msg =
+          res.status === 401
+            ? "ClearVoice 授权码无效或未提供 (401)"
+            : res.status === 403
+              ? "ClearVoice 授权码缺少 clearvoice 服务权限 (403)"
+              : `ClearVoice 远程健康检查失败 (${res.status})`;
+        this._remoteHealthy = false;
+        this._lastError = msg;
+        if (res.status === 401 || res.status === 403) {
+          this._initFailedAt = Date.now();
+        }
+        return {
+          ok: false,
+          protocol: isGwHint ? "gateway" : "local-binary",
+          latencyMs,
+          gpuName: this._activeGpuName,
+          loadedModels: [],
+          ssSupported: false,
+          error: msg,
+        };
+      }
+
+      const json = (await res.json()) as {
+        status?: string;
+        ok?: boolean;
+        service?: string;
+        gpuName?: string | null;
+        gpu_name?: string | null;
+        ssReady?: boolean;
+        loaded_models?: Array<{ name?: string; task?: string }>;
+        upstreams?: {
+          clearvoice?: {
+            status?: string;
+            details?: {
+              status?: string;
+              gpu_name?: string | null;
+              loaded_models?: Array<{ name?: string; task?: string }>;
+            };
+          };
+        };
+      };
+
+      const cvUpstream = json.upstreams?.clearvoice;
+      if (cvUpstream || json.service === "clearvoice" || Array.isArray(json.loaded_models)) {
+        const details = cvUpstream?.details ?? json;
+        const ok = cvUpstream ? cvUpstream.status === "ok" : json.status === "ok";
+        const gpuName =
+          typeof details?.gpu_name === "string" && details.gpu_name.trim()
+            ? details.gpu_name.trim()
+            : null;
+        const loadedModels = Array.isArray(details?.loaded_models)
+          ? details.loaded_models
+              .map((m) => (typeof m?.name === "string" ? m.name : ""))
+              .filter(Boolean)
+          : [];
+        this._remoteProtocol = "gateway";
+        this._remoteHealthy = ok;
+        this._remoteLoadedModels = loadedModels;
+        this._remoteSeparateSupported = true;
+        this._activeProvider = "remote";
+        this._activeSsProvider = "remote";
+        if (gpuName) this._activeGpuName = gpuName;
+        this._lastLatencyMs = latencyMs;
+        if (ok) {
+          this._warmedUp = true;
+          this._initFailedAt = 0;
+          this._lastError = null;
+        } else {
+          this._lastError = "远程 ClearVoice 上游服务暂不可用";
+        }
+        return {
+          ok,
+          protocol: "gateway",
+          latencyMs,
+          gpuName,
+          loadedModels,
+          ssSupported: true,
+          ...(ok ? {} : { error: "远程 ClearVoice 上游服务暂不可用" }),
+        };
+      }
+
+      // 本地兼容二进制服务 /health
+      const ok = json.ok !== false && json.status !== "error";
+      const gpuName =
+        typeof json.gpuName === "string" && json.gpuName.trim() ? json.gpuName.trim() : null;
+      this._remoteProtocol = "local-binary";
+      this._remoteHealthy = ok;
+      this._remoteSeparateSupported = json.ssReady !== false;
+      if (gpuName) this._activeGpuName = gpuName;
+      this._lastLatencyMs = latencyMs;
+      if (ok) {
+        this._warmedUp = true;
+        this._initFailedAt = 0;
+        this._lastError = null;
+      }
+      return {
+        ok,
+        protocol: "local-binary",
+        latencyMs,
+        gpuName,
+        loadedModels: [],
+        ssSupported: json.ssReady !== false,
+      };
+    } catch (err) {
+      const latencyMs = Math.round(performance.now() - t0);
+      const msg = `远程 ClearVoice 连接失败: ${err instanceof Error ? err.message : String(err)}`;
+      this._remoteHealthy = false;
+      this._lastError = msg;
+      return {
+        ok: false,
+        protocol: isGwHint ? "gateway" : "local-binary",
+        latencyMs,
+        gpuName: this._activeGpuName,
+        loadedModels: [],
+        ssSupported: false,
+        error: msg,
+      };
+    }
   }
 
   /**
@@ -607,10 +1001,14 @@ export class ClearVoiceGpuRuntime {
   }
 
   /**
-   * 后台预热 ClearVoice GPU 推理服务（含模型显存加载与 CUDA kernel 预热）。
+   * 后台预热 ClearVoice GPU 推理服务（本地服务完成模型显存加载与 CUDA kernel 预热；在线网关则执行轻量 /health 探活与远端 GPU 信息同步）。
    */
   async warmup(): Promise<void> {
-    if (this._disposed || (this._warmedUp && this._baseUrl)) return;
+    if (this._disposed || (this._warmedUp && (this._baseUrl || this._customServiceUrl))) return;
+    if (this.isRemoteConfigured() && this._isGatewayProtocol()) {
+      await this.probeRemoteHealth({ timeoutMs: 8000 });
+      return;
+    }
     await this.ensureStarted();
     if (this._disposed || this._warmedUp) return;
     try {
@@ -622,6 +1020,113 @@ export class ClearVoiceGpuRuntime {
       this._warmedUp = true;
     } catch {
       // warmup failure does not block subsequent calls
+    }
+  }
+
+  /**
+   * 通过在线 Voice & ASR Gateway（/clearvoice/v1/enhance）执行单轨语音降噪增强。
+   */
+  private async _denoiseSliceViaGateway(
+    pcmWithContext: Float32Array,
+    options: ClearVoiceDenoiseSliceOptions,
+  ): Promise<ClearVoiceDenoiseSliceResult> {
+    const inSr = options.inputSampleRate ?? 16000;
+    const outSr = options.outputSampleRate ?? inSr;
+    const expectedOutLen =
+      inSr === outSr
+        ? pcmWithContext.length
+        : Math.max(1, Math.round(pcmWithContext.length * (outSr / inSr)));
+    const t0 = performance.now();
+    const endpoints = resolveClearVoiceGatewayEndpoints(this._customServiceUrl);
+    const model = this._customModel || DEFAULT_CLEARVOICE_MODEL;
+
+    const wavBytes = encodeWavPcm16(pcmWithContext, inSr);
+    const form = new FormData();
+    form.append("file", new Blob([wavBytes as unknown as BlobPart], { type: "audio/wav" }), "slice.wav");
+    form.append("model", model);
+    form.append("response_format", "wav");
+
+    const timeoutMs = options.timeoutMs ?? (this._warmedUp ? 20_000 : 45_000);
+    const timeoutCtrl = new AbortController();
+    const timer = setTimeout(() => timeoutCtrl.abort(), timeoutMs);
+    const signal = options.signal
+      ? AbortSignal.any([options.signal, timeoutCtrl.signal])
+      : timeoutCtrl.signal;
+
+    try {
+      const res = await this._fetcher(endpoints.enhanceUrl, {
+        method: "POST",
+        headers: this._buildAuthHeaders(),
+        body: form,
+        signal,
+      });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        if (res.status === 401 || res.status === 403) {
+          this._initFailedAt = Date.now();
+        }
+        throw new Error(`ClearVoice 在线降噪失败 (${res.status}): ${errText.slice(0, 180)}`);
+      }
+
+      const contentType = (res.headers.get("content-type") || "").toLowerCase();
+      let decodedSamples: Float32Array;
+      let decodedSr = inSr;
+      let inferMsRaw = Number(res.headers.get("X-Elapsed-Ms"));
+      let modelOut = res.headers.get("X-ClearVoice-Model") || model;
+
+      if (contentType.includes("application/json")) {
+        const json = (await res.json()) as {
+          audio_base64?: string;
+          elapsed_ms?: number;
+          model?: string;
+        };
+        if (!json.audio_base64) {
+          throw new Error("ClearVoice 在线降噪返回缺少 audio_base64 数据");
+        }
+        const wavBuf = new Uint8Array(Buffer.from(json.audio_base64, "base64"));
+        const dec = decodeWavPcm(wavBuf);
+        decodedSamples = dec.samples;
+        decodedSr = dec.sampleRate;
+        if (typeof json.elapsed_ms === "number") inferMsRaw = json.elapsed_ms;
+        if (typeof json.model === "string" && json.model) modelOut = json.model;
+      } else {
+        const wavBuf = new Uint8Array(await res.arrayBuffer());
+        const dec = decodeWavPcm(wavBuf);
+        decodedSamples = dec.samples;
+        decodedSr = dec.sampleRate;
+      }
+
+      const resampled =
+        decodedSr === outSr ? decodedSamples : resampleLinear(decodedSamples, decodedSr, outSr);
+      const outSamples = fitAudioLength(resampled, expectedOutLen);
+      const durationMs = Math.round(performance.now() - t0);
+      const inferMs = Number.isFinite(inferMsRaw) ? Number(inferMsRaw.toFixed(1)) : durationMs;
+
+      this._remoteProtocol = "gateway";
+      this._remoteHealthy = true;
+      this._warmedUp = true;
+      this._lastLatencyMs = durationMs;
+      this._lastInferMs = inferMs;
+      this._lastError = null;
+      this._activeProvider = "remote";
+
+      return {
+        samples: outSamples,
+        sampleRate: outSr,
+        durationMs,
+        inferMs,
+        provider: "remote",
+        device: "gpu",
+        model: modelOut,
+        gpuName: this._activeGpuName ?? "在线 ClearVoice GPU",
+      };
+    } catch (err) {
+      if (!(err instanceof DOMException && err.name === "AbortError")) {
+        this._lastError = err instanceof Error ? err.message : String(err);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -644,10 +1149,14 @@ export class ClearVoiceGpuRuntime {
         durationMs: 0,
         inferMs: 0,
         provider: this._activeProvider,
-        device: this._activeProvider === "cuda" ? "gpu" : "cpu",
-        model: "MossFormer2_SE_48K",
+        device: this._activeProvider === "cuda" || this._activeProvider === "remote" ? "gpu" : "cpu",
+        model: this._customModel || DEFAULT_CLEARVOICE_MODEL,
         gpuName: this._activeGpuName,
       };
+    }
+
+    if (this.isRemoteConfigured() && this._isGatewayProtocol()) {
+      return this._denoiseSliceViaGateway(pcmWithContext, options);
     }
 
     const t0 = performance.now();
@@ -670,7 +1179,7 @@ export class ClearVoiceGpuRuntime {
       : timeoutCtrl.signal;
 
     try {
-      const res = await fetch(`${baseUrl}/denoise`, {
+      const res = await this._fetcher(`${baseUrl}/denoise`, {
         method: "POST",
         headers: {
           "Content-Type": "application/octet-stream",
@@ -771,6 +1280,7 @@ export class ClearVoiceGpuRuntime {
     });
 
     let lastDevice: "gpu" | "cpu" = "gpu";
+    let lastProvider = "cuda";
     let lastGpuName: string | null = this._activeGpuName;
 
     let pos = 0;
@@ -788,6 +1298,7 @@ export class ClearVoiceGpuRuntime {
         signal: options.signal,
       });
       lastDevice = res.device;
+      lastProvider = res.provider;
       lastGpuName = res.gpuName;
 
       assembler.appendEnhancedSlice({
@@ -806,7 +1317,11 @@ export class ClearVoiceGpuRuntime {
       samples: stitched,
       sampleRate: 16000,
       engine:
-        lastDevice === "gpu" ? "clearvoice-mossformer2-gpu" : "clearvoice-mossformer2-cpu",
+        lastProvider === "remote"
+          ? "clearvoice-mossformer2-remote"
+          : lastDevice === "gpu"
+            ? "clearvoice-mossformer2-gpu"
+            : "clearvoice-mossformer2-cpu",
       inputSnrDb,
       outputSnrDb,
       snrGainDb: Number((outputSnrDb - inputSnrDb).toFixed(2)),
@@ -815,6 +1330,221 @@ export class ClearVoiceGpuRuntime {
       crossfadeCount: assembler.crossfadeCount,
       gpuName: lastGpuName,
     };
+  }
+
+  /**
+   * 通过在线 Voice & ASR Gateway（/clearvoice/v1/separate + 按需并行 /clearvoice/v1/enhance）
+   * 执行多轨盲源分离与分轨降噪，内置物理投影增益恢复防止单说话人残影轨被 RMS 归一化误放大。
+   */
+  private async _separateSliceViaGateway(
+    pcmWithContext: Float32Array,
+    options: ClearVoiceSeparateSliceOptions,
+  ): Promise<ClearVoiceSeparateSliceResult> {
+    const inSr = options.inputSampleRate ?? 16000;
+    const outSr = options.outputSampleRate ?? inSr;
+    const expectedOutLen =
+      inSr === outSr
+        ? pcmWithContext.length
+        : Math.max(1, Math.round(pcmWithContext.length * (outSr / inSr)));
+    const t0 = performance.now();
+    const endpoints = resolveClearVoiceGatewayEndpoints(this._customServiceUrl);
+
+    const wavBytes = encodeWavPcm16(pcmWithContext, inSr);
+    const form = new FormData();
+    form.append("file", new Blob([wavBytes as unknown as BlobPart], { type: "audio/wav" }), "mix.wav");
+    form.append("model", "MossFormer2_SS_16K");
+    form.append("response_format", "json");
+
+    // 首次调用远端 MossFormer2_SS_16K 可能需要懒加载权重，放宽冷启动超时
+    const timeoutMs = options.timeoutMs ?? (this._warmedUp ? 35_000 : 90_000);
+    const timeoutCtrl = new AbortController();
+    const timer = setTimeout(() => timeoutCtrl.abort(), timeoutMs);
+    const signal = options.signal
+      ? AbortSignal.any([options.signal, timeoutCtrl.signal])
+      : timeoutCtrl.signal;
+
+    try {
+      const res = await this._fetcher(endpoints.separateUrl, {
+        method: "POST",
+        headers: this._buildAuthHeaders(),
+        body: form,
+        signal,
+      });
+
+      if (res.status === 404 || res.status === 405 || res.status === 501) {
+        clearTimeout(timer);
+        this._remoteSeparateSupported = false;
+        return this._separateFallbackViaDenoise(pcmWithContext, options);
+      }
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        if (res.status === 401 || res.status === 403) {
+          this._initFailedAt = Date.now();
+        }
+        throw new Error(`ClearVoice 在线盲源分离失败 (${res.status}): ${errText.slice(0, 180)}`);
+      }
+
+      const json = (await res.json()) as {
+        model?: string;
+        elapsed_ms?: number;
+        speakers?: Array<{
+          speaker?: number;
+          sample_rate?: number;
+          audio_base64?: string;
+        }>;
+      };
+      const speakers = Array.isArray(json.speakers) ? json.speakers : [];
+      if (speakers.length === 0) {
+        clearTimeout(timer);
+        return this._separateFallbackViaDenoise(pcmWithContext, options);
+      }
+
+      const ssMsRaw = typeof json.elapsed_ms === "number" ? json.elapsed_ms : performance.now() - t0;
+      const decodedInSr: Float32Array[] = [];
+      for (const sp of speakers) {
+        if (!sp.audio_base64) continue;
+        const wavBuf = new Uint8Array(Buffer.from(sp.audio_base64, "base64"));
+        const dec = decodeWavPcm(wavBuf);
+        const atInSr =
+          dec.sampleRate === inSr ? dec.samples : resampleLinear(dec.samples, dec.sampleRate, inSr);
+        decodedInSr.push(fitAudioLength(atInSr, pcmWithContext.length));
+      }
+      if (decodedInSr.length === 0) {
+        clearTimeout(timer);
+        return this._separateFallbackViaDenoise(pcmWithContext, options);
+      }
+
+      // 物理投影增益恢复：撤销远端 ClearVoice 分轨独立 RMS 归一化，恢复真实物理响度与相位符号
+      const gainRecovered = recoverSeparatedTrackGains(pcmWithContext, decodedInSr);
+
+      let workingSlots: Array<{ sourceSlot: number; samples: Float32Array }> = gainRecovered.map(
+        (samples, idx) => ({ sourceSlot: idx, samples }),
+      );
+      let pairWcorr = 0;
+      let pairEcorr = 0;
+
+      // 单次离线整段模式（pruneTracks !== false）：先剔除物理增益恢复后的空轨/残影轨，避免对死静音轨浪费远程 /enhance 往返
+      if (options.pruneTracks !== false && workingSlots.length > 1) {
+        const prePrune = pruneInactiveOrDuplicateTracks(workingSlots.map((w) => w.samples));
+        pairWcorr = prePrune.pairWcorr;
+        pairEcorr = prePrune.pairEcorr;
+        workingSlots = prePrune.tracks.map((tr) => ({
+          sourceSlot: workingSlots[tr.sourceSlot]?.sourceSlot ?? tr.sourceSlot,
+          samples: tr.samples,
+        }));
+      }
+
+      const applyDenoise = options.applyDenoise !== false;
+      let seMsTotal = 0;
+      const processedSlots: Array<{ sourceSlot: number; samples: Float32Array; seApplied: boolean }> =
+        await Promise.all(
+          workingSlots.map(async (slot) => {
+            const trRms = computeRms(slot.samples);
+            // 流式滑窗模式下保留全槽位，但对极低能量死静音槽位跳过远程 /enhance 降低延迟与带宽
+            if (applyDenoise && trRms >= 0.002) {
+              try {
+                const enh = await this._denoiseSliceViaGateway(slot.samples, {
+                  inputSampleRate: inSr,
+                  outputSampleRate: outSr,
+                  timeoutMs: options.timeoutMs,
+                  signal: options.signal,
+                });
+                seMsTotal += enh.inferMs;
+                return {
+                  sourceSlot: slot.sourceSlot,
+                  samples: fitAudioLength(enh.samples, expectedOutLen),
+                  seApplied: true,
+                };
+              } catch (err) {
+                if (options.signal?.aborted || (err instanceof DOMException && err.name === "AbortError")) {
+                  throw err;
+                }
+                // 单轨远程降噪异常时保底输出分离轨，不丢弃有效说话人
+              }
+            }
+            const resampled =
+              inSr === outSr ? slot.samples : resampleLinear(slot.samples, inSr, outSr);
+            return {
+              sourceSlot: slot.sourceSlot,
+              samples: fitAudioLength(resampled, expectedOutLen),
+              seApplied: false,
+            };
+          }),
+        );
+
+      let finalSlots = processedSlots;
+      if (options.pruneTracks !== false && finalSlots.length > 1) {
+        const postPrune = pruneInactiveOrDuplicateTracks(finalSlots.map((s) => s.samples));
+        pairWcorr = postPrune.pairWcorr;
+        pairEcorr = postPrune.pairEcorr;
+        finalSlots = postPrune.tracks.map((tr) => {
+          const src = finalSlots[tr.sourceSlot]!;
+          return {
+            sourceSlot: src.sourceSlot,
+            samples: tr.samples,
+            seApplied: src.seApplied,
+          };
+        });
+      }
+
+      const rmsVals = finalSlots.map((s) => computeRms(s.samples));
+      const totalEnergy = rmsVals.reduce((acc, r) => acc + r * r, 0);
+      const tracks: ClearVoiceSeparatedTrackSlice[] = finalSlots.map((slot, idx) => {
+        const r = rmsVals[idx] ?? 0;
+        const ratio =
+          totalEnergy > 1e-12 ? (r * r) / totalEnergy : 1 / Math.max(1, finalSlots.length);
+        return {
+          trackIndex: idx + 1,
+          sourceSlot: slot.sourceSlot,
+          samples: slot.samples,
+          rms: Number(r.toFixed(5)),
+          energyRatio: Number(ratio.toFixed(4)),
+          seApplied: slot.seApplied,
+        };
+      });
+
+      const durationMs = Math.round(performance.now() - t0);
+      const ssMs = Number(ssMsRaw.toFixed(1));
+      const seMs = Number(seMsTotal.toFixed(1));
+      const inferMs = Number((ssMs + seMs).toFixed(1));
+
+      this._remoteProtocol = "gateway";
+      this._remoteHealthy = true;
+      this._remoteSeparateSupported = true;
+      this._warmedUp = true;
+      this._lastLatencyMs = durationMs;
+      this._lastSeparateMs = ssMs;
+      this._lastInferMs = inferMs;
+      this._lastError = null;
+      this._activeProvider = "remote";
+      this._activeSsProvider = "remote";
+
+      const seModelName = this._customModel || DEFAULT_CLEARVOICE_MODEL;
+      return {
+        tracks,
+        sampleRate: outSr,
+        ssUsed: true,
+        durationMs,
+        ssMs,
+        seMs,
+        inferMs,
+        provider: "remote",
+        device: "gpu",
+        model: applyDenoise ? `MossFormer2_SS_16K+${seModelName}` : "MossFormer2_SS_16K",
+        gpuName: this._activeGpuName ?? "在线 ClearVoice GPU",
+        swaps: 0,
+        pairWcorr,
+        pairEcorr,
+      };
+    } catch (err) {
+      if (!(err instanceof DOMException && err.name === "AbortError")) {
+        this._lastError = err instanceof Error ? err.message : String(err);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
@@ -840,8 +1570,8 @@ export class ClearVoiceGpuRuntime {
         seMs: 0,
         inferMs: 0,
         provider: this._activeProvider,
-        device: this._activeProvider === "cuda" ? "gpu" : "cpu",
-        model: "MossFormer2_SE_48K",
+        device: this._activeProvider === "cuda" || this._activeProvider === "remote" ? "gpu" : "cpu",
+        model: this._customModel || DEFAULT_CLEARVOICE_MODEL,
         gpuName: this._activeGpuName,
         swaps: 0,
         pairWcorr: 0,
@@ -852,6 +1582,10 @@ export class ClearVoiceGpuRuntime {
     // 若已确认远程/Mock 服务不支持 /separate，直接走 /denoise 单轨路径避免多余 404 往返
     if (this._customServiceUrl && this._remoteSeparateSupported === false) {
       return this._separateFallbackViaDenoise(pcmWithContext, options);
+    }
+
+    if (this.isRemoteConfigured() && this._isGatewayProtocol()) {
+      return this._separateSliceViaGateway(pcmWithContext, options);
     }
 
     const t0 = performance.now();
@@ -874,7 +1608,7 @@ export class ClearVoiceGpuRuntime {
       : timeoutCtrl.signal;
 
     try {
-      const res = await fetch(`${baseUrl}/separate`, {
+      const res = await this._fetcher(`${baseUrl}/separate`, {
         method: "POST",
         headers: {
           "Content-Type": "application/octet-stream",
@@ -1108,12 +1842,16 @@ export class ClearVoiceGpuRuntime {
         signal: options.signal,
       });
       const engineLabel = res.ssUsed
-        ? res.device === "gpu"
-          ? "clearvoice-mossformer2-bss-se-gpu"
-          : "clearvoice-mossformer2-bss-se-cpu"
-        : res.device === "gpu"
-          ? "clearvoice-mossformer2-gpu"
-          : "clearvoice-mossformer2-cpu";
+        ? res.provider === "remote"
+          ? "clearvoice-mossformer2-bss-se-remote"
+          : res.device === "gpu"
+            ? "clearvoice-mossformer2-bss-se-gpu"
+            : "clearvoice-mossformer2-bss-se-cpu"
+        : res.provider === "remote"
+          ? "clearvoice-mossformer2-remote"
+          : res.device === "gpu"
+            ? "clearvoice-mossformer2-gpu"
+            : "clearvoice-mossformer2-cpu";
       const tracks: ClearVoiceOfflineTrackItem[] = res.tracks.map((tr, idx) => {
         const outSnr = estimateSnrDb(tr.samples, 16000);
         return {
@@ -1158,6 +1896,7 @@ export class ClearVoiceGpuRuntime {
     });
 
     let lastDevice: "gpu" | "cpu" = "gpu";
+    let lastProvider = "cuda";
     let lastGpuName: string | null = this._activeGpuName;
     let ssUsedAny = false;
     let totalSsMs = 0;
@@ -1181,6 +1920,7 @@ export class ClearVoiceGpuRuntime {
         signal: options.signal,
       });
       lastDevice = res.device;
+      lastProvider = res.provider;
       lastGpuName = res.gpuName;
       ssUsedAny = ssUsedAny || res.ssUsed;
       totalSsMs += res.ssMs;
@@ -1200,12 +1940,16 @@ export class ClearVoiceGpuRuntime {
 
     const pruned = assembler.getTracks({ prune: true });
     const engineLabel = ssUsedAny
-      ? lastDevice === "gpu"
-        ? "clearvoice-mossformer2-bss-se-gpu"
-        : "clearvoice-mossformer2-bss-se-cpu"
-      : lastDevice === "gpu"
-        ? "clearvoice-mossformer2-gpu"
-        : "clearvoice-mossformer2-cpu";
+      ? lastProvider === "remote"
+        ? "clearvoice-mossformer2-bss-se-remote"
+        : lastDevice === "gpu"
+          ? "clearvoice-mossformer2-bss-se-gpu"
+          : "clearvoice-mossformer2-bss-se-cpu"
+      : lastProvider === "remote"
+        ? "clearvoice-mossformer2-remote"
+        : lastDevice === "gpu"
+          ? "clearvoice-mossformer2-gpu"
+          : "clearvoice-mossformer2-cpu";
 
     const tracks: ClearVoiceOfflineTrackItem[] = pruned.tracks.map((tr) => {
       const outSnr = estimateSnrDb(tr.samples, 16000);
