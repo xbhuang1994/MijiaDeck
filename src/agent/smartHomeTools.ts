@@ -22,7 +22,6 @@ import {
   coercePropWriteValue,
   deviceCategoryLabel,
   formatWasherCardMetrics,
-  isIrRemoteDevice,
   isWasherDevice,
   resolveEnumLabel,
 } from "../core/deviceDetailModel.ts";
@@ -1242,18 +1241,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
             newState = targetBool;
           }
           deps.mainWindow.applyPowerState(dev.did, newState);
-          let irNote: string | undefined;
-          if (isIrRemoteDevice(dev)) {
-            try {
-              const detail = await runJob(deps.jobs, () => deps.service.deviceDetail(dev.did), 2);
-              if (detail.control_warning) {
-                irNote = `${newState ? "已开" : "已关"}（提示：当前为涂鸦扫码共享模式，如设备无响应请在设置→多平台接入补充涂鸦 OpenAPI 凭据）`;
-              }
-            } catch {
-              // ignore advisory detail check errors
-            }
-          }
-          succeeded.push({ did: dev.did, name: dev.name, state: newState, ...(irNote ? { note: irNote } : {}) });
+          succeeded.push({ did: dev.did, name: dev.name, state: newState });
         } catch (err) {
           failed.push({
             did: dev.did,
@@ -2312,12 +2300,9 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
           return textResult(msg, { ok: false, did: speaker.did, name: speaker.name, uiSummary: msg }, true);
         }
 
-        const warningSuffix = detail.control_warning
-          ? "（提示：当前为涂鸦扫码共享模式，如设备无响应请在设置→多平台接入补充涂鸦 OpenAPI 凭据）"
-          : "";
         const msg = `${speaker.name} ${changes.join("，")}${
           unsupported.length > 0 ? `（不支持${unsupported.join("、")}）` : ""
-        }${warningSuffix}`;
+        }`;
         return textResult(msg, {
           ok: true,
           did: speaker.did,
