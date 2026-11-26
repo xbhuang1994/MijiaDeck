@@ -2535,15 +2535,7 @@ export function createRequestHandler(
           if (updated.ttsEngine !== "browser" && updated.autoSpeakReply) {
             void runtime.voiceListener.prewarmLocalTts().catch(() => {});
           }
-          if (
-            updated.voicePipelineMode === "clearvoice" &&
-            runtime.voiceListener.localEngine.clearVoiceGpu.getStatus().ready
-          ) {
-            void runtime.voiceListener.localEngine.clearVoiceGpu
-              .warmup()
-              .then(() => emitBroadcast(runtime))
-              .catch(() => {});
-          } else if (runtime.voiceListener.localEngine.clearVoiceGpu.isRemoteConfigured()) {
+          if (runtime.voiceListener.localEngine.clearVoiceGpu.isRemoteConfigured()) {
             void runtime.voiceListener.localEngine.clearVoiceGpu
               .probeRemoteHealth({ timeoutMs: 6000 })
               .then(() => emitBroadcast(runtime))
@@ -2827,14 +2819,12 @@ export function createRequestHandler(
           throw new HttpError(400, "请先填写 ClearVoice 或 Qwen3-ASR 在线服务地址");
         }
 
-        const modelsDir = runtime.voiceListener?.localEngine.paths.modelsDir ?? projectRoot();
         let clearvoiceResult: Awaited<ReturnType<ClearVoiceGpuRuntime["probeRemoteHealth"]>> | null =
           null;
         let asrResult: Awaited<ReturnType<Qwen3AsrGpuRuntime["probeRemoteHealth"]>> | null = null;
 
         if (cvAuth.serviceUrl) {
           const probeCv = new ClearVoiceGpuRuntime({
-            modelsDir,
             serviceUrl: cvAuth.serviceUrl,
             apiKey: cvAuth.apiKey ?? "",
             model: cvAuth.model,
@@ -2852,7 +2842,6 @@ export function createRequestHandler(
 
         if (qwenAuth.serviceUrl) {
           const probeQwen = new Qwen3AsrGpuRuntime({
-            modelsDir,
             serviceUrl: qwenAuth.serviceUrl,
             apiKey: qwenAuth.apiKey ?? "",
             model: qwenAuth.model,

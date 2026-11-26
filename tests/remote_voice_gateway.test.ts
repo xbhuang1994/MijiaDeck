@@ -358,9 +358,21 @@ describe("在线 Voice & ASR Gateway 协议联调（Mock Gateway 还原 README �
 
     const gatewayUrl = `http://127.0.0.1:${mockGateway.port}`;
 
+    // 0. 未配置在线网关时，ClearVoice 与 Qwen3-ASR 均严格报告未就绪且仅支持在线模式（不再启动本地模型/进程）
+    const unconfiguredCv = new ClearVoiceGpuRuntime();
+    expect(unconfiguredCv.getStatus().ready).toBe(false);
+    expect(unconfiguredCv.getStatus().provider).toBe("none");
+    await expect(unconfiguredCv.denoiseSlice(makeSine(0.5))).rejects.toThrow(/仅支持在线模式/);
+    unconfiguredCv.dispose();
+
+    const unconfiguredQwen = new Qwen3AsrGpuRuntime();
+    expect(unconfiguredQwen.getStatus().ready).toBe(false);
+    expect(unconfiguredQwen.getStatus().backend).toBe("none");
+    await expect(unconfiguredQwen.transcribe(makeSine(0.5))).rejects.toThrow(/仅支持在线模式/);
+    unconfiguredQwen.dispose();
+
     // 1. 直接验证 ClearVoiceGpuRuntime (gateway 模式)
     const cv = new ClearVoiceGpuRuntime({
-      modelsDir: tmpDir,
       serviceUrl: gatewayUrl,
       apiKey: AUTH_CODE,
       model: "MossFormer2_SE_48K",
@@ -413,7 +425,6 @@ describe("在线 Voice & ASR Gateway 协议联调（Mock Gateway 还原 README �
 
     // 2. 验证 Qwen3AsrGpuRuntime (multipart OpenAI Whisper 兼容 + JSON /v1/transcribe)
     const qwen = new Qwen3AsrGpuRuntime({
-      modelsDir: tmpDir,
       serviceUrl: gatewayUrl,
       apiKey: AUTH_CODE,
       model: "Qwen/Qwen3-ASR-0.6B",
@@ -441,7 +452,6 @@ describe("在线 Voice & ASR Gateway 协议联调（Mock Gateway 还原 README �
 
     // /v1/transcribe JSON 模式
     const qwenJson = new Qwen3AsrGpuRuntime({
-      modelsDir: tmpDir,
       serviceUrl: `${gatewayUrl}/v1/transcribe`,
       apiKey: AUTH_CODE,
     });
@@ -552,7 +562,7 @@ describe("在线 Voice & ASR Gateway 协议联调（Mock Gateway 还原 README �
     expect(testBadJson.clearvoice.error).toContain("401");
     expect(testBadJson.clearvoice.error).not.toContain("vgw_wrong_token_00000000");
 
-    // 页面 DOM 包含在线模型网关设置控件
+    // 页面 DOM 包含在线模型网关设置控件，且已移除本地 GPU 推理设备选择器与本地 GPU 徽章
     const html = await (await fetch(`${server.url}/`)).text();
     expect(html).toContain("setting-row-voice-gateway");
     expect(html).toContain("set-clearvoice-service-url");
@@ -560,5 +570,8 @@ describe("在线 Voice & ASR Gateway 协议联调（Mock Gateway 还原 README �
     expect(html).toContain("set-qwen3-asr-service-url");
     expect(html).toContain("set-qwen3-asr-api-key");
     expect(html).toContain("set-voice-gateway-test-btn");
+    expect(html).not.toContain("setting-row-qwen3-device");
+    expect(html).not.toContain("set-voice-qwen3-device");
+    expect(html).not.toContain("badge-model-qwen3-gpu");
   });
 });

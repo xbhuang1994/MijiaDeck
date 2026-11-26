@@ -23,7 +23,6 @@ export interface ClientVoiceConfig {
   qwen3AsrServiceUrl?: string;
   qwen3AsrModel?: string;
   localAsrEngine?: "auto" | "qwen3-asr" | "sensevoice";
-  qwen3ComputeDevice?: "auto" | "gpu" | "cpu";
   qwen3StreamingEnabled?: boolean;
   voiceLang: string;
   wakeWordEnabled: boolean;
@@ -1164,7 +1163,7 @@ export class VoiceListenerClient {
     const engine = this.pickEngine(options.forceEngine);
     if (!engine) {
       const msg =
-        "当前浏览器无法访问麦克风且不支持在线语音识别，请允许麦克风权限并启用本地离线 Qwen3-ASR / SenseVoice 引擎或配置 STT 接口。";
+        "当前浏览器无法访问麦克风且不支持在线语音识别，请允许麦克风权限并配置在线 Qwen3-ASR / 本地 SenseVoice 引擎或 STT 接口。";
       this.active = false;
       this.mode = "error";
       this.lastError = msg;
@@ -2014,7 +2013,7 @@ export class VoiceListenerClient {
           const wasOneShot = this.oneShot;
           this.cb.onToast(
             fallbackEngine === "local"
-              ? "浏览器在线识别不可达，已自动切换至本地离线 Qwen3-ASR / SenseVoice 引擎"
+              ? "浏览器在线识别不可达，已自动切换至内置语音管线（在线 Qwen3-ASR / 本地 SenseVoice）"
               : "浏览器在线识别不可达，已自动切换至 Whisper VAD 降噪转写模式",
             3200,
           );
@@ -2025,7 +2024,7 @@ export class VoiceListenerClient {
           return;
         }
         this.lastError =
-          "浏览器在线语音识别网络不可达（建议在「设置 → 语音与 Pi Agent」启用本地离线 Qwen3-ASR / SenseVoice 引擎或配置 STT 接口）。";
+          "浏览器在线语音识别网络不可达（建议在「设置 → 语音与 Pi Agent」配置在线 Qwen3-ASR / 补齐本地 SenseVoice 或配置 STT 接口）。";
         this.active = false;
         this.mode = "error";
         this.stopAudioCapture();

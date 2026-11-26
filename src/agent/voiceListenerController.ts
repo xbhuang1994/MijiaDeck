@@ -281,7 +281,6 @@ export interface VoiceListenerSnapshot {
   qwen3AsrServiceUrl: string;
   qwen3AsrModel: string;
   localAsrEngine: AgentVoiceConfig["localAsrEngine"];
-  qwen3ComputeDevice: AgentVoiceConfig["qwen3ComputeDevice"];
   qwen3StreamingEnabled: boolean;
   asyncVoicePipeline: boolean;
   echoCancellationMode: EchoCancellationMode;
@@ -647,7 +646,6 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const cvAuth = resolveEffectiveClearVoiceAuth(cfg);
     const qwenAuth = resolveEffectiveQwen3AsrAuth(cfg);
     this._localEngine.setPreferredAsrEngine?.(cfg.localAsrEngine);
-    this._localEngine.setQwen3ComputeDevice?.(cfg.qwen3ComputeDevice);
     if (typeof this._localEngine.setClearVoiceRemoteConfig === "function") {
       this._localEngine.setClearVoiceRemoteConfig({
         serviceUrl: cvAuth.serviceUrl,
@@ -1570,7 +1568,6 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         void this._localEngine.warmup({
           preloadEnglish: hasAsciiWake,
           localAsrEngine: this.config.localAsrEngine,
-          qwen3ComputeDevice: this.config.qwen3ComputeDevice,
           voicePipelineMode: this.config.voicePipelineMode,
         });
         if (this.config.sourceSeparationMode !== "off") {
@@ -2787,7 +2784,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       this._lastWakeHit = { ...acousticWake, timestamp: Date.now() };
     }
 
-    // ---- Stage 5: 语音识别（优先本地离线 Qwen3-ASR-0.6B 主方案 / SenseVoice 备用方案，降级云端 Whisper） ----
+    // ---- Stage 5: 语音识别（优先在线 Qwen3-ASR-0.6B 主方案 / 本地 SenseVoice 备用方案，降级云端 Whisper） ----
     const sttAuth = resolveEffectiveSttAuth(cfg);
     const hasCloudStt = Boolean(sttAuth.baseUrl && (sttAuth.apiKey || isLocalEndpointUrl(sttAuth.baseUrl)));
     const localReady = this._localEngine.getStatus().readyForLocalAsr;
@@ -2796,7 +2793,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     let transcript = "";
     let altText: string | undefined;
     let acousticEvent = "";
-    let asrEngine = "qwen3-asr-local";
+    let asrEngine = "qwen3-asr-remote";
     let asrMs = 0;
     let runtimeEngine: VoiceRuntimeEngine = "local";
 
@@ -2804,7 +2801,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       pref === "local" || (pref === "auto" && localReady) || (pref === "whisper" && !hasCloudStt && localReady);
 
     if (useLocal) {
-      // 双轨抗音乐/强噪融合识别：主用 Qwen3-ASR-0.6B (GPU/CPU)，备用 SenseVoice 自动兜底，并结合 openWakeWord 与 SystemOne
+      // 双轨抗音乐/强噪融合识别：主用在线 Qwen3-ASR-0.6B，本地 SenseVoice 自动兜底，并结合 openWakeWord 与 SystemOne
       const sv = await this._localEngine.transcribeDualTrack(pcm16k, vad.speechSamples, {
         voiceLang: lang,
         wakeWords: cfg.wakeWords,
@@ -3686,10 +3683,10 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         this._lastWakeHit = { ...acousticWake, timestamp: now };
       }
 
-      // A4. 分轨独立语音转文字（Qwen3-ASR / SenseVoice / Whisper）
+      // A4. 分轨独立语音转文字（在线 Qwen3-ASR / 本地 SenseVoice / Whisper）
       let text = "";
       let acousticEvent = "";
-      let asrEngine = "qwen3-asr-local";
+      let asrEngine = "qwen3-asr-remote";
       let asrMs = 0;
       let runtimeEngine: VoiceRuntimeEngine = "local";
 
@@ -4523,7 +4520,6 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       qwen3AsrServiceUrl: cfg.qwen3AsrServiceUrl,
       qwen3AsrModel: cfg.qwen3AsrModel,
       localAsrEngine: cfg.localAsrEngine,
-      qwen3ComputeDevice: cfg.qwen3ComputeDevice,
       qwen3StreamingEnabled: cfg.qwen3StreamingEnabled,
       asyncVoicePipeline: cfg.asyncVoicePipeline,
       echoCancellationMode: cfg.echoCancellationMode,

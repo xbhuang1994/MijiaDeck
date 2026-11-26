@@ -280,7 +280,7 @@ export class VoiceStreamSession {
   private _cvTotalSeMs = 0;
   private _cvBssUsed = false;
   private _cvServerSwaps = 0;
-  private _cvLastEngine = "clearvoice-mossformer2-gpu";
+  private _cvLastEngine = "clearvoice-mossformer2-remote";
   private _cvLastGpuName: string | null = null;
   private _cvUtteranceStartSample: number | null = null;
   private _cvWakeAnchored = false;
@@ -1238,23 +1238,13 @@ export class VoiceStreamSession {
             sliceSwaps = res.swaps;
             if (res.ssUsed) {
               this._cvBssUsed = true;
-              this._cvLastEngine =
-                res.provider === "remote"
-                  ? "clearvoice-mossformer2-bss-se-remote"
-                  : res.device === "gpu"
-                    ? "clearvoice-mossformer2-bss-se-gpu"
-                    : "clearvoice-mossformer2-bss-se-cpu";
+              this._cvLastEngine = "clearvoice-mossformer2-bss-se-remote";
             } else {
-              this._cvLastEngine =
-                res.provider === "remote"
-                  ? "clearvoice-mossformer2-remote"
-                  : res.device === "gpu"
-                    ? "clearvoice-mossformer2-gpu"
-                    : "clearvoice-mossformer2-cpu";
+              this._cvLastEngine = "clearvoice-mossformer2-remote";
             }
             this._cvLastGpuName = res.gpuName;
           } catch {
-            // GPU ClearVoice 服务临时失败时优雅回退本地降噪，保证语音链路不断流
+            // 在线 ClearVoice 服务临时失败时优雅回退本地降噪，保证语音链路不断流
             const fb = this._opts.localEngine.denoise(
               next.rawWithContext,
               TARGET_SR,
@@ -1416,9 +1406,7 @@ export class VoiceStreamSession {
               const allowPreview =
                 status.readyForLocalAsr &&
                 this._cvSliceQueue.length < 2 &&
-                (status.activeQwen3Device === "gpu" ||
-                  status.activeQwen3Device === "remote" ||
-                  this._cvSliceQueue.length === 0);
+                (status.activeQwen3Device === "remote" || this._cvSliceQueue.length === 0);
               if (allowPreview) {
                 const prunedPreview = assembler.getTracks({ prune: true });
                 const totalPreviewTracks = prunedPreview.tracks.length;
@@ -1432,7 +1420,7 @@ export class VoiceStreamSession {
                   durationMs: number;
                   acousticEvent: string;
                 }> = [];
-                let previewEngine = "qwen3-asr-stream";
+                let previewEngine = "qwen3-asr-remote-stream";
                 let previewLatencyMs = 0;
                 const maxPreviewSamples = TARGET_SR * 8;
 
@@ -2402,7 +2390,7 @@ export class VoiceStreamSession {
    */
   private _commitStreamingByPunctPause(unfedTailSamples = 0): void {
     const sentences = this._streamTracker.flush();
-    const lastEngine = this._streamLastEngine || "qwen3-asr-stream";
+    const lastEngine = this._streamLastEngine || "qwen3-asr-remote-stream";
     const lastLatencyMs = this._streamLastLatencyMs;
     const anchor = this._wakeAnchorSample;
     const anchorHit = this._wakeAnchorHit;
@@ -2489,17 +2477,14 @@ export class VoiceStreamSession {
       this._wakeAnchorSample ?? this._streamSpeechOriginSample ?? this._activeSegmentStartSample;
     if (origin === null) return;
 
-    const isGpu = status.activeQwen3Device === "gpu";
     const isRemote = status.activeQwen3Device === "remote";
-    const pollMs = this._opts.streamingPollIntervalMs ?? (isGpu ? 360 : isRemote ? 550 : 850);
+    const pollMs = this._opts.streamingPollIntervalMs ?? (isRemote ? 550 : 850);
     const minAudioMs =
       this._opts.streamingPollIntervalMs !== undefined
         ? Math.min(320, pollMs)
-        : isGpu
-          ? 480
-          : isRemote
-            ? 560
-            : 700;
+        : isRemote
+          ? 560
+          : 700;
 
     const windowSamples = this._rawTotalSamples - origin;
     const newSamples = this._rawTotalSamples - this._streamLastDecodedEndSample;
@@ -2549,7 +2534,7 @@ export class VoiceStreamSession {
             text: clean,
             stableText: stablePrefix,
             unstableText: unstable,
-            engine: this._streamLastEngine || "qwen3-asr-stream",
+            engine: this._streamLastEngine || "qwen3-asr-remote-stream",
             latencyMs: Math.round(performance.now() - t0),
           });
         },
@@ -2652,7 +2637,7 @@ export class VoiceStreamSession {
             this._enqueueSegment({
               ...basePayload,
               precomputedTranscript: sentence,
-              precomputedAsrEngine: lastEngine || "qwen3-asr-stream",
+              precomputedAsrEngine: lastEngine || "qwen3-asr-remote-stream",
               precomputedAsrMs: lastLatencyMs,
               commitReason,
             });
@@ -2685,7 +2670,7 @@ export class VoiceStreamSession {
         candidatePayload = {
           ...candidatePayload,
           precomputedTranscript: latestText.trim(),
-          precomputedAsrEngine: lastEngine || "qwen3-asr-stream",
+          precomputedAsrEngine: lastEngine || "qwen3-asr-remote-stream",
           precomputedAsrMs: lastLatencyMs,
         };
       } else if (committedPrefix) {
