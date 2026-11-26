@@ -111,6 +111,8 @@ export interface SystemOneHistoryEntry {
 }
 
 export type WakeAttentionDecision = "valid_wake" | "false_wake";
+export type WakeDeviceCommandDecision = "has_device_command" | "no_device_command";
+export type WakeAttentionAcceptBy = "wake_word" | "device_command" | "both" | "none";
 export type ConversationActionChoice = "followup" | "side_talk" | "goodbye";
 export type CommandIntentChoice = "device_control" | "status_query" | "scene" | "general_chat";
 export type DualTrackAsrChoice = "track_a" | "track_b" | "neither_noise";
@@ -149,9 +151,19 @@ export interface WakeAttentionResult {
   decision: WakeAttentionDecision;
   confidence: number;
   probabilities: Record<WakeAttentionDecision, number>;
-  /** 非误听（确认有人在叫触发词且置信度达标），可直接进入下一流程 */
+  /** 或条件：判断 utterance 中是否存在控制智能家居设备的指令 */
+  deviceCommand: {
+    choice: WakeDeviceCommandDecision;
+    confidence: number;
+    probabilities: Record<WakeDeviceCommandDecision, number>;
+  };
+  /** 存在明确控制设备指令且置信度达标 */
+  hasDeviceCommand: boolean;
+  /** 放行依据：唤醒词有效 / 存在控制设备指令 / 两者同时命中 / 未放行 */
+  acceptedBy: WakeAttentionAcceptBy;
+  /** 满足或条件（确认有人在叫触发词 OR 存在控制设备指令）且置信度达标，可直接进入下一流程 */
   accepted: boolean;
-  /** 判定为误听/误唤醒（或置信度不足未放行） */
+  /** 判定为误听/误唤醒且无控制设备指令（或置信度不足未放行） */
   isFalseWake: boolean;
   model: string;
   usage: SystemOneUsage;
@@ -394,6 +406,18 @@ const WAKE_DECISION_QUESTION: SystemOneChoiceQuestion<WakeAttentionDecision> = {
       "确实有人在呼唤触发词（不是误听）：直接叫出触发词（单独叫或后接任意内容），或句首近音/同音词按原字面语义不通顺/语法别扭、替换回触发词（if_replaced）后语义自然通顺（如“你有播放点音乐吧”->“Neo，播放点音乐吧”，“六，我觉得客厅有点暗呢”->“Neo，我觉得客厅有点暗呢”）。",
     false_wake:
       "误听或误唤醒：并没有人在叫触发词，包括原句按字面本就是自然通顺的日常问句/陈述句（如“你有打开窗户吗？”“你有时间吗？”“六个苹果多少钱”）、纯杂音碎片，或在与他人聊天、转述、评价、否定中顺带提及该词而并非在呼叫触发词。",
+  },
+};
+
+const WAKE_DEVICE_COMMAND_QUESTION: SystemOneChoiceQuestion<WakeDeviceCommandDecision> = {
+  type: "choice",
+  instructions:
+    "作为唤醒词判定的或条件，仅判断语音转写文本 utterance 中是否存在控制智能家居设备的指令或明确设备操作命令（支持中英文及轻微语音识别同音误差）：包括开关或调节灯光/亮度/色温/颜色、空调/温度/风速/模式、风扇、窗帘、电视/投影仪、音箱/音量/静音/播放/暂停/切歌、洗衣机/烘干/洗袜子/洗内裤、扫地机、加湿器/除湿机/净化器、浴霸/热水器、插座/开关、喂食器/出粮、场景/模式切换等。注意区分：纯日常是非问句（如“你有打开窗户吗？”“空调是不是开着？”）、普通闲聊/天气问答/家务跑腿（如“晚饭吃什么”“明天北京天气怎么样”“帮我倒杯水”“六个苹果多少钱”）、对触发词的第三人称提及或评价（如“我刚才聊到Neo挺好用的”）以及纯呼唤词/杂音碎片均不属于控制设备指令，判定为 no_device_command。",
+  criteria: {
+    has_device_command:
+      "文本中存在明确控制或调节智能家居设备的指令（如“打开客厅灯”“把卧室空调调到26度”“关灯”“播放点音乐吧”“把电视声音调小”“暂停播放”“启动扫地机”“把窗帘拉上”“帮我洗一下袜子”等，即使没有唤醒词或句首唤醒词被吞字/误听也属此类）。",
+    no_device_command:
+      "文本中不存在控制设备指令：包括纯日常问句（如“你有打开窗户吗？”“你有时间吗？”）、普通闲聊/天气问答、家务跑腿、对唤醒词的第三人称提及/评价、纯呼唤词或杂音碎片。",
   },
 };
 
@@ -1115,9 +1139,9 @@ export class SystemOneClient {
   }
 
   /**
-   * (a) 唤醒词触发后纯误唤醒校验（单问题二分类：`valid_wake | false_wake`）。
-   * 仅判断是不是误听有人在叫触发词，不附带上下文/背景/设备能力/意图/双轨等其它判断；
-   * 仅缓存负向误听判定（`false_wake`），绝不缓存正向放行判定（`valid_wake`）。
+   * (a) 唤醒词触发后校验（单次请求并行二分类：`decision` 唤醒词非误听 OR `device_command` 存在控制设备指令）。
+   * 满足任一条件且置信度达标即放行不拦截，不附带上下文/背景/设备能力/双轨等其它字段；
+   * 仅缓存完全未通过（既非唤醒词又无控制设备指令）的负向判定，绝不缓存任何放行判定。
    */
   async evaluateWakeAttention(
     input: WakeAttentionInput,
@@ -1182,6 +1206,7 @@ export class SystemOneClient {
 
     const questions = {
       decision: WAKE_DECISION_QUESTION,
+      device_command: WAKE_DEVICE_COMMAND_QUESTION,
     };
 
     const t0 = performance.now();
@@ -1190,16 +1215,35 @@ export class SystemOneClient {
 
     const latencyMs = Math.max(0, Math.round(performance.now() - t0));
     const decisionAns = res.answers.decision;
+    const deviceCmdAns = res.answers.device_command;
     const acceptThreshold = this._effectiveAcceptThreshold(strict);
     const decision = decisionAns.choice;
     const confidence = decisionAns.confidence;
-    const accepted = decision === "valid_wake" && confidence >= acceptThreshold;
+    const wakeAccepted = decision === "valid_wake" && confidence >= acceptThreshold;
+    const hasDeviceCommand =
+      deviceCmdAns.choice === "has_device_command" && deviceCmdAns.confidence >= acceptThreshold;
+    const accepted = wakeAccepted || hasDeviceCommand;
     const isFalseWake = !accepted;
+    const acceptedBy: WakeAttentionAcceptBy =
+      wakeAccepted && hasDeviceCommand
+        ? "both"
+        : wakeAccepted
+          ? "wake_word"
+          : hasDeviceCommand
+            ? "device_command"
+            : "none";
 
     const result: WakeAttentionResult = {
       decision,
       confidence,
       probabilities: decisionAns.probabilities,
+      deviceCommand: {
+        choice: deviceCmdAns.choice,
+        confidence: deviceCmdAns.confidence,
+        probabilities: deviceCmdAns.probabilities,
+      },
+      hasDeviceCommand,
+      acceptedBy,
       accepted,
       isFalseWake,
       model: res.model,
@@ -1208,8 +1252,8 @@ export class SystemOneClient {
       cached: false,
     };
 
-    // 仅缓存误唤醒负向判定，绝不缓存正向放行判定
-    if (decision === "false_wake") {
+    // 仅缓存完全未通过（既非唤醒词又无控制设备指令）的负向判定，绝不缓存任何放行判定
+    if (!accepted && decision === "false_wake" && deviceCmdAns.choice === "no_device_command") {
       this._cache.set(cacheKey, result);
     }
 

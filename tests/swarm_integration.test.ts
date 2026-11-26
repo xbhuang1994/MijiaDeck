@@ -84,6 +84,15 @@ describe("Swarm Integrated E2E: SystemOne + Caveman + openWakeWord + Dual-State 
         }
       }
 
+      if (payload.questions.device_command) {
+        answers.device_command = {
+          type: "choice",
+          choice: "no_device_command",
+          probabilities: { has_device_command: 0.05, no_device_command: 0.95 },
+          confidence: 0.95,
+        };
+      }
+
       if (payload.questions.conv_action) {
         if (utterance.includes("晚饭") || utterance.includes("快递")) {
           answers.conv_action = {
@@ -209,7 +218,10 @@ describe("Swarm Integrated E2E: SystemOne + Caveman + openWakeWord + Dual-State 
     expect(vl.snapshot().dialogState).toBe("standby");
     const wakeCall = systemOneCalls.find((c) => Boolean((c.questions as any)?.decision));
     expect(wakeCall).toBeTruthy();
-    expect(Object.keys((wakeCall!.questions as Record<string, unknown>))).toEqual(["decision"]);
+    expect(Object.keys((wakeCall!.questions as Record<string, unknown>)).sort()).toEqual([
+      "decision",
+      "device_command",
+    ]);
     expect(Object.keys((wakeCall!.state as Record<string, unknown>)).sort()).toEqual([
       "utterance",
       "wake_words",
@@ -318,9 +330,10 @@ describe("Swarm Integrated E2E: SystemOne + Caveman + openWakeWord + Dual-State 
       service: demo,
     });
 
-    // 1. Acoustic veto blocks fuzzy ASR alias when openWakeWord score is low
+    // 1. Acoustic veto blocks fuzzy ASR alias without a device command when openWakeWord score is low,
+    //    while a fuzzy alias carrying an explicit device control command passes via the OR condition!
     const vetoed = await evaluateVoiceAttention({
-      rawText: "你有播放音乐",
+      rawText: "尼奥，讲个笑话",
       wakeWordEnabled: true,
       wakeWords: ["Neo"],
       attentionMode: "smart",
@@ -339,6 +352,28 @@ describe("Swarm Integrated E2E: SystemOne + Caveman + openWakeWord + Dual-State 
     });
     expect(vetoed.accept).toBe(false);
     expect(vetoed.stage).toBe("acoustic-veto");
+
+    const allowedDeviceCmd = await evaluateVoiceAttention({
+      rawText: "你有播放音乐",
+      wakeWordEnabled: true,
+      wakeWords: ["Neo"],
+      attentionMode: "smart",
+      owwActiveForWord: true,
+      acousticWake: {
+        matched: false,
+        wakeWord: "Neo",
+        score: 0.22,
+        rawScore: 0.22,
+        threshold: 0.6,
+        source: "enrolled",
+        frameIndex: 4,
+        sampleOffset: 5120,
+        latencyMs: 5,
+      },
+    });
+    expect(allowedDeviceCmd.accept).toBe(true);
+    expect(allowedDeviceCmd.passSource).toBe("device_command");
+    expect(allowedDeviceCmd.command).toBe("播放音乐");
 
     // 2. Wakeword prototype REST lifecycle
     const list0 = await fetch(`${server.url}/api/voice/wakewords/prototypes`);

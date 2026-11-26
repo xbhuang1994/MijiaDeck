@@ -67,6 +67,7 @@ import type { VoiceStreamSegmentPayload } from "./voiceStreamSession.ts";
 import {
   evaluateVoiceAttention,
   findWakeWordSpan,
+  hasExplicitDeviceControlCommand,
   type AttentionDecision,
   type AttentionLlmEvaluator,
 } from "./voiceAttentionGate.ts";
@@ -427,6 +428,15 @@ export function extractWakeCommand(
 
   const span = findWakeWordSpan(cleaned, options.wakeWords);
   if (!span) {
+    if (hasExplicitDeviceControlCommand(cleaned)) {
+      const cmd = cleaned.replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
+      return {
+        matched: cmd.length > 0,
+        wokeOnly: false,
+        wakeWord: null,
+        command: cmd,
+      };
+    }
     return { matched: false, wokeOnly: false, wakeWord: null, command: "" };
   }
   if (span.afterText.length > 0) {
@@ -2695,7 +2705,25 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           inConversation &&
           this._dialogEpoch !== preSepEpoch &&
           this._dialogState === "standby" &&
-          !sep.attention.wakeWord;
+          !sep.attention.wakeWord &&
+          !options.bypassWakeWord &&
+          cfg.wakeWordEnabled;
+
+        const staleRejectedAttention: AttentionDecision | undefined = staleConversationDecision
+          ? {
+              accept: false,
+              wokeOnly: false,
+              addressed: false,
+              inConversation: false,
+              confidence: 0.9,
+              stage: "no-wake",
+              reason: "旧连续对话轮次已结束，已忽略过期异步识别结果",
+              wakeWord: null,
+              command: "",
+              usedLlm: false,
+              latencyMs: 0,
+            }
+          : undefined;
 
         const dispatched = await this.handleTranscript(sepText, {
           isFinal: true,
@@ -2711,8 +2739,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           snrGainDb: sep.snrGainDb,
           timingsBase: { voiceprintMs, asrMs: sep.totalMs },
           llmAttentionOverride: options.llmAttentionOverride,
-          precomputedAttention:
-            staleConversationDecision || Boolean(segment.stripCommittedPrefixHint)
+          precomputedAttention: staleRejectedAttention
+            ? staleRejectedAttention
+            : Boolean(segment.stripCommittedPrefixHint)
               ? undefined
               : sep.attention,
           asyncDispatch: options.asyncDispatch,
@@ -3304,9 +3333,11 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     // 仅向唯一未屏蔽有效音轨（或得分显著领先且 >= 0.25 的单一音轨）恢复声学唤醒命中，严格保持其余音轨隔离。
     if (options.autoDispatch && trackCount > 1 && meta.streamAcousticWake?.matched) {
       const activeTracks = prepared.filter((p) => !p.muted && p.speechDetected && p.text.length > 0);
-      const anyTrackAlreadyWoke = activeTracks.some(
-        (p) => Boolean(p.acousticWake?.matched) || Boolean(findWakeWordSpan(p.text, cfg.wakeWords)),
-      );
+      const anyTrackAlreadyWoke = activeTracks.some((p) => {
+        if (p.acousticWake?.matched) return true;
+        const sp = findWakeWordSpan(p.text, cfg.wakeWords);
+        return Boolean(sp && !sp.fuzzy);
+      });
       if (!anyTrackAlreadyWoke && activeTracks.length > 0) {
         if (activeTracks.length === 1) {
           activeTracks[0]!.acousticWake = meta.streamAcousticWake;
@@ -3402,7 +3433,19 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           const suppressExitConversation =
             anyAcceptedInBatch && !isAccepted && p.decision?.exitConversation === true;
           const effectivePrecomputedAttention = staleAfterExit
-            ? undefined
+            ? {
+                accept: false,
+                wokeOnly: false,
+                addressed: false,
+                inConversation: false,
+                confidence: 0.9,
+                stage: "no-wake" as const,
+                reason: "旧连续对话轮次已结束，已忽略过期音轨结果",
+                wakeWord: null,
+                command: "",
+                usedLlm: false,
+                latencyMs: 0,
+              }
             : suppressExitConversation && p.decision
               ? { ...p.decision, exitConversation: false }
               : (p.decision ?? undefined);
