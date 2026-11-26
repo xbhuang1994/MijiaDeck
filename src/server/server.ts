@@ -184,10 +184,20 @@ function handleWsMessage(
         owwThreshold: cfg.owwThreshold,
         streamingAsrEnabled: cfg.qwen3StreamingEnabled,
         voicePipelineMode: cfg.voicePipelineMode,
+        echoCancellationMode: cfg.echoCancellationMode,
+        clientAecActive: parsed.clientAecActive === true,
         trackMuteManager: vl.trackMuteManager,
         getSystemOneClient: () => vl.systemOneClient,
         getRecentHistory: () => vl.getRecentHistoryForSystemOne(5),
         getDialogEpoch: () => vl.dialogEpoch,
+        onAecTelemetry: (telemetry) => {
+          vl.handleTtsClientState({
+            phase: "telemetry",
+            aecActive: telemetry.active,
+            erleDb: telemetry.erleDb,
+            doubleTalk: telemetry.doubleTalk,
+          });
+        },
         onPartialTranscript: (partial) => {
           try {
             ws.send(
@@ -333,14 +343,36 @@ function handleWsMessage(
       if (speaking !== undefined) {
         ws.data.ttsSpeaking = speaking;
       }
+      const clientAecFlag = typeof parsed.aecActive === "boolean" ? parsed.aecActive : undefined;
+      if (clientAecFlag !== undefined) {
+        ws.data.voiceStream?.setClientAecActive(clientAecFlag);
+      }
+      const uttText = typeof parsed.text === "string" ? parsed.text : undefined;
+      if (phase === "cancel") {
+        ws.data.voiceStream?.clearFarEndReference();
+      } else if (
+        ws.data.voiceStream &&
+        !ws.data.voiceStream.clientAecActive &&
+        uttText &&
+        (phase === "start" || (speaking === true && phase !== "telemetry"))
+      ) {
+        const cfg = vl.config;
+        const cachedRef = vl.localEngine.tts.getCachedPcm16k(uttText, {
+          voice: cfg.ttsVoice,
+          speed: cfg.ttsSpeed,
+        });
+        if (cachedRef && cachedRef.length > 0) {
+          ws.data.voiceStream.pushFarEndReference(cachedRef, 16000);
+        }
+      }
       vl.handleTtsClientState({
         speaking,
         phase,
         utteranceId: typeof parsed.utteranceId === "string" ? parsed.utteranceId : undefined,
-        text: typeof parsed.text === "string" ? parsed.text : undefined,
+        text: uttText,
         queueLength: typeof parsed.queueLength === "number" ? parsed.queueLength : undefined,
         ducked: typeof parsed.ducked === "boolean" ? parsed.ducked : undefined,
-        aecActive: typeof parsed.aecActive === "boolean" ? parsed.aecActive : undefined,
+        aecActive: clientAecFlag,
         erleDb: typeof parsed.erleDb === "number" ? parsed.erleDb : undefined,
         doubleTalk: typeof parsed.doubleTalk === "boolean" ? parsed.doubleTalk : undefined,
       });
@@ -500,6 +532,9 @@ export async function startMijiaDeckServer(
         }
         if (streamOpts?.noiseSuppressionMode !== undefined) {
           stream.setNoiseMode(streamOpts.noiseSuppressionMode);
+        }
+        if (streamOpts?.echoCancellationMode !== undefined) {
+          stream.setEchoCancellationMode(streamOpts.echoCancellationMode);
         }
         if (
           typeof streamOpts?.vadSilenceMs === "number" ||

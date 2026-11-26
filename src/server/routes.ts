@@ -180,6 +180,7 @@ export interface AppRuntime {
       vadSensitivity?: agentConfigStoreModule.VadSensitivityMode;
       wakeWordEnabled?: boolean;
       owwEnabled?: boolean;
+      echoCancellationMode?: agentConfigStoreModule.EchoCancellationMode;
     },
   ) => void;
   speakerAudioProps?: Map<string, { volName: string; muteName: string }>;
@@ -2558,6 +2559,7 @@ export function createRequestHandler(
           vadSensitivity: updated.vadSensitivity,
           wakeWordEnabled: updated.wakeWordEnabled,
           owwEnabled: updated.owwEnabled,
+          echoCancellationMode: updated.echoCancellationMode,
         });
         emitBroadcast(runtime);
         return jsonResponse({

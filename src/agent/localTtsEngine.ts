@@ -15,7 +15,7 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { projectRoot } from "../core/appMeta.ts";
-import { encodeWavPcm16 } from "./audioPcm.ts";
+import { encodeWavPcm16, resampleLinear } from "./audioPcm.ts";
 
 export type TtsEngineMode = "auto" | "local" | "browser";
 export type TtsVoicePreset = "gentle-zh-en" | "warm-zh-baker";
@@ -447,6 +447,42 @@ export class LocalTtsEngine {
 
     this._instances.set(voice, promise);
     return promise;
+  }
+
+  /**
+   * 零开销读取近期已合成 TTS 的 16kHz Mono Float32 PCM 波形（供服务端兜底 AEC 参考信号使用，未命中缓存返回 null）。
+   */
+  getCachedPcm16k(
+    rawText: string,
+    options: { voice?: TtsVoicePreset; speed?: number } = {},
+  ): Float32Array | null {
+    const requestedVoice = normalizeTtsVoice(options.voice, DEFAULT_TTS_VOICE);
+    const speed = normalizeTtsSpeed(options.speed, DEFAULT_TTS_SPEED);
+    const normPreferred = normalizeTextForLocalTts(rawText, requestedVoice);
+    if (!normPreferred) return null;
+
+    let hit = this._cache.get(`${requestedVoice}|${speed.toFixed(2)}|${normPreferred}`);
+    if (!hit) {
+      // 兼容音色回落或语速微调的最近缓存命中
+      for (const [key, entry] of this._cache) {
+        if (key.endsWith(`|${normPreferred}`)) {
+          hit = entry;
+          break;
+        }
+      }
+    }
+    if (!hit || hit.wav.byteLength <= 44) return null;
+
+    const wav = hit.wav;
+    const view = new DataView(wav.buffer, wav.byteOffset, wav.byteLength);
+    const dataBytes = Math.min(wav.byteLength - 44, view.getUint32(40, true));
+    const count = Math.floor(dataBytes / 2);
+    if (count <= 0) return null;
+    const pcm = new Float32Array(count);
+    for (let i = 0; i < count; i += 1) {
+      pcm[i] = view.getInt16(44 + i * 2, true) / 32768;
+    }
+    return hit.sampleRate === 16000 ? pcm : resampleLinear(pcm, hit.sampleRate, 16000);
   }
 
   /**

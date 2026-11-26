@@ -298,12 +298,13 @@ export function encodeFloat32ToWavBlob(samples: Float32Array, sampleRate = 16000
 }
 
 /**
- * 独立音频线程 AudioWorkletProcessor 源码（全双工 + 实时参考信号 PBFDAF/NLMS 声学回声消除）：
- * 1. 双输入时钟同步下采样至 16kHz Mono PCM（Input 0 = 麦克风，Input 1 = 本机 TTS 播报远端参考信号）
- * 2. 85Hz 一阶高通滤波去除直流偏移与低频嗡声
- * 3. 内置 16 分块 × 256 采样 (256ms) PBFDAF 频域自适应回声消除 + 双讲检测 (DTD) + 残余回声抑制 (RES)
- * 4. 全双工异步流模式：播报期间绝不强行暂停麦克风收音，经实时 AEC 净化后的近端人声持续直推服务端！
- * 5. 双讲检测仅在真实近端人声出现时通知主线程平滑降音（Ducking）与打断，彻底消除扬声器自回声误打断。
+ * 独立音频线程 AudioWorkletProcessor 源码（全双工 + 样本级延迟对齐双路径 PBFDAF + Hann-OLA 相干 RES 声学回声消除）：
+ * 1. 双输入匹配 85Hz 高通 + 7.2kHz 巴特沃斯抗混叠低通 + 精确分数线性插值下采样至 16kHz Mono PCM
+ *    （Input 0 = 麦克风，Input 1 = 本机 TTS 播报远端参考信号，自动兼容单/双声道参考）
+ * 2. 2kHz 无边缘衰减线性 GCC-PHAT 自动延迟估计（0~640ms，0.5ms 精度，覆盖本机/USB/HDMI/蓝牙扬声器延迟）
+ * 3. 双路径（Shadow 敏捷学习 + Main 稳健主滤波）严格时域线性卷积约束 PBFDAF（16 分块 = 256ms 混响尾）
+ * 4. 延迟对齐房间耦合增益 + 低偏置能量加权相干度双讲检测（DTD）+ 50% 重叠 Hann-OLA 相干残余回声抑制（RES）
+ * 5. 全双工异步流模式：播报期间经实时 AEC 深度消除播报语音后的近端人声持续直推服务端；关闭打断时继续训练滤波器并静默门控上行。
  */
 const VOICE_WORKLET_CODE = `
 function aecFft(re, im, inverse) {
@@ -348,215 +349,725 @@ function aecFft(re, im, inverse) {
 }
 
 class WorkletPbfdafAec {
-  constructor(aggressive) {
+  constructor(aggressive, initialDelayMs) {
+    this.sampleRate = 16000;
     this.N = 256;
     this.F = 512;
     this.B = 257;
     this.M = 16;
-    this.stepSize = 0.45;
+    this.stepSize = 0.85;
     this.reg = 1e-4;
-    this.farEndThresh = 0.0025;
+    this.farEndThresh = 0.002;
     this.aggressive = Boolean(aggressive);
-    this.prevRef = new Float32Array(this.N);
+
+    this.maxDelaySamples = Math.round(0.64 * this.sampleRate);
+    this.preMarginSamples = Math.round(0.004 * this.sampleRate);
+    this.refSampleRingLen = this.maxDelaySamples + (this.M + 4) * this.N;
+    this.refSampleRing = new Float32Array(this.refSampleRingLen);
+    this.refSampleWrite = 0;
+    this.refPowRingLen = Math.ceil(this.refSampleRingLen / this.N) + 2;
+    this.refBlockPowRing = new Float32Array(this.refPowRingLen);
+    this.refPowWrite = 0;
+
+    this.alignedDelaySamples = 0;
+    this.estimatedDelaySamples = 0;
+    this.delayLocked = false;
+    this.candidateDelaySamples = 0;
+    this.candidateDelayStreak = 0;
+
+    this.decimFactor = 8;
+    this.decimStep = this.N / 8;
+    this.gccFftSize = 2048;
+    this.gccRefRing = new Float32Array(this.gccFftSize);
+    this.gccMicRing = new Float32Array(this.gccFftSize);
+    this.gccWrite = 0;
+    this.gccFilled = 0;
+    this.gccTick = 0;
+    this.gccRe1 = new Float32Array(this.gccFftSize);
+    this.gccIm1 = new Float32Array(this.gccFftSize);
+    this.gccRe2 = new Float32Array(this.gccFftSize);
+    this.gccIm2 = new Float32Array(this.gccFftSize);
+    this.gccAcc = new Float32Array(this.gccFftSize);
+    this.gccPreMicPrev = 0;
+    this.gccPreRefPrev = 0;
+
+    this.alignedRefBlock = new Float32Array(this.N);
+    this.prevAlignedRef = new Float32Array(this.N);
     this.xRe = Array.from({ length: this.M }, () => new Float32Array(this.B));
     this.xIm = Array.from({ length: this.M }, () => new Float32Array(this.B));
-    this.wRe = Array.from({ length: this.M }, () => new Float32Array(this.B));
-    this.wIm = Array.from({ length: this.M }, () => new Float32Array(this.B));
+    this.wMainRe = Array.from({ length: this.M }, () => new Float32Array(this.B));
+    this.wMainIm = Array.from({ length: this.M }, () => new Float32Array(this.B));
+    this.wShadowRe = Array.from({ length: this.M }, () => new Float32Array(this.B));
+    this.wShadowIm = Array.from({ length: this.M }, () => new Float32Array(this.B));
     this.partHead = 0;
+
+    this.hann = new Float32Array(this.F);
+    for (let i = 0; i < this.F; i += 1) {
+      this.hann[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / this.F));
+    }
+    this.prevErrTime = new Float32Array(this.N);
+    this.prevEchoTime = new Float32Array(this.N);
+    this.prevRefResTime = new Float32Array(this.N);
+    this.olaTail = new Float32Array(this.N);
+    this.olaActive = false;
+
     this.psdRef = new Float32Array(this.B).fill(this.reg);
+    this.instTotalX = new Float32Array(this.B);
     this.psdErr = new Float32Array(this.B).fill(1e-7);
     this.psdEcho = new Float32Array(this.B).fill(1e-7);
+    this.psdRefRes = new Float32Array(this.B).fill(1e-7);
+    this.psdRefTail = new Float32Array(this.B).fill(1e-7);
+    this.crossYeRe = new Float32Array(this.B);
+    this.crossYeIm = new Float32Array(this.B);
+    this.crossXeRe = new Float32Array(this.B);
+    this.crossXeIm = new Float32Array(this.B);
     this.prevPostGain = new Float32Array(this.B).fill(1);
-    this.prevErrTime = new Float32Array(this.N);
+
     this.tmpRe = new Float32Array(this.F);
     this.tmpIm = new Float32Array(this.F);
-    this.yRe = new Float32Array(this.F);
-    this.yIm = new Float32Array(this.F);
+    this.yMainRe = new Float32Array(this.F);
+    this.yMainIm = new Float32Array(this.F);
+    this.yShadowRe = new Float32Array(this.F);
+    this.yShadowIm = new Float32Array(this.F);
     this.eRe = new Float32Array(this.F);
     this.eIm = new Float32Array(this.F);
     this.gradRe = new Float32Array(this.F);
     this.gradIm = new Float32Array(this.F);
+    this.resRefRe = new Float32Array(this.F);
+    this.resRefIm = new Float32Array(this.F);
+    this.linearErrMain = new Float32Array(this.N);
+    this.linearErrShadow = new Float32Array(this.N);
+
     this.smoothMicPow = 1e-8;
-    this.smoothErrPow = 1e-8;
+    this.smoothErrMainPow = 1e-8;
+    this.smoothErrShadowPow = 1e-8;
+    this.smoothAlignedRefPow = 1e-8;
+    this.couplingGainPow = 0.35;
+    this.couplingInitialized = false;
     this.farEndHold = 0;
     this.doubleTalkHold = 0;
+    this.dtConfirmStreak = 0;
+    this.shadowWinStreak = 0;
+    this.shadowDivergeStreak = 0;
+    this.mainCopyCount = 0;
     this.erleDb = 0;
+    this.linearErleDb = 0;
     this.convergedRatio = 0;
     this.adaptBlocks = 0;
     this.constraintTick = 0;
+    this.activeMicPowAcc = 1e-8;
+    this.activeOutPowAcc = 1e-8;
+    this.activeLinErrPowAcc = 1e-8;
+
+    if (typeof initialDelayMs === "number" && Number.isFinite(initialDelayMs) && initialDelayMs > 0) {
+      this.setInitialDelayMs(initialDelayMs);
+    }
+  }
+
+  setInitialDelayMs(delayMs) {
+    if (!Number.isFinite(delayMs) || delayMs <= 0 || this.delayLocked) return;
+    const clampedMs = Math.max(0, Math.min(540, delayMs));
+    const samples = Math.round((clampedMs / 1000) * this.sampleRate);
+    this.estimatedDelaySamples = samples;
+    this.alignedDelaySamples = Math.max(0, Math.min(this.maxDelaySamples, samples - this.preMarginSamples));
+  }
+
+  readRefSamples(dst, dstOff, delayEndOffset, len) {
+    const L = this.refSampleRingLen;
+    let src = (this.refSampleWrite - delayEndOffset - len) % L;
+    if (src < 0) src += L;
+    for (let i = 0; i < len; i += 1) {
+      dst[dstOff + i] = this.refSampleRing[src];
+      src += 1;
+      if (src >= L) src = 0;
+    }
+  }
+
+  rebuildAlignedRefSpectra() {
+    const N = this.N, F = this.F, B = this.B, M = this.M;
+    this.partHead = 0;
+    this.psdRef.fill(this.reg);
+    for (let p = 0; p < M; p += 1) {
+      this.readRefSamples(this.tmpRe, 0, this.alignedDelaySamples + p * N, F);
+      this.tmpIm.fill(0);
+      aecFft(this.tmpRe, this.tmpIm, false);
+      const dstRe = this.xRe[p], dstIm = this.xIm[p];
+      for (let k = 0; k < B; k += 1) {
+        const xr = this.tmpRe[k], xi = this.tmpIm[k];
+        dstRe[k] = xr;
+        dstIm[k] = xi;
+        this.psdRef[k] += xr * xr + xi * xi;
+      }
+      if (p === 0) {
+        this.readRefSamples(this.prevAlignedRef, 0, this.alignedDelaySamples, N);
+      }
+    }
+  }
+
+  applyAlignedDelay(newAlignedSamples) {
+    const clamped = Math.max(0, Math.min(this.maxDelaySamples, Math.round(newAlignedSamples)));
+    if (Math.abs(clamped - this.alignedDelaySamples) < 16) return;
+    this.alignedDelaySamples = clamped;
+    for (let p = 0; p < this.M; p += 1) {
+      this.wMainRe[p].fill(0);
+      this.wMainIm[p].fill(0);
+      this.wShadowRe[p].fill(0);
+      this.wShadowIm[p].fill(0);
+    }
+    this.rebuildAlignedRefSpectra();
+    this.shadowWinStreak = 0;
+    this.shadowDivergeStreak = 0;
+    this.mainCopyCount = 0;
+    this.convergedRatio = 0;
+    this.adaptBlocks = 0;
+    this.crossYeRe.fill(0);
+    this.crossYeIm.fill(0);
+    this.crossXeRe.fill(0);
+    this.crossXeIm.fill(0);
+  }
+
+  updateDelayEstimator(mic, ref, micPow, anyRefEnergy) {
+    const step = this.decimStep, factor = this.decimFactor, G = this.gccFftSize;
+    for (let s = 0; s < step; s += 1) {
+      const base = s * factor;
+      let mSum = 0, rSum = 0;
+      for (let j = 0; j < factor; j += 1) {
+        mSum += mic[base + j];
+        rSum += ref[base + j];
+      }
+      const mAvg = mSum / factor, rAvg = rSum / factor;
+      const mPre = mAvg - 0.85 * this.gccPreMicPrev;
+      const rPre = rAvg - 0.85 * this.gccPreRefPrev;
+      this.gccPreMicPrev = mAvg;
+      this.gccPreRefPrev = rAvg;
+      this.gccMicRing[this.gccWrite] = mPre;
+      this.gccRefRing[this.gccWrite] = rPre;
+      this.gccWrite = (this.gccWrite + 1) % G;
+      if (this.gccFilled < G) this.gccFilled += 1;
+    }
+
+    this.gccTick += 1;
+    const interval = this.delayLocked ? 6 : 2;
+    if (this.gccTick % interval !== 0) return;
+    if (!anyRefEnergy || micPow < 1e-6 || this.gccFilled < 192) return;
+
+    const refLen = Math.min(1664, this.gccFilled);
+    const micLen = Math.min(384, refLen);
+    const micStartInBuf = refLen - micLen;
+
+    this.gccRe1.fill(0);
+    this.gccIm1.fill(0);
+    this.gccRe2.fill(0);
+    this.gccIm2.fill(0);
+
+    const refStart = (this.gccWrite - refLen + G) % G;
+    for (let i = 0; i < refLen; i += 1) {
+      this.gccRe1[i] = this.gccRefRing[(refStart + i) % G];
+    }
+    const micStart = (this.gccWrite - micLen + G) % G;
+    for (let i = 0; i < micLen; i += 1) {
+      const w = i < 16 ? i / 16 : i >= micLen - 16 ? (micLen - 1 - i) / 16 : 1;
+      this.gccRe2[micStartInBuf + i] = this.gccMicRing[(micStart + i) % G] * w;
+    }
+
+    aecFft(this.gccRe1, this.gccIm1, false);
+    aecFft(this.gccRe2, this.gccIm2, false);
+
+    const minBin = Math.max(4, Math.floor((120 * G) / 2000));
+    const maxBin = Math.min(G / 2 - 4, Math.floor((920 * G) / 2000));
+    const outRe = this.gccRe1, outIm = this.gccIm1;
+    for (let k = 0; k <= G / 2; k += 1) {
+      if (k < minBin || k > maxBin) {
+        outRe[k] = 0;
+        outIm[k] = 0;
+      } else {
+        const xr = outRe[k], xi = outIm[k], mr = this.gccRe2[k], mi = this.gccIm2[k];
+        const cr = mr * xr + mi * xi;
+        const ci = mi * xr - mr * xi;
+        const mag = Math.sqrt(cr * cr + ci * ci) + 1e-6;
+        outRe[k] = cr / mag;
+        outIm[k] = ci / mag;
+      }
+      if (k > 0 && k < G / 2) {
+        outRe[G - k] = outRe[k];
+        outIm[G - k] = -outIm[k];
+      }
+    }
+    aecFft(outRe, outIm, true);
+
+    const maxValidLag = Math.min(Math.max(0, refLen - micLen), Math.ceil(this.maxDelaySamples / factor));
+    if (maxValidLag < 4) return;
+    const decay = this.delayLocked ? 0.85 : 0.55;
+    let peakVal = 0, peakLag = 0, sumAbs = 0;
+    for (let lag = 0; lag <= maxValidLag; lag += 1) {
+      const v = Math.abs(outRe[lag]);
+      const acc = decay * this.gccAcc[lag] + (1 - decay) * v;
+      this.gccAcc[lag] = acc;
+      sumAbs += acc;
+      if (acc > peakVal) {
+        peakVal = acc;
+        peakLag = lag;
+      }
+    }
+    const meanVal = sumAbs / Math.max(1, maxValidLag + 1);
+    const peakToMean = meanVal > 1e-9 ? peakVal / meanVal : 0;
+
+    if (peakToMean >= (this.delayLocked ? 4.4 : 3.4)) {
+      const estSamples = peakLag * factor;
+      const targetAligned = Math.max(0, Math.min(this.maxDelaySamples, estSamples - this.preMarginSamples));
+      this.estimatedDelaySamples = Math.round(
+        this.delayLocked ? 0.72 * this.estimatedDelaySamples + 0.28 * estSamples : estSamples
+      );
+      if (!this.delayLocked) {
+        if (Math.abs(targetAligned - this.candidateDelaySamples) <= 64) this.candidateDelayStreak += 1;
+        else { this.candidateDelaySamples = targetAligned; this.candidateDelayStreak = 1; }
+        if (peakToMean >= 5.2 || this.candidateDelayStreak >= 2) {
+          this.delayLocked = true;
+          this.applyAlignedDelay(targetAligned);
+        }
+      } else {
+        const rel = estSamples - this.alignedDelaySamples;
+        if (rel < 0 || rel > this.N * 3) {
+          if (Math.abs(targetAligned - this.candidateDelaySamples) <= 96) this.candidateDelayStreak += 1;
+          else { this.candidateDelaySamples = targetAligned; this.candidateDelayStreak = 1; }
+          if (this.candidateDelayStreak >= 3) {
+            this.candidateDelayStreak = 0;
+            this.applyAlignedDelay(targetAligned);
+          }
+        } else {
+          this.candidateDelayStreak = 0;
+        }
+      }
+    }
+  }
+
+  predictFilter(wReArr, wImArr, outRe, outIm) {
+    const F = this.F, B = this.B, M = this.M;
+    outRe.fill(0);
+    outIm.fill(0);
+    for (let p = 0; p < M; p += 1) {
+      const idx = (this.partHead + p) % M;
+      const xpRe = this.xRe[idx], xpIm = this.xIm[idx];
+      const wpRe = wReArr[p], wpIm = wImArr[p];
+      for (let k = 0; k < B; k += 1) {
+        const xr = xpRe[k], xi = xpIm[k], wr = wpRe[k], wi = wpIm[k];
+        outRe[k] += wr * xr - wi * xi;
+        outIm[k] += wr * xi + wi * xr;
+      }
+    }
+    for (let k = 1; k < B - 1; k += 1) {
+      outRe[F - k] = outRe[k];
+      outIm[F - k] = -outIm[k];
+    }
+    aecFft(outRe, outIm, true);
+  }
+
+  constrainWeight(wpRe, wpIm) {
+    const N = this.N, F = this.F, B = this.B;
+    for (let k = 0; k < B; k += 1) {
+      const wr = wpRe[k], wi = wpIm[k];
+      this.gradRe[k] = wr;
+      this.gradIm[k] = wi;
+      if (k > 0 && k < B - 1) {
+        this.gradRe[F - k] = wr;
+        this.gradIm[F - k] = -wi;
+      }
+    }
+    aecFft(this.gradRe, this.gradIm, true);
+    for (let i = N; i < F; i += 1) this.gradRe[i] = 0;
+    this.gradIm.fill(0);
+    aecFft(this.gradRe, this.gradIm, false);
+    for (let k = 0; k < B; k += 1) {
+      wpRe[k] = this.gradRe[k];
+      wpIm[k] = this.gradIm[k];
+    }
+  }
+
+  copyShadowToMain() {
+    for (let p = 0; p < this.M; p += 1) {
+      this.wMainRe[p].set(this.wShadowRe[p]);
+      this.wMainIm[p].set(this.wShadowIm[p]);
+    }
+    this.mainCopyCount += 1;
+  }
+
+  copyMainToShadow() {
+    for (let p = 0; p < this.M; p += 1) {
+      this.wShadowRe[p].set(this.wMainRe[p]);
+      this.wShadowIm[p].set(this.wMainIm[p]);
+    }
   }
 
   processBlock(mic, ref) {
-    const N = this.N, F = this.F, B = this.B, M = this.M;
+    const N = this.N, F = this.F, B = this.B, M = this.M, L = this.refSampleRingLen;
     let micSum = 0, refSum = 0;
     for (let i = 0; i < N; i += 1) {
       const m = mic[i], r = ref[i];
       micSum += m * m;
       refSum += r * r;
+      this.refSampleRing[this.refSampleWrite] = r;
+      this.refSampleWrite += 1;
+      if (this.refSampleWrite >= L) this.refSampleWrite = 0;
     }
     const micPow = micSum / N;
     const refPow = refSum / N;
     const micRms = Math.sqrt(micPow);
     const refRms = Math.sqrt(refPow);
-    const refNow = refRms >= this.farEndThresh;
-    if (refNow) this.farEndHold = 18;
-    else if (this.farEndHold > 0) this.farEndHold -= 1;
-    const farEndActive = refNow || this.farEndHold > 0;
 
-    this.tmpRe.set(this.prevRef, 0);
-    this.tmpRe.set(ref, N);
-    this.tmpIm.fill(0);
-    this.prevRef.set(ref, 0);
-    aecFft(this.tmpRe, this.tmpIm, false);
+    const powSlot = this.refPowWrite;
+    this.refBlockPowRing[powSlot] = refPow;
+    this.refPowWrite = (powSlot + 1) % this.refPowRingLen;
 
-    this.partHead = (this.partHead - 1 + M) % M;
-    const cxRe = this.xRe[this.partHead], cxIm = this.xIm[this.partHead];
-    for (let k = 0; k < B; k += 1) {
-      cxRe[k] = this.tmpRe[k];
-      cxIm[k] = this.tmpIm[k];
+    const rawRefNow = refRms >= this.farEndThresh;
+    if (rawRefNow) {
+      const dynHold = Math.ceil((Math.max(this.estimatedDelaySamples, this.alignedDelaySamples) + 0.28 * this.sampleRate) / N);
+      this.farEndHold = Math.max(this.farEndHold, Math.max(18, dynHold));
+    } else if (this.farEndHold > 0) {
+      this.farEndHold -= 1;
     }
+
+    const alignedBlocksApprox = Math.floor(this.alignedDelaySamples / N);
+    const checkBlocks = Math.min(this.refPowRingLen, alignedBlocksApprox + M + 2);
+    let spanMaxRefPow = refPow, spanSumRefPow = 0;
+    for (let d = 0; d < checkBlocks; d += 1) {
+      const slot = (powSlot - d + this.refPowRingLen * 4) % this.refPowRingLen;
+      const p = this.refBlockPowRing[slot];
+      if (p > spanMaxRefPow) spanMaxRefPow = p;
+      if (d >= alignedBlocksApprox && d < alignedBlocksApprox + M) spanSumRefPow += p;
+    }
+    const alignedSpanRms = Math.sqrt(spanSumRefPow / M);
+    const anyRefEnergy = spanMaxRefPow >= this.farEndThresh * this.farEndThresh;
+    const farEndActive = rawRefNow || anyRefEnergy || this.farEndHold > 0;
+
+    const prevAlignedDelay = this.alignedDelaySamples;
+    this.updateDelayEstimator(mic, ref, micPow, anyRefEnergy);
+    const delayShifted = this.alignedDelaySamples !== prevAlignedDelay;
+
+    this.readRefSamples(this.alignedRefBlock, 0, this.alignedDelaySamples, N);
+    let alignedRefSum = 0;
+    for (let i = 0; i < N; i += 1) alignedRefSum += this.alignedRefBlock[i] * this.alignedRefBlock[i];
+    const alignedRefPow = alignedRefSum / N;
+    const alignedRefPresent =
+      alignedRefPow >= this.farEndThresh * this.farEndThresh ||
+      alignedSpanRms >= this.farEndThresh * 0.65;
+
+    if (!delayShifted) {
+      this.tmpRe.set(this.prevAlignedRef, 0);
+      this.tmpRe.set(this.alignedRefBlock, N);
+      this.tmpIm.fill(0);
+      this.prevAlignedRef.set(this.alignedRefBlock, 0);
+      aecFft(this.tmpRe, this.tmpIm, false);
+
+      this.partHead = (this.partHead - 1 + M) % M;
+      const cxRe = this.xRe[this.partHead], cxIm = this.xIm[this.partHead];
+      for (let k = 0; k < B; k += 1) {
+        cxRe[k] = this.tmpRe[k];
+        cxIm[k] = this.tmpIm[k];
+      }
+    }
+
+    const estDelayMs = Math.round(((this.estimatedDelaySamples * 1000) / this.sampleRate) * 10) / 10;
 
     if (!farEndActive) {
       this.doubleTalkHold = 0;
-      this.prevErrTime.set(mic, 0);
+      this.dtConfirmStreak = 0;
       this.prevPostGain.fill(1);
-      return { output: mic, farEndActive: false, doubleTalk: false, erleDb: this.erleDb, outputRms: micRms };
+      this.psdRefTail.fill(1e-7);
+      let out = mic;
+      if (this.olaActive) {
+        out = new Float32Array(N);
+        for (let i = 0; i < N; i += 1) {
+          const v = this.olaTail[i] + mic[i] * this.hann[i];
+          out[i] = v > 1 ? 1 : v < -1 ? -1 : v;
+        }
+        this.olaTail.fill(0);
+        this.olaActive = false;
+      }
+      this.prevErrTime.set(mic, 0);
+      this.prevEchoTime.fill(0);
+      this.prevRefResTime.fill(0);
+      return {
+        output: out,
+        farEndActive: false,
+        doubleTalk: false,
+        erleDb: this.erleDb,
+        linearErleDb: this.linearErleDb,
+        estimatedDelayMs: estDelayMs,
+        outputRms: micRms,
+      };
     }
 
-    this.yRe.fill(0);
-    this.yIm.fill(0);
-    for (let p = 0; p < M; p += 1) {
-      const idx = (this.partHead + p) % M;
-      const xpRe = this.xRe[idx], xpIm = this.xIm[idx];
-      const wpRe = this.wRe[p], wpIm = this.wIm[p];
-      for (let k = 0; k < B; k += 1) {
-        const xr = xpRe[k], xi = xpIm[k], wr = wpRe[k], wi = wpIm[k];
-        this.yRe[k] += wr * xr - wi * xi;
-        this.yIm[k] += wr * xi + wi * xr;
+    this.predictFilter(this.wMainRe, this.wMainIm, this.yMainRe, this.yMainIm);
+    this.predictFilter(this.wShadowRe, this.wShadowIm, this.yShadowRe, this.yShadowIm);
+
+    let errMainSum = 0, errShadowSum = 0, echoMainSum = 0, micEchoDot = 0, errEchoDot = 0;
+    for (let i = 0; i < N; i += 1) {
+      const m = mic[i], ym = this.yMainRe[N + i], ys = this.yShadowRe[N + i];
+      const em = m - ym, es = m - ys;
+      this.linearErrMain[i] = em;
+      this.linearErrShadow[i] = es;
+      errMainSum += em * em;
+      errShadowSum += es * es;
+      echoMainSum += ym * ym;
+      micEchoDot += m * ym;
+      errEchoDot += em * ym;
+    }
+    let errMainPow = errMainSum / N;
+    const errShadowPow = errShadowSum / N;
+    let echoMainPow = echoMainSum / N;
+
+    this.smoothMicPow = 0.72 * this.smoothMicPow + 0.28 * micPow;
+    this.smoothErrMainPow = 0.72 * this.smoothErrMainPow + 0.28 * errMainPow;
+    this.smoothErrShadowPow = 0.72 * this.smoothErrShadowPow + 0.28 * errShadowPow;
+    const effectiveSpanPow = Math.max(alignedRefPow, spanSumRefPow / Math.min(4, M));
+    this.smoothAlignedRefPow = 0.72 * this.smoothAlignedRefPow + 0.28 * effectiveSpanPow;
+
+    if (alignedRefPresent && micPow > 1e-7 && this.doubleTalkHold === 0) {
+      if (errShadowPow < errMainPow * 0.92 && errShadowPow < micPow * 0.94) {
+        this.shadowWinStreak += 1;
+        this.shadowDivergeStreak = 0;
+        if (this.shadowWinStreak >= 2 || errShadowPow < errMainPow * 0.72) {
+          this.copyShadowToMain();
+          this.linearErrMain.set(this.linearErrShadow);
+          echoMainSum = 0; micEchoDot = 0; errEchoDot = 0;
+          for (let i = 0; i < N; i += 1) {
+            const m = mic[i], ys = this.yShadowRe[N + i], es = this.linearErrShadow[i];
+            this.yMainRe[N + i] = ys;
+            echoMainSum += ys * ys;
+            micEchoDot += m * ys;
+            errEchoDot += es * ys;
+          }
+          errMainPow = errShadowPow;
+          errMainSum = errShadowSum;
+          echoMainPow = echoMainSum / N;
+          this.smoothErrMainPow = this.smoothErrShadowPow;
+          this.shadowWinStreak = 0;
+        }
+      } else {
+        this.shadowWinStreak = 0;
+        if (this.mainCopyCount > 0 && errShadowPow > Math.max(errMainPow * 1.65, micPow * 1.25)) {
+          this.shadowDivergeStreak += 1;
+          if (this.shadowDivergeStreak >= 2) {
+            this.copyMainToShadow();
+            this.shadowDivergeStreak = 0;
+          }
+        } else {
+          this.shadowDivergeStreak = 0;
+        }
       }
     }
-    for (let k = 1; k < B - 1; k += 1) {
-      this.yRe[F - k] = this.yRe[k];
-      this.yIm[F - k] = -this.yIm[k];
-    }
-    aecFft(this.yRe, this.yIm, true);
 
-    const linearErr = new Float32Array(N);
-    let errSum = 0, echoSum = 0, micEchoDot = 0, errEchoDot = 0;
+    const errMainRms = Math.sqrt(errMainPow);
+    const echoMainRms = Math.sqrt(echoMainPow);
+
     for (let i = 0; i < N; i += 1) {
-      const m = mic[i], yh = this.yRe[N + i], e = m - yh;
-      linearErr[i] = e;
-      errSum += e * e;
-      echoSum += yh * yh;
-      micEchoDot += m * yh;
-      errEchoDot += e * yh;
+      this.tmpRe[i] = this.prevErrTime[i] * this.hann[i];
+      this.tmpRe[N + i] = this.linearErrMain[i] * this.hann[N + i];
+      this.gradRe[i] = this.prevEchoTime[i] * this.hann[i];
+      this.gradRe[N + i] = this.yMainRe[N + i] * this.hann[N + i];
+      this.resRefRe[i] = this.prevRefResTime[i] * this.hann[i];
+      this.resRefRe[N + i] = this.alignedRefBlock[i] * this.hann[N + i];
     }
-    const errPow = errSum / N;
-    const echoPow = echoSum / N;
-    this.smoothMicPow = 0.72 * this.smoothMicPow + 0.28 * micPow;
-    this.smoothErrPow = 0.72 * this.smoothErrPow + 0.28 * errPow;
+    this.tmpIm.fill(0);
+    this.gradIm.fill(0);
+    this.resRefIm.fill(0);
+    aecFft(this.tmpRe, this.tmpIm, false);
+    aecFft(this.gradRe, this.gradIm, false);
+    aecFft(this.resRefRe, this.resRefIm, false);
 
-    const micEchoCorr = micSum > 1e-9 && echoSum > 1e-9 ? Math.abs(micEchoDot) / Math.sqrt(micSum * echoSum) : 0;
-    const errEchoCorr = errSum > 1e-9 && echoSum > 1e-9 ? Math.abs(errEchoDot) / Math.sqrt(errSum * echoSum) : 0;
-    const converged = this.adaptBlocks >= 10 && this.convergedRatio > 0.45;
-    const errRms = Math.sqrt(errPow);
-    const echoRms = Math.sqrt(echoPow);
+    this.prevErrTime.set(this.linearErrMain, 0);
+    for (let i = 0; i < N; i += 1) this.prevEchoTime[i] = this.yMainRe[N + i];
+    this.prevRefResTime.set(this.alignedRefBlock, 0);
 
-    const strongNear = converged && errRms > Math.max(0.014, echoRms * 0.42) && errEchoCorr < 0.35 && micPow > echoPow * 1.35;
-    const loudNear = micRms > Math.max(0.035, refRms * 1.45) && errRms > Math.max(0.025, echoRms * 0.85) && micEchoCorr < 0.55;
-    if (strongNear || loudNear) this.doubleTalkHold = 6;
-    else if (this.doubleTalkHold > 0) this.doubleTalkHold -= 1;
+    let speechErrEnergy = 0, uncorrNearEnergy = 0, sumCohWeighted = 0, meanEchoSpec = 0;
+    const speechMinBin = Math.max(4, Math.floor((200 * F) / this.sampleRate));
+    const speechMaxBin = Math.min(B - 2, Math.floor((3800 * F) / this.sampleRate));
+    for (let k = 0; k < B; k += 1) {
+      const er = this.tmpRe[k], ei = this.tmpIm[k];
+      const yr = this.gradRe[k], yi = this.gradIm[k];
+      const xr = this.resRefRe[k], xi = this.resRefIm[k];
+      const errP = er * er + ei * ei;
+      const echoP = yr * yr + yi * yi;
+      const refP = xr * xr + xi * xi;
+      this.psdErr[k] = 0.72 * this.psdErr[k] + 0.28 * errP;
+      this.psdEcho[k] = 0.72 * this.psdEcho[k] + 0.28 * echoP;
+      this.psdRefRes[k] = 0.72 * this.psdRefRes[k] + 0.28 * refP;
+      this.psdRefTail[k] = Math.max(this.psdRefRes[k], 0.8 * this.psdRefTail[k]);
+      this.crossYeRe[k] = 0.78 * this.crossYeRe[k] + 0.22 * (er * yr + ei * yi);
+      this.crossYeIm[k] = 0.78 * this.crossYeIm[k] + 0.22 * (ei * yr - er * yi);
+      this.crossXeRe[k] = 0.78 * this.crossXeRe[k] + 0.22 * (er * xr + ei * xi);
+      this.crossXeIm[k] = 0.78 * this.crossXeIm[k] + 0.22 * (ei * xr - er * xi);
+      meanEchoSpec += this.psdEcho[k];
+
+      if (k >= speechMinBin && k <= speechMaxBin) {
+        const sEE = this.psdErr[k], sYY = this.psdEcho[k], sXX = this.psdRefTail[k];
+        const cohYe = sYY > 1e-8 && sEE > 1e-8
+          ? Math.min(1, (this.crossYeRe[k] * this.crossYeRe[k] + this.crossYeIm[k] * this.crossYeIm[k]) / (sYY * sEE + 1e-12))
+          : 0;
+        const cohXe = sXX > 1e-8 && sEE > 1e-8
+          ? Math.min(1, (this.crossXeRe[k] * this.crossXeRe[k] + this.crossXeIm[k] * this.crossXeIm[k]) / (sXX * sEE + 1e-12))
+          : 0;
+        const coh = Math.max(cohYe, cohXe);
+        if (sEE > 1e-4) {
+          speechErrEnergy += sEE;
+          sumCohWeighted += coh * sEE;
+          const expectedResBin = sYY * 0.35 + sXX * this.couplingGainPow * 0.22 + 5e-4;
+          if (coh < 0.45 && sEE > expectedResBin * 1.8) {
+            uncorrNearEnergy += sEE - expectedResBin;
+          }
+        }
+      }
+    }
+    meanEchoSpec /= B;
+
+    const micEchoCorr = micSum > 1e-9 && echoMainSum > 1e-9 ? Math.abs(micEchoDot) / Math.sqrt(micSum * echoMainSum) : 0;
+    const errEchoCorr = errMainSum > 1e-9 && echoMainSum > 1e-9 ? Math.abs(errEchoDot) / Math.sqrt(errMainSum * echoMainSum) : 0;
+    const converged = this.mainCopyCount >= 2 && this.adaptBlocks >= 8 && this.convergedRatio > 0.45;
+    const uncorrNearFrac = speechErrEnergy > 1e-5 ? uncorrNearEnergy / speechErrEnergy : 0;
+    const avgCoh = speechErrEnergy > 1e-5 ? sumCohWeighted / speechErrEnergy : 0;
+    const expectedEchoPow = Math.max(echoMainPow, this.couplingGainPow * Math.max(effectiveSpanPow, this.smoothAlignedRefPow));
+
+    const strongJump =
+      converged &&
+      errMainPow > Math.max(0.00035, echoMainPow * 0.38) &&
+      micPow > echoMainPow * 1.38 &&
+      errEchoCorr < 0.34 &&
+      micEchoCorr < 0.82 &&
+      uncorrNearFrac >= 0.36 &&
+      avgCoh < 0.46;
+    const preConvLoud =
+      this.couplingInitialized &&
+      this.adaptBlocks >= 14 &&
+      micPow > Math.max(0.0035, expectedEchoPow * 3.8) &&
+      errMainRms > Math.max(0.032, echoMainRms * 1.05) &&
+      micEchoCorr < 0.38 &&
+      uncorrNearFrac >= 0.45 &&
+      avgCoh < 0.38;
+
+    if (strongJump || preConvLoud) {
+      this.dtConfirmStreak += 1;
+      if (this.dtConfirmStreak >= 2 || (strongJump && uncorrNearFrac >= 0.58 && errMainPow > echoMainPow * 0.85)) {
+        this.doubleTalkHold = 8;
+      }
+    } else {
+      this.dtConfirmStreak = 0;
+      if (this.doubleTalkHold > 0) this.doubleTalkHold -= 1;
+    }
     const doubleTalk = this.doubleTalkHold > 0;
+
+    if (!doubleTalk && alignedRefPresent && effectiveSpanPow > 2e-5 && micPow > 2e-5) {
+      const instCoupling = Math.max(0.01, Math.min(9.0, micPow / (effectiveSpanPow + 1e-8)));
+      if (!this.couplingInitialized) {
+        this.couplingGainPow = instCoupling;
+        this.couplingInitialized = true;
+      } else {
+        const rate = converged ? 0.05 : instCoupling > this.couplingGainPow ? 0.45 : 0.1;
+        this.couplingGainPow = (1 - rate) * this.couplingGainPow + rate * instCoupling;
+      }
+    }
 
     this.eRe.fill(0);
     this.eIm.fill(0);
-    for (let i = 0; i < N; i += 1) this.eRe[N + i] = linearErr[i];
+    for (let i = 0; i < N; i += 1) this.eRe[N + i] = this.linearErrShadow[i];
     aecFft(this.eRe, this.eIm, false);
 
+    let meanPsdRef = 0;
     for (let k = 0; k < B; k += 1) {
       let totalX = 0;
       for (let p = 0; p < M; p += 1) {
         const xr = this.xRe[p][k], xi = this.xIm[p][k];
         totalX += xr * xr + xi * xi;
       }
-      this.psdRef[k] = 0.65 * this.psdRef[k] + 0.35 * totalX;
+      this.instTotalX[k] = totalX;
+      this.psdRef[k] = 0.55 * this.psdRef[k] + 0.45 * totalX;
+      meanPsdRef += this.psdRef[k];
     }
+    meanPsdRef /= B;
 
-    if (refNow && !doubleTalk) {
-      if (errPow > micPow * 2.5 && micPow > 1e-6) {
-        for (let p = 0; p < M; p += 1) {
-          for (let k = 0; k < B; k += 1) {
-            this.wRe[p][k] *= 0.5;
-            this.wIm[p][k] *= 0.5;
+    if (alignedRefPresent) {
+      if (errShadowPow > micPow * 2.4 && micPow > 1e-6) {
+        if (this.mainCopyCount > 0 && errMainPow < errShadowPow * 0.75) {
+          this.copyMainToShadow();
+        } else {
+          for (let p = 0; p < M; p += 1) {
+            for (let k = 0; k < B; k += 1) {
+              this.wShadowRe[p][k] *= 0.5;
+              this.wShadowIm[p][k] *= 0.5;
+            }
           }
         }
-      } else {
-        const cPart = this.constraintTick % M;
-        this.constraintTick += 1;
+      } else if (!(doubleTalk && converged)) {
+        const baseMu = doubleTalk ? this.stepSize * 0.08 : this.stepSize;
+        const dynReg = this.reg + meanPsdRef * 0.0015;
         for (let p = 0; p < M; p += 1) {
           const idx = (this.partHead + p) % M;
           const xpRe = this.xRe[idx], xpIm = this.xIm[idx];
-          const wpRe = this.wRe[p], wpIm = this.wIm[p];
-          if (p === cPart) {
-            this.gradRe.fill(0);
-            this.gradIm.fill(0);
-            for (let k = 0; k < B; k += 1) {
-              const norm = this.stepSize / (this.psdRef[k] + this.reg);
-              const er = this.eRe[k], ei = this.eIm[k], xr = xpRe[k], xi = xpIm[k];
-              const gr = (xr * er + xi * ei) * norm;
-              const gi = (xr * ei - xi * er) * norm;
-              this.gradRe[k] = gr;
-              this.gradIm[k] = gi;
-              if (k > 0 && k < B - 1) {
-                this.gradRe[F - k] = gr;
-                this.gradIm[F - k] = -gi;
-              }
-            }
-            aecFft(this.gradRe, this.gradIm, true);
-            for (let i = N; i < F; i += 1) this.gradRe[i] = 0;
-            this.gradIm.fill(0);
-            aecFft(this.gradRe, this.gradIm, false);
-            for (let k = 0; k < B; k += 1) {
-              wpRe[k] += this.gradRe[k];
-              wpIm[k] += this.gradIm[k];
-            }
-          } else {
-            for (let k = 0; k < B; k += 1) {
-              const norm = this.stepSize / (this.psdRef[k] + this.reg);
-              const er = this.eRe[k], ei = this.eIm[k], xr = xpRe[k], xi = xpIm[k];
-              wpRe[k] += (xr * er + xi * ei) * norm;
-              wpIm[k] += (xr * ei - xi * er) * norm;
-            }
+          const wpRe = this.wShadowRe[p], wpIm = this.wShadowIm[p];
+          const muP = baseMu * (p < 5 ? 1.0 : p < 10 ? 0.8 : 0.6);
+          for (let k = 0; k < B; k += 1) {
+            const norm = muP / (Math.max(this.psdRef[k], this.instTotalX[k]) + dynReg);
+            const er = this.eRe[k], ei = this.eIm[k], xr = xpRe[k], xi = xpIm[k];
+            wpRe[k] += (xr * er + xi * ei) * norm;
+            wpIm[k] += (xr * ei - xi * er) * norm;
           }
         }
-        this.adaptBlocks += 1;
-        const ratio = this.smoothMicPow > 1e-8 ? Math.max(0, Math.min(1, 1 - this.smoothErrPow / this.smoothMicPow)) : 0;
-        this.convergedRatio = 0.85 * this.convergedRatio + 0.15 * ratio;
+        const cCount = Math.min(M, 6);
+        for (let c = 0; c < cCount; c += 1) {
+          const p = (this.constraintTick + c) % M;
+          this.constrainWeight(this.wShadowRe[p], this.wShadowIm[p]);
+        }
+        this.constraintTick = (this.constraintTick + cCount) % M;
+        if (!doubleTalk) {
+          this.adaptBlocks += 1;
+          const bestErr = Math.min(this.smoothErrMainPow, this.smoothErrShadowPow);
+          const ratio = this.smoothMicPow > 1e-8 ? Math.max(0, Math.min(1, 1 - bestErr / this.smoothMicPow)) : 0;
+          this.convergedRatio = 0.8 * this.convergedRatio + 0.2 * ratio;
+          if (this.mainCopyCount === 0 && errShadowPow < micPow * 0.8) {
+            this.copyShadowToMain();
+          }
+        }
       }
     }
 
-    this.tmpRe.set(this.prevErrTime, 0);
-    this.tmpRe.set(linearErr, N);
-    this.tmpIm.fill(0);
-    this.prevErrTime.set(linearErr, 0);
-    aecFft(this.tmpRe, this.tmpIm, false);
+    const singleOverSub = this.aggressive ? 3.4 : 2.35;
+    const singleFloor = this.aggressive ? 0.003 : 0.008;
+    const linLeak = converged ? (this.aggressive ? 0.65 : 0.45) : 0.95;
+    const coldUncover = Math.max(0, 1 - this.convergedRatio);
+    const coldTailScale = coldUncover * coldUncover * (this.aggressive ? 1.8 : 1.35) + (this.aggressive ? 0.14 : 0.08);
+    const unalignedColdBoost = !this.delayLocked && !converged ? 0.65 : 0;
+    const nonlinFloor = doubleTalk ? 0 : meanEchoSpec * (this.aggressive ? 0.14 : 0.075);
 
-    this.gradRe.fill(0);
-    this.gradIm.fill(0);
-    for (let i = 0; i < N; i += 1) this.gradRe[N + i] = this.yRe[N + i];
-    aecFft(this.gradRe, this.gradIm, false);
-
-    const overSub = doubleTalk ? (this.aggressive ? 0.65 : 0.45) : (this.aggressive ? 2.2 : 1.45);
-    const gainFloor = doubleTalk ? 0.35 : (this.aggressive ? 0.025 : 0.06);
-    const leak = converged ? 0.32 : 0.65;
     for (let k = 0; k < B; k += 1) {
-      const errP = this.tmpRe[k] * this.tmpRe[k] + this.tmpIm[k] * this.tmpIm[k];
-      const echoP = this.gradRe[k] * this.gradRe[k] + this.gradIm[k] * this.gradIm[k];
-      this.psdErr[k] = 0.55 * this.psdErr[k] + 0.45 * errP;
-      this.psdEcho[k] = 0.55 * this.psdEcho[k] + 0.45 * echoP;
-      const resEst = this.psdEcho[k] * leak + (refNow ? this.psdRef[k] * 0.004 : 0);
-      const wiener = this.psdErr[k] > 1e-10 ? Math.max(0, this.psdErr[k] - overSub * resEst) / this.psdErr[k] : gainFloor;
-      const g = 0.35 * this.prevPostGain[k] + 0.65 * Math.max(gainFloor, Math.min(1, wiener));
+      const sEE = this.psdErr[k], sYY = this.psdEcho[k], sXXTail = this.psdRefTail[k];
+      const multiPartRef = this.psdRef[k] / M;
+      const cohYe = sYY > 1e-8 && sEE > 1e-8
+        ? Math.min(1, (this.crossYeRe[k] * this.crossYeRe[k] + this.crossYeIm[k] * this.crossYeIm[k]) / (sYY * sEE + 1e-12))
+        : 0;
+      const cohXe = sXXTail > 1e-8 && sEE > 1e-8
+        ? Math.min(1, (this.crossXeRe[k] * this.crossXeRe[k] + this.crossXeIm[k] * this.crossXeIm[k]) / (sXXTail * sEE + 1e-12))
+        : 0;
+      const coh = Math.max(cohYe, cohXe);
+      const envRef = Math.max(sXXTail, multiPartRef * (0.45 + unalignedColdBoost));
+      const resEst = sYY * linLeak + envRef * this.couplingGainPow * coldTailScale + nonlinFloor + coh * sEE * (doubleTalk ? 0.55 : 1.2);
+
+      let overSub, gainFloor;
+      if (doubleTalk) {
+        if (coh < 0.48) {
+          overSub = this.aggressive ? 0.55 : 0.35;
+          gainFloor = 0.42;
+        } else {
+          overSub = this.aggressive ? 1.45 : 1.1;
+          gainFloor = 0.1;
+        }
+      } else {
+        overSub = singleOverSub;
+        gainFloor = singleFloor;
+      }
+
+      const wiener = sEE > 1e-10 ? Math.max(0, sEE - overSub * resEst) / sEE : gainFloor;
+      const targetG = Math.max(gainFloor, Math.min(1, wiener));
+      const prevG = this.prevPostGain[k];
+      const g = targetG < prevG ? 0.22 * prevG + 0.78 * targetG : 0.52 * prevG + 0.48 * targetG;
       this.prevPostGain[k] = g;
       this.tmpRe[k] *= g;
       this.tmpIm[k] *= g;
@@ -566,19 +1077,38 @@ class WorkletPbfdafAec {
       }
     }
     aecFft(this.tmpRe, this.tmpIm, true);
+
     const out = new Float32Array(N);
     let outSum = 0;
     for (let i = 0; i < N; i += 1) {
-      const v = Math.max(-1, Math.min(1, this.tmpRe[N + i]));
+      const sample = this.olaActive ? this.olaTail[i] + this.tmpRe[i] : this.tmpRe[N + i];
+      const v = sample > 1 ? 1 : sample < -1 ? -1 : sample;
       out[i] = v;
       outSum += v * v;
+      this.olaTail[i] = this.tmpRe[N + i];
     }
+    this.olaActive = true;
     const outPow = outSum / N;
-    if (refNow && !doubleTalk && this.smoothMicPow > 1e-7) {
-      const db = Math.max(0, Math.min(45, 10 * Math.log10((this.smoothMicPow + 1e-9) / (outPow + 1e-9))));
-      this.erleDb = Math.round((0.8 * this.erleDb + 0.2 * db) * 10) / 10;
+
+    if (alignedRefPresent && !doubleTalk && micPow > 1e-5 && effectiveSpanPow > 1e-5) {
+      this.activeMicPowAcc = 0.88 * this.activeMicPowAcc + 0.12 * micPow;
+      this.activeOutPowAcc = 0.88 * this.activeOutPowAcc + 0.12 * outPow;
+      this.activeLinErrPowAcc = 0.88 * this.activeLinErrPowAcc + 0.12 * errMainPow;
+      const totDb = Math.max(0, Math.min(48, 10 * Math.log10((this.activeMicPowAcc + 1e-10) / (this.activeOutPowAcc + 1e-10))));
+      const linDb = Math.max(0, Math.min(40, 10 * Math.log10((this.activeMicPowAcc + 1e-10) / (this.activeLinErrPowAcc + 1e-10))));
+      this.erleDb = Math.round(totDb * 10) / 10;
+      this.linearErleDb = Math.round(linDb * 10) / 10;
     }
-    return { output: out, farEndActive: true, doubleTalk, erleDb: this.erleDb, outputRms: Math.sqrt(outPow) };
+
+    return {
+      output: out,
+      farEndActive: true,
+      doubleTalk,
+      erleDb: this.erleDb,
+      linearErleDb: this.linearErleDb,
+      estimatedDelayMs: estDelayMs,
+      outputRms: Math.sqrt(outPow),
+    };
   }
 }
 
@@ -589,13 +1119,35 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
     this.targetRate = 16000;
     this.ratio = sampleRate / this.targetRate;
     this.phase = 0;
+    this.needDownsample = sampleRate > this.targetRate + 1;
 
-    // 85Hz 一阶高通滤波器状态
+    // 85Hz 一阶高通滤波器（Mic 与 Ref 完全对称匹配，确保低频相位一致）
     const rc = 1 / (2 * Math.PI * 85);
     const dt = 1 / sampleRate;
     this.hpAlpha = rc / (rc + dt);
-    this.hpPrevX = 0;
-    this.hpPrevY = 0;
+    this.hpMicPrevX = 0;
+    this.hpMicPrevY = 0;
+    this.hpRefPrevX = 0;
+    this.hpRefPrevY = 0;
+
+    // 7.2kHz 二阶巴特沃斯抗混叠低通滤波器（48kHz/44.1kHz -> 16kHz 下采样前对 Mic 与 Ref 同步滤波，消除高频混叠与相位抖动）
+    this.lpB0 = 1; this.lpB1 = 0; this.lpB2 = 0; this.lpA1 = 0; this.lpA2 = 0;
+    if (this.needDownsample) {
+      const fc = Math.min(7200, sampleRate * 0.44);
+      const w0 = (2 * Math.PI * fc) / sampleRate;
+      const cosW0 = Math.cos(w0);
+      const alpha = Math.sin(w0) / Math.SQRT2;
+      const a0 = 1 + alpha;
+      this.lpB0 = ((1 - cosW0) * 0.5) / a0;
+      this.lpB1 = (1 - cosW0) / a0;
+      this.lpB2 = ((1 - cosW0) * 0.5) / a0;
+      this.lpA1 = (-2 * cosW0) / a0;
+      this.lpA2 = (1 - alpha) / a0;
+    }
+    this.lpMicZ1 = 0; this.lpMicZ2 = 0;
+    this.lpRefZ1 = 0; this.lpRefZ2 = 0;
+    this.dsPrevMic = 0;
+    this.dsPrevRef = 0;
 
     // 400ms 16kHz pre-roll 环形缓冲 (6400 samples)
     this.preRollCapacity = Math.round(this.targetRate * 0.4);
@@ -609,7 +1161,8 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
     this.bargeInEnabled = opts.bargeInEnabled !== false;
     this.echoMode = typeof opts.echoMode === "string" ? opts.echoMode : "auto";
     this.aecEnabled = this.echoMode !== "off" && this.echoMode !== "standard";
-    this.aec = new WorkletPbfdafAec(this.echoMode === "aggressive");
+    const initDelay = typeof opts.initialDelayMs === "number" ? opts.initialDelayMs : 0;
+    this.aec = new WorkletPbfdafAec(this.echoMode === "aggressive", initDelay);
     this.aecBlockSize = 256;
     this.aecMicBuf = new Float32Array(this.aecBlockSize);
     this.aecRefBuf = new Float32Array(this.aecBlockSize);
@@ -647,6 +1200,7 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
         if (typeof msg.streamMode === "boolean") this.streamMode = msg.streamMode;
         if (typeof msg.fullDuplex === "boolean") this.fullDuplex = msg.fullDuplex;
         if (typeof msg.bargeInEnabled === "boolean") this.bargeInEnabled = msg.bargeInEnabled;
+        if (typeof msg.initialDelayMs === "number") this.aec.setInitialDelayMs(msg.initialDelayMs);
         if (typeof msg.echoMode === "string") {
           this.echoMode = msg.echoMode;
           this.aecEnabled = this.echoMode !== "off" && this.echoMode !== "standard";
@@ -857,33 +1411,60 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
     if (!micIn || !micIn[0] || micIn[0].length === 0) return true;
     const micCh = micIn[0];
     const refIn = inputs[1];
-    const refCh = refIn && refIn[0] && refIn[0].length === micCh.length ? refIn[0] : null;
+    const refCh0 = refIn && refIn[0] && refIn[0].length === micCh.length ? refIn[0] : null;
+    const refCh1 = refIn && refIn[1] && refIn[1].length === micCh.length ? refIn[1] : null;
 
     const micOut = [];
     const refOut = [];
     let phase = this.phase;
 
     for (let i = 0; i < micCh.length; i += 1) {
-      const x = micCh[i];
-      const y = this.hpAlpha * (this.hpPrevY + x - this.hpPrevX);
-      this.hpPrevX = x;
-      this.hpPrevY = y;
+      const xm = micCh[i];
+      const xr = refCh0 ? (refCh1 ? 0.5 * (refCh0[i] + refCh1[i]) : refCh0[i]) : 0;
 
-      phase += 1;
-      if (phase >= this.ratio) {
-        phase -= this.ratio;
-        const clampedMic = y > 1 ? 1 : y < -1 ? -1 : y;
-        const r = refCh ? refCh[i] : 0;
-        const clampedRef = r > 1 ? 1 : r < -1 ? -1 : r;
-        micOut.push(clampedMic);
-        refOut.push(clampedRef);
+      // 对 Mic 与 Ref 执行完全对称的 85Hz 高通滤波，保证相位响应一致
+      const ym = this.hpAlpha * (this.hpMicPrevY + xm - this.hpMicPrevX);
+      this.hpMicPrevX = xm;
+      this.hpMicPrevY = ym;
+
+      const yr = this.hpAlpha * (this.hpRefPrevY + xr - this.hpRefPrevX);
+      this.hpRefPrevX = xr;
+      this.hpRefPrevY = yr;
+
+      let fm = ym;
+      let fr = yr;
+      if (this.needDownsample) {
+        // Direct Form II Transposed 7.2kHz 巴特沃斯抗混叠低通滤波（Mic 与 Ref 完全一致）
+        fm = this.lpB0 * ym + this.lpMicZ1;
+        this.lpMicZ1 = this.lpB1 * ym - this.lpA1 * fm + this.lpMicZ2;
+        this.lpMicZ2 = this.lpB2 * ym - this.lpA2 * fm;
+
+        fr = this.lpB0 * yr + this.lpRefZ1;
+        this.lpRefZ1 = this.lpB1 * yr - this.lpA1 * fr + this.lpRefZ2;
+        this.lpRefZ2 = this.lpB2 * yr - this.lpA2 * fr;
+
+        phase += 1;
+        if (phase >= this.ratio) {
+          phase -= this.ratio;
+          // 精确分数线性插值（消除 44.1kHz 非整数倍下采样相位抖动）
+          const frac = 1 - phase;
+          const interpM = this.dsPrevMic + (fm - this.dsPrevMic) * (frac > 1 ? 1 : frac < 0 ? 0 : frac);
+          const interpR = this.dsPrevRef + (fr - this.dsPrevRef) * (frac > 1 ? 1 : frac < 0 ? 0 : frac);
+          micOut.push(interpM > 1 ? 1 : interpM < -1 ? -1 : interpM);
+          refOut.push(interpR > 1 ? 1 : interpR < -1 ? -1 : interpR);
+        }
+        this.dsPrevMic = fm;
+        this.dsPrevRef = fr;
+      } else {
+        micOut.push(fm > 1 ? 1 : fm < -1 ? -1 : fm);
+        refOut.push(fr > 1 ? 1 : fr < -1 ? -1 : fr);
       }
     }
     this.phase = phase;
     if (micOut.length === 0) return true;
 
-    // 启用参考信号实时 PBFDAF AEC（全双工 + auto/aggressive 模式）
-    if (this.aecEnabled && this.fullDuplex) {
+    // 启用参考信号实时延迟对齐双路径 PBFDAF + Hann-OLA RES 声学回声消除（auto / aggressive 模式全程生效）
+    if (this.aecEnabled) {
       for (let i = 0; i < micOut.length; i += 1) {
         this.aecMicBuf[this.aecPos] = micOut[i];
         this.aecRefBuf[this.aecPos] = refOut[i];
@@ -914,6 +1495,8 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
               active: dt,
               rms: res.outputRms,
               erleDb: res.erleDb,
+              linearErleDb: res.linearErleDb,
+              estimatedDelayMs: res.estimatedDelayMs,
               farEndActive: res.farEndActive,
             });
           } else if (res.farEndActive && this.aecMetricsTick % 16 === 0) {
@@ -921,6 +1504,8 @@ class MijiaVoiceProcessor extends AudioWorkletProcessor {
               type: "aec_metrics",
               active: true,
               erleDb: res.erleDb,
+              linearErleDb: res.linearErleDb,
+              estimatedDelayMs: res.estimatedDelayMs,
               doubleTalk: dt,
               farEndActive: true,
             });
@@ -1112,6 +1697,7 @@ export class VoiceListenerClient {
   private activeTtsItem: TtsQueueItem | null = null;
   private lastAckEnqueuedAt = 0;
   private activeAudioEl: HTMLAudioElement | null = null;
+  private activeMediaElSource: MediaElementAudioSourceNode | null = null;
   private activeAudioUrl: string | null = null;
   private activeBufferSource: AudioBufferSourceNode | null = null;
   private activeTtsAbort: AbortController | null = null;
@@ -1159,14 +1745,33 @@ export class VoiceListenerClient {
     return this.config.asyncVoicePipeline !== false;
   }
 
+  private getAudioOutputLatencyMs(): number {
+    const ctx = this.audioCtx;
+    if (!ctx || ctx.state === "closed") return 0;
+    const base = typeof ctx.baseLatency === "number" && Number.isFinite(ctx.baseLatency) ? ctx.baseLatency : 0;
+    const output =
+      typeof ctx.outputLatency === "number" && Number.isFinite(ctx.outputLatency) ? ctx.outputLatency : 0;
+    return Math.max(0, Math.min(400, Math.round((base + output) * 1000)));
+  }
+
   updateConfig(next: Partial<ClientVoiceConfig>): void {
     const prevLang = this.config.voiceLang;
     const prevEngine = this.config.voiceEngine;
+    const prevEchoMode = this.config.echoCancellationMode ?? "auto";
     this.config = { ...this.config, ...next };
+
+    const echoMode = this.config.echoCancellationMode ?? "auto";
+    // 动态热更新浏览器硬件 AEC 约束（切换关闭/开启时无需重启麦克风流）
+    if (this.mediaStream && (prevEchoMode === "off") !== (echoMode === "off")) {
+      for (const track of this.mediaStream.getAudioTracks()) {
+        if (typeof track.applyConstraints === "function") {
+          void track.applyConstraints({ echoCancellation: echoMode !== "off" }).catch(() => {});
+        }
+      }
+    }
 
     // 动态热更新 AudioWorklet 参数（含全双工开关、语音打断与回声消除档位，无需重启麦克风）
     if (this.workletNode) {
-      const echoMode = this.config.echoCancellationMode ?? "auto";
       this.workletNode.port.postMessage({
         type: "config",
         vadThreshold: this.config.vadThreshold,
@@ -1174,9 +1779,9 @@ export class VoiceListenerClient {
         fullDuplex: this.isFullDuplexEnabled(),
         bargeInEnabled: this.config.bargeInEnabled !== false,
         echoMode,
+        initialDelayMs: this.getAudioOutputLatencyMs(),
       });
-      this.aecActive =
-        this.isFullDuplexEnabled() && echoMode !== "off" && echoMode !== "standard";
+      this.aecActive = echoMode !== "off" && echoMode !== "standard";
     }
 
     if (this.active && (this.config.voiceLang !== prevLang || this.config.voiceEngine !== prevEngine)) {
@@ -1408,6 +2013,14 @@ export class VoiceListenerClient {
       }
       this.activeBufferSource = null;
     }
+    if (this.activeMediaElSource) {
+      try {
+        this.activeMediaElSource.disconnect();
+      } catch {
+        // ignore
+      }
+      this.activeMediaElSource = null;
+    }
     if (this.activeAudioEl) {
       try {
         this.activeAudioEl.onended = null;
@@ -1638,9 +2251,10 @@ export class VoiceListenerClient {
     const fullDuplex = this.isFullDuplexEnabled();
 
     if (!next) {
-      // 所有分段播报结束：等待声学混响与系统音频输出缓冲泄放后再结束播报态、释放 Worklet 静音门控并通知服务端
+      // 所有分段播报结束：叠加真实 AudioContext 输出缓冲延迟（WASAPI/USB/蓝牙）+ 声学混响尾后再结束播报态
       const bargeIn = this.config.bargeInEnabled !== false;
-      const tailMs = fullDuplex && bargeIn ? 280 : 420;
+      const audioLatencyMs = this.getAudioOutputLatencyMs();
+      const tailMs = (fullDuplex && bargeIn ? 280 : 420) + audioLatencyMs;
       this.ttsReleaseTimer = window.setTimeout(() => {
         this.ttsReleaseTimer = null;
         this.speakingMuted = false;
@@ -1830,6 +2444,20 @@ export class VoiceListenerClient {
         audio.volume = this.ttsDucked ? 0.16 : 1.0;
         this.activeAudioUrl = url;
         this.activeAudioEl = audio;
+
+        // 若 WebAudio 上下文存活，仍将 HTMLAudioElement 路由到 ttsGainNode，为 Worklet AEC 提供精确远端参考信号
+        const ctx = this.audioCtx;
+        const gain = this.ttsGainNode;
+        if (ctx && gain && ctx.state !== "closed" && typeof ctx.createMediaElementSource === "function") {
+          try {
+            const mediaSrc = ctx.createMediaElementSource(audio);
+            mediaSrc.connect(gain);
+            this.activeMediaElSource = mediaSrc;
+            audio.volume = 1.0;
+          } catch {
+            // 部分浏览器环境无法挂载 MediaElementSource 时安全退回原生播放
+          }
+        }
 
         const estMs = Math.max(5000, Math.min(25_000, textLen * 320 + 3500));
         this.ttsWatchdogTimer = window.setTimeout(finishChunk, estMs);
@@ -2192,6 +2820,9 @@ export class VoiceListenerClient {
         this.workletBlobUrl = url;
         await ctx.audioWorklet.addModule(url);
 
+        const clientAecActive = echoMode !== "off" && echoMode !== "standard";
+        const initialDelayMs = this.getAudioOutputLatencyMs();
+
         if (canStreamWs) {
           this.streamingOverWs = Boolean(
             this.cb.sendVoiceStreamControl?.({
@@ -2200,6 +2831,7 @@ export class VoiceListenerClient {
               lang: this.config.voiceLang || "zh-CN",
               bypassWakeWord: this.oneShot,
               engine,
+              clientAecActive,
             }),
           );
         } else {
@@ -2217,10 +2849,11 @@ export class VoiceListenerClient {
             fullDuplex,
             bargeInEnabled: this.config.bargeInEnabled !== false,
             echoMode,
+            initialDelayMs,
           },
         });
         this.workletNode = node;
-        this.aecActive = fullDuplex && echoMode !== "off" && echoMode !== "standard";
+        this.aecActive = clientAecActive;
 
         if (this.ttsSpeaking) {
           if (fullDuplex) {
@@ -2239,6 +2872,8 @@ export class VoiceListenerClient {
             buffer?: ArrayBuffer;
             active?: boolean;
             erleDb?: number;
+            linearErleDb?: number;
+            estimatedDelayMs?: number;
             doubleTalk?: boolean;
             farEndActive?: boolean;
           };
@@ -2258,6 +2893,7 @@ export class VoiceListenerClient {
               this.cb.sendVoiceStreamControl?.({
                 type: "voice_tts_state",
                 speaking: true,
+                phase: "telemetry",
                 utteranceId: this.activeTtsItem?.utteranceId,
                 queueLength: this.ttsQueue.length,
                 aecActive: this.aecActive,
@@ -2432,6 +3068,14 @@ export class VoiceListenerClient {
         // ignore
       }
       this.activeBufferSource = null;
+    }
+    if (this.activeMediaElSource) {
+      try {
+        this.activeMediaElSource.disconnect();
+      } catch {
+        // ignore
+      }
+      this.activeMediaElSource = null;
     }
     if (this.ttsGainNode) {
       try {
