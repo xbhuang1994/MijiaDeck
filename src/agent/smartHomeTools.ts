@@ -1791,7 +1791,7 @@ export function createSmartHomeTools(deps: SmartHomeToolDeps): AgentTool<any>[] 
           Array.isArray(params.params) && typeof params.params[0] === "string"
             ? params.params[0]
             : undefined;
-        // 洗衣机启动动作执行实时物理安全探针（过热/故障/未开远程控制直接硬阻断；门未关/童锁/高温残留升级确认）
+        // 洗衣机启动动作执行实时物理安全探针（过热/故障直接硬阻断；门未关/童锁/高温残留升级确认）
         if (isWasherDevice(device) && (actionName === "start-wash" || actionName === "start_wash")) {
           const probe = await probeWasherRuntimeSafety(deps.service, device.did, drumParam);
           if (probe.status === "hard_block") {

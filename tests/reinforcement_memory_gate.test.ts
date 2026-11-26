@@ -30,7 +30,9 @@ import {
   detectSafetyBypassInstruction,
   probeWasherRuntimeSafety,
   resolveSpeakerPrincipal,
+  SafetyConfirmationRegistry,
 } from "../src/agent/safetyGate.ts";
+import { createSmartHomeTools } from "../src/agent/smartHomeTools.ts";
 import { SystemOneClient } from "../src/agent/systemOneClient.ts";
 import { evaluateVoiceAttention } from "../src/agent/voiceAttentionGate.ts";
 import { VoiceListenerController } from "../src/agent/voiceListenerController.ts";
@@ -168,6 +170,7 @@ class MockSmartHomeService implements IMijiaService {
       props: isWasher
         ? [
             createPropInfo({ name: "on", desc: "电源开关", type: "bool", readable: true, writable: true }),
+            createPropInfo({ name: "control-status", desc: "启停控制", type: "bool", readable: true, writable: true }),
             createPropInfo({
               name: "drum-location",
               desc: "当前操作筒",
@@ -888,6 +891,42 @@ describe("Group 5: 确定性安全红线、硬件实时探针与附加指令反�
     expect(hotRes.awaitingConfirmation).toBeUndefined();
     expect(hotRes.reply).toContain("过热告警");
     expect(service.calls.filter((c) => c.kind === "runAction" && c.name === "start-wash").length).toBe(2);
+
+    // 场景 C：remote-control-flag=false 不再误报“未开启远程控制权限”硬阻断（美的 0xD9/0xDB 关机态及副筒会上报 0）
+    service.propStore.get(washer.did)!["drum-left-water-overheating"] = false;
+    service.propStore.get(washer.did)!["remote-control-flag"] = false;
+    service.propStore.get(washer.did)!["drum-left-remote-control-flag"] = false;
+    const remoteProbe = await probeWasherRuntimeSafety(service, washer.did, "left");
+    expect(remoteProbe.status).toBe("ok");
+    const mainRemoteProbe = await probeWasherRuntimeSafety(service, washer.did);
+    expect(mainRemoteProbe.status).toBe("ok");
+    const okRes = await agent.prompt("帮我洗一下袜子");
+    expect(okRes.reply).not.toContain("远程控制");
+    expect(service.calls.filter((c) => c.kind === "runAction" && c.name === "start-wash").length).toBe(3);
+
+    // 场景 D：直调 smartHomeTools（启用 safetyConfirmRegistry）启动洗衣机时同样不因 remote-control-flag=false 误报硬阻断
+    const directTools = createSmartHomeTools({
+      service,
+      jobs: harness.jobs,
+      mainWindow: harness.mainWindow,
+      settingsStore,
+      broadcastState: () => {},
+      safetyConfirmRegistry: new SafetyConfirmationRegistry(),
+    });
+    const runActTool = directTools.find((t) => t.name === "run_device_action")!;
+    const setPropTool = directTools.find((t) => t.name === "set_device_property")!;
+    const directStartRes = await runActTool.execute("direct-start", {
+      target: washer.did,
+      action: "start-wash",
+      params: ["left"],
+    });
+    expect((directStartRes.details as Record<string, unknown>).ok).toBe(true);
+    const directCtrlRes = await setPropTool.execute("direct-ctrl", {
+      target: washer.did,
+      property: "control-status",
+      value: true,
+    });
+    expect((directCtrlRes.details as Record<string, unknown>).ok).toBe(true);
     } finally {
       await harness.cleanup();
     }

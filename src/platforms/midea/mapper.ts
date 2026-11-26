@@ -1222,17 +1222,19 @@ function buildWasherProps(
         }),
       );
     }
-    props.push(
-      createPropInfo({
-        name: "remote-control-flag",
-        desc: "远程控制权限",
-        type: "bool",
-        readable: true,
-        writable: false,
-        service: "washer-alerts",
-        service_desc: "耗材与安全",
-      }),
-    );
+    if (activeSpec.supportsRemoteControlAgree !== false) {
+      props.push(
+        createPropInfo({
+          name: "remote-control-flag",
+          desc: "远程控制权限",
+          type: "bool",
+          readable: true,
+          writable: false,
+          service: "washer-alerts",
+          service_desc: "耗材与安全",
+        }),
+      );
+    }
   }
 
   props.push(
@@ -1628,6 +1630,11 @@ function applyWasherPowerProp(
           : existing.runningStatus
         : "off",
       progress: targetPower ? existing.progress : "idle",
+      remoteControlEnabled: targetPower
+        ? existing.remoteControlEnabled
+        : existing.remoteControlEnabled === true
+          ? true
+          : null,
     };
   }
 

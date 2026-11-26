@@ -3104,7 +3104,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
       return true;
     }
 
-    // 洗衣机启动前再次实时检查硬件安全（过热/故障/未开远程控制直接硬阻断）
+    // 洗衣机启动前再次实时检查硬件安全（过热/故障直接硬阻断）
     const isWasherStart = pending.binding.steps.some(
       (s) => s.toolName === "run_device_action" && s.actionName === "start-wash",
     );
