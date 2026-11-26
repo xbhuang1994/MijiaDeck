@@ -258,32 +258,36 @@ function startMockClearVoiceServer() {
       const u = new URL(req.url);
       if (u.pathname === "/health") {
         return Response.json({
-          ok: true,
-          model: "MossFormer2_SE_48K",
-          provider: "CUDAExecutionProvider",
-          device: "gpu",
-          gpuName: "Mock RTX 3060",
-          warmedUp: true,
+          status: "ok",
+          upstreams: {
+            clearvoice: {
+              status: "ok",
+              details: {
+                status: "ok",
+                gpu_name: "Mock Online GPU",
+                loaded_models: [{ name: "MossFormer2_SE_48K", task: "speech_enhancement" }],
+              },
+            },
+          },
         });
       }
-      if (u.pathname === "/denoise") {
-        const buf = await req.arrayBuffer();
-        const input = new Float32Array(buf);
-        receivedSlices.push(new Float32Array(input));
+      if (u.pathname === "/clearvoice/v1/enhance") {
+        const form = await req.formData();
+        const file = form.get("file") as Blob;
+        const decoded = decodeWavPcm(new Uint8Array(await file.arrayBuffer()));
+        receivedSlices.push(new Float32Array(decoded.samples));
         // 原样返回（乘 0.9 便于区分降噪前后且保持每个样点标记值可精确断言）
-        const out = new Float32Array(input.length);
-        for (let i = 0; i < input.length; i += 1) {
-          out[i] = input[i]! * 0.9;
+        const out = new Float32Array(decoded.samples.length);
+        for (let i = 0; i < decoded.samples.length; i += 1) {
+          out[i] = decoded.samples[i]! * 0.9;
         }
-        return new Response(new Uint8Array(out.buffer), {
+        const wav = encodeWavPcm16(out, decoded.sampleRate);
+        return new Response(new Uint8Array(wav), {
           status: 200,
           headers: {
-            "Content-Type": "application/octet-stream",
+            "Content-Type": "audio/wav",
             "X-ClearVoice-Model": "MossFormer2_SE_48K",
-            "X-ClearVoice-Provider": "CUDAExecutionProvider",
-            "X-ClearVoice-Device": "gpu",
-            "X-ClearVoice-Infer-Ms": "12.0",
-            "X-ClearVoice-Gpu-Name": "Mock RTX 3060",
+            "X-Elapsed-Ms": "12.0",
           },
         });
       }
@@ -317,7 +321,7 @@ function createFakeLocalEngine(opts: {
     clearVoiceGpu: opts.cvRuntime,
     getStatus: () => ({
       readyForLocalAsr: true,
-      activeQwen3Device: "gpu",
+      activeQwen3Device: "remote",
       readyForClearVoiceGpu: Boolean(opts.cvRuntime),
       clearVoice: opts.cvRuntime?.getStatus(),
     }),
@@ -352,9 +356,9 @@ function createFakeLocalEngine(opts: {
         lang: "zh",
         emotion: "",
         event: "",
-        engine: "qwen3-asr-gpu",
+        engine: "qwen3-asr-remote",
         durationMs: 40,
-        computeDevice: "gpu",
+        computeDevice: "remote",
       };
     },
   } as unknown as LocalVoiceEngine;
@@ -414,7 +418,6 @@ describe("未唤醒门控待机（零实时转写 + 循环录制缓冲区持续�
     const dir = useTempDataDir();
     const { server, receivedSlices } = startMockClearVoiceServer();
     const cvRuntime = new ClearVoiceGpuRuntime({
-      modelsDir: dir,
       serviceUrl: `http://127.0.0.1:${server.port}`,
     });
     const owwCtrl = createMockOwwController(true);
@@ -584,7 +587,6 @@ describe("唤醒后回放循环录制缓冲区 + 无缝衔接后续音频", () =
     const dir = useTempDataDir();
     const { server, receivedSlices } = startMockClearVoiceServer();
     const cvRuntime = new ClearVoiceGpuRuntime({
-      modelsDir: dir,
       serviceUrl: `http://127.0.0.1:${server.port}`,
     });
     const owwCtrl = createMockOwwController(true);
@@ -667,7 +669,6 @@ describe("唤醒后回放循环录制缓冲区 + 无缝衔接后续音频", () =
     const dir = useTempDataDir();
     const { server, receivedSlices } = startMockClearVoiceServer();
     const cvRuntime = new ClearVoiceGpuRuntime({
-      modelsDir: dir,
       serviceUrl: `http://127.0.0.1:${server.port}`,
     });
     const owwCtrl = createMockOwwController(true);
@@ -711,7 +712,6 @@ describe("连续对话续说、异步间隙回放、退出对话回归零 ASR �
     const dir = useTempDataDir();
     const { server, receivedSlices } = startMockClearVoiceServer();
     const cvRuntime = new ClearVoiceGpuRuntime({
-      modelsDir: dir,
       serviceUrl: `http://127.0.0.1:${server.port}`,
     });
     const owwCtrl = createMockOwwController(true);
@@ -822,9 +822,9 @@ describe("连续对话续说、异步间隙回放、退出对话回归零 ASR �
           lang: "zh",
           emotion: "",
           event: "",
-          engine: "qwen3-asr-gpu",
+          engine: "qwen3-asr-remote",
           durationMs: 400,
-          computeDevice: "gpu",
+          computeDevice: "remote",
         };
       },
     });
@@ -1023,9 +1023,9 @@ describe("HTTP /api/voice/audio 兜底上传门控与 WebSocket /ws 端到端集
         lang: "zh",
         emotion: "",
         event: "",
-        engine: "qwen3-asr-gpu",
+        engine: "qwen3-asr-remote",
         durationMs: 30,
-        computeDevice: "gpu",
+        computeDevice: "remote",
       };
     };
 
@@ -1096,7 +1096,7 @@ describe("HTTP /api/voice/audio 兜底上传门控与 WebSocket /ws 端到端集
       ...LocalVoiceEngine.prototype.getStatus.call(vl.localEngine),
       readyForLocalAsr: true,
       readyForWakeWord: true,
-      activeQwen3Device: "gpu",
+      activeQwen3Device: "remote",
     });
     engine.transcribeLocal = async () => {
       asrCalls += 1;
@@ -1106,9 +1106,9 @@ describe("HTTP /api/voice/audio 兜底上传门控与 WebSocket /ws 端到端集
         lang: "zh",
         emotion: "",
         event: "",
-        engine: "qwen3-asr-gpu",
+        engine: "qwen3-asr-remote",
         durationMs: 25,
-        computeDevice: "gpu",
+        computeDevice: "remote",
       };
     };
 

@@ -193,7 +193,6 @@ describe("Continuous Speech & Active Conversation Preservation (Not Mistaken for
 
     const slowEngine = {
       setPreferredAsrEngine: () => {},
-      setQwen3ComputeDevice: () => {},
       setClearVoiceServiceUrl: () => {},
       getStatus: () => ({
         readyForLocalAsr: true,
@@ -216,7 +215,7 @@ describe("Continuous Speech & Active Conversation Preservation (Not Mistaken for
           lang: "<|zh|>",
           emotion: "",
           event: "<|Speech|>",
-          engine: "qwen3-asr-gpu",
+          engine: "qwen3-asr-remote",
           durationMs: 1400,
         };
       },

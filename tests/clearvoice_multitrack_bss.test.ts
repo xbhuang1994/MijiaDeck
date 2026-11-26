@@ -253,7 +253,7 @@ describe("ClearVoice 多轨全链路独立声纹、独立 ASR、独立逻辑判�
     enrollVoiceprint({ name: "主人", role: "owner", embedding: ownerEmb, engine: "3dspeaker-campplus" });
     enrollVoiceprint({ name: "家人", role: "member", embedding: familyEmb, engine: "3dspeaker-campplus" });
 
-    // 启动模拟 ClearVoice 多轨 BSS+SE 服务：返回 2 条完全独立音轨（音轨1=320Hz主人, 音轨2=880Hz家人），并在第2片故意对调顺序检验 PIT！
+    // 启动模拟在线 ClearVoice 多轨 BSS+SE 网关：返回 2 条完全独立音轨（音轨1=320Hz主人, 音轨2=880Hz家人），并在第2片故意对调顺序检验 PIT！
     let sepCallCount = 0;
     let totalEmittedSamples = 0;
     mockCvServer = Bun.serve({
@@ -263,47 +263,58 @@ describe("ClearVoice 多轨全链路独立声纹、独立 ASR、独立逻辑判�
         const u = new URL(req.url);
         if (u.pathname === "/health") {
           return Response.json({
-            ok: true,
-            model: "MossFormer2_SE_48K",
-            ssReady: true,
-            ssModel: "MossFormer2_SS_16K",
-            provider: "CUDAExecutionProvider",
-            ssProvider: "CUDAExecutionProvider",
-            device: "gpu",
-            ssDevice: "gpu",
-            gpuName: "Mock RTX 3060",
-            warmedUp: true,
+            status: "ok",
+            upstreams: {
+              clearvoice: {
+                status: "ok",
+                details: {
+                  status: "ok",
+                  gpu_name: "Mock Online GPU",
+                  loaded_models: [
+                    { name: "MossFormer2_SE_48K", task: "speech_enhancement" },
+                    { name: "MossFormer2_SS_16K", task: "speech_separation" },
+                  ],
+                },
+              },
+            },
           });
         }
-        if (u.pathname === "/separate") {
-          const buf = await req.arrayBuffer();
-          const input = new Float32Array(buf);
-          const n = input.length;
+        if (u.pathname === "/clearvoice/v1/enhance") {
+          const form = await req.formData();
+          const file = form.get("file") as Blob;
+          const decoded = decodeWavPcm(new Uint8Array(await file.arrayBuffer()));
+          const outWav = encodeWavPcm16(decoded.samples, decoded.sampleRate);
+          return new Response(new Uint8Array(outWav), {
+            status: 200,
+            headers: {
+              "Content-Type": "audio/wav",
+              "X-ClearVoice-Model": "MossFormer2_SE_48K",
+              "X-Elapsed-Ms": "22.0",
+            },
+          });
+        }
+        if (u.pathname === "/clearvoice/v1/separate") {
+          const form = await req.formData();
+          const file = form.get("file") as Blob;
+          const decoded = decodeWavPcm(new Uint8Array(await file.arrayBuffer()));
+          const n = decoded.samples.length;
+          const sr = decoded.sampleRate;
           const callIdx = sepCallCount++;
           const startPos = callIdx === 0 ? 0 : Math.max(0, totalEmittedSamples - 4800);
           totalEmittedSamples = startPos + n;
-          const trackOwner = makeSineSlice(startPos, n, 16000, 320, 0.26);
-          const trackFamily = makeSineSlice(startPos, n, 16000, 880, 0.22);
+          const trackOwner = makeSineSlice(startPos, n, sr, 320, 0.26);
+          const trackFamily = makeSineSlice(startPos, n, sr, 880, 0.22);
           // 第 2 片故意互换输出顺序以检验 PIT 对齐防混轨
           const outTracks = callIdx % 2 === 1 ? [trackFamily, trackOwner] : [trackOwner, trackFamily];
-          const packed = new Float32Array(n * 2);
-          packed.set(outTracks[0]!, 0);
-          packed.set(outTracks[1]!, n);
-          return new Response(new Uint8Array(packed.buffer), {
-            status: 200,
-            headers: {
-              "Content-Type": "application/octet-stream",
-              "X-ClearVoice-Track-Count": "2",
-              "X-ClearVoice-Samples-Per-Track": String(n),
-              "X-ClearVoice-SS-Available": "1",
-              "X-ClearVoice-Model": "MossFormer2_SS_16K+MossFormer2_SE_48K",
-              "X-ClearVoice-Provider": "CUDAExecutionProvider",
-              "X-ClearVoice-Device": "gpu",
-              "X-ClearVoice-SS-Ms": "35.0",
-              "X-ClearVoice-SE-Ms": "22.0",
-              "X-ClearVoice-Infer-Ms": "57.0",
-              "X-ClearVoice-Gpu-Name": "Mock RTX 3060",
-            },
+          return Response.json({
+            task: "speech_separation",
+            model: "MossFormer2_SS_16K",
+            elapsed_ms: 35.0,
+            speakers: outTracks.map((tr, idx) => ({
+              speaker: idx + 1,
+              sample_rate: sr,
+              audio_base64: Buffer.from(encodeWavPcm16(tr, sr)).toString("base64"),
+            })),
           });
         }
         return new Response("not found", { status: 404 });
@@ -311,7 +322,6 @@ describe("ClearVoice 多轨全链路独立声纹、独立 ASR、独立逻辑判�
     });
 
     const cvRuntime = new ClearVoiceGpuRuntime({
-      modelsDir: tmpDir,
       serviceUrl: `http://127.0.0.1:${mockCvServer.port}`,
     });
 
@@ -330,14 +340,13 @@ describe("ClearVoice 多轨全链路独立声纹、独立 ASR、独立逻辑判�
         warmup: async () => {},
       },
       setPreferredAsrEngine: () => {},
-      setQwen3ComputeDevice: () => {},
       setClearVoiceServiceUrl: () => {},
       createOnlineDenoiser: () => null,
       createStreamingVad: () => createEnergyMockVad(0.02),
       createWakeWordStream: () => null,
       getStatus: () => ({
         readyForLocalAsr: true,
-        activeQwen3Device: "gpu",
+        activeQwen3Device: "remote",
         readyForClearVoiceGpu: true,
         readyForClearVoiceBss: true,
         clearVoice: cvRuntime.getStatus(),
@@ -372,9 +381,9 @@ describe("ClearVoice 多轨全链路独立声纹、独立 ASR、独立逻辑判�
           lang: "zh",
           emotion: "",
           event: "",
-          engine: "qwen3-asr-gpu",
+          engine: "qwen3-asr-remote",
           durationMs: 65,
-          computeDevice: "gpu",
+          computeDevice: "remote",
         };
       },
       denoise: (s: Float32Array) => ({
@@ -411,8 +420,14 @@ describe("ClearVoice 多轨全链路独立声纹、独立 ASR、独立逻辑判�
         },
       });
 
-      // 连续讲话 2.5s + 0.35s 静音（触发 2 个切片，测试跨切片 PIT 对齐与分轨独立处理）
-      session.pushFloat32Samples(makeSine(2.5, 16000, 500, 0.25));
+      // 连续讲话 2.5s（320Hz 主人 + 880Hz 家人真实物理叠加）+ 0.35s 静音（触发 2 个切片，测试跨切片 PIT 对齐与分轨独立处理）
+      const mixOwner = makeSine(2.5, 16000, 320, 0.26);
+      const mixFamily = makeSine(2.5, 16000, 880, 0.22);
+      const mixedSpeech = new Float32Array(mixOwner.length);
+      for (let i = 0; i < mixedSpeech.length; i += 1) {
+        mixedSpeech[i] = mixOwner[i]! + mixFamily[i]!;
+      }
+      session.pushFloat32Samples(mixedSpeech);
       session.pushFloat32Samples(new Float32Array(Math.round(16000 * 0.35)));
       await session.flush();
       await session.waitForIdle();
@@ -492,19 +507,18 @@ describe("ClearVoice 多轨全链路独立声纹、独立 ASR、独立逻辑判�
     enrollVoiceprint({ name: "主人", role: "owner", embedding: ownerEmb, engine: "3dspeaker-campplus" });
 
     const fakeEngine = {
-      clearVoiceGpu: new ClearVoiceGpuRuntime({ modelsDir: tmpDir }),
+      clearVoiceGpu: new ClearVoiceGpuRuntime(),
       openWakeWord: { isReady: false, getStatus: () => ({ ready: false, prototypeCount: 0 }) },
       sourceSeparator: { warmupAsync: async () => {} },
       tts: { getStatus: () => ({ ready: false, addonAvailable: false, readyVoices: [], activeVoice: null }) },
       setPreferredAsrEngine: () => {},
-      setQwen3ComputeDevice: () => {},
       setClearVoiceServiceUrl: () => {},
       getStatus: () => ({
         readyForLocalAsr: true,
         readyForClearVoiceGpu: true,
         readyForClearVoiceBss: true,
         readyForVoiceprint: true,
-        clearVoice: new ClearVoiceGpuRuntime({ modelsDir: tmpDir }).getStatus(),
+        clearVoice: new ClearVoiceGpuRuntime().getStatus(),
       }),
       detectSpeechSegments: (samples: Float32Array) => ({
         hasSpeech: true,
@@ -532,7 +546,7 @@ describe("ClearVoice 多轨全链路独立声纹、独立 ASR、独立逻辑判�
           lang: "zh",
           emotion: "",
           event: "",
-          engine: "qwen3-asr-gpu",
+          engine: "qwen3-asr-remote",
           durationMs: 40,
         };
       },
@@ -547,7 +561,7 @@ describe("ClearVoice 多轨全链路独立声纹、独立 ASR、独立逻辑判�
           { trackId: "cv_track_2", trackIndex: 2, samples: makeSine(1.2, 16000, 900, 0.22), energyRatio: 0.45 },
         ],
         {
-          denoiseEngine: "clearvoice-mossformer2-bss-se-gpu",
+          denoiseEngine: "clearvoice-mossformer2-bss-se-remote",
           bssUsed: true,
           inputSnrDb: 8,
           denoiseMs: 60,
@@ -579,7 +593,7 @@ describe("ClearVoice 多轨全链路独立声纹、独立 ASR、独立逻辑判�
           { trackId: "cv_track_2", trackIndex: 2, samples: makeSine(1.2, 16000, 900, 0.22), energyRatio: 0.48 },
         ],
         {
-          denoiseEngine: "clearvoice-mossformer2-bss-se-gpu",
+          denoiseEngine: "clearvoice-mossformer2-bss-se-remote",
           bssUsed: true,
           inputSnrDb: 10,
           denoiseMs: 55,
@@ -649,7 +663,6 @@ describe("真实 GPU ClearVoice (MossFormer2_SS_16K + SE_48K) 多轨端到端验
     async () => {
       const engine = new LocalVoiceEngine({
         ...(REAL_MODELS_DIR ? { modelsDir: REAL_MODELS_DIR } : {}),
-        qwen3ComputeDevice: "cpu",
       });
       const st = engine.getStatus();
       if (

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// MijiaDeck: Qwen3-ASR-0.6B (CPU 主方案) + SenseVoice (备用/储备方案) 单元测试与集成测试
+// MijiaDeck: 在线 Qwen3-ASR-0.6B (主方案) + 本地 SenseVoice (备用/储备方案) 单元测试与集成测试
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
@@ -9,7 +9,6 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
-  writeFileSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -19,18 +18,12 @@ import {
   cleanQwen3AsrText,
   LocalVoiceEngine,
   mapQwen3AsrLang,
-  QWEN3_ASR_DIR_NAME,
   resolveVoiceModelPaths,
   SENSE_VOICE_DIR_NAME,
   type LocalAsrOutput,
   type StreamingVadHandleLike,
 } from "../src/agent/localVoiceEngine.ts";
-import {
-  buildQwen3GpuChatPayload,
-  parseLlamaListDevicesOutput,
-  parseQwen3GpuResponseText,
-  selectBestGpuDevice,
-} from "../src/agent/qwen3AsrGpuRuntime.ts";
+import { parseQwen3GpuResponseText } from "../src/agent/qwen3AsrGpuRuntime.ts";
 import {
   endsWithStrongSentencePunct,
   isStandaloneWakePrefix,
@@ -49,7 +42,6 @@ import {
   defaultAgentVoiceConfig,
   loadAgentVoiceConfig,
   normalizeLocalAsrEngine,
-  normalizeQwen3ComputeDevice,
   updateAgentVoiceConfig,
 } from "../src/core/agentConfigStore.ts";
 import { setDataPathOverrides } from "../src/core/jsonStore.ts";
@@ -143,7 +135,7 @@ describe("Qwen3-ASR Primary & SenseVoice Reserve Config & Utilities", () => {
         lang: "",
         emotion: "",
         event: "",
-        engine: "qwen3-asr-local",
+        engine: "qwen3-asr-remote",
         durationMs: 1400,
       },
       {
@@ -152,18 +144,18 @@ describe("Qwen3-ASR Primary & SenseVoice Reserve Config & Utilities", () => {
         lang: "",
         emotion: "",
         event: "",
-        engine: "qwen3-asr-local",
+        engine: "qwen3-asr-remote",
         durationMs: 1300,
       },
       { wakeWords: ["Neo"], inputSnrDb: 5 },
     );
-    expect(qwenPick.engine).toBe("qwen3-asr-dual-raw");
+    expect(qwenPick.engine).toBe("qwen3-asr-remote-dual-raw");
     expect(qwenPick.text).toBe("Neo，打开客厅吸顶灯。");
   });
 });
 
-describe("Qwen3-ASR Primary + SenseVoice Reserve Fallback Behavior", () => {
-  test("reports unavailable cleanly when neither Qwen3-ASR nor SenseVoice exists", async () => {
+describe("Qwen3-ASR Online Primary + SenseVoice Reserve Fallback Behavior", () => {
+  test("reports unavailable cleanly when neither online Qwen3-ASR nor local SenseVoice is ready", async () => {
     const emptyModelsDir = path.join(tmpDir, "empty_models");
     mkdirSync(emptyModelsDir, { recursive: true });
     const engine = new LocalVoiceEngine({ modelsDir: emptyModelsDir });
@@ -183,7 +175,7 @@ describe("Qwen3-ASR Primary + SenseVoice Reserve Fallback Behavior", () => {
     engine.dispose();
   });
 
-  test("falls back automatically to SenseVoice reserve when Qwen3-ASR model is missing", async () => {
+  test("falls back automatically to SenseVoice reserve when online Qwen3-ASR is not configured", async () => {
     const fallbackModelsDir = path.join(tmpDir, "sv_only_models");
     if (!copySenseVoiceModelTo(fallbackModelsDir) || !HAS_CLIP_001) {
       return;
@@ -201,10 +193,10 @@ describe("Qwen3-ASR Primary + SenseVoice Reserve Fallback Behavior", () => {
     const autoRes = await engine.transcribeLocal(pcm, 16000, "zh-CN");
     expect(autoRes.engine).toBe("sensevoice-fallback");
     expect(autoRes.fallbackUsed).toBe(true);
-    expect(autoRes.fallbackReason).toBe("qwen3-asr-model-missing");
+    expect(autoRes.fallbackReason).toBe("qwen3-asr-remote-unconfigured");
     expect(autoRes.text).toContain("客厅");
 
-    // Explicit qwen3-asr mode reports clear missing-model error instead of silently ignoring user choice
+    // Explicit qwen3-asr mode reports clear online-only error instead of silently ignoring user choice
     await expect(
       engine.transcribeLocal(pcm, 16000, "zh-CN", { engine: "qwen3-asr" }),
     ).rejects.toThrow(/Qwen3-ASR-0\.6B/);
@@ -212,124 +204,52 @@ describe("Qwen3-ASR Primary + SenseVoice Reserve Fallback Behavior", () => {
     engine.dispose();
   }, 30_000);
 
-  test("falls back automatically to SenseVoice reserve when Qwen3-ASR fails to initialize at runtime", async () => {
-    const corruptModelsDir = path.join(tmpDir, "corrupt_qwen3_models");
-    if (!copySenseVoiceModelTo(corruptModelsDir) || !HAS_CLIP_001) {
+  test("falls back automatically to SenseVoice reserve when online Qwen3-ASR gateway errors", async () => {
+    const fallbackModelsDir = path.join(tmpDir, "remote_err_qwen3_models");
+    if (!copySenseVoiceModelTo(fallbackModelsDir) || !HAS_CLIP_001) {
       return;
     }
-    // Create structurally present but corrupted Qwen3-ASR files to trigger runtime init failure
-    const qwenDir = path.join(corruptModelsDir, QWEN3_ASR_DIR_NAME);
-    const tokDir = path.join(qwenDir, "tokenizer");
-    mkdirSync(tokDir, { recursive: true });
-    writeFileSync(path.join(tokDir, "vocab.json"), "{}");
-    writeFileSync(path.join(qwenDir, "conv_frontend.onnx"), "not-a-valid-onnx");
-    writeFileSync(path.join(qwenDir, "encoder.int8.onnx"), "not-a-valid-onnx");
-    writeFileSync(path.join(qwenDir, "decoder.int8.onnx"), "not-a-valid-onnx");
 
-    const engine = new LocalVoiceEngine({ modelsDir: corruptModelsDir });
-    const pcm = loadClip001Pcm16k();
-    const res = await engine.transcribeLocal(pcm, 16000, "zh-CN");
-    expect(res.engine).toBe("sensevoice-fallback");
-    expect(res.fallbackUsed).toBe(true);
-    expect(res.fallbackReason).toContain("qwen3-asr-error");
-    expect(res.text).toContain("客厅");
-
-    engine.dispose();
+    const failingGateway = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch() {
+        return Response.json({ detail: "upstream unavailable" }, { status: 503 });
+      },
+    });
+    const engine = new LocalVoiceEngine({ modelsDir: fallbackModelsDir });
+    try {
+      engine.setQwen3AsrRemoteConfig({
+        serviceUrl: `http://127.0.0.1:${failingGateway.port}`,
+      });
+      const pcm = loadClip001Pcm16k();
+      const res = await engine.transcribeLocal(pcm, 16000, "zh-CN");
+      expect(res.engine).toBe("sensevoice-fallback");
+      expect(res.fallbackUsed).toBe(true);
+      expect(res.fallbackReason).toContain("qwen3-asr-error");
+      expect(res.text).toContain("客厅");
+    } finally {
+      engine.dispose();
+      failingGateway.stop(true);
+    }
   }, 30_000);
 });
 
-describe("Qwen3-ASR GPU Auto-Detection, Compute Device & Streaming Segmentation", () => {
-  test("parses llama-server --list-devices and selects discrete GPU over integrated/virtual adapters", () => {
-    const sampleOutput = [
-      "Available devices:",
-      "  Vulkan0: Intel(R) UHD Graphics (16295 MiB, 15527 MiB free)",
-      "  Vulkan1: NVIDIA GeForce RTX 3060 Laptop GPU (6009 MiB, 5241 MiB free)",
-      "  Vulkan2: Todesk Virtual Display Adapter (128 MiB, 128 MiB free)",
-      "  Vulkan3: Microsoft Basic Render Driver (4096 MiB, 4096 MiB free)",
-    ].join("\n");
-
-    const devices = parseLlamaListDevicesOutput(sampleOutput);
-    expect(devices.length).toBe(2);
-    expect(devices[0]!.id).toBe("Vulkan0");
-    expect(devices[0]!.isDiscrete).toBe(false);
-    expect(devices[1]!.id).toBe("Vulkan1");
-    expect(devices[1]!.name).toBe("NVIDIA GeForce RTX 3060 Laptop GPU");
-    expect(devices[1]!.isDiscrete).toBe(true);
-    expect(devices[1]!.vramTotalMb).toBe(6009);
-    expect(devices[1]!.vramFreeMb).toBe(5241);
-
-    const best = selectBestGpuDevice(devices);
-    expect(best?.id).toBe("Vulkan1");
-    expect(best?.backend).toBe("vulkan");
-
-    // Integrated GPU still selected when no discrete GPU exists
-    const igpuOnly = selectBestGpuDevice([devices[0]!]);
-    expect(igpuOnly?.id).toBe("Vulkan0");
-
-    // Too-small VRAM or virtual-only devices return null
-    expect(
-      selectBestGpuDevice([
-        {
-          id: "Vulkan0",
-          backend: "vulkan",
-          name: "Tiny GPU",
-          vramTotalMb: 512,
-          vramFreeMb: 256,
-          isDiscrete: true,
-        },
-      ]),
-    ).toBeNull();
-    expect(selectBestGpuDevice([])).toBeNull();
-  });
-
-  test("builds Qwen3 GPU OpenAI chat payload with hotwords and cleans response tags", () => {
-    const payload = buildQwen3GpuChatPayload("UklGRg==", {
-      hotwords: ["Neo", "小派"],
-      maxTokens: 96,
-      stream: true,
-    });
-    expect(payload.stream).toBe(true);
-    expect(payload.max_tokens).toBe(96);
-    const msgs = payload.messages as Array<{ role: string; content: unknown }>;
-    expect(msgs.length).toBe(2);
-    expect(msgs[0]!.role).toBe("system");
-    expect(msgs[0]!.content).toBe("Neo 小派");
-    expect(msgs[1]!.role).toBe("user");
-
+describe("Qwen3-ASR Online Response Cleaning & Streaming Segmentation", () => {
+  test("cleans Qwen3 response tags and persists qwen3StreamingEnabled", () => {
     expect(
       parseQwen3GpuResponseText("<think>language Chinese</think>language Chinese<asr_text>Neo，打开客厅灯。"),
     ).toBe("Neo，打开客厅灯。");
-  });
 
-  test("persists qwen3ComputeDevice and qwen3StreamingEnabled with strict validation", () => {
     const def = defaultAgentVoiceConfig();
-    expect(def.qwen3ComputeDevice).toBe("auto");
     expect(def.qwen3StreamingEnabled).toBe(true);
 
-    expect(normalizeQwen3ComputeDevice("gpu")).toBe("gpu");
-    expect(normalizeQwen3ComputeDevice("vulkan")).toBe("gpu");
-    expect(normalizeQwen3ComputeDevice("cuda")).toBe("gpu");
-    expect(normalizeQwen3ComputeDevice("cpu")).toBe("cpu");
-    expect(normalizeQwen3ComputeDevice("auto")).toBe("auto");
-    expect(normalizeQwen3ComputeDevice("unknown", "auto")).toBe("auto");
-
-    const updated = updateAgentVoiceConfig({
-      qwen3ComputeDevice: "cpu",
-      qwen3StreamingEnabled: false,
-    });
-    expect(updated.qwen3ComputeDevice).toBe("cpu");
+    const updated = updateAgentVoiceConfig({ qwen3StreamingEnabled: false });
     expect(updated.qwen3StreamingEnabled).toBe(false);
-    expect(loadAgentVoiceConfig().qwen3ComputeDevice).toBe("cpu");
     expect(loadAgentVoiceConfig().qwen3StreamingEnabled).toBe(false);
 
-    const backOn = updateAgentVoiceConfig({
-      qwen3ComputeDevice: "vulkan",
-      qwen3StreamingEnabled: true,
-    });
-    expect(backOn.qwen3ComputeDevice).toBe("gpu");
+    const backOn = updateAgentVoiceConfig({ qwen3StreamingEnabled: true });
     expect(backOn.qwen3StreamingEnabled).toBe(true);
-
-    expect(() => updateAgentVoiceConfig({ qwen3ComputeDevice: "tpu-999" })).toThrow();
   });
 
   test("segments bilingual streaming sentences accurately while protecting wake words and decimals", () => {
@@ -392,14 +312,14 @@ describe("Qwen3-ASR GPU Auto-Detection, Compute Device & Streaming Segmentation"
       punctuationPauseMs: 320,
     });
     const d1 = defaultTracker.ingestHypothesis("Neo。打开客厅吸顶灯。", {
-      engine: "qwen3-asr-gpu-stream",
+      engine: "qwen3-asr-remote-stream",
       latencyMs: 140,
     });
     expect(d1.completedSentences).toEqual([]);
     expect(d1.partial?.text).toBe("Neo。打开客厅吸顶灯。");
 
     const d2 = defaultTracker.ingestHypothesis("Neo。打开客厅吸顶灯。关闭卧室灯。", {
-      engine: "qwen3-asr-gpu-stream",
+      engine: "qwen3-asr-remote-stream",
       latencyMs: 155,
     });
     expect(d2.completedSentences).toEqual([]);
@@ -416,19 +336,19 @@ describe("Qwen3-ASR GPU Auto-Detection, Compute Device & Streaming Segmentation"
     });
 
     // Standalone wake word should NOT trigger punctuation pause commit
-    tracker.ingestHypothesis("Neo。", { engine: "qwen3-asr-gpu-stream", latencyMs: 120 });
+    tracker.ingestHypothesis("Neo。", { engine: "qwen3-asr-remote-stream", latencyMs: 120 });
     expect(tracker.advanceFrame(400, false).shouldCommitByPunctPause).toBe(false);
 
     // Command arrives -> mid-stream second sentence triggers immediate split of sentence 1
     const r1 = tracker.ingestHypothesis("Neo。打开客厅吸顶灯。", {
-      engine: "qwen3-asr-gpu-stream",
+      engine: "qwen3-asr-remote-stream",
       latencyMs: 140,
     });
     expect(r1.completedSentences).toEqual([]);
     expect(r1.partial?.text).toBe("Neo。打开客厅吸顶灯。");
 
     const r2 = tracker.ingestHypothesis("Neo。打开客厅吸顶灯。关闭卧室灯", {
-      engine: "qwen3-asr-gpu-stream",
+      engine: "qwen3-asr-remote-stream",
       latencyMs: 155,
     });
     expect(r2.completedSentences).toEqual(["Neo。打开客厅吸顶灯。"]);
@@ -437,7 +357,7 @@ describe("Qwen3-ASR GPU Auto-Detection, Compute Device & Streaming Segmentation"
 
     // Sentence 2 finishes with punctuation -> 320ms silence triggers fast punctuation_pause commit
     const r3 = tracker.ingestHypothesis("Neo。打开客厅吸顶灯。关闭卧室灯。", {
-      engine: "qwen3-asr-gpu-stream",
+      engine: "qwen3-asr-remote-stream",
       latencyMs: 160,
     });
     expect(r3.completedSentences).toEqual([]);
@@ -525,7 +445,7 @@ describe("Qwen3-ASR GPU Auto-Detection, Compute Device & Streaming Segmentation"
         createWakeWordStream: () => null,
         getStatus: () => ({
           readyForLocalAsr: true,
-          activeQwen3Device: "gpu" as const,
+          activeQwen3Device: "remote" as const,
         }),
         transcribeLocal: async (
           _pcm: Float32Array,
@@ -542,9 +462,9 @@ describe("Qwen3-ASR GPU Auto-Detection, Compute Device & Streaming Segmentation"
             lang: "Chinese",
             emotion: "",
             event: "",
-            engine: "qwen3-asr-gpu-stream",
+            engine: "qwen3-asr-remote-stream",
             durationMs: 42,
-            computeDevice: "gpu",
+            computeDevice: "remote",
           };
         },
         getCallCount: () => callCount,
@@ -670,201 +590,218 @@ describe("Qwen3-ASR GPU Auto-Detection, Compute Device & Streaming Segmentation"
   });
 });
 
-describe("Real Qwen3-ASR-0.6B (GPU/CPU) Primary, Streaming & HTTP API Integration", () => {
-  test("auto-detects GPU for Qwen3-ASR-0.6B when available, streams SSE partials, and switches cleanly to CPU & SenseVoice", async () => {
-    const engine = new LocalVoiceEngine();
-    const status = engine.getStatus();
-    if (!status.readyForQwen3Asr || !status.readyForSenseVoice || !HAS_CLIP_001) {
-      engine.dispose();
-      return;
-    }
-
-    expect(status.primaryAsrEngine).toBe("qwen3-asr");
-    expect(status.fallbackAsrEngine).toBe("sensevoice");
-    expect(status.readyForLocalAsr).toBe(true);
-
-    const pcm = loadClip001Pcm16k();
-    const streamedPartials: string[] = [];
-    const qwenRes = await engine.transcribeLocal(pcm, 16000, "zh-CN", {
-      hotwords: ["Neo"],
-      onPartial: (p) => streamedPartials.push(p),
-    });
-
-    if (status.readyForQwen3Gpu) {
-      expect(status.activeQwen3Device).toBe("gpu");
-      expect(status.gpu.detected).toBe(true);
-      expect(qwenRes.engine).toBe("qwen3-asr-gpu-stream");
-      expect(qwenRes.computeDevice).toBe("gpu");
-      expect(streamedPartials.length).toBeGreaterThanOrEqual(2);
-    } else {
-      expect(status.activeQwen3Device).toBe("cpu");
-      expect(qwenRes.engine).toBe("qwen3-asr-stream");
-      expect(qwenRes.computeDevice).toBe("cpu");
-    }
-    expect(qwenRes.fallbackUsed).toBe(false);
-    expect(qwenRes.text).toContain("Neo");
-    expect(qwenRes.text).toContain("客厅吸顶灯");
-
-    // Explicit CPU mode works even when GPU is present
-    const cpuRes = await engine.transcribeLocal(pcm, 16000, "zh-CN", {
-      computeDevice: "cpu",
-      hotwords: ["Neo"],
-    });
-    expect(cpuRes.engine).toBe("qwen3-asr-local");
-    expect(cpuRes.computeDevice).toBe("cpu");
-    expect(cpuRes.text).toContain("客厅吸顶灯");
-
-    const svRes = await engine.transcribeLocal(pcm, 16000, "zh-CN", {
-      engine: "sensevoice",
-    });
-    expect(svRes.engine).toBe("sensevoice-local");
-    expect(svRes.fallbackUsed).toBe(false);
-    expect(svRes.text).toContain("客厅吸顶灯");
-
-    engine.dispose();
-  }, 90_000);
-
-  test("exposes localAsrEngine, GPU device mode, and streaming switch via HTTP API and HTML", async () => {
-    const demoService = new VirtualDemoService();
-    server = await startMijiaDeckServer({
-      mode: "demo",
+describe("Online Qwen3-ASR Primary, SenseVoice Reserve & HTTP API Integration", () => {
+  test("uses online Qwen3-ASR gateway as primary when configured and switches cleanly to local SenseVoice reserve", async () => {
+    const authHeaders: string[] = [];
+    const mockQwenGateway = Bun.serve({
       port: 0,
-      service: demoService,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        const url = new URL(req.url);
+        authHeaders.push(req.headers.get("authorization") ?? "");
+        if (url.pathname === "/health") {
+          return Response.json({ status: "ok", device: "remote-gpu", model: "qwen3-asr-online" });
+        }
+        if (url.pathname === "/v1/audio/transcriptions") {
+          const form = await req.formData();
+          const file = form.get("file");
+          if (!(file instanceof Blob) || file.size < 44) {
+            return Response.json({ error: "missing audio file" }, { status: 400 });
+          }
+          return Response.json({
+            text: "Neo，打开客厅吸顶灯",
+            language: "zh",
+          });
+        }
+        return new Response("not found", { status: 404 });
+      },
     });
 
-    // 1. Settings & Drawer HTML contain GPU badge, compute device selector, and streaming toggle controls
-    const htmlRes = await fetch(`${server.url}/`);
-    expect(htmlRes.ok).toBe(true);
-    const html = await htmlRes.text();
-    expect(html).toContain('id="badge-model-qwen3-asr"');
-    expect(html).toContain('id="badge-model-qwen3-gpu"');
-    expect(html).toContain('id="badge-model-asr"');
-    expect(html).toContain('id="set-voice-local-asr-engine"');
-    expect(html).toContain('id="set-voice-qwen3-device"');
-    expect(html).toContain('id="set-voice-qwen3-streaming"');
-    expect(html).toContain('id="pi-streaming-toggle-btn"');
+    const engine = new LocalVoiceEngine();
+    engine.setQwen3AsrRemoteConfig({
+      serviceUrl: `http://127.0.0.1:${mockQwenGateway.port}`,
+      apiKey: "test-online-token",
+    });
 
-    // 2. Default config & pipeline status
-    const statusRes = await fetch(`${server.url}/api/voice/pipeline/status`);
-    expect(statusRes.ok).toBe(true);
-    const statusJson = (await statusRes.json()) as {
-      localEngine: {
-        readyForQwen3Asr: boolean;
-        readyForQwen3Gpu: boolean;
-        activeQwen3Device: string | null;
-        qwen3ComputeDevice: string;
-        gpu: { detected: boolean; deviceName: string | null };
-        readyForSenseVoice: boolean;
-        primaryAsrEngine: string | null;
-        fallbackAsrEngine: string | null;
-        activeLocalAsrMode: string;
+    try {
+      const status = engine.getStatus();
+      expect(status.readyForQwen3Asr).toBe(true);
+      expect(status.readyForQwen3Gpu).toBe(true);
+      expect(status.activeQwen3Device).toBe("remote");
+      expect(status.primaryAsrEngine).toBe("qwen3-asr");
+      expect(status.readyForLocalAsr).toBe(true);
+
+      const pcm = HAS_CLIP_001
+        ? loadClip001Pcm16k()
+        : new Float32Array(16000).map((_, i) => 0.2 * Math.sin((2 * Math.PI * 440 * i) / 16000));
+
+      const qwenRes = await engine.transcribeLocal(pcm, 16000, "zh-CN", {
+        hotwords: ["Neo"],
+      });
+      expect(qwenRes.engine).toBe("qwen3-asr-remote");
+      expect(qwenRes.computeDevice).toBe("remote");
+      expect(qwenRes.fallbackUsed).toBe(false);
+      expect(qwenRes.text).toContain("Neo");
+      expect(qwenRes.text).toContain("客厅吸顶灯");
+      expect(authHeaders.some((h) => h === "Bearer test-online-token")).toBe(true);
+
+      if (status.readyForSenseVoice && HAS_CLIP_001) {
+        const svRes = await engine.transcribeLocal(pcm, 16000, "zh-CN", {
+          engine: "sensevoice",
+        });
+        expect(svRes.engine).toBe("sensevoice-local");
+        expect(svRes.fallbackUsed).toBe(false);
+        expect(svRes.text).toContain("客厅吸顶灯");
+      }
+    } finally {
+      engine.dispose();
+      mockQwenGateway.stop(true);
+    }
+  }, 30_000);
+
+  test("exposes online Qwen3-ASR gateway, localAsrEngine, and streaming switch via HTTP API and HTML (with local GPU device selector removed)", async () => {
+    const mockQwenGateway = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/health") {
+          return Response.json({ status: "ok", device: "remote-gpu", model: "qwen3-asr-online" });
+        }
+        if (url.pathname === "/v1/audio/transcriptions") {
+          return Response.json({
+            text: "Neo，打开客厅吸顶灯",
+            language: "zh",
+          });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+
+    try {
+      const demoService = new VirtualDemoService();
+      server = await startMijiaDeckServer({
+        mode: "demo",
+        port: 0,
+        service: demoService,
+      });
+
+      // 1. Settings & Drawer HTML contain online gateway + ASR controls and exclude removed local Qwen3 device controls
+      const htmlRes = await fetch(`${server.url}/`);
+      expect(htmlRes.ok).toBe(true);
+      const html = await htmlRes.text();
+      expect(html).toContain('id="badge-model-qwen3-asr"');
+      expect(html).toContain('id="badge-model-asr"');
+      expect(html).toContain('id="set-voice-local-asr-engine"');
+      expect(html).toContain('id="set-voice-qwen3-streaming"');
+      expect(html).toContain('id="pi-streaming-toggle-btn"');
+      expect(html).toContain('id="set-qwen3-asr-service-url"');
+      expect(html).not.toContain('id="badge-model-qwen3-gpu"');
+      expect(html).not.toContain('id="set-voice-qwen3-device"');
+      expect(html).not.toContain('id="setting-row-qwen3-device"');
+
+      // 2. Default config & pipeline status (unconfigured online gateway -> activeQwen3Device is null)
+      const statusRes = await fetch(`${server.url}/api/voice/pipeline/status`);
+      expect(statusRes.ok).toBe(true);
+      const statusJson = (await statusRes.json()) as {
+        localEngine: {
+          readyForQwen3Asr: boolean;
+          readyForQwen3Gpu: boolean;
+          activeQwen3Device: string | null;
+          gpu: { detected: boolean; deviceName: string | null; remoteConfigured: boolean };
+          readyForSenseVoice: boolean;
+          primaryAsrEngine: string | null;
+          fallbackAsrEngine: string | null;
+          activeLocalAsrMode: string;
+        };
+        voice: {
+          localAsrEngine: string;
+          qwen3StreamingEnabled: boolean;
+        };
       };
-      voice: {
-        localAsrEngine: string;
-        qwen3ComputeDevice: string;
-        qwen3StreamingEnabled: boolean;
+      expect(statusJson.voice.localAsrEngine).toBe("auto");
+      expect(statusJson.voice.qwen3StreamingEnabled).toBe(true);
+      expect(statusJson.localEngine.activeLocalAsrMode).toBe("auto");
+      expect(statusJson.localEngine.readyForQwen3Asr).toBe(false);
+      expect(statusJson.localEngine.activeQwen3Device).toBeNull();
+
+      // 3. Reject invalid localAsrEngine via HTTP 400
+      const badRes = await fetch(`${server.url}/api/agent/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ localAsrEngine: "invalid-asr" }),
+      });
+      expect(badRes.status).toBe(400);
+
+      // 4. Toggle streaming switch & configure online Qwen3-ASR gateway via /api/agent/config
+      const toggleRes = await fetch(`${server.url}/api/agent/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          qwen3StreamingEnabled: false,
+          qwen3AsrServiceUrl: `http://127.0.0.1:${mockQwenGateway.port}`,
+          qwen3AsrApiKey: "mock-online-key",
+        }),
+      });
+      expect(toggleRes.ok).toBe(true);
+      const toggleJson = (await toggleRes.json()) as {
+        config: { qwen3StreamingEnabled: boolean; qwen3AsrServiceUrl: string };
+        voice: {
+          qwen3StreamingEnabled: boolean;
+          localEngine: { readyForQwen3Asr: boolean; activeQwen3Device: string | null };
+        };
       };
-    };
-    expect(statusJson.voice.localAsrEngine).toBe("auto");
-    expect(statusJson.voice.qwen3ComputeDevice).toBe("auto");
-    expect(statusJson.voice.qwen3StreamingEnabled).toBe(true);
-    expect(statusJson.localEngine.activeLocalAsrMode).toBe("auto");
-    expect(statusJson.localEngine.qwen3ComputeDevice).toBe("auto");
+      expect(toggleJson.config.qwen3StreamingEnabled).toBe(false);
+      expect(toggleJson.config.qwen3AsrServiceUrl).toBe(`http://127.0.0.1:${mockQwenGateway.port}`);
+      expect(toggleJson.voice.qwen3StreamingEnabled).toBe(false);
+      expect(toggleJson.voice.localEngine.readyForQwen3Asr).toBe(true);
+      expect(toggleJson.voice.localEngine.activeQwen3Device).toBe("remote");
 
-    // 3. Reject invalid localAsrEngine and qwen3ComputeDevice via HTTP 400
-    const badRes = await fetch(`${server.url}/api/agent/config`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ localAsrEngine: "invalid-asr" }),
-    });
-    expect(badRes.status).toBe(400);
-
-    const badDevRes = await fetch(`${server.url}/api/agent/config`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ qwen3ComputeDevice: "invalid-gpu" }),
-    });
-    expect(badDevRes.status).toBe(400);
-
-    // 4. Toggle streaming switch & compute device via /api/agent/config
-    const toggleRes = await fetch(`${server.url}/api/agent/config`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        qwen3StreamingEnabled: false,
-        qwen3ComputeDevice: "cpu",
-      }),
-    });
-    expect(toggleRes.ok).toBe(true);
-    const toggleJson = (await toggleRes.json()) as {
-      config: { qwen3StreamingEnabled: boolean; qwen3ComputeDevice: string };
-      voice: {
-        qwen3StreamingEnabled: boolean;
-        qwen3ComputeDevice: string;
-        localEngine: { qwen3ComputeDevice: string; activeQwen3Device: string | null };
+      // 5. Switch to SenseVoice reserve and back to auto via /api/agent/config
+      const svCfgRes = await fetch(`${server.url}/api/agent/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          localAsrEngine: "sensevoice",
+          qwen3StreamingEnabled: true,
+          wakeWords: ["Neo"],
+          sourceSeparationMode: "off",
+        }),
+      });
+      expect(svCfgRes.ok).toBe(true);
+      const svCfgJson = (await svCfgRes.json()) as {
+        config: { localAsrEngine: string; qwen3StreamingEnabled: boolean };
+        voice: { localAsrEngine: string; localEngine: { activeLocalAsrMode: string } };
       };
-    };
-    expect(toggleJson.config.qwen3StreamingEnabled).toBe(false);
-    expect(toggleJson.config.qwen3ComputeDevice).toBe("cpu");
-    expect(toggleJson.voice.qwen3StreamingEnabled).toBe(false);
-    expect(toggleJson.voice.localEngine.qwen3ComputeDevice).toBe("cpu");
+      expect(svCfgJson.config.localAsrEngine).toBe("sensevoice");
+      expect(svCfgJson.config.qwen3StreamingEnabled).toBe(true);
+      expect(svCfgJson.voice.localAsrEngine).toBe("sensevoice");
+      expect(svCfgJson.voice.localEngine.activeLocalAsrMode).toBe("sensevoice");
 
-    // 5. Switch to SenseVoice reserve and back to auto (GPU/CPU) via /api/agent/config
-    const svCfgRes = await fetch(`${server.url}/api/agent/config`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        localAsrEngine: "sensevoice",
-        qwen3ComputeDevice: "auto",
-        qwen3StreamingEnabled: true,
-        wakeWords: ["Neo"],
-        sourceSeparationMode: "off",
-      }),
-    });
-    expect(svCfgRes.ok).toBe(true);
-    const svCfgJson = (await svCfgRes.json()) as {
-      config: { localAsrEngine: string; qwen3StreamingEnabled: boolean };
-      voice: { localAsrEngine: string; localEngine: { activeLocalAsrMode: string } };
-    };
-    expect(svCfgJson.config.localAsrEngine).toBe("sensevoice");
-    expect(svCfgJson.config.qwen3StreamingEnabled).toBe(true);
-    expect(svCfgJson.voice.localAsrEngine).toBe("sensevoice");
-    expect(svCfgJson.voice.localEngine.activeLocalAsrMode).toBe("sensevoice");
-
-    // 6. If real models + benchmark WAV exist, verify /api/voice/audio uses SenseVoice when set to sensevoice, and Qwen3-ASR (GPU/CPU) when set to auto
-    if (
-      statusJson.localEngine.readyForQwen3Asr &&
-      statusJson.localEngine.readyForSenseVoice &&
-      HAS_CLIP_001
-    ) {
-      const wavBytes = encodeWavPcm16(loadClip001Pcm16k(), 16000);
-      const uploadAudio = async () => {
-        const form = new FormData();
-        form.append("audio", new Blob([wavBytes as unknown as BlobPart], { type: "audio/wav" }), "clip_001.wav");
-        form.append("autoDispatch", "false");
-        const r = await fetch(`${server!.url}/api/voice/audio`, { method: "POST", body: form });
-        expect(r.ok).toBe(true);
-        return (await r.json()) as { text: string; asrEngine: string };
-      };
-
-      const svUpload = await uploadAudio();
-      expect(svUpload.asrEngine.startsWith("sensevoice")).toBe(true);
-      expect(svUpload.text).toContain("客厅吸顶灯");
-
+      // 6. Verify /api/voice/audio routes through online Qwen3-ASR when localAsrEngine=auto
       const autoCfgRes = await fetch(`${server.url}/api/agent/config`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ localAsrEngine: "auto" }),
+        body: JSON.stringify({ localAsrEngine: "auto", owwEnabled: false }),
       });
       expect(autoCfgRes.ok).toBe(true);
 
-      const qwenUpload = await uploadAudio();
-      expect(qwenUpload.asrEngine.startsWith("qwen3-asr")).toBe(true);
-      if (statusJson.localEngine.readyForQwen3Gpu) {
-        expect(qwenUpload.asrEngine.startsWith("qwen3-asr-gpu")).toBe(true);
-      }
+      const pcm = HAS_CLIP_001
+        ? loadClip001Pcm16k()
+        : new Float32Array(16000).map((_, i) => 0.25 * Math.sin((2 * Math.PI * 440 * i) / 16000));
+      const wavBytes = encodeWavPcm16(pcm, 16000);
+      const form = new FormData();
+      form.append("audio", new Blob([wavBytes as unknown as BlobPart], { type: "audio/wav" }), "test.wav");
+      form.append("autoDispatch", "false");
+      form.append("bypassWakeWord", "true");
+      const uploadRes = await fetch(`${server.url}/api/voice/audio`, { method: "POST", body: form });
+      expect(uploadRes.ok).toBe(true);
+      const qwenUpload = (await uploadRes.json()) as { text: string; asrEngine: string };
+      expect(qwenUpload.asrEngine.startsWith("qwen3-asr-remote")).toBe(true);
       expect(qwenUpload.text).toContain("Neo");
       expect(qwenUpload.text).toContain("客厅吸顶灯");
+    } finally {
+      mockQwenGateway.stop(true);
     }
-  }, 90_000);
+  }, 30_000);
 });

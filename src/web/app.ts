@@ -3805,7 +3805,6 @@ export class MijiaDeckWebApp {
 
     el<HTMLSelectElement>("set-voice-engine").value = cfg?.voiceEngine || "auto";
     el<HTMLSelectElement>("set-voice-local-asr-engine").value = cfg?.localAsrEngine || "auto";
-    el<HTMLSelectElement>("set-voice-qwen3-device").value = cfg?.qwen3ComputeDevice || "auto";
     el<HTMLInputElement>("set-voice-qwen3-streaming").checked = cfg?.qwen3StreamingEnabled !== false;
     el<HTMLInputElement>("set-voice-clearvoice-enabled").checked =
       cfg?.voicePipelineMode === "clearvoice";
@@ -3908,84 +3907,55 @@ export class MijiaDeckWebApp {
     const voxOk = Boolean(status?.readyForVoxlock);
     const vadOk = Boolean(status?.readyForVad);
     const vpOk = Boolean(status?.readyForVoiceprint);
-    const qwen3Ok = Boolean(status?.readyForQwen3Asr ?? status?.models?.qwen3Asr);
+    const qwen3Ok = Boolean(status?.readyForQwen3Remote ?? status?.readyForQwen3Asr);
     const gpuInfo = status?.gpu ?? null;
-    const gpuDetected = Boolean(gpuInfo?.detected);
-    const gpuOk = Boolean(status?.readyForQwen3Gpu ?? gpuInfo?.ready);
     const cvInfo = status?.clearVoice ?? null;
     const cvOk = Boolean(status?.readyForClearVoiceGpu ?? cvInfo?.ready);
     const cvBssOk = Boolean(status?.readyForClearVoiceBss ?? cvInfo?.multiTrackReady);
-    const activeDev = status?.activeQwen3Device ?? null;
     const senseVoiceOk = Boolean(status?.readyForSenseVoice ?? status?.models?.senseVoice);
-    const asrOk = Boolean(status?.readyForLocalAsr);
     const owwOk = Boolean(status?.readyForWakeWord ?? status?.models?.openWakeWord);
     const ttsOk = Boolean(status?.readyForLocalTts ?? status?.models?.localTts);
 
-    const qwen3BadgeLabel =
-      qwen3Ok && activeDev === "remote"
-        ? "Qwen3-ASR 0.6B (主·在线 GPU)"
-        : qwen3Ok && activeDev === "gpu"
-          ? "Qwen3-ASR 0.6B (主·GPU)"
-          : qwen3Ok && activeDev === "cpu"
-            ? "Qwen3-ASR 0.6B (主·CPU)"
-            : "Qwen3-ASR 0.6B (主)";
+    const qwen3BadgeLabel = qwen3Ok
+      ? "Qwen3-ASR 0.6B (在线)"
+      : "Qwen3-ASR 0.6B (未配置在线)";
     setBadge("badge-model-qwen3-asr", qwen3BadgeLabel, qwen3Ok);
-    const gpuBadgeLabel = gpuOk
-      ? gpuInfo?.remote || gpuInfo?.backend === "remote"
-        ? "在线 GPU (REMOTE)"
-        : `GPU 加速 (${gpuInfo?.backend ? gpuInfo.backend.toUpperCase() : "GPU"})`
-      : gpuDetected
-        ? "GPU 待下载组件"
-        : "无 GPU (CPU)";
-    setBadge("badge-model-qwen3-gpu", gpuBadgeLabel, gpuOk);
-    const cvBadgeLabel = cvOk
-      ? cvInfo?.provider === "cuda"
-        ? "ClearVoice SE (CUDA)"
-        : cvInfo?.provider === "remote"
-          ? "ClearVoice SE (在线 GPU)"
-          : "ClearVoice SE"
-      : "ClearVoice SE 待就绪";
+    const qwen3BadgeEl = document.getElementById("badge-model-qwen3-asr");
+    if (qwen3BadgeEl) {
+      qwen3BadgeEl.title = qwen3Ok
+        ? `在线 Qwen3-ASR 已就绪 (${gpuInfo?.modelName || "Qwen/Qwen3-ASR-0.6B"}${gpuInfo?.deviceName ? ` · ${gpuInfo.deviceName}` : ""})`
+        : gpuInfo?.lastError || "请在下方配置在线 Qwen3-ASR 网关地址与授权码（仅支持在线模式）";
+    }
+    const cvBadgeLabel = cvOk ? "ClearVoice SE (在线)" : "ClearVoice SE (未配置在线)";
     setBadge("badge-model-clearvoice", cvBadgeLabel, cvOk);
     const cvBadgeEl = document.getElementById("badge-model-clearvoice");
     if (cvBadgeEl) {
       cvBadgeEl.title = cvOk
-        ? `${cvInfo?.modelName || "MossFormer2_SE_48K"} 降噪去背景音已就绪${cvInfo?.gpuName ? ` · ${cvInfo.gpuName}` : ""}${typeof cvInfo?.lastInferMs === "number" ? ` · 最近推理 ${cvInfo.lastInferMs}ms` : ""}`
-        : cvInfo?.lastError || "ClearVoice MossFormer2_SE_48K 降噪模型尚未就绪";
+        ? `在线 ${cvInfo?.modelName || "MossFormer2_SE_48K"} 降噪去背景音已就绪${cvInfo?.gpuName ? ` · ${cvInfo.gpuName}` : ""}${typeof cvInfo?.lastInferMs === "number" ? ` · 最近推理 ${cvInfo.lastInferMs}ms` : ""}`
+        : cvInfo?.lastError || "请在下方配置在线 ClearVoice 网关地址与授权码（仅支持在线模式）";
     }
     const cvSsBadgeLabel = cvBssOk
-      ? cvInfo?.ssProvider === "cuda"
-        ? "ClearVoice BSS 多轨 (CUDA)"
-        : cvInfo?.ssProvider === "remote"
-          ? "ClearVoice BSS 多轨 (在线 GPU)"
-          : "ClearVoice BSS 多轨"
-      : "ClearVoice BSS 待就绪";
+      ? "ClearVoice BSS 多轨 (在线)"
+      : "ClearVoice BSS (未配置在线)";
     setBadge("badge-model-clearvoice-ss", cvSsBadgeLabel, cvBssOk);
     const cvSsBadgeEl = document.getElementById("badge-model-clearvoice-ss");
     if (cvSsBadgeEl) {
       cvSsBadgeEl.title = cvBssOk
-        ? `MossFormer2_SS_16K 多轨盲源分离已就绪${typeof cvInfo?.lastSeparateMs === "number" ? ` · 最近分离 ${cvInfo.lastSeparateMs}ms` : ""}`
-        : "ClearVoice MossFormer2_SS_16K 多轨盲源分离模型尚未就绪（可点击一键补齐模型下载）";
+        ? `在线 MossFormer2_SS_16K 多轨盲源分离已就绪${typeof cvInfo?.lastSeparateMs === "number" ? ` · 最近分离 ${cvInfo.lastSeparateMs}ms` : ""}`
+        : cvInfo?.lastError || "请在下方配置在线 ClearVoice 网关地址与授权码以启用多轨盲源分离";
     }
     const cvDescEl = document.getElementById("set-voice-clearvoice-desc");
     if (cvDescEl) {
       if (cvOk && cvBssOk) {
-        const gpuLabel = cvInfo?.gpuName ? `${cvInfo.gpuName} (${(cvInfo.provider || "cuda").toUpperCase()})` : (cvInfo?.provider || "GPU").toUpperCase();
-        cvDescEl.textContent = `ClearVoice 多轨盲源分离与降噪服务已全面就绪（MossFormer2_SS_16K + MossFormer2_SE_48K · ${gpuLabel}）。先盲源分离再分轨降噪与剔除背景音，每条音轨独立执行声纹识别、Qwen3-ASR 转文字、逻辑判定与后续流程，界面分轨展示绝不混轨`;
+        const gpuLabel = cvInfo?.gpuName ? `${cvInfo.gpuName} (在线)` : "在线 GPU";
+        cvDescEl.textContent = `在线 ClearVoice 多轨盲源分离与降噪服务已全面就绪（MossFormer2_SS_16K + ${cvInfo?.modelName || "MossFormer2_SE_48K"} · ${gpuLabel}）。先盲源分离再分轨降噪与剔除背景音，每条音轨独立执行声纹识别、语音转文字、逻辑判定与后续流程，界面分轨展示绝不混轨`;
       } else if (cvOk) {
-        const gpuLabel = cvInfo?.gpuName ? `${cvInfo.gpuName} (${(cvInfo.provider || "cuda").toUpperCase()})` : (cvInfo?.provider || "GPU").toUpperCase();
-        cvDescEl.textContent = `ClearVoice SE 降噪已就绪（MossFormer2_SE_48K · ${gpuLabel}；MossFormer2_SS_16K 盲源分离模型待补齐）。开启后按准实时滑窗降噪并送入独立分轨处理管线；关闭则使用原方案`;
+        const gpuLabel = cvInfo?.gpuName ? `${cvInfo.gpuName} (在线)` : "在线 GPU";
+        cvDescEl.textContent = `在线 ClearVoice SE 降噪已就绪（${cvInfo?.modelName || "MossFormer2_SE_48K"} · ${gpuLabel}）。开启后按准实时滑窗降噪并送入独立分轨处理管线；关闭则使用原方案`;
       } else {
         cvDescEl.textContent =
-          "开启后切换为 ClearVoice 多轨盲源分离 + 分轨降噪去背景音 → 分轨独立声纹/Qwen3-ASR/逻辑判定新方案（当前 ClearVoice GPU 运行时或模型未就绪，将自动平滑降级本地降噪）；关闭则使用原方案";
+          "开启后调用在线 ClearVoice 多轨盲源分离 + 分轨降噪去背景音 → 分轨独立声纹/语音识别/逻辑判定新方案（当前未配置在线网关或缺少授权码，将自动平滑降级本地 GTCRN 降噪）；关闭则使用原方案";
       }
-    }
-    const gpuBadgeEl = document.getElementById("badge-model-qwen3-gpu");
-    if (gpuBadgeEl && gpuInfo?.deviceName) {
-      const vramGb =
-        typeof gpuInfo.vramTotalMb === "number" && gpuInfo.vramTotalMb > 0
-          ? ` · ${(gpuInfo.vramTotalMb / 1024).toFixed(1)} GB VRAM`
-          : "";
-      gpuBadgeEl.title = `${gpuInfo.deviceName}${vramGb}`;
     }
     setBadge("badge-model-asr", "SenseVoice (备用)", senseVoiceOk);
     setBadge("badge-model-gtcrn", "GTCRN 降噪", gtcrnOk);
@@ -3996,50 +3966,28 @@ export class MijiaDeckWebApp {
     setBadge("badge-model-oww", "openWakeWord 唤醒", owwOk);
     setBadge("badge-model-tts", "Matcha 温柔女声", ttsOk);
 
-    const deviceDesc = document.getElementById("set-voice-qwen3-device-desc");
-    if (deviceDesc) {
-      if (gpuInfo?.remote && gpuOk) {
-        deviceDesc.textContent = `已接入在线 Qwen3-ASR 网关（${gpuInfo.deviceName || "远程 GPU"} · ${gpuInfo.modelName || "Qwen/Qwen3-ASR-0.6B"}），自动免除本机显存占用；异常或切至仅 CPU 时无缝回落本机模型`;
-      } else if (gpuDetected && gpuInfo?.deviceName) {
-        const vramText =
-          typeof gpuInfo.vramTotalMb === "number" && gpuInfo.vramTotalMb > 0
-            ? ` (${(gpuInfo.vramTotalMb / 1024).toFixed(1)} GB · ${gpuInfo.backend.toUpperCase()})`
-            : ` (${gpuInfo.backend.toUpperCase()})`;
-        deviceDesc.textContent = gpuOk
-          ? `已自动识别 GPU：${gpuInfo.deviceName}${vramText}，推理速度提升约 8~15 倍；不可用或选择仅 CPU 时无缝回落 CPU`
-          : `已检测到 GPU：${gpuInfo.deviceName}${vramText}，点击上方「一键补齐模型」即可启用 GPU 加速（当前暂由 CPU 兜底）`;
-      } else {
-        deviceDesc.textContent =
-          "未检测到可用独立 GPU，自动使用 CPU 运行 Qwen3-ASR-0.6B；若后续接入兼容 GPU 或配置下方在线网关将自动启用加速";
-      }
-    }
-
-    const coreReady = gtcrnOk && vadOk && vpOk && asrOk;
-    const gpuPendingDownload = gpuDetected && !gpuOk;
-    const allReady = coreReady && qwen3Ok && !gpuPendingDownload && senseVoiceOk && owwOk && ttsOk;
+    const localCoreReady = gtcrnOk && vadOk && vpOk && senseVoiceOk;
+    const localAllReady = localCoreReady && owwOk && ttsOk;
     const dlBtn = document.getElementById("voice-download-models-btn") as HTMLButtonElement | null;
     if (dlBtn) {
-      dlBtn.hidden = allReady || !status?.addonAvailable;
+      dlBtn.hidden = localAllReady || !status?.addonAvailable;
       dlBtn.disabled = Boolean(status?.downloading);
-      dlBtn.textContent = status?.downloading ? "下载中…" : "一键补齐模型";
+      dlBtn.textContent = status?.downloading ? "下载中…" : "一键补齐本地模型";
     }
     const desc = document.getElementById("voice-pipeline-status-desc");
     if (desc) {
-      const qwen3RunTag =
-        activeDev === "remote"
-          ? `在线 Qwen3-ASR-0.6B (${gpuInfo?.deviceName || "远程 GPU"})`
-          : activeDev === "gpu" && gpuInfo?.deviceName
-            ? `Qwen3-ASR-0.6B GPU 加速 (${gpuInfo.deviceName})`
-            : "Qwen3-ASR-0.6B CPU";
-      desc.textContent = allReady
-        ? `本地离线语音 AI 管线已全面就绪（主方案 ${qwen3RunTag} + 备用方案 SenseVoice + openWakeWord 唤醒 + GTCRN 降噪 + Silero VAD + 3D-Speaker 声纹）`
-        : coreReady && gpuPendingDownload
-          ? `核心离线语音已就绪（检测到 GPU ${gpuInfo?.deviceName ?? ""}，点击「一键补齐模型」可补齐 GPU 加速模型大幅提速）`
-          : coreReady && !qwen3Ok
-            ? "当前由 SenseVoice 储备方案兜底离线识别（Qwen3-ASR-0.6B 主方案模型未下载，点击「一键补齐模型」即可启用更高精度转写）"
-            : coreReady
-              ? "核心离线语音模型已就绪（Qwen3-ASR-0.6B 主方案可用，可一键补齐备用 SenseVoice / openWakeWord / 本地女声模型）"
-              : "本地离线语音模型尚未完全就绪，可点击「一键补齐模型」自动下载，未就绪项将自动使用 DSP/云端降级";
+      const onlineParts: string[] = [];
+      if (cvOk) onlineParts.push(`在线 ClearVoice (${cvInfo?.gpuName || "远程 GPU"})`);
+      if (qwen3Ok) onlineParts.push(`在线 Qwen3-ASR-0.6B (${gpuInfo?.deviceName || "远程 GPU"})`);
+      const onlineSummary =
+        onlineParts.length > 0
+          ? onlineParts.join(" + ")
+          : "在线 ClearVoice / Qwen3-ASR 尚未配置（请在下方模型网关填写地址与授权码）";
+      desc.textContent = localAllReady
+        ? `${onlineSummary}；本机基础组件（SenseVoice 备用 + openWakeWord 唤醒 + GTCRN 降噪 + Silero VAD + 3D-Speaker 声纹）已全部就绪`
+        : localCoreReady
+          ? `${onlineSummary}；本机核心组件已就绪（可点击「一键补齐本地模型」补齐 openWakeWord / 本地女声）`
+          : `${onlineSummary}；本机基础组件尚未完全就绪，可点击「一键补齐本地模型」下载 SenseVoice 备用 / GTCRN / Silero VAD / 声纹等轻量模型`;
     }
   }
 
@@ -5415,7 +5363,6 @@ export class MijiaDeckWebApp {
       systemPromptExtra: el<HTMLTextAreaElement>("set-agent-system-prompt").value.trim(),
       voiceEngine: el<HTMLSelectElement>("set-voice-engine").value,
       localAsrEngine: el<HTMLSelectElement>("set-voice-local-asr-engine").value,
-      qwen3ComputeDevice: el<HTMLSelectElement>("set-voice-qwen3-device").value,
       qwen3StreamingEnabled: el<HTMLInputElement>("set-voice-qwen3-streaming").checked,
       voicePipelineMode: el<HTMLInputElement>("set-voice-clearvoice-enabled").checked
         ? "clearvoice"

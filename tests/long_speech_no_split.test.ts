@@ -10,6 +10,7 @@ import {
   fauxAssistantMessage,
   fauxProvider,
 } from "@earendil-works/pi-ai";
+import { decodeWavPcm, encodeWavPcm16 } from "../src/agent/audioPcm.ts";
 import { ClearVoiceRealtimeChunker } from "../src/agent/clearVoiceChunker.ts";
 import { ClearVoiceGpuRuntime } from "../src/agent/clearVoiceGpuRuntime.ts";
 import type { LocalAsrOutput, LocalVoiceEngine, StreamingVadHandleLike } from "../src/agent/localVoiceEngine.ts";
@@ -255,27 +256,31 @@ describe("ClearVoice Pipeline Slow & Long Utterance Continuity", () => {
         const u = new URL(req.url);
         if (u.pathname === "/health") {
           return Response.json({
-            ok: true,
-            model: "MossFormer2_SE_48K",
-            provider: "CUDAExecutionProvider",
-            device: "gpu",
-            gpuName: "Mock RTX 3060",
-            warmedUp: true,
+            status: "ok",
+            upstreams: {
+              clearvoice: {
+                status: "ok",
+                details: {
+                  status: "ok",
+                  gpu_name: "Mock Online GPU",
+                  loaded_models: [{ name: "MossFormer2_SE_48K", task: "speech_enhancement" }],
+                },
+              },
+            },
           });
         }
-        if (u.pathname === "/denoise") {
-          const buf = await req.arrayBuffer();
-          const input = new Float32Array(buf);
-          receivedSliceLengths.push(input.length);
-          return new Response(new Uint8Array(input.buffer.slice(0)), {
+        if (u.pathname === "/clearvoice/v1/enhance") {
+          const form = await req.formData();
+          const file = form.get("file") as Blob;
+          const decoded = decodeWavPcm(new Uint8Array(await file.arrayBuffer()));
+          receivedSliceLengths.push(decoded.samples.length);
+          const wav = encodeWavPcm16(decoded.samples, decoded.sampleRate);
+          return new Response(new Uint8Array(wav), {
             status: 200,
             headers: {
-              "Content-Type": "application/octet-stream",
+              "Content-Type": "audio/wav",
               "X-ClearVoice-Model": "MossFormer2_SE_48K",
-              "X-ClearVoice-Provider": "CUDAExecutionProvider",
-              "X-ClearVoice-Device": "gpu",
-              "X-ClearVoice-Infer-Ms": "18",
-              "X-ClearVoice-Gpu-Name": "Mock RTX 3060",
+              "X-Elapsed-Ms": "18",
             },
           });
         }
@@ -284,7 +289,6 @@ describe("ClearVoice Pipeline Slow & Long Utterance Continuity", () => {
     });
 
     const cvRuntime = new ClearVoiceGpuRuntime({
-      modelsDir: tmpDir,
       serviceUrl: `http://127.0.0.1:${mockCvServer.port}`,
     });
 
@@ -302,7 +306,7 @@ describe("ClearVoice Pipeline Slow & Long Utterance Continuity", () => {
       clearVoiceGpu: cvRuntime,
       getStatus: () => ({
         readyForLocalAsr: true,
-        activeQwen3Device: "gpu" as const,
+        activeQwen3Device: "remote" as const,
         readyForClearVoiceGpu: true,
         clearVoice: cvRuntime.getStatus(),
       }),
@@ -324,9 +328,9 @@ describe("ClearVoice Pipeline Slow & Long Utterance Continuity", () => {
           lang: "zh",
           emotion: "",
           event: "",
-          engine: "qwen3-asr-gpu",
+          engine: "qwen3-asr-remote",
           durationMs: 35,
-          computeDevice: "gpu",
+          computeDevice: "remote",
         };
       },
     } as unknown as LocalVoiceEngine;
@@ -402,7 +406,7 @@ describe("Legacy Pipeline Long Speech, Wake-Anchored & Audio Stitching", () => {
       createStreamingVad: (opts?: { minSilenceDuration?: number }) =>
         createSileroLikeMockVad(opts?.minSilenceDuration ?? 1.2, 0.02),
       createWakeWordStream: () => null,
-      getStatus: () => ({ readyForLocalAsr: true, activeQwen3Device: "gpu" as const }),
+      getStatus: () => ({ readyForLocalAsr: true, activeQwen3Device: "remote" as const }),
       sourceSeparator: {
         analyzeAudioScene: () => ({
           tags: [],
@@ -459,7 +463,7 @@ describe("Legacy Pipeline Long Speech, Wake-Anchored & Audio Stitching", () => {
       createStreamingVad: (opts?: { minSilenceDuration?: number }) =>
         createSileroLikeMockVad(opts?.minSilenceDuration ?? 1.0, 0.02),
       createWakeWordStream: () => null,
-      getStatus: () => ({ readyForLocalAsr: true, activeQwen3Device: "gpu" as const }),
+      getStatus: () => ({ readyForLocalAsr: true, activeQwen3Device: "remote" as const }),
       transcribeLocal: async (): Promise<LocalAsrOutput> => {
         const text = hyps[Math.min(callIdx, hyps.length - 1)]!;
         callIdx += 1;
@@ -469,9 +473,9 @@ describe("Legacy Pipeline Long Speech, Wake-Anchored & Audio Stitching", () => {
           lang: "zh",
           emotion: "",
           event: "",
-          engine: "qwen3-asr-gpu-stream",
+          engine: "qwen3-asr-remote-stream",
           durationMs: 25,
-          computeDevice: "gpu",
+          computeDevice: "remote",
         };
       },
     } as unknown as LocalVoiceEngine;
@@ -580,7 +584,6 @@ describe("End-to-End VoiceListenerController -> PiAgentService Single Combined D
       "Neo，我等下要洗深色衣服。这批里面有棉质衬衫不能高温洗。你先帮我拟定两个可选方案看看。";
     const fakeLocalEngine = {
       setPreferredAsrEngine: () => {},
-      setQwen3ComputeDevice: () => {},
       setClearVoiceServiceUrl: () => {},
       getStatus: () => ({
         readyForLocalAsr: true,
@@ -602,9 +605,9 @@ describe("End-to-End VoiceListenerController -> PiAgentService Single Combined D
         lang: "zh",
         emotion: "",
         event: "",
-        engine: "qwen3-asr-gpu",
+        engine: "qwen3-asr-remote",
         durationMs: 120,
-        computeDevice: "gpu",
+        computeDevice: "remote",
       }),
       dispose: () => {},
     } as unknown as LocalVoiceEngine;
@@ -639,7 +642,7 @@ describe("End-to-End VoiceListenerController -> PiAgentService Single Combined D
         {
           rawSamples: makeSine(11.5),
           denoisedSamples: makeSine(11.5),
-          denoiseEngine: "clearvoice-mossformer2-gpu",
+          denoiseEngine: "clearvoice-mossformer2-remote",
           inputSnrDb: 18,
           outputSnrDb: 24,
           snrGainDb: 6,

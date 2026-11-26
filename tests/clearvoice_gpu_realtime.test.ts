@@ -272,8 +272,8 @@ describe("ClearVoice 配置持久化、热切换按钮 API 与准实时流集成
     expect(switchedBack.voicePipelineMode).toBe("legacy");
   });
 
-  test("VoiceStreamSession 在 ClearVoice 新方案下完整跑通：双触发切片 -> GPU HTTP 服务 -> 裁剪与淡入淡出 -> Qwen3-ASR 交付", async () => {
-    // 启动轻量 Mock ClearVoice GPU HTTP 服务，验证真实二进制 Float32 请求头与 0.3s lookback 传递
+  test("VoiceStreamSession 在 ClearVoice 新方案下完整跑通：双触发切片 -> 在线网关 -> 裁剪与淡入淡出 -> Qwen3-ASR 交付", async () => {
+    // 启动轻量 Mock 在线 ClearVoice 网关服务，验证 WAV 表单上传与 0.3s lookback 传递
     const receivedLengths: number[] = [];
     mockCvServer = Bun.serve({
       port: 0,
@@ -282,32 +282,36 @@ describe("ClearVoice 配置持久化、热切换按钮 API 与准实时流集成
         const u = new URL(req.url);
         if (u.pathname === "/health") {
           return Response.json({
-            ok: true,
-            model: "MossFormer2_SE_48K",
-            provider: "CUDAExecutionProvider",
-            device: "gpu",
-            gpuName: "Mock RTX 3060",
-            warmedUp: true,
+            status: "ok",
+            upstreams: {
+              clearvoice: {
+                status: "ok",
+                details: {
+                  status: "ok",
+                  gpu_name: "Mock Online GPU",
+                  loaded_models: [{ name: "MossFormer2_SE_48K", task: "speech_enhancement" }],
+                },
+              },
+            },
           });
         }
-        if (u.pathname === "/denoise") {
-          const buf = await req.arrayBuffer();
-          const input = new Float32Array(buf);
-          receivedLengths.push(input.length);
+        if (u.pathname === "/clearvoice/v1/enhance") {
+          const form = await req.formData();
+          const file = form.get("file") as Blob;
+          const decoded = decodeWavPcm(new Uint8Array(await file.arrayBuffer()));
+          receivedLengths.push(decoded.samples.length);
           // 模拟降噪（轻微衰减幅值以产生可验证信号变化）
-          const out = new Float32Array(input.length);
-          for (let i = 0; i < input.length; i += 1) {
-            out[i] = input[i]! * 0.85;
+          const out = new Float32Array(decoded.samples.length);
+          for (let i = 0; i < decoded.samples.length; i += 1) {
+            out[i] = decoded.samples[i]! * 0.85;
           }
-          return new Response(new Uint8Array(out.buffer), {
+          const wav = encodeWavPcm16(out, decoded.sampleRate);
+          return new Response(new Uint8Array(wav), {
             status: 200,
             headers: {
-              "Content-Type": "application/octet-stream",
+              "Content-Type": "audio/wav",
               "X-ClearVoice-Model": "MossFormer2_SE_48K",
-              "X-ClearVoice-Provider": "CUDAExecutionProvider",
-              "X-ClearVoice-Device": "gpu",
-              "X-ClearVoice-Infer-Ms": "28.5",
-              "X-ClearVoice-Gpu-Name": "Mock RTX 3060",
+              "X-Elapsed-Ms": "28.5",
             },
           });
         }
@@ -316,7 +320,6 @@ describe("ClearVoice 配置持久化、热切换按钮 API 与准实时流集成
     });
 
     const cvRuntime = new ClearVoiceGpuRuntime({
-      modelsDir: tmpDir,
       serviceUrl: `http://127.0.0.1:${mockCvServer.port}`,
     });
 
@@ -327,7 +330,7 @@ describe("ClearVoice 配置持久化、热切换按钮 API 与准实时流集成
       clearVoiceGpu: cvRuntime,
       getStatus: () => ({
         readyForLocalAsr: true,
-        activeQwen3Device: "gpu",
+        activeQwen3Device: "remote",
         readyForClearVoiceGpu: true,
         clearVoice: cvRuntime.getStatus(),
       }),
@@ -346,9 +349,9 @@ describe("ClearVoice 配置持久化、热切换按钮 API 与准实时流集成
         lang: "zh",
         emotion: "",
         event: "",
-        engine: "qwen3-asr-gpu",
+        engine: "qwen3-asr-remote",
         durationMs: 140,
-        computeDevice: "gpu",
+        computeDevice: "remote",
       }),
     } as unknown as LocalVoiceEngine;
 
@@ -377,7 +380,7 @@ describe("ClearVoice 配置持久化、热切换按钮 API 与准实时流集成
     await session.flush();
     await session.waitForIdle();
 
-    // ClearVoice GPU 服务收到 2 个切片（第 1 段 timeout 强制切分 + 第 2 段带 0.3s 历史上下文的 silence 切分）
+    // 在线 ClearVoice 网关收到 2 个切片（第 1 段 timeout 强制切分 + 第 2 段带 0.3s 历史上下文的 silence 切分）
     expect(receivedLengths.length).toBe(2);
     expect(receivedLengths[1]!).toBeGreaterThan(Math.round(16000 * 0.3));
     // 超时切分阶段实时刷出了流式字幕预览
@@ -387,7 +390,7 @@ describe("ClearVoice 配置持久化、热切换按钮 API 与准实时流集成
     expect(emittedSegments.length).toBe(1);
     const seg = emittedSegments[0]!;
     expect(seg.pipelineMode).toBe("clearvoice");
-    expect(seg.denoiseEngine).toBe("clearvoice-mossformer2-gpu");
+    expect(seg.denoiseEngine).toBe("clearvoice-mossformer2-remote");
     expect(seg.clearVoiceMeta?.sliceCount).toBe(2);
     expect(seg.clearVoiceMeta?.crossfadeCount).toBe(1);
     expect(seg.denoisedSamples.length).toBe(seg.rawSamples.length);
@@ -453,22 +456,22 @@ describe("ClearVoice 配置持久化、热切换按钮 API 与准实时流集成
 });
 
 // ---------------------------------------------------------------------------
-// 真实 GPU ClearVoice (MossFormer2_SE_48K CUDA) -> Qwen3-ASR 端到端实测（当本机模型就绪时自动运行）
+// 在线 ClearVoice (MossFormer2_SE_48K) -> 在线 Qwen3-ASR 端到端实测（配置了在线网关且样本就绪时自动运行）
 // ---------------------------------------------------------------------------
 
 const REAL_MODELS_DIR = process.env.MIJIADECK_VOICE_MODELS_DIR || "";
 const REAL_BENCH_WAV = path.resolve(import.meta.dir, "../benchmarks/voice_sep_100/audio/clip_001.wav");
 
-describe("真实 GPU ClearVoice (MossFormer2_SE_48K) -> Qwen3-ASR 端到端验证", () => {
+describe("在线 ClearVoice (MossFormer2_SE_48K) -> Qwen3-ASR 端到端验证", () => {
   test(
-    "本地 RTX GPU ClearVoice 服务降噪 + Qwen3-ASR 转写端到端链路",
+    "在线 ClearVoice 服务降噪 + Qwen3-ASR 转写端到端链路",
     async () => {
       const engine = new LocalVoiceEngine(
         REAL_MODELS_DIR ? { modelsDir: REAL_MODELS_DIR } : {},
       );
       const status = engine.getStatus();
       if (!status.readyForClearVoiceGpu || !status.readyForQwen3Asr || !existsSync(REAL_BENCH_WAV)) {
-        // CI 或未下载本地模型的环境跳过真实硬件测试
+        // 未配置在线 ClearVoice / Qwen3-ASR 网关或无录音样本时跳过实测
         engine.dispose();
         return;
       }

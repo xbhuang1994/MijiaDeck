@@ -3,14 +3,15 @@
 // Copyright (C) 2026 MiHome-Windows contributors
 
 /**
- * 本地离线语音 AI 引擎（基于 sherpa-onnx-node）：
- * - 环境降噪：GTCRN（gtcrn_simple.onnx，实时极速）/ DPDFNet4（dpdfnet4.onnx，强效去噪）/
- *   VoxLock 目标说话人声纹锁定人声提取（sherpa-onnx-voxlock-int8），无模型时自动降级纯 TS 频谱减法
+ * 语音 AI 引擎（在线 ClearVoice / Qwen3-ASR 网关 + 本地 sherpa-onnx-node 基础管线）：
+ * - 环境降噪：
+ *   - 在线新方案：ClearVoice（Voice & ASR Gateway，多轨 MossFormer2_SS_16K 盲源分离 + 分轨 MossFormer2_SE_48K 降噪）
+ *   - 本地原方案/兜底：GTCRN（gtcrn_simple.onnx）/ DPDFNet4（dpdfnet4.onnx）/ VoxLock 目标人声提取 / 纯 TS 频谱减法
  * - 语音活动检测：Silero VAD 神经端点检测（支持离线与连续流式检测），无模型时自动降级自适应能量+过零率 VAD
  * - 声纹识别：阿里 3D-Speaker CAM++（192 维中文说话人嵌入），无模型时自动降级声学指纹
- * - 本地离线 ASR：
- *   - 主方案：Qwen3-ASR-0.6B int8（CPU ONNX 异步非阻塞 decodeAsync，高精度中英双语转写）
- *   - 备用/储备方案：FunAudioLLM SenseVoiceSmall int8（主模型未就绪或异常时自动无缝降级，亦可手动切换）
+ * - 语音识别（ASR）：
+ *   - 主方案（仅在线）：Qwen3-ASR-0.6B（通过在线 Voice & ASR Gateway 调用远端 GPU）
+ *   - 备用/储备方案（本地离线）：FunAudioLLM SenseVoiceSmall int8（在线主方案未配置或异常时自动无缝降级，亦可手动切换）
  */
 
 import { existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
@@ -19,10 +20,8 @@ import os from "node:os";
 import path from "node:path";
 import {
   DEFAULT_LOCAL_ASR_ENGINE,
-  DEFAULT_QWEN3_COMPUTE_DEVICE,
   type LocalAsrEngineMode,
   type NoiseSuppressionMode,
-  type Qwen3ComputeDeviceMode,
   type VadEngineMode,
   type VoicePipelineMode,
 } from "../core/agentConfigStore.ts";
@@ -77,7 +76,6 @@ export type {
   ClearVoiceGpuStatus,
   LocalAsrEngineMode,
   NoiseSuppressionMode,
-  Qwen3ComputeDeviceMode,
   Qwen3GpuStatus,
   VadEngineMode,
   VoicePipelineMode,
@@ -93,11 +91,6 @@ export interface LocalVoiceModelPaths {
   voxlockChunk: string;
   sileroVad: string;
   speakerCampp: string;
-  qwen3AsrDir: string;
-  qwen3AsrConvFrontend: string;
-  qwen3AsrEncoder: string;
-  qwen3AsrDecoder: string;
-  qwen3AsrTokenizer: string;
   senseVoiceDir: string;
   senseVoiceModel: string;
   senseVoiceTokens: string;
@@ -143,8 +136,7 @@ export interface LocalVoiceEngineStatus {
   readyForQwen3Asr: boolean;
   readyForQwen3Gpu: boolean;
   readyForQwen3Remote?: boolean;
-  activeQwen3Device: "remote" | "gpu" | "cpu" | null;
-  qwen3ComputeDevice: Qwen3ComputeDeviceMode;
+  activeQwen3Device: "remote" | null;
   gpu: Qwen3GpuStatus;
   readyForSenseVoice: boolean;
   readyForLocalAsr: boolean;
@@ -190,14 +182,6 @@ export type LocalAsrResultEngine =
   | "qwen3-asr-remote-stream"
   | "qwen3-asr-remote-dual-raw"
   | "qwen3-asr-remote-dual-denoised"
-  | "qwen3-asr-gpu"
-  | "qwen3-asr-gpu-stream"
-  | "qwen3-asr-gpu-dual-raw"
-  | "qwen3-asr-gpu-dual-denoised"
-  | "qwen3-asr-local"
-  | "qwen3-asr-stream"
-  | "qwen3-asr-dual-raw"
-  | "qwen3-asr-dual-denoised"
   | "sensevoice-local"
   | "sensevoice-fallback"
   | "sensevoice-dual-raw"
@@ -205,11 +189,10 @@ export type LocalAsrResultEngine =
 
 export interface LocalAsrTranscribeOptions {
   engine?: LocalAsrEngineMode;
-  computeDevice?: Qwen3ComputeDeviceMode;
   hotwords?: readonly string[];
   maxNewTokens?: number;
   allowFallback?: boolean;
-  /** 流式转写实时局部回调（GPU 模式下直接透传 SSE 逐 token 流式结果） */
+  /** 流式转写实时局部回调 */
   onPartial?: (partialText: string) => void;
   signal?: AbortSignal;
 }
@@ -222,7 +205,7 @@ export interface LocalAsrOutput {
   event: string;
   engine: LocalAsrResultEngine;
   durationMs: number;
-  computeDevice?: "remote" | "gpu" | "cpu";
+  computeDevice?: "remote" | "cpu";
   gpuDeviceName?: string | null;
   altText?: string;
   enHeadText?: string;
@@ -298,8 +281,6 @@ const MODEL_URLS = {
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
   speakerCampp:
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
-  qwen3AsrTar:
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2",
   senseVoiceTar:
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2",
   cedTinyTar:
@@ -310,10 +291,8 @@ const MODEL_URLS = {
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/source-separation-models/sherpa-onnx-spleeter-2stems-fp16.tar.bz2",
 } as const;
 
-export const QWEN3_ASR_DIR_NAME = "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25";
 export const SENSE_VOICE_DIR_NAME = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17";
 const VOXLOCK_DIR_NAME = "sherpa-onnx-voxlock-int8";
-const QWEN3_ASR_INIT_RETRY_COOLDOWN_MS = 30_000;
 
 let cachedSherpa: SherpaModuleLike | null | undefined;
 
@@ -340,7 +319,6 @@ export function resolveVoiceModelPaths(modelsDirOverride?: string): LocalVoiceMo
   const modelsDir = path.resolve(
     modelsDirOverride || envDir || path.join(projectRoot(), "voice_models"),
   );
-  const qwen3AsrDir = path.join(modelsDir, QWEN3_ASR_DIR_NAME);
   const senseVoiceDir = path.join(modelsDir, SENSE_VOICE_DIR_NAME);
   const voxlockDir = path.join(modelsDir, VOXLOCK_DIR_NAME);
   const openWakeWordDir = path.join(modelsDir, "openwakeword");
@@ -354,11 +332,6 @@ export function resolveVoiceModelPaths(modelsDirOverride?: string): LocalVoiceMo
     voxlockChunk: path.join(voxlockDir, "chunk_int8.onnx"),
     sileroVad: path.join(modelsDir, "silero_vad.onnx"),
     speakerCampp: path.join(modelsDir, "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"),
-    qwen3AsrDir,
-    qwen3AsrConvFrontend: path.join(qwen3AsrDir, "conv_frontend.onnx"),
-    qwen3AsrEncoder: path.join(qwen3AsrDir, "encoder.int8.onnx"),
-    qwen3AsrDecoder: path.join(qwen3AsrDir, "decoder.int8.onnx"),
-    qwen3AsrTokenizer: path.join(qwen3AsrDir, "tokenizer"),
     senseVoiceDir,
     senseVoiceModel: path.join(senseVoiceDir, "model.int8.onnx"),
     senseVoiceTokens: path.join(senseVoiceDir, "tokens.txt"),
@@ -484,13 +457,9 @@ export function chooseBestAsrCandidate(
   const scoreMargin = Number(Math.abs(rawScore - denScore).toFixed(2));
 
   if (rawScore >= denScore) {
-    const engine: LocalAsrResultEngine = rawAsr.engine.startsWith("qwen3-asr-remote")
+    const engine: LocalAsrResultEngine = rawAsr.engine.startsWith("qwen3-asr")
       ? "qwen3-asr-remote-dual-raw"
-      : rawAsr.engine.startsWith("qwen3-asr-gpu")
-        ? "qwen3-asr-gpu-dual-raw"
-        : rawAsr.engine.startsWith("qwen3-asr")
-          ? "qwen3-asr-dual-raw"
-          : "sensevoice-dual-raw";
+      : "sensevoice-dual-raw";
     return {
       ...rawAsr,
       engine,
@@ -499,13 +468,9 @@ export function chooseBestAsrCandidate(
       scoreMargin,
     };
   }
-  const engine: LocalAsrResultEngine = denoisedAsr.engine.startsWith("qwen3-asr-remote")
+  const engine: LocalAsrResultEngine = denoisedAsr.engine.startsWith("qwen3-asr")
     ? "qwen3-asr-remote-dual-denoised"
-    : denoisedAsr.engine.startsWith("qwen3-asr-gpu")
-      ? "qwen3-asr-gpu-dual-denoised"
-      : denoisedAsr.engine.startsWith("qwen3-asr")
-        ? "qwen3-asr-dual-denoised"
-        : "sensevoice-dual-denoised";
+    : "sensevoice-dual-denoised";
   return {
     ...denoisedAsr,
     engine,
@@ -522,7 +487,6 @@ export class LocalVoiceEngine {
   private readonly _qwen3Gpu: Qwen3AsrGpuRuntime;
   private readonly _clearVoiceGpu: ClearVoiceGpuRuntime;
   private _preferredAsrEngine: LocalAsrEngineMode = DEFAULT_LOCAL_ASR_ENGINE;
-  private _qwen3ComputeDevice: Qwen3ComputeDeviceMode = DEFAULT_QWEN3_COMPUTE_DEVICE;
   private _sourceSeparator: AudioSourceSeparator | null = null;
   private _gtcrnDenoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
   private _dpdfnetDenoiser: InstanceType<SherpaModuleLike["OfflineSpeechDenoiser"]> | null = null;
@@ -532,11 +496,6 @@ export class LocalVoiceEngine {
   } | null = null;
   private _speakerExtractor: InstanceType<SherpaModuleLike["SpeakerEmbeddingExtractor"]> | null =
     null;
-  private _qwen3AsrRecognizer: Promise<
-    Awaited<ReturnType<SherpaModuleLike["OfflineRecognizer"]["createAsync"]>>
-  > | null = null;
-  private _qwen3AsrInitFailedAt = 0;
-  private _qwen3AsrInitError: string | null = null;
   private _recognizers = new Map<
     string,
     Promise<Awaited<ReturnType<SherpaModuleLike["OfflineRecognizer"]["createAsync"]>>>
@@ -548,17 +507,15 @@ export class LocalVoiceEngine {
     options: {
       modelsDir?: string;
       preferredAsrEngine?: LocalAsrEngineMode;
-      qwen3ComputeDevice?: Qwen3ComputeDeviceMode;
     } = {},
   ) {
     this._modelsDirOverride = options.modelsDir;
     this._preferredAsrEngine = options.preferredAsrEngine ?? DEFAULT_LOCAL_ASR_ENGINE;
-    this._qwen3ComputeDevice = options.qwen3ComputeDevice ?? DEFAULT_QWEN3_COMPUTE_DEVICE;
     const p = resolveVoiceModelPaths(options.modelsDir);
     this._oww = new OpenWakeWordEngine({ modelsDir: p.modelsDir });
     this._tts = new LocalTtsEngine({ modelsDir: p.modelsDir });
-    this._qwen3Gpu = new Qwen3AsrGpuRuntime({ modelsDir: p.modelsDir });
-    this._clearVoiceGpu = new ClearVoiceGpuRuntime({ modelsDir: p.modelsDir });
+    this._qwen3Gpu = new Qwen3AsrGpuRuntime();
+    this._clearVoiceGpu = new ClearVoiceGpuRuntime();
   }
 
   get preferredAsrEngine(): LocalAsrEngineMode {
@@ -568,30 +525,13 @@ export class LocalVoiceEngine {
   set preferredAsrEngine(mode: LocalAsrEngineMode) {
     if (this._preferredAsrEngine !== mode) {
       this._preferredAsrEngine = mode;
-      // 切换策略时重置 Qwen3-ASR 失败冷却以便立即重检
-      this._qwen3AsrInitFailedAt = 0;
-      this._qwen3AsrInitError = null;
+      // 切换策略时重置在线 Qwen3-ASR 失败冷却以便立即重检
       this._qwen3Gpu.resetFailureCooldown();
     }
   }
 
   setPreferredAsrEngine(mode: LocalAsrEngineMode): void {
     this.preferredAsrEngine = mode;
-  }
-
-  get qwen3ComputeDevice(): Qwen3ComputeDeviceMode {
-    return this._qwen3ComputeDevice;
-  }
-
-  set qwen3ComputeDevice(mode: Qwen3ComputeDeviceMode) {
-    if (this._qwen3ComputeDevice !== mode) {
-      this._qwen3ComputeDevice = mode;
-      this._qwen3Gpu.resetFailureCooldown();
-    }
-  }
-
-  setQwen3ComputeDevice(mode: Qwen3ComputeDeviceMode): void {
-    this.qwen3ComputeDevice = mode;
   }
 
   get qwen3Gpu(): Qwen3AsrGpuRuntime {
@@ -654,16 +594,6 @@ export class LocalVoiceEngine {
     return this._oww.scoreClip(pcm16k, wakeWords, opts);
   }
 
-  private _hasQwen3AsrModels(p: LocalVoiceModelPaths = this.paths): boolean {
-    return (
-      existsSync(p.qwen3AsrConvFrontend) &&
-      existsSync(p.qwen3AsrEncoder) &&
-      existsSync(p.qwen3AsrDecoder) &&
-      existsSync(p.qwen3AsrTokenizer) &&
-      existsSync(path.join(p.qwen3AsrTokenizer, "vocab.json"))
-    );
-  }
-
   private _hasSenseVoiceModels(p: LocalVoiceModelPaths = this.paths): boolean {
     return existsSync(p.senseVoiceModel) && existsSync(p.senseVoiceTokens);
   }
@@ -676,12 +606,11 @@ export class LocalVoiceEngine {
     const voxlock = existsSync(p.voxlockEnroll) && existsSync(p.voxlockChunk);
     const sileroVad = existsSync(p.sileroVad);
     const speakerCampp = existsSync(p.speakerCampp);
-    const qwen3AsrCpu = this._hasQwen3AsrModels(p);
     const gpuStatus = this._qwen3Gpu.getStatus();
     const clearVoiceStatus = this._clearVoiceGpu.getStatus();
-    const readyForQwen3Gpu = gpuStatus.ready;
     const readyForQwen3Remote = Boolean(gpuStatus.remote && gpuStatus.ready);
-    const qwen3AsrGpu = gpuStatus.runtimeReady && gpuStatus.modelReady;
+    const readyForQwen3Gpu = readyForQwen3Remote;
+    const readyForQwen3Asr = readyForQwen3Remote;
     const senseVoice = this._hasSenseVoiceModels(p);
     const openWakeWord = existsSync(p.openWakeWordMel) && existsSync(p.openWakeWordEmbedding);
     const cedAudioTagging = existsSync(p.cedModel) && existsSync(p.cedLabels);
@@ -689,21 +618,7 @@ export class LocalVoiceEngine {
     const spleeterSeparation = existsSync(p.spleeterVocals) && existsSync(p.spleeterAccompaniment);
     const ttsStatus = this._tts.getStatus();
     const addonAvailable = sherpa !== null;
-    const readyForQwen3Cpu = addonAvailable && qwen3AsrCpu;
-    const useGpuEligible = this._qwen3ComputeDevice !== "cpu" && readyForQwen3Gpu;
-    const readyForQwen3Asr = useGpuEligible || readyForQwen3Cpu;
-    const activeQwen3Device: "remote" | "gpu" | "cpu" | null =
-      this._qwen3ComputeDevice === "cpu"
-        ? readyForQwen3Cpu
-          ? "cpu"
-          : null
-        : readyForQwen3Remote
-          ? "remote"
-          : readyForQwen3Gpu
-            ? "gpu"
-            : readyForQwen3Cpu
-              ? "cpu"
-              : null;
+    const activeQwen3Device: "remote" | null = readyForQwen3Remote ? "remote" : null;
     const readyForSenseVoice = addonAvailable && senseVoice;
     const readyForLocalAsr =
       this._preferredAsrEngine === "qwen3-asr"
@@ -732,8 +647,8 @@ export class LocalVoiceEngine {
         voxlock,
         sileroVad,
         speakerCampp,
-        qwen3Asr: qwen3AsrCpu || qwen3AsrGpu,
-        qwen3AsrGpu,
+        qwen3Asr: readyForQwen3Remote,
+        qwen3AsrGpu: readyForQwen3Remote,
         senseVoice,
         openWakeWord,
         cedAudioTagging,
@@ -755,7 +670,6 @@ export class LocalVoiceEngine {
       readyForQwen3Gpu,
       readyForQwen3Remote,
       activeQwen3Device,
-      qwen3ComputeDevice: this._qwen3ComputeDevice,
       gpu: gpuStatus,
       readyForSenseVoice,
       readyForLocalAsr,
@@ -777,13 +691,6 @@ export class LocalVoiceEngine {
   }
 
   /**
-   * Qwen3-ASR-0.6B int8 CPU 推理线程数：取物理核数（上限 6），兼顾大矩阵乘吞吐与事件循环平滑响应。
-   */
-  private _qwen3AsrThreads(): number {
-    return Math.min(6, Math.max(2, Math.floor(os.cpus().length / 2)));
-  }
-
-  /**
    * 帧级递归降噪模型（GTCRN / DPDFNet4）实测在单线程下省去每帧线程栅栏开销，速度提升约 10%~25%
    * 且不与并行 ASR/Spleeter 争抢线程池。
    */
@@ -792,20 +699,18 @@ export class LocalVoiceEngine {
   }
 
   /**
-   * 后台异步分阶段预热本地 ONNX 模型（GTCRN / CAM++ / Qwen3-ASR 主方案或 SenseVoice 备用 / openWakeWord），
-   * 每步让出事件循环避免启动/开麦瞬间卡顿。
+   * 后台异步分阶段预热本地 ONNX 基础模型（GTCRN / CAM++ / SenseVoice 备用 / openWakeWord）
+   * 与在线 ClearVoice / Qwen3-ASR 网关轻量探活，每步让出事件循环避免启动/开麦瞬间卡顿。
    */
   async warmup(
     options: {
       preloadEnglish?: boolean;
       localAsrEngine?: LocalAsrEngineMode;
-      qwen3ComputeDevice?: Qwen3ComputeDeviceMode;
       voicePipelineMode?: VoicePipelineMode;
     } = {},
   ): Promise<void> {
     const yieldTick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
     const mode = options.localAsrEngine ?? this._preferredAsrEngine;
-    const deviceMode = options.qwen3ComputeDevice ?? this._qwen3ComputeDevice;
     try {
       this._oww.ensureLoaded();
       await yieldTick();
@@ -821,8 +726,8 @@ export class LocalVoiceEngine {
         void this._clearVoiceGpu.warmup().catch(() => {});
       }
       if (mode !== "sensevoice") {
-        // 1. 若检测到可用 GPU 且未强制仅 CPU，优先预热 GPU 运行时（含 Vulkan 着色器预热），无需加载 9.5s CPU ONNX
-        if (deviceMode !== "cpu" && this._qwen3Gpu.getStatus().ready && !this._qwen3Gpu.isInFailureCooldown()) {
+        // 已配置在线 Qwen3-ASR 网关时执行轻量 /health 探活
+        if (this._qwen3Gpu.getStatus().ready && !this._qwen3Gpu.isInFailureCooldown()) {
           try {
             await this._qwen3Gpu.warmup();
             if (options.preloadEnglish && this._hasSenseVoiceModels()) {
@@ -831,23 +736,11 @@ export class LocalVoiceEngine {
             }
             return;
           } catch {
-            // GPU 预热失败自动回落 CPU Qwen3-ASR
-          }
-        }
-        // 2. CPU Qwen3-ASR 预热
-        if (this._hasQwen3AsrModels()) {
-          try {
-            await this._ensureQwen3AsrRecognizer();
-            if (options.preloadEnglish && this._hasSenseVoiceModels()) {
-              await yieldTick();
-              await this._ensureRecognizer("en");
-            }
-            return;
-          } catch {
-            // 主方案预热失败时按 auto 策略降级预热 SenseVoice 储备模型
+            // 在线探活异常时按 auto 策略降级预热 SenseVoice 储备模型
             if (mode === "qwen3-asr") return;
           }
         }
+        if (mode === "qwen3-asr") return;
       }
       await this._ensureRecognizer("auto");
       if (options.preloadEnglish) {
@@ -1059,54 +952,6 @@ export class LocalVoiceEngine {
       this._lastError = err instanceof Error ? err.message : String(err);
       return null;
     }
-  }
-
-  private async _ensureQwen3AsrRecognizer(): Promise<
-    Awaited<ReturnType<SherpaModuleLike["OfflineRecognizer"]["createAsync"]>> | null
-  > {
-    const sherpa = loadSherpaModule();
-    const p = this.paths;
-    if (!sherpa || !this._hasQwen3AsrModels(p)) {
-      return null;
-    }
-    if (this._qwen3AsrRecognizer) {
-      return this._qwen3AsrRecognizer;
-    }
-    const promise = sherpa.OfflineRecognizer.createAsync({
-      featConfig: { sampleRate: 16000, featureDim: 80 },
-      modelConfig: {
-        qwen3Asr: {
-          convFrontend: p.qwen3AsrConvFrontend,
-          encoder: p.qwen3AsrEncoder,
-          decoder: p.qwen3AsrDecoder,
-          tokenizer: p.qwen3AsrTokenizer,
-          hotwords: "",
-          maxTotalLen: 1024,
-          maxNewTokens: 256,
-          temperature: 1e-6,
-          topP: 0.8,
-          seed: 42,
-        },
-        tokens: "",
-        numThreads: this._qwen3AsrThreads(),
-        debug: false,
-        provider: "cpu",
-      },
-    })
-      .then((rec) => {
-        this._qwen3AsrInitFailedAt = 0;
-        this._qwen3AsrInitError = null;
-        return rec;
-      })
-      .catch((err) => {
-        this._qwen3AsrRecognizer = null;
-        this._qwen3AsrInitFailedAt = Date.now();
-        this._qwen3AsrInitError = err instanceof Error ? err.message : String(err);
-        this._lastError = this._qwen3AsrInitError;
-        throw err;
-      });
-    this._qwen3AsrRecognizer = promise;
-    return promise;
   }
 
   private async _ensureRecognizer(
@@ -1351,7 +1196,7 @@ export class LocalVoiceEngine {
   }
 
   /**
-   * 主方案：本地离线 Qwen3-ASR-0.6B（自动识别 GPU 优先加速，无 GPU 或异常时自动无缝回退 CPU ONNX）。
+   * 主方案：在线 Qwen3-ASR-0.6B（仅支持在线 Voice & ASR Gateway 远端 GPU 推理）。
    */
   async transcribeWithQwen3Asr(
     input: Float32Array,
@@ -1359,114 +1204,37 @@ export class LocalVoiceEngine {
     voiceLang = "zh-CN",
     options: Pick<
       LocalAsrTranscribeOptions,
-      "hotwords" | "maxNewTokens" | "computeDevice" | "allowFallback" | "onPartial" | "signal"
+      "hotwords" | "maxNewTokens" | "allowFallback" | "onPartial" | "signal"
     > = {},
   ): Promise<LocalAsrOutput> {
     if (options.signal?.aborted) {
       throw new DOMException("Aborted", "AbortError");
     }
-    const t0 = performance.now();
     const pcm16k = sampleRate === 16000 ? input : resampleLinear(input, sampleRate, 16000);
-    const deviceMode = options.computeDevice ?? this._qwen3ComputeDevice;
     const gpuStatus = this._qwen3Gpu.getStatus();
-    const canTryGpu =
-      deviceMode !== "cpu" && gpuStatus.ready && !this._qwen3Gpu.isInFailureCooldown();
-
-    // Tier 1: GPU 加速推理（RTX / Radeon / Arc / Apple Silicon，实测 ~150~220ms/句，支持 SSE 逐 token 流式）
-    if (canTryGpu) {
-      try {
-        const gpuRes = await this._qwen3Gpu.transcribe(pcm16k, {
-          voiceLang,
-          hotwords: options.hotwords,
-          maxTokens: options.maxNewTokens,
-          onPartial: options.onPartial,
-          signal: options.signal,
-        });
-        const isRemote = gpuRes.backend === "remote";
-        return {
-          text: gpuRes.text,
-          rawText: gpuRes.rawText,
-          lang: gpuRes.lang,
-          emotion: "",
-          event: "",
-          engine: isRemote
-            ? options.onPartial
-              ? "qwen3-asr-remote-stream"
-              : "qwen3-asr-remote"
-            : options.onPartial
-              ? "qwen3-asr-gpu-stream"
-              : "qwen3-asr-gpu",
-          durationMs: gpuRes.durationMs,
-          computeDevice: isRemote ? "remote" : "gpu",
-          gpuDeviceName: gpuRes.deviceName,
-          fallbackUsed: false,
-        };
-      } catch (err) {
-        if (options.signal?.aborted || (err instanceof DOMException && err.name === "AbortError")) {
-          throw err;
-        }
-        const reason = err instanceof Error ? err.message : String(err);
-        this._lastError = reason;
-        // 显式指定仅 GPU 且禁止回落时直接抛错，否则静默回退至 CPU Qwen3-ASR
-        if (deviceMode === "gpu" && options.allowFallback === false) {
-          throw err;
-        }
-      }
-    }
-
-    if (options.signal?.aborted) {
-      throw new DOMException("Aborted", "AbortError");
-    }
-
-    // Tier 2: CPU ONNX Qwen3-ASR-0.6B int8
-    const recognizer = await this._ensureQwen3AsrRecognizer();
-    if (!recognizer) {
+    if (!gpuStatus.ready) {
       throw new Error(
-        "本地离线 Qwen3-ASR-0.6B 语音识别模型尚未就绪，请在「设置 → 语音与 Pi Agent」中点击一键补齐本地语音模型，或切换备用 SenseVoice 方案。",
+        "在线 Qwen3-ASR-0.6B 服务尚未配置（仅支持在线模式），请在「设置 → 语音与 Pi Agent → 在线 ClearVoice 与 Qwen3-ASR 模型网关」中填写服务地址与授权码，或切换备用 SenseVoice 方案。",
       );
     }
 
-    const stream = recognizer.createStream();
-    const qwenLang = mapQwen3AsrLang(voiceLang);
-    if (qwenLang && typeof stream.setOption === "function") {
-      stream.setOption("language", qwenLang);
-    }
-    if (options.hotwords && options.hotwords.length > 0 && typeof stream.setOption === "function") {
-      const csv = options.hotwords
-        .map((w) => w.replace(/,/g, " ").trim())
-        .filter((w) => w.length > 0)
-        .slice(0, 12)
-        .join(",");
-      if (csv) {
-        stream.setOption("hotwords", csv);
-      }
-    }
-    const effectiveMaxNewTokens =
-      typeof options.maxNewTokens === "number" &&
-      Number.isFinite(options.maxNewTokens) &&
-      options.maxNewTokens > 0
-        ? Math.round(options.maxNewTokens)
-        : Math.max(128, Math.min(384, Math.ceil((pcm16k.length / 16000) * 16) + 32));
-    if (typeof stream.setOption === "function") {
-      stream.setOption("max_new_tokens", String(effectiveMaxNewTokens));
-    }
-    stream.acceptWaveform({ samples: pcm16k, sampleRate: 16000 });
-    const rawResult = await recognizer.decodeAsync(stream);
-    const rawText = String(rawResult?.text ?? "");
-    const text = cleanQwen3AsrText(rawText);
-    if (!options.signal?.aborted && text && options.onPartial) {
-      options.onPartial(text);
-    }
-
+    const gpuRes = await this._qwen3Gpu.transcribe(pcm16k, {
+      voiceLang,
+      hotwords: options.hotwords,
+      maxTokens: options.maxNewTokens,
+      onPartial: options.onPartial,
+      signal: options.signal,
+    });
     return {
-      text,
-      rawText,
-      lang: String(rawResult?.lang ?? qwenLang),
-      emotion: String(rawResult?.emotion ?? ""),
-      event: String(rawResult?.event ?? ""),
-      engine: options.onPartial ? "qwen3-asr-stream" : "qwen3-asr-local",
-      durationMs: Math.round(performance.now() - t0),
-      computeDevice: "cpu",
+      text: gpuRes.text,
+      rawText: gpuRes.rawText,
+      lang: gpuRes.lang,
+      emotion: "",
+      event: "",
+      engine: options.onPartial ? "qwen3-asr-remote-stream" : "qwen3-asr-remote",
+      durationMs: gpuRes.durationMs,
+      computeDevice: "remote",
+      gpuDeviceName: gpuRes.deviceName,
       fallbackUsed: false,
     };
   }
@@ -1486,7 +1254,7 @@ export class LocalVoiceEngine {
     const recognizer = await this._ensureRecognizer(svLang);
     if (!recognizer) {
       throw new Error(
-        "本地离线 SenseVoice 备用语音识别模型尚未就绪，请在「设置 → 语音与 Pi Agent」中点击一键下载本地语音模型，或配置 STT 接口。",
+        "本地离线 SenseVoice 备用语音识别模型尚未就绪，请在「设置 → 语音与 Pi Agent」中点击一键补齐本地模型，或配置在线 Qwen3-ASR / STT 接口。",
       );
     }
 
@@ -1510,10 +1278,10 @@ export class LocalVoiceEngine {
   }
 
   /**
-   * 本地离线多语种 ASR 统一入口：
-   * - `auto`（默认）：主用 Qwen3-ASR-0.6B（自动检测 GPU 加速 -> CPU ONNX 降级），若主方案不可用或异常则无缝切换至备用 SenseVoiceSmall int8
-   * - `qwen3-asr`：显式指定 Qwen3-ASR-0.6B（GPU/CPU）
-   * - `sensevoice`：显式切换至备用 SenseVoiceSmall int8
+   * 多语种语音识别统一入口：
+   * - `auto`（默认）：主用在线 Qwen3-ASR-0.6B，若在线服务未配置或异常则无缝切换至本地备用 SenseVoiceSmall int8
+   * - `qwen3-asr`：显式指定在线 Qwen3-ASR-0.6B
+   * - `sensevoice`：显式切换至本地备用 SenseVoiceSmall int8
    */
   async transcribeLocal(
     input: Float32Array,
@@ -1533,24 +1301,16 @@ export class LocalVoiceEngine {
       return svRes;
     }
 
-    const deviceMode = options.computeDevice ?? this._qwen3ComputeDevice;
-    const hasQwen3Gpu =
-      deviceMode !== "cpu" &&
-      this._qwen3Gpu.getStatus().ready &&
-      !this._qwen3Gpu.isInFailureCooldown();
-    const hasQwen3Cpu = this._hasQwen3AsrModels();
+    const qwenStatus = this._qwen3Gpu.getStatus();
+    const hasQwen3Remote = qwenStatus.ready && !this._qwen3Gpu.isInFailureCooldown();
     const hasSenseVoice = this._hasSenseVoiceModels();
     const allowFallback = options.allowFallback ?? mode === "auto";
-    const inCpuInitCooldown =
-      this._qwen3AsrInitFailedAt > 0 &&
-      Date.now() - this._qwen3AsrInitFailedAt < QWEN3_ASR_INIT_RETRY_COOLDOWN_MS;
 
-    if (hasQwen3Gpu || (hasQwen3Cpu && !inCpuInitCooldown)) {
+    if (hasQwen3Remote) {
       try {
         return await this.transcribeWithQwen3Asr(input, sampleRate, voiceLang, {
           hotwords: options.hotwords,
           maxNewTokens: options.maxNewTokens,
-          computeDevice: deviceMode,
           allowFallback,
           onPartial: options.onPartial,
           signal: options.signal,
@@ -1578,9 +1338,9 @@ export class LocalVoiceEngine {
     if (allowFallback && hasSenseVoice) {
       const svRes = await this.transcribeWithSenseVoice(input, sampleRate, voiceLang, {
         asFallback: true,
-        fallbackReason: hasQwen3Cpu
-          ? `qwen3-asr-cooldown: ${this._qwen3AsrInitError || "init failed"}`
-          : "qwen3-asr-model-missing",
+        fallbackReason: this._qwen3Gpu.isInFailureCooldown()
+          ? `qwen3-asr-cooldown: ${qwenStatus.lastError || "remote auth/init failed"}`
+          : "qwen3-asr-remote-unconfigured",
       });
       if (!options.signal?.aborted && svRes.text && options.onPartial) {
         options.onPartial(svRes.text);
@@ -1590,16 +1350,16 @@ export class LocalVoiceEngine {
 
     throw new Error(
       mode === "qwen3-asr"
-        ? "本地离线 Qwen3-ASR-0.6B 模型尚未就绪，请在「设置 → 语音与 Pi Agent」中点击一键补齐模型，或将本地语音识别方案设为「自动（主用 Qwen3-ASR · 备用 SenseVoice）」。"
-        : "本地离线语音识别模型（Qwen3-ASR-0.6B 主方案 / SenseVoice 备用方案）均未就绪，请在「设置 → 语音与 Pi Agent」中点击一键下载本地语音模型，或配置 STT 接口。",
+        ? "在线 Qwen3-ASR-0.6B 服务尚未配置（仅支持在线模式），请在「设置 → 语音与 Pi Agent → 在线 ClearVoice 与 Qwen3-ASR 模型网关」中填写地址与授权码，或将转写方案设为「自动」。"
+        : "在线 Qwen3-ASR-0.6B 主方案与本地 SenseVoice 备用方案均未就绪，请在「设置 → 语音与 Pi Agent」中配置在线模型网关、补齐本地备用模型或配置 STT 接口。",
     );
   }
 
   /**
-   * 抗音乐/强噪双轨本地识别 + 中英混说唤醒词句首英文探针恢复：
-   * - 默认使用 Qwen3-ASR-0.6B（CPU）主方案，未就绪/异常时自动降级 SenseVoice 备用方案；
+   * 抗音乐/强噪双轨识别 + 中英混说唤醒词句首英文探针恢复：
+   * - 默认优先使用在线 Qwen3-ASR-0.6B 主方案，未配置/异常时自动降级本地 SenseVoice 备用方案；
    * - 高信噪比安静环境优先单轨极速解码；
-   * - 嘈杂环境/音乐播放，或降噪单轨未检出唤醒词：融合「高通原始轨」与「神经降噪轨」择优（Qwen3-ASR 在 CPU 上采用顺序双轨避免 0.6B 模型争抢内存带宽，且首轨精确命中唤醒指令时自动早退）；
+   * - 嘈杂环境/音乐播放，或降噪单轨未检出唤醒词：融合「高通原始轨」与「神经降噪轨」择优（在线 Qwen3-ASR 顺序单轨优先且首轨精确命中时早退减少往返）；
    * - 若配置了英文唤醒词且主解码仍未命中，按需触发句首英文探针恢复。
    */
   async transcribeDualTrack(
@@ -1627,7 +1387,8 @@ export class LocalVoiceEngine {
     };
     const usingQwen3Primary =
       asrMode !== "sensevoice" &&
-      (this._hasQwen3AsrModels() || (this._qwen3ComputeDevice !== "cpu" && this._qwen3Gpu.getStatus().ready));
+      this._qwen3Gpu.getStatus().ready &&
+      !this._qwen3Gpu.isInFailureCooldown();
 
     let best: LocalAsrOutput;
     let dualRawRes: LocalAsrOutput | null = null;
@@ -1721,13 +1482,9 @@ export class LocalVoiceEngine {
               };
             }
           } else if (sel.choice === "track_a") {
-            const rawDualEngine: LocalAsrResultEngine = dualRawRes.engine.startsWith("qwen3-asr-remote")
+            const rawDualEngine: LocalAsrResultEngine = dualRawRes.engine.startsWith("qwen3-asr")
               ? "qwen3-asr-remote-dual-raw"
-              : dualRawRes.engine.startsWith("qwen3-asr-gpu")
-                ? "qwen3-asr-gpu-dual-raw"
-                : dualRawRes.engine.startsWith("qwen3-asr")
-                  ? "qwen3-asr-dual-raw"
-                  : "sensevoice-dual-raw";
+              : "sensevoice-dual-raw";
             best = {
               ...dualRawRes,
               engine: rawDualEngine,
@@ -1736,13 +1493,9 @@ export class LocalVoiceEngine {
               scoreMargin: best.scoreMargin,
             };
           } else if (sel.choice === "track_b") {
-            const denDualEngine: LocalAsrResultEngine = dualDenRes.engine.startsWith("qwen3-asr-remote")
+            const denDualEngine: LocalAsrResultEngine = dualDenRes.engine.startsWith("qwen3-asr")
               ? "qwen3-asr-remote-dual-denoised"
-              : dualDenRes.engine.startsWith("qwen3-asr-gpu")
-                ? "qwen3-asr-gpu-dual-denoised"
-                : dualDenRes.engine.startsWith("qwen3-asr")
-                  ? "qwen3-asr-dual-denoised"
-                  : "sensevoice-dual-denoised";
+              : "sensevoice-dual-denoised";
             best = {
               ...dualDenRes,
               engine: denDualEngine,
@@ -1929,8 +1682,9 @@ export class LocalVoiceEngine {
   }
 
   /**
-   * 一键补齐下载缺失的本地 ONNX 模型（GTCRN / DPDFNet4 / Silero VAD / 3D-Speaker CAM++ /
-   * Qwen3-ASR-0.6B int8 主方案 / SenseVoiceSmall int8 备用方案 / openWakeWord）。
+   * 一键补齐下载缺失的本地 ONNX 基础模型（GTCRN / DPDFNet4 / Silero VAD / 3D-Speaker CAM++ /
+   * SenseVoiceSmall int8 备用方案 / openWakeWord / 本地温柔女声 TTS）。
+   * 注：ClearVoice 与 Qwen3-ASR 仅支持在线网关模式，不再下载本地模型权重。
    */
   async downloadMissingModels(): Promise<LocalVoiceEngineStatus> {
     if (this._downloading) {
@@ -2010,42 +1764,9 @@ export class LocalVoiceEngine {
       await fetchFile(OPEN_WAKEWORD_MODEL_URLS.embedding, p.openWakeWordEmbedding);
       this._oww.ensureLoaded();
 
-      // 1. 先补齐 SenseVoice 储备/备用模型（体积小，先保底离线识别可用）
+      // 补齐 SenseVoice 本地备用模型（在线 Qwen3-ASR 未配置或异常时无缝兜底）
       if (!this._hasSenseVoiceModels(p)) {
         await fetchAndExtractTar(MODEL_URLS.senseVoiceTar, "sensevoice.tar.bz2", "SenseVoice");
-      }
-
-      // 2. 补齐 Qwen3-ASR-0.6B int8 主方案模型（CPU 高精度多语种 ASR，流式落盘零大内存占用）
-      if (!this._hasQwen3AsrModels(p)) {
-        await fetchAndExtractTar(MODEL_URLS.qwen3AsrTar, "qwen3-asr-0.6B-int8.tar.bz2", "Qwen3-ASR-0.6B");
-        this._qwen3AsrInitFailedAt = 0;
-        this._qwen3AsrInitError = null;
-      }
-
-      // 2.5 若本机检测到硬件 GPU 且未配置在线 Qwen3-ASR 网关，自动补齐本地 Qwen3-ASR-0.6B Vulkan GPU 组件
-      if (
-        !this._qwen3Gpu.isRemoteConfigured() &&
-        this._qwen3Gpu.detectGpu(true) &&
-        !this._qwen3Gpu.getStatus().ready
-      ) {
-        try {
-          await this._qwen3Gpu.downloadMissingAssets();
-        } catch {
-          // GPU 加速组件为自动增强项，下载失败时无缝使用已就绪的 CPU Qwen3-ASR
-        }
-      }
-
-      // 2.6 若未配置在线 ClearVoice 网关且已就绪本地 ClearVoice 运行时但缺失模型，顺带补齐
-      if (
-        !this._clearVoiceGpu.isRemoteConfigured() &&
-        this._clearVoiceGpu.hasRuntime() &&
-        (!this._clearVoiceGpu.hasModel() || !this._clearVoiceGpu.hasSsModel())
-      ) {
-        try {
-          await this._clearVoiceGpu.downloadMissingModel();
-        } catch {
-          // ClearVoice 为可选增强方案，下载失败不阻断主方案
-        }
       }
 
       const fetchAndExtractOptionalTar = async (url: string, checkFile: string, archiveName: string) => {
@@ -2098,9 +1819,6 @@ export class LocalVoiceEngine {
     this._dpdfnetDenoiser = null;
     this._voxlockDenoiser = null;
     this._speakerExtractor = null;
-    this._qwen3AsrRecognizer = null;
-    this._qwen3AsrInitFailedAt = 0;
-    this._qwen3AsrInitError = null;
     this._recognizers.clear();
   }
 }
