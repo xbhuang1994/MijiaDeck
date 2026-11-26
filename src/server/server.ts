@@ -498,6 +498,9 @@ export async function startMijiaDeckServer(
         ) {
           stream.setVoicePipelineMode(streamOpts.voicePipelineMode);
         }
+        if (streamOpts?.noiseSuppressionMode !== undefined) {
+          stream.setNoiseMode(streamOpts.noiseSuppressionMode);
+        }
         if (
           typeof streamOpts?.vadSilenceMs === "number" ||
           streamOpts?.vadSensitivity !== undefined

@@ -464,6 +464,187 @@ export function spectralSubtractDenoise(
 }
 
 /**
+ * 连续流式纯 TS 频谱维纳降噪器（85Hz 连续高通 + 512 点周期 sqrt-Hann 50% 重叠 STFT/ISTFT +
+ * 逐频点非对称底噪追踪）：
+ * - 当用户选择 `dsp` 模式或本地 ONNX 降噪模型（GTCRN/DPDFNet4）尚未就绪时，
+ *   保障待机与对话实时流仍具备连续低延迟（16ms 帧移）环境降噪能力，不再退化为零降噪直通。
+ */
+export class StreamingDspDenoiser {
+  readonly sampleRate: number;
+  readonly frameShiftInSamples = 256;
+
+  private readonly _fftSize = 512;
+  private readonly _hop = 256;
+  private readonly _bins = 257;
+  private readonly _win: Float32Array;
+  private readonly _hpAlpha: number;
+
+  private _hpPrevX = 0;
+  private _hpPrevY = 0;
+  private _inPending = new Float32Array(0);
+  private _prevInputHalf = new Float32Array(256);
+  private _olaTail = new Float32Array(256);
+  private _noisePsd = new Float32Array(257);
+  private _prevGain = new Float32Array(257).fill(1);
+  private _noiseInitialized = false;
+  private _re = new Float32Array(512);
+  private _im = new Float32Array(512);
+
+  constructor(sampleRate = 16000) {
+    this.sampleRate = sampleRate;
+    const rc = 1 / (2 * Math.PI * 85);
+    const dt = 1 / sampleRate;
+    this._hpAlpha = rc / (rc + dt);
+    this._win = new Float32Array(this._fftSize);
+    for (let i = 0; i < this._fftSize; i += 1) {
+      // 周期 sqrt-Hann：50% hop 完美满足 COLA（sin^2 + cos^2 === 1）
+      this._win[i] = Math.sin((Math.PI * i) / this._fftSize);
+    }
+  }
+
+  reset(): void {
+    this._hpPrevX = 0;
+    this._hpPrevY = 0;
+    this._inPending = new Float32Array(0);
+    this._prevInputHalf.fill(0);
+    this._olaTail.fill(0);
+    this._noisePsd.fill(0);
+    this._prevGain.fill(1);
+    this._noiseInitialized = false;
+  }
+
+  private _processHop(hopSamples: Float32Array, outDest: Float32Array, outOffset: number): void {
+    const N = this._fftSize;
+    const H = this._hop;
+    const B = this._bins;
+    const re = this._re;
+    const im = this._im;
+    const win = this._win;
+
+    // 拼接 [prev 256, curr 256] 并施加 85Hz 高通 + sqrt-Hann 分析窗
+    for (let i = 0; i < H; i += 1) {
+      re[i] = this._prevInputHalf[i]! * win[i]!;
+      im[i] = 0;
+    }
+    let prevX = this._hpPrevX;
+    let prevY = this._hpPrevY;
+    const alpha = this._hpAlpha;
+    for (let i = 0; i < H; i += 1) {
+      const x = hopSamples[i]!;
+      const y = alpha * (prevY + x - prevX);
+      prevX = x;
+      prevY = y;
+      this._prevInputHalf[i] = y;
+      re[H + i] = y * win[H + i]!;
+      im[H + i] = 0;
+    }
+    this._hpPrevX = prevX;
+    this._hpPrevY = prevY;
+
+    fftInPlace(re, im, false);
+
+    // 帧级信噪比辅助判断：语音活跃帧极慢更新底噪，静默/稳态噪声帧平稳跟踪底噪
+    let totalPwr = 0;
+    let totalNoise = 0;
+    for (let k = 0; k < B; k += 1) {
+      const p = re[k]! * re[k]! + im[k]! * im[k]!;
+      totalPwr += p;
+      totalNoise += this._noisePsd[k]!;
+    }
+
+    if (!this._noiseInitialized) {
+      for (let k = 0; k < B; k += 1) {
+        this._noisePsd[k] = re[k]! * re[k]! + im[k]! * im[k]!;
+      }
+      this._noiseInitialized = true;
+    } else {
+      const speechLikely = totalNoise > 1e-10 && totalPwr > totalNoise * 2.2;
+      const upRate = speechLikely ? 0.0025 : 0.08;
+      const downRate = speechLikely ? 0.16 : 0.12;
+      for (let k = 0; k < B; k += 1) {
+        const p = re[k]! * re[k]! + im[k]! * im[k]!;
+        const cur = this._noisePsd[k]!;
+        const rate = p < cur ? downRate : upRate;
+        this._noisePsd[k] = cur * (1 - rate) + p * rate;
+      }
+    }
+
+    const oversubtract = 1.75;
+    const gainFloor = 0.12;
+    for (let k = 0; k < B; k += 1) {
+      const p = re[k]! * re[k]! + im[k]! * im[k]!;
+      const cleanEst = Math.max(0, p - oversubtract * this._noisePsd[k]!);
+      const wiener = p > 1e-12 ? cleanEst / p : gainFloor;
+      const clamped = Math.max(gainFloor, Math.min(1, wiener));
+      const g = 0.35 * this._prevGain[k]! + 0.65 * clamped;
+      this._prevGain[k] = g;
+
+      re[k] = re[k]! * g;
+      im[k] = im[k]! * g;
+      if (k > 0 && k < B - 1) {
+        const mirror = N - k;
+        re[mirror] = re[mirror]! * g;
+        im[mirror] = im[mirror]! * g;
+      }
+    }
+
+    fftInPlace(re, im, true);
+
+    for (let i = 0; i < H; i += 1) {
+      const s = this._olaTail[i]! + re[i]! * win[i]!;
+      outDest[outOffset + i] = Math.max(-1, Math.min(1, s));
+      this._olaTail[i] = re[H + i]! * win[H + i]!;
+    }
+  }
+
+  run(req: { samples: Float32Array; sampleRate: number }): {
+    samples: Float32Array;
+    sampleRate: number;
+  } {
+    const input =
+      req.sampleRate === this.sampleRate
+        ? req.samples
+        : resampleLinear(req.samples, req.sampleRate, this.sampleRate);
+    if (input.length === 0) {
+      return { samples: new Float32Array(0), sampleRate: this.sampleRate };
+    }
+
+    let buf: Float32Array;
+    if (this._inPending.length === 0) {
+      buf = input;
+    } else {
+      buf = new Float32Array(this._inPending.length + input.length);
+      buf.set(this._inPending, 0);
+      buf.set(input, this._inPending.length);
+    }
+
+    const H = this._hop;
+    const fullHops = Math.floor(buf.length / H);
+    const out = new Float32Array(fullHops * H);
+    for (let h = 0; h < fullHops; h += 1) {
+      this._processHop(buf.subarray(h * H, (h + 1) * H), out, h * H);
+    }
+
+    const consumed = fullHops * H;
+    this._inPending = consumed < buf.length ? buf.slice(consumed) : new Float32Array(0);
+    return { samples: out, sampleRate: this.sampleRate };
+  }
+
+  flush(): { samples: Float32Array; sampleRate: number } {
+    if (this._inPending.length === 0) {
+      return { samples: new Float32Array(0), sampleRate: this.sampleRate };
+    }
+    const pendingLen = this._inPending.length;
+    const padded = new Float32Array(this._hop);
+    padded.set(this._inPending, 0);
+    this._inPending = new Float32Array(0);
+    const tmp = new Float32Array(this._hop);
+    this._processHop(padded, tmp, 0);
+    return { samples: tmp.slice(0, pendingLen), sampleRate: this.sampleRate };
+  }
+}
+
+/**
  * 纯 TS 自适应底噪 + 过零率端点检测（Silero VAD 不可用时的降级方案）。
  */
 export function adaptiveEnergyVad(
