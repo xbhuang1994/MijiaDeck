@@ -9,6 +9,8 @@
 
 import {
   isLocalEndpointUrl,
+  resolveEffectiveClearVoiceAuth,
+  resolveEffectiveQwen3AsrAuth,
   resolveEffectiveSttAuth,
   type AgentVoiceConfig,
   type CavemanReplyMode,
@@ -275,6 +277,9 @@ export interface VoiceListenerSnapshot {
   engine: VoiceRuntimeEngine;
   voicePipelineMode: AgentVoiceConfig["voicePipelineMode"];
   clearVoiceServiceUrl: string;
+  clearVoiceModel: string;
+  qwen3AsrServiceUrl: string;
+  qwen3AsrModel: string;
   localAsrEngine: AgentVoiceConfig["localAsrEngine"];
   qwen3ComputeDevice: AgentVoiceConfig["qwen3ComputeDevice"];
   qwen3StreamingEnabled: boolean;
@@ -558,10 +563,10 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         ? Math.round(options.maxIdleRechecks)
         : DEFAULT_MAX_IDLE_RECHECKS;
     this._conversationEndEvaluatorOverride = options.conversationEndEvaluatorOverride;
-    this._localEngine.setPreferredAsrEngine?.(this.config.localAsrEngine);
-    this._localEngine.setQwen3ComputeDevice?.(this.config.qwen3ComputeDevice);
-    this._localEngine.setClearVoiceServiceUrl?.(this.config.clearVoiceServiceUrl);
+    this._syncLocalEngineConfig();
     this._engine = this._localEngine.getStatus().readyForLocalAsr ? "local" : "browser";
+    // 若已配置在线 ClearVoice / Qwen3-ASR 网关，启动后异步探活并同步远端 GPU 名称与状态（非阻塞）
+    this._triggerRemoteGatewayProbeIfConfigured();
 
     // 转发 Pi Agent 流式分句语音播报事件，并登记到多语段回声账本（带唯一 utteranceId 与确认提问标记）
     this._unsubAgentSpeak = this._agent.on(
@@ -635,6 +640,45 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
 
   get trackMuteManager(): ConversationTrackMuteManager {
     return this._trackMuteManager;
+  }
+
+  private _syncLocalEngineConfig(): void {
+    const cfg = this.config;
+    const cvAuth = resolveEffectiveClearVoiceAuth(cfg);
+    const qwenAuth = resolveEffectiveQwen3AsrAuth(cfg);
+    this._localEngine.setPreferredAsrEngine?.(cfg.localAsrEngine);
+    this._localEngine.setQwen3ComputeDevice?.(cfg.qwen3ComputeDevice);
+    if (typeof this._localEngine.setClearVoiceRemoteConfig === "function") {
+      this._localEngine.setClearVoiceRemoteConfig({
+        serviceUrl: cvAuth.serviceUrl,
+        apiKey: cvAuth.apiKey ?? "",
+        model: cvAuth.model,
+      });
+    } else {
+      this._localEngine.setClearVoiceServiceUrl?.(cvAuth.serviceUrl);
+    }
+    this._localEngine.setQwen3AsrRemoteConfig?.({
+      serviceUrl: qwenAuth.serviceUrl,
+      apiKey: qwenAuth.apiKey ?? "",
+      model: qwenAuth.model,
+    });
+  }
+
+  private _triggerRemoteGatewayProbeIfConfigured(): void {
+    const cv = this._localEngine.clearVoiceGpu;
+    const qwen = this._localEngine.qwen3Gpu;
+    const probes: Promise<unknown>[] = [];
+    if (cv && typeof cv.isRemoteConfigured === "function" && cv.isRemoteConfigured()) {
+      probes.push(cv.probeRemoteHealth({ timeoutMs: 6000 }).catch(() => null));
+    }
+    if (qwen && typeof qwen.isRemoteConfigured === "function" && qwen.isRemoteConfigured()) {
+      probes.push(qwen.probeRemoteHealth({ timeoutMs: 6000 }).catch(() => null));
+    }
+    if (probes.length > 0) {
+      void Promise.all(probes).then(() => {
+        this.emit("stateChanged", this.snapshot());
+      });
+    }
   }
 
   getRecentHistoryForSystemOne(limit = 5): SystemOneHistoryEntry[] {
@@ -1486,9 +1530,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     interimTranscript?: string;
     error?: string | null;
   }): VoiceListenerSnapshot {
-    this._localEngine.setPreferredAsrEngine?.(this.config.localAsrEngine);
-    this._localEngine.setQwen3ComputeDevice?.(this.config.qwen3ComputeDevice);
-    this._localEngine.setClearVoiceServiceUrl?.(this.config.clearVoiceServiceUrl);
+    this._syncLocalEngineConfig();
     if (patch.active !== undefined) {
       this._active = Boolean(patch.active);
       if (!this._active) {
@@ -2391,9 +2433,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     }
 
     // ---- Stage 1.5: 本地自适应多级声源分离与说话人隔离主通道（S_Fused 最终方案） ----
-    this._localEngine.setPreferredAsrEngine?.(cfg.localAsrEngine);
-    this._localEngine.setQwen3ComputeDevice?.(cfg.qwen3ComputeDevice);
-    this._localEngine.setClearVoiceServiceUrl?.(cfg.clearVoiceServiceUrl);
+    this._syncLocalEngineConfig();
     const sttAuthPre = resolveEffectiveSttAuth(cfg);
     const hasCloudSttPre = Boolean(
       sttAuthPre.baseUrl && (sttAuthPre.apiKey || isLocalEndpointUrl(sttAuthPre.baseUrl)),
@@ -2907,9 +2947,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const vpAudio =
       segment.denoisedSamples.length >= 4000 ? segment.denoisedSamples : segment.rawSamples;
 
-    this._localEngine.setPreferredAsrEngine?.(cfg.localAsrEngine);
-    this._localEngine.setQwen3ComputeDevice?.(cfg.qwen3ComputeDevice);
-    this._localEngine.setClearVoiceServiceUrl?.(cfg.clearVoiceServiceUrl);
+    this._syncLocalEngineConfig();
     const sttAuth = resolveEffectiveSttAuth(cfg);
     const hasCloudStt = Boolean(
       sttAuth.baseUrl && (sttAuth.apiKey || isLocalEndpointUrl(sttAuth.baseUrl)),
@@ -4415,9 +4453,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
 
   snapshot(): VoiceListenerSnapshot {
     const cfg = this.config;
-    this._localEngine.setPreferredAsrEngine?.(cfg.localAsrEngine);
-    this._localEngine.setQwen3ComputeDevice?.(cfg.qwen3ComputeDevice);
-    this._localEngine.setClearVoiceServiceUrl?.(cfg.clearVoiceServiceUrl);
+    this._syncLocalEngineConfig();
     const now = Date.now();
     const conversationHoldReason = this._resolveConversationHoldReason();
     const effectivePaused = this._timerPaused || conversationHoldReason !== null;
@@ -4483,6 +4519,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       engine: this._engine,
       voicePipelineMode: cfg.voicePipelineMode,
       clearVoiceServiceUrl: cfg.clearVoiceServiceUrl,
+      clearVoiceModel: cfg.clearVoiceModel,
+      qwen3AsrServiceUrl: cfg.qwen3AsrServiceUrl,
+      qwen3AsrModel: cfg.qwen3AsrModel,
       localAsrEngine: cfg.localAsrEngine,
       qwen3ComputeDevice: cfg.qwen3ComputeDevice,
       qwen3StreamingEnabled: cfg.qwen3StreamingEnabled,

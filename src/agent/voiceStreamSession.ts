@@ -1239,12 +1239,18 @@ export class VoiceStreamSession {
             if (res.ssUsed) {
               this._cvBssUsed = true;
               this._cvLastEngine =
-                res.device === "gpu"
-                  ? "clearvoice-mossformer2-bss-se-gpu"
-                  : "clearvoice-mossformer2-bss-se-cpu";
+                res.provider === "remote"
+                  ? "clearvoice-mossformer2-bss-se-remote"
+                  : res.device === "gpu"
+                    ? "clearvoice-mossformer2-bss-se-gpu"
+                    : "clearvoice-mossformer2-bss-se-cpu";
             } else {
               this._cvLastEngine =
-                res.device === "gpu" ? "clearvoice-mossformer2-gpu" : "clearvoice-mossformer2-cpu";
+                res.provider === "remote"
+                  ? "clearvoice-mossformer2-remote"
+                  : res.device === "gpu"
+                    ? "clearvoice-mossformer2-gpu"
+                    : "clearvoice-mossformer2-cpu";
             }
             this._cvLastGpuName = res.gpuName;
           } catch {
@@ -1410,7 +1416,9 @@ export class VoiceStreamSession {
               const allowPreview =
                 status.readyForLocalAsr &&
                 this._cvSliceQueue.length < 2 &&
-                (status.activeQwen3Device === "gpu" || this._cvSliceQueue.length === 0);
+                (status.activeQwen3Device === "gpu" ||
+                  status.activeQwen3Device === "remote" ||
+                  this._cvSliceQueue.length === 0);
               if (allowPreview) {
                 const prunedPreview = assembler.getTracks({ prune: true });
                 const totalPreviewTracks = prunedPreview.tracks.length;
@@ -2482,13 +2490,16 @@ export class VoiceStreamSession {
     if (origin === null) return;
 
     const isGpu = status.activeQwen3Device === "gpu";
-    const pollMs = this._opts.streamingPollIntervalMs ?? (isGpu ? 360 : 850);
+    const isRemote = status.activeQwen3Device === "remote";
+    const pollMs = this._opts.streamingPollIntervalMs ?? (isGpu ? 360 : isRemote ? 550 : 850);
     const minAudioMs =
       this._opts.streamingPollIntervalMs !== undefined
         ? Math.min(320, pollMs)
         : isGpu
           ? 480
-          : 700;
+          : isRemote
+            ? 560
+            : 700;
 
     const windowSamples = this._rawTotalSamples - origin;
     const newSamples = this._rawTotalSamples - this._streamLastDecodedEndSample;

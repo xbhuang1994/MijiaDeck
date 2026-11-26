@@ -14,9 +14,10 @@
 import { existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { DEFAULT_QWEN3_ASR_MODEL, isLocalEndpointUrl } from "../core/agentConfigStore.ts";
 import { encodeWavPcm16 } from "./audioPcm.ts";
 
-export type GpuBackendKind = "vulkan" | "cuda" | "metal" | "rocm" | "none";
+export type GpuBackendKind = "vulkan" | "cuda" | "metal" | "rocm" | "remote" | "none";
 
 export interface DetectedGpuDevice {
   id: string;
@@ -30,6 +31,9 @@ export interface DetectedGpuDevice {
 export interface Qwen3GpuStatus {
   detected: boolean;
   backend: GpuBackendKind;
+  remote?: boolean;
+  serviceUrl?: string | null;
+  modelName?: string;
   deviceId: string | null;
   deviceName: string | null;
   vramTotalMb: number | null;
@@ -38,7 +42,68 @@ export interface Qwen3GpuStatus {
   modelReady: boolean;
   ready: boolean;
   serverRunning: boolean;
+  lastLatencyMs?: number | null;
   lastError: string | null;
+}
+
+export interface Qwen3AsrGatewayEndpoints {
+  rootUrl: string;
+  healthUrl: string;
+  modelsUrl: string;
+  transcriptionsUrl: string;
+  transcribeJsonUrl: string;
+  preferJsonTranscribe: boolean;
+}
+
+export interface Qwen3RemoteHealthResult {
+  ok: boolean;
+  latencyMs: number;
+  gpuName: string | null;
+  model: string | null;
+  supportedLanguagesCount: number | null;
+  error?: string;
+}
+
+/**
+ * 规范化在线 Voice & ASR Gateway 的 Qwen3-ASR 接口路径：
+ * 支持传入根地址（https://voice.1inch.cn:18443）、/v1、/asr、/asr/v1、
+ * /v1/audio/transcriptions、/asr/v1/audio/transcriptions 或 /v1/transcribe。
+ */
+export function resolveQwen3AsrGatewayEndpoints(serviceUrl: string): Qwen3AsrGatewayEndpoints {
+  const trimmed = serviceUrl.trim().replace(/\/+$/, "");
+  const isExplicitTranscriptions = /\/audio\/transcriptions$/i.test(trimmed);
+  const isExplicitJsonTranscribe = /\/v1\/transcribe$/i.test(trimmed);
+  const rootUrl = trimmed
+    .replace(/\/asr\/v1\/audio\/transcriptions$/i, "")
+    .replace(/\/v1\/audio\/transcriptions$/i, "")
+    .replace(/\/audio\/transcriptions$/i, "")
+    .replace(/\/v1\/transcribe$/i, "")
+    .replace(/\/asr\/v1$/i, "")
+    .replace(/\/asr$/i, "")
+    .replace(/\/v1$/i, "")
+    .replace(/\/+$/, "");
+  return {
+    rootUrl,
+    healthUrl: `${rootUrl}/health`,
+    modelsUrl: `${rootUrl}/v1/models`,
+    transcriptionsUrl: isExplicitTranscriptions ? trimmed : `${rootUrl}/v1/audio/transcriptions`,
+    transcribeJsonUrl: isExplicitJsonTranscribe ? trimmed : `${rootUrl}/v1/transcribe`,
+    preferJsonTranscribe: isExplicitJsonTranscribe,
+  };
+}
+
+/**
+ * 将 UI 语种映射为在线 Qwen3-ASR 网关的 language 参数：
+ * 中文（zh-CN / zh）与 auto 留空以启用原生中英混说自动识别并防止静音幻觉。
+ */
+export function mapQwen3GatewayLang(voiceLang?: string): string {
+  const lower = (voiceLang ?? "").trim().toLowerCase();
+  if (!lower || lower === "auto" || lower === "zh" || lower.startsWith("zh-cn")) return "";
+  if (lower.startsWith("zh-hk") || lower.includes("yue")) return "Cantonese";
+  if (lower.startsWith("en")) return "English";
+  if (lower.startsWith("ja")) return "Japanese";
+  if (lower.startsWith("ko")) return "Korean";
+  return "";
 }
 
 export interface Qwen3GpuModelPaths {
@@ -340,6 +405,12 @@ function registerProcessExitCleanup(): void {
 
 export class Qwen3AsrGpuRuntime {
   private readonly _modelsDir: string;
+  private readonly _fetcher: typeof fetch;
+  private _remoteServiceUrl = "";
+  private _remoteApiKey = "";
+  private _remoteModel = DEFAULT_QWEN3_ASR_MODEL;
+  private _remoteGpuName: string | null = null;
+  private _remoteLastLatencyMs: number | null = null;
   private _cachedDevice: DetectedGpuDevice | null | undefined;
   private _cachedFromBinary = false;
   private _proc: ReturnType<typeof Bun.spawn> | null = null;
@@ -350,12 +421,80 @@ export class Qwen3AsrGpuRuntime {
   private _lastError: string | null = null;
   private _disposed = false;
 
-  constructor(options: { modelsDir: string }) {
+  constructor(options: {
+    modelsDir: string;
+    serviceUrl?: string;
+    apiKey?: string;
+    model?: string;
+    fetcher?: typeof fetch;
+  }) {
     this._modelsDir = path.resolve(options.modelsDir);
+    this._fetcher = options.fetcher ?? globalThis.fetch;
+    if (options.serviceUrl || options.apiKey || options.model) {
+      this.setRemoteConfig({
+        serviceUrl: options.serviceUrl ?? "",
+        apiKey: options.apiKey ?? "",
+        model: options.model ?? DEFAULT_QWEN3_ASR_MODEL,
+      });
+    }
   }
 
   get paths(): Qwen3GpuModelPaths {
     return resolveQwen3GpuModelPaths(this._modelsDir);
+  }
+
+  get remoteServiceUrl(): string {
+    return this._remoteServiceUrl;
+  }
+
+  get remoteModel(): string {
+    return this._remoteModel;
+  }
+
+  isRemoteConfigured(): boolean {
+    return (
+      this._remoteServiceUrl.length > 0 &&
+      (this._remoteApiKey.length > 0 || isLocalEndpointUrl(this._remoteServiceUrl))
+    );
+  }
+
+  private _buildAuthHeaders(): Record<string, string> {
+    if (!this._remoteApiKey) return {};
+    return {
+      Authorization: `Bearer ${this._remoteApiKey}`,
+      "X-Auth-Code": this._remoteApiKey,
+    };
+  }
+
+  setRemoteConfig(config: { serviceUrl?: string; apiKey?: string; model?: string }): void {
+    const nextUrl =
+      config.serviceUrl !== undefined
+        ? config.serviceUrl.trim().replace(/\/+$/, "")
+        : this._remoteServiceUrl;
+    const nextKey = config.apiKey !== undefined ? config.apiKey.trim() : this._remoteApiKey;
+    const nextModel =
+      config.model !== undefined
+        ? config.model.trim() || DEFAULT_QWEN3_ASR_MODEL
+        : this._remoteModel;
+
+    const urlChanged = nextUrl !== this._remoteServiceUrl;
+    const keyChanged = nextKey !== this._remoteApiKey;
+    this._remoteServiceUrl = nextUrl;
+    this._remoteApiKey = nextKey;
+    this._remoteModel = nextModel;
+
+    if (urlChanged || keyChanged) {
+      if (urlChanged) {
+        this._remoteGpuName = null;
+        this._remoteLastLatencyMs = null;
+      }
+      this._warmedUp = false;
+      this.resetFailureCooldown();
+      if (this.isRemoteConfigured()) {
+        // 切至在线远程 Qwen3-ASR 网关时立即释放本地 llama-server 显存
+        this._killProcess();
+      }
+    }
   }
 
   hasRuntimeBinary(): boolean {
@@ -413,14 +552,37 @@ export class Qwen3AsrGpuRuntime {
   }
 
   getStatus(): Qwen3GpuStatus {
+    const hasRemoteUrl = this._remoteServiceUrl.length > 0;
+    if (this.isRemoteConfigured()) {
+      return {
+        detected: true,
+        backend: "remote",
+        remote: true,
+        serviceUrl: this._remoteServiceUrl,
+        modelName: this._remoteModel,
+        deviceId: "remote",
+        deviceName: this._remoteGpuName ?? "在线 Qwen3-ASR GPU",
+        vramTotalMb: null,
+        vramFreeMb: null,
+        runtimeReady: true,
+        modelReady: true,
+        ready: true,
+        serverRunning: true,
+        lastLatencyMs: this._remoteLastLatencyMs,
+        lastError: this._lastError,
+      };
+    }
     const dev = this.detectGpu(false);
     const runtimeReady = this.hasRuntimeBinary();
     const modelReady = this.hasGgufModels();
     const detected = dev !== null;
-    const ready = detected && runtimeReady && modelReady;
+    const ready = !hasRemoteUrl && detected && runtimeReady && modelReady;
     return {
       detected,
       backend: dev?.backend ?? "none",
+      remote: false,
+      serviceUrl: hasRemoteUrl ? this._remoteServiceUrl : this._baseUrl,
+      modelName: hasRemoteUrl ? this._remoteModel : "Qwen3-ASR-0.6B-Q8_0",
       deviceId: dev?.id ?? null,
       deviceName: dev?.name ?? null,
       vramTotalMb: dev?.vramTotalMb ?? null,
@@ -429,16 +591,128 @@ export class Qwen3AsrGpuRuntime {
       modelReady,
       ready,
       serverRunning: this._proc !== null && this._baseUrl !== null,
-      lastError: this._lastError,
+      lastLatencyMs: this._remoteLastLatencyMs,
+      lastError: hasRemoteUrl ? "缺少在线 Qwen3-ASR 授权码，请填写授权码" : this._lastError,
     };
   }
 
   /**
-   * 惰性启动本地回环 GPU 推理服务，等待 `/health` 就绪后返回服务地址。
+   * 探测在线 Qwen3-ASR 网关健康状态，获取远端 GPU 名称与模型信息。
+   */
+  async probeRemoteHealth(options: { timeoutMs?: number } = {}): Promise<Qwen3RemoteHealthResult> {
+    if (!this._remoteServiceUrl) {
+      return {
+        ok: false,
+        latencyMs: 0,
+        gpuName: null,
+        model: null,
+        supportedLanguagesCount: null,
+        error: "未配置在线 Qwen3-ASR 服务地址",
+      };
+    }
+    const t0 = performance.now();
+    const endpoints = resolveQwen3AsrGatewayEndpoints(this._remoteServiceUrl);
+    const timeoutMs = options.timeoutMs ?? 8000;
+    try {
+      const res = await this._fetcher(endpoints.healthUrl, {
+        method: "GET",
+        headers: this._buildAuthHeaders(),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      const latencyMs = Math.round(performance.now() - t0);
+      if (!res.ok) {
+        const msg =
+          res.status === 401
+            ? "Qwen3-ASR 授权码无效或未提供 (401)"
+            : res.status === 403
+              ? "Qwen3-ASR 授权码缺少 asr 服务权限 (403)"
+              : `Qwen3-ASR 远程健康检查失败 (${res.status})`;
+        this._lastError = msg;
+        if (res.status === 401 || res.status === 403) {
+          this._initFailedAt = Date.now();
+        }
+        return {
+          ok: false,
+          latencyMs,
+          gpuName: this._remoteGpuName,
+          model: this._remoteModel,
+          supportedLanguagesCount: null,
+          error: msg,
+        };
+      }
+      const json = (await res.json()) as {
+        status?: string;
+        model?: string;
+        gpu_name?: string | null;
+        supported_languages_count?: number;
+        upstreams?: {
+          asr?: {
+            status?: string;
+            details?: {
+              status?: string;
+              model?: string;
+              gpu_name?: string | null;
+              supported_languages_count?: number;
+            };
+          };
+        };
+      };
+      const asrUpstream = json.upstreams?.asr;
+      const details = asrUpstream?.details ?? json;
+      const ok = asrUpstream ? asrUpstream.status === "ok" : json.status === "ok";
+      const gpuName =
+        typeof details?.gpu_name === "string" && details.gpu_name.trim()
+          ? details.gpu_name.trim()
+          : null;
+      const model =
+        typeof details?.model === "string" && details.model.trim()
+          ? details.model.trim()
+          : this._remoteModel;
+      const langCount =
+        typeof details?.supported_languages_count === "number"
+          ? details.supported_languages_count
+          : null;
+      if (gpuName) this._remoteGpuName = gpuName;
+      this._remoteLastLatencyMs = latencyMs;
+      if (ok) {
+        this._warmedUp = true;
+        this._initFailedAt = 0;
+        this._lastError = null;
+      } else {
+        this._lastError = "在线 Qwen3-ASR 上游服务暂不可用";
+      }
+      return {
+        ok,
+        latencyMs,
+        gpuName,
+        model,
+        supportedLanguagesCount: langCount,
+        ...(ok ? {} : { error: "在线 Qwen3-ASR 上游服务暂不可用" }),
+      };
+    } catch (err) {
+      const latencyMs = Math.round(performance.now() - t0);
+      const msg = `在线 Qwen3-ASR 连接失败: ${err instanceof Error ? err.message : String(err)}`;
+      this._lastError = msg;
+      return {
+        ok: false,
+        latencyMs,
+        gpuName: this._remoteGpuName,
+        model: this._remoteModel,
+        supportedLanguagesCount: null,
+        error: msg,
+      };
+    }
+  }
+
+  /**
+   * 惰性启动本地回环 GPU 推理服务（或返回已配置的在线 Qwen3-ASR 网关地址），等待 `/health` 就绪后返回服务地址。
    */
   async ensureStarted(): Promise<string> {
     if (this._disposed) {
       throw new Error("Qwen3-ASR GPU 运行时已释放");
+    }
+    if (this.isRemoteConfigured()) {
+      return this._remoteServiceUrl;
     }
     if (this._baseUrl && this._proc && this._proc.exitCode === null) {
       return this._baseUrl;
@@ -562,10 +836,14 @@ export class Qwen3AsrGpuRuntime {
   }
 
   /**
-   * 后台预热 GPU 推理服务并编译 Vulkan 着色器管线（首句冷编译约数秒，预热后实测单句仅 ~150~220ms）。
+   * 后台预热 GPU 推理服务（本地编译 Vulkan 着色器管线；在线网关则执行轻量 /health 探活并同步远端 GPU 信息）。
    */
   async warmup(): Promise<void> {
     if (this._disposed || this._warmedUp) return;
+    if (this.isRemoteConfigured()) {
+      await this.probeRemoteHealth({ timeoutMs: 8000 });
+      return;
+    }
     await this.ensureStarted();
     if (this._disposed || this._warmedUp) return;
     try {
@@ -580,7 +858,128 @@ export class Qwen3AsrGpuRuntime {
   }
 
   /**
-   * 在 GPU 上执行 Qwen3-ASR-0.6B 语音转写（支持一次性转写与 SSE 逐 token 流式转写）。
+   * 通过在线 Voice & ASR Gateway（OpenAI Whisper 兼容 /v1/audio/transcriptions 或 /v1/transcribe）
+   * 调用远程 GPU Qwen3-ASR-0.6B 执行多语言语音识别。
+   */
+  private async _transcribeViaRemoteGateway(
+    pcm16k: Float32Array,
+    options: Qwen3GpuTranscribeOptions,
+  ): Promise<Qwen3GpuTranscribeResult> {
+    const t0 = performance.now();
+    const endpoints = resolveQwen3AsrGatewayEndpoints(this._remoteServiceUrl);
+    const wavBytes = encodeWavPcm16(pcm16k, 16000);
+    const audioSec = pcm16k.length / 16000;
+    const langHint = mapQwen3GatewayLang(options.voiceLang);
+    const hotwordPrompt = (options.hotwords ?? [])
+      .map((w) => w.replace(/,/g, " ").trim())
+      .filter((w) => w.length > 0)
+      .slice(0, 12)
+      .join(" ");
+
+    const defaultTimeoutMs = Math.max(15_000, Math.min(45_000, Math.round(audioSec * 1200) + 10_000));
+    const timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
+    const timeoutController = new AbortController();
+    const timer = setTimeout(() => timeoutController.abort(), timeoutMs);
+    const combinedSignal = options.signal
+      ? AbortSignal.any([options.signal, timeoutController.signal])
+      : timeoutController.signal;
+
+    try {
+      let res: Response;
+      if (endpoints.preferJsonTranscribe) {
+        const wavBase64 = Buffer.from(
+          wavBytes.buffer,
+          wavBytes.byteOffset,
+          wavBytes.byteLength,
+        ).toString("base64");
+        res = await this._fetcher(endpoints.transcribeJsonUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...this._buildAuthHeaders(),
+          },
+          body: JSON.stringify({
+            audio_base64: wavBase64,
+            filename: "speech.wav",
+            model: this._remoteModel,
+            ...(langHint ? { language: langHint } : {}),
+            ...(hotwordPrompt ? { prompt: hotwordPrompt } : {}),
+          }),
+          signal: combinedSignal,
+        });
+      } else {
+        const form = new FormData();
+        form.append(
+          "file",
+          new Blob([wavBytes as unknown as BlobPart], { type: "audio/wav" }),
+          "speech.wav",
+        );
+        form.append("model", this._remoteModel);
+        form.append("response_format", "verbose_json");
+        if (langHint) {
+          form.append("language", langHint);
+        }
+        if (hotwordPrompt) {
+          form.append("prompt", hotwordPrompt);
+        }
+        res = await this._fetcher(endpoints.transcriptionsUrl, {
+          method: "POST",
+          headers: this._buildAuthHeaders(),
+          body: form,
+          signal: combinedSignal,
+        });
+      }
+
+      if (!res.ok) {
+        const bodyText = await res.text().catch(() => "");
+        if (res.status === 401 || res.status === 403) {
+          this._initFailedAt = Date.now();
+        }
+        throw new Error(`Qwen3-ASR 在线识别失败 (${res.status}): ${bodyText.slice(0, 180)}`);
+      }
+
+      const rawBody = await res.text();
+      let rawText = "";
+      let lang = "";
+      try {
+        const parsed = JSON.parse(rawBody) as { text?: unknown; language?: unknown };
+        rawText = typeof parsed.text === "string" ? parsed.text : "";
+        lang = typeof parsed.language === "string" ? parsed.language : "";
+      } catch {
+        rawText = rawBody;
+      }
+
+      const text = parseQwen3GpuResponseText(rawText);
+      if (!options.signal?.aborted && text && typeof options.onPartial === "function") {
+        options.onPartial(text);
+      }
+
+      const durationMs = Math.round(performance.now() - t0);
+      this._remoteLastLatencyMs = durationMs;
+      this._warmedUp = true;
+      this._lastError = null;
+
+      return {
+        text,
+        rawText,
+        lang,
+        durationMs,
+        deviceId: "remote",
+        deviceName: this._remoteGpuName ?? "在线 Qwen3-ASR GPU",
+        backend: "remote",
+      };
+    } catch (err) {
+      if (!(err instanceof DOMException && err.name === "AbortError")) {
+        this._lastError = err instanceof Error ? err.message : String(err);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * 在 GPU 上执行 Qwen3-ASR-0.6B 语音转写（支持在线网关、本地 GPU 一次性转写与 SSE 逐 token 流式转写）。
    */
   async transcribe(
     pcm16k: Float32Array,
@@ -588,6 +987,9 @@ export class Qwen3AsrGpuRuntime {
   ): Promise<Qwen3GpuTranscribeResult> {
     if (options.signal?.aborted) {
       throw new DOMException("Aborted", "AbortError");
+    }
+    if (this.isRemoteConfigured()) {
+      return this._transcribeViaRemoteGateway(pcm16k, options);
     }
     const t0 = performance.now();
     const baseUrl = await this.ensureStarted();

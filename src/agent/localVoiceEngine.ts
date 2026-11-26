@@ -141,7 +141,8 @@ export interface LocalVoiceEngineStatus {
   readyForVoiceprint: boolean;
   readyForQwen3Asr: boolean;
   readyForQwen3Gpu: boolean;
-  activeQwen3Device: "gpu" | "cpu" | null;
+  readyForQwen3Remote?: boolean;
+  activeQwen3Device: "remote" | "gpu" | "cpu" | null;
   qwen3ComputeDevice: Qwen3ComputeDeviceMode;
   gpu: Qwen3GpuStatus;
   readyForSenseVoice: boolean;
@@ -184,6 +185,10 @@ export interface SpeakerEmbeddingOutput {
 }
 
 export type LocalAsrResultEngine =
+  | "qwen3-asr-remote"
+  | "qwen3-asr-remote-stream"
+  | "qwen3-asr-remote-dual-raw"
+  | "qwen3-asr-remote-dual-denoised"
   | "qwen3-asr-gpu"
   | "qwen3-asr-gpu-stream"
   | "qwen3-asr-gpu-dual-raw"
@@ -216,7 +221,7 @@ export interface LocalAsrOutput {
   event: string;
   engine: LocalAsrResultEngine;
   durationMs: number;
-  computeDevice?: "gpu" | "cpu";
+  computeDevice?: "remote" | "gpu" | "cpu";
   gpuDeviceName?: string | null;
   altText?: string;
   enHeadText?: string;
@@ -478,11 +483,13 @@ export function chooseBestAsrCandidate(
   const scoreMargin = Number(Math.abs(rawScore - denScore).toFixed(2));
 
   if (rawScore >= denScore) {
-    const engine: LocalAsrResultEngine = rawAsr.engine.startsWith("qwen3-asr-gpu")
-      ? "qwen3-asr-gpu-dual-raw"
-      : rawAsr.engine.startsWith("qwen3-asr")
-        ? "qwen3-asr-dual-raw"
-        : "sensevoice-dual-raw";
+    const engine: LocalAsrResultEngine = rawAsr.engine.startsWith("qwen3-asr-remote")
+      ? "qwen3-asr-remote-dual-raw"
+      : rawAsr.engine.startsWith("qwen3-asr-gpu")
+        ? "qwen3-asr-gpu-dual-raw"
+        : rawAsr.engine.startsWith("qwen3-asr")
+          ? "qwen3-asr-dual-raw"
+          : "sensevoice-dual-raw";
     return {
       ...rawAsr,
       engine,
@@ -491,11 +498,13 @@ export function chooseBestAsrCandidate(
       scoreMargin,
     };
   }
-  const engine: LocalAsrResultEngine = denoisedAsr.engine.startsWith("qwen3-asr-gpu")
-    ? "qwen3-asr-gpu-dual-denoised"
-    : denoisedAsr.engine.startsWith("qwen3-asr")
-      ? "qwen3-asr-dual-denoised"
-      : "sensevoice-dual-denoised";
+  const engine: LocalAsrResultEngine = denoisedAsr.engine.startsWith("qwen3-asr-remote")
+    ? "qwen3-asr-remote-dual-denoised"
+    : denoisedAsr.engine.startsWith("qwen3-asr-gpu")
+      ? "qwen3-asr-gpu-dual-denoised"
+      : denoisedAsr.engine.startsWith("qwen3-asr")
+        ? "qwen3-asr-dual-denoised"
+        : "sensevoice-dual-denoised";
   return {
     ...denoisedAsr,
     engine,
@@ -596,6 +605,14 @@ export class LocalVoiceEngine {
     this._clearVoiceGpu.setCustomServiceUrl(url);
   }
 
+  setClearVoiceRemoteConfig(config: { serviceUrl?: string; apiKey?: string; model?: string }): void {
+    this._clearVoiceGpu.setRemoteConfig(config);
+  }
+
+  setQwen3AsrRemoteConfig(config: { serviceUrl?: string; apiKey?: string; model?: string }): void {
+    this._qwen3Gpu.setRemoteConfig(config);
+  }
+
   get paths(): LocalVoiceModelPaths {
     return resolveVoiceModelPaths(this._modelsDirOverride);
   }
@@ -662,6 +679,7 @@ export class LocalVoiceEngine {
     const gpuStatus = this._qwen3Gpu.getStatus();
     const clearVoiceStatus = this._clearVoiceGpu.getStatus();
     const readyForQwen3Gpu = gpuStatus.ready;
+    const readyForQwen3Remote = Boolean(gpuStatus.remote && gpuStatus.ready);
     const qwen3AsrGpu = gpuStatus.runtimeReady && gpuStatus.modelReady;
     const senseVoice = this._hasSenseVoiceModels(p);
     const openWakeWord = existsSync(p.openWakeWordMel) && existsSync(p.openWakeWordEmbedding);
@@ -673,16 +691,18 @@ export class LocalVoiceEngine {
     const readyForQwen3Cpu = addonAvailable && qwen3AsrCpu;
     const useGpuEligible = this._qwen3ComputeDevice !== "cpu" && readyForQwen3Gpu;
     const readyForQwen3Asr = useGpuEligible || readyForQwen3Cpu;
-    const activeQwen3Device: "gpu" | "cpu" | null =
+    const activeQwen3Device: "remote" | "gpu" | "cpu" | null =
       this._qwen3ComputeDevice === "cpu"
         ? readyForQwen3Cpu
           ? "cpu"
           : null
-        : readyForQwen3Gpu
-          ? "gpu"
-          : readyForQwen3Cpu
-            ? "cpu"
-            : null;
+        : readyForQwen3Remote
+          ? "remote"
+          : readyForQwen3Gpu
+            ? "gpu"
+            : readyForQwen3Cpu
+              ? "cpu"
+              : null;
     const readyForSenseVoice = addonAvailable && senseVoice;
     const readyForLocalAsr =
       this._preferredAsrEngine === "qwen3-asr"
@@ -732,6 +752,7 @@ export class LocalVoiceEngine {
       readyForVoiceprint: addonAvailable && speakerCampp,
       readyForQwen3Asr,
       readyForQwen3Gpu,
+      readyForQwen3Remote,
       activeQwen3Device,
       qwen3ComputeDevice: this._qwen3ComputeDevice,
       gpu: gpuStatus,
@@ -1350,15 +1371,22 @@ export class LocalVoiceEngine {
           onPartial: options.onPartial,
           signal: options.signal,
         });
+        const isRemote = gpuRes.backend === "remote";
         return {
           text: gpuRes.text,
           rawText: gpuRes.rawText,
           lang: gpuRes.lang,
           emotion: "",
           event: "",
-          engine: options.onPartial ? "qwen3-asr-gpu-stream" : "qwen3-asr-gpu",
+          engine: isRemote
+            ? options.onPartial
+              ? "qwen3-asr-remote-stream"
+              : "qwen3-asr-remote"
+            : options.onPartial
+              ? "qwen3-asr-gpu-stream"
+              : "qwen3-asr-gpu",
           durationMs: gpuRes.durationMs,
-          computeDevice: "gpu",
+          computeDevice: isRemote ? "remote" : "gpu",
           gpuDeviceName: gpuRes.deviceName,
           fallbackUsed: false,
         };
@@ -1682,11 +1710,13 @@ export class LocalVoiceEngine {
               };
             }
           } else if (sel.choice === "track_a") {
-            const rawDualEngine: LocalAsrResultEngine = dualRawRes.engine.startsWith("qwen3-asr-gpu")
-              ? "qwen3-asr-gpu-dual-raw"
-              : dualRawRes.engine.startsWith("qwen3-asr")
-                ? "qwen3-asr-dual-raw"
-                : "sensevoice-dual-raw";
+            const rawDualEngine: LocalAsrResultEngine = dualRawRes.engine.startsWith("qwen3-asr-remote")
+              ? "qwen3-asr-remote-dual-raw"
+              : dualRawRes.engine.startsWith("qwen3-asr-gpu")
+                ? "qwen3-asr-gpu-dual-raw"
+                : dualRawRes.engine.startsWith("qwen3-asr")
+                  ? "qwen3-asr-dual-raw"
+                  : "sensevoice-dual-raw";
             best = {
               ...dualRawRes,
               engine: rawDualEngine,
@@ -1695,11 +1725,13 @@ export class LocalVoiceEngine {
               scoreMargin: best.scoreMargin,
             };
           } else if (sel.choice === "track_b") {
-            const denDualEngine: LocalAsrResultEngine = dualDenRes.engine.startsWith("qwen3-asr-gpu")
-              ? "qwen3-asr-gpu-dual-denoised"
-              : dualDenRes.engine.startsWith("qwen3-asr")
-                ? "qwen3-asr-dual-denoised"
-                : "sensevoice-dual-denoised";
+            const denDualEngine: LocalAsrResultEngine = dualDenRes.engine.startsWith("qwen3-asr-remote")
+              ? "qwen3-asr-remote-dual-denoised"
+              : dualDenRes.engine.startsWith("qwen3-asr-gpu")
+                ? "qwen3-asr-gpu-dual-denoised"
+                : dualDenRes.engine.startsWith("qwen3-asr")
+                  ? "qwen3-asr-dual-denoised"
+                  : "sensevoice-dual-denoised";
             best = {
               ...dualDenRes,
               engine: denDualEngine,
@@ -1979,8 +2011,12 @@ export class LocalVoiceEngine {
         this._qwen3AsrInitError = null;
       }
 
-      // 2.5 若本机检测到硬件 GPU，自动补齐 Qwen3-ASR-0.6B Vulkan GPU 运行时与 Q8_0 GGUF 加速模型（失败不阻断 CPU/SenseVoice）
-      if (this._qwen3Gpu.detectGpu(true) && !this._qwen3Gpu.getStatus().ready) {
+      // 2.5 若本机检测到硬件 GPU 且未配置在线 Qwen3-ASR 网关，自动补齐本地 Qwen3-ASR-0.6B Vulkan GPU 组件
+      if (
+        !this._qwen3Gpu.isRemoteConfigured() &&
+        this._qwen3Gpu.detectGpu(true) &&
+        !this._qwen3Gpu.getStatus().ready
+      ) {
         try {
           await this._qwen3Gpu.downloadMissingAssets();
         } catch {
@@ -1988,8 +2024,9 @@ export class LocalVoiceEngine {
         }
       }
 
-      // 2.6 若已就绪 ClearVoice 运行时但缺失 MossFormer2_SE_48K 或 MossFormer2_SS_16K 模型，顺带补齐
+      // 2.6 若未配置在线 ClearVoice 网关且已就绪本地 ClearVoice 运行时但缺失模型，顺带补齐
       if (
+        !this._clearVoiceGpu.isRemoteConfigured() &&
         this._clearVoiceGpu.hasRuntime() &&
         (!this._clearVoiceGpu.hasModel() || !this._clearVoiceGpu.hasSsModel())
       ) {

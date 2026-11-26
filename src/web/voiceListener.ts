@@ -19,6 +19,9 @@ export interface ClientVoiceConfig {
   voiceEngine: "auto" | "local" | "browser" | "whisper";
   voicePipelineMode?: "legacy" | "clearvoice";
   clearVoiceServiceUrl?: string;
+  clearVoiceModel?: string;
+  qwen3AsrServiceUrl?: string;
+  qwen3AsrModel?: string;
   localAsrEngine?: "auto" | "qwen3-asr" | "sensevoice";
   qwen3ComputeDevice?: "auto" | "gpu" | "cpu";
   qwen3StreamingEnabled?: boolean;
