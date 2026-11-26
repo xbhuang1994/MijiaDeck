@@ -9,6 +9,14 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import {
+  ClearVoiceGpuRuntime,
+  resolveClearVoiceGatewayEndpoints,
+} from "../agent/clearVoiceGpuRuntime.ts";
+import {
+  Qwen3AsrGpuRuntime,
+  resolveQwen3AsrGatewayEndpoints,
+} from "../agent/qwen3AsrGpuRuntime.ts";
+import {
   addCustomInstruction,
   clearCustomInstructions,
   deleteCustomInstruction,
@@ -193,10 +201,11 @@ export class HttpError extends Error {
 }
 
 const SECRET_PATTERNS: ReadonlyArray<RegExp> = [
-  /(serviceToken|ssecurity|passToken|cUserId|userId|p2p_id|init_string|authorization|cookie|api[_-]?key|sttApiKey|systemOneApiKey|accessSecret|localKey|refreshToken|authToken|accessToken|password)\s*[:=]\s*[^\s,;'"&}]+/gi,
+  /(serviceToken|ssecurity|passToken|cUserId|userId|p2p_id|init_string|authorization|cookie|api[_-]?key|sttApiKey|systemOneApiKey|clearVoiceApiKey|qwen3AsrApiKey|x-auth-code|accessSecret|localKey|refreshToken|authToken|accessToken|password)\s*[:=]\s*[^\s,;'"&}]+/gi,
   /Bearer\s+[A-Za-z0-9._~+/=-]+/gi,
   /JWT\s+[A-Za-z0-9._~+/=-]+/gi,
   /sk-[A-Za-z0-9_\-]{8,}/g,
+  /vgw_[A-Za-z0-9_\-]{8,}/g,
 ];
 
 /**
@@ -2530,7 +2539,21 @@ export function createRequestHandler(
             updated.voicePipelineMode === "clearvoice" &&
             runtime.voiceListener.localEngine.clearVoiceGpu.getStatus().ready
           ) {
-            void runtime.voiceListener.localEngine.clearVoiceGpu.warmup().catch(() => {});
+            void runtime.voiceListener.localEngine.clearVoiceGpu
+              .warmup()
+              .then(() => emitBroadcast(runtime))
+              .catch(() => {});
+          } else if (runtime.voiceListener.localEngine.clearVoiceGpu.isRemoteConfigured()) {
+            void runtime.voiceListener.localEngine.clearVoiceGpu
+              .probeRemoteHealth({ timeoutMs: 6000 })
+              .then(() => emitBroadcast(runtime))
+              .catch(() => {});
+          }
+          if (runtime.voiceListener.localEngine.qwen3Gpu.isRemoteConfigured()) {
+            void runtime.voiceListener.localEngine.qwen3Gpu
+              .probeRemoteHealth({ timeoutMs: 6000 })
+              .then(() => emitBroadcast(runtime))
+              .catch(() => {});
           }
         }
         runtime.reloadVoiceStreams?.(updated.wakeWords, updated.owwThreshold, {
@@ -2765,6 +2788,104 @@ export function createRequestHandler(
           voiceprints: snap.voiceprints,
           lastMetrics: snap.lastMetrics,
           voice: snap,
+        });
+      }
+
+      if (method === "POST" && pathname === "/api/voice/gateway/test") {
+        const cfgStore = runtime.agentConfigStore ?? agentConfigStoreModule;
+        const saved = runtime.piAgent ? runtime.piAgent.config : cfgStore.loadAgentVoiceConfig();
+        const body = await readJsonBody(req);
+        const cvUrlRaw =
+          typeof body.clearVoiceServiceUrl === "string"
+            ? body.clearVoiceServiceUrl.trim()
+            : saved.clearVoiceServiceUrl;
+        const qwenUrlRaw =
+          typeof body.qwen3AsrServiceUrl === "string"
+            ? body.qwen3AsrServiceUrl.trim()
+            : saved.qwen3AsrServiceUrl;
+        const tempCfg = cfgStore.normalizeAgentVoiceConfig({
+          ...saved,
+          clearVoiceServiceUrl: cvUrlRaw,
+          clearVoiceApiKey:
+            body.clearClearVoiceApiKey === true
+              ? ""
+              : typeof body.clearVoiceApiKey === "string" && body.clearVoiceApiKey.trim()
+                ? body.clearVoiceApiKey.trim()
+                : saved.clearVoiceApiKey,
+          qwen3AsrServiceUrl: qwenUrlRaw,
+          qwen3AsrApiKey:
+            body.clearQwen3AsrApiKey === true
+              ? ""
+              : typeof body.qwen3AsrApiKey === "string" && body.qwen3AsrApiKey.trim()
+                ? body.qwen3AsrApiKey.trim()
+                : saved.qwen3AsrApiKey,
+        });
+
+        const cvAuth = cfgStore.resolveEffectiveClearVoiceAuth(tempCfg);
+        const qwenAuth = cfgStore.resolveEffectiveQwen3AsrAuth(tempCfg);
+        if (!cvAuth.serviceUrl && !qwenAuth.serviceUrl) {
+          throw new HttpError(400, "请先填写 ClearVoice 或 Qwen3-ASR 在线服务地址");
+        }
+
+        const modelsDir = runtime.voiceListener?.localEngine.paths.modelsDir ?? projectRoot();
+        let clearvoiceResult: Awaited<ReturnType<ClearVoiceGpuRuntime["probeRemoteHealth"]>> | null =
+          null;
+        let asrResult: Awaited<ReturnType<Qwen3AsrGpuRuntime["probeRemoteHealth"]>> | null = null;
+
+        if (cvAuth.serviceUrl) {
+          const probeCv = new ClearVoiceGpuRuntime({
+            modelsDir,
+            serviceUrl: cvAuth.serviceUrl,
+            apiKey: cvAuth.apiKey ?? "",
+            model: cvAuth.model,
+            fetcher: options.modelFetcher,
+          });
+          clearvoiceResult = await probeCv.probeRemoteHealth({ timeoutMs: 8000 });
+          if (clearvoiceResult.error) {
+            clearvoiceResult = {
+              ...clearvoiceResult,
+              error: sanitizeErrorMessage(clearvoiceResult.error),
+            };
+          }
+          probeCv.dispose();
+        }
+
+        if (qwenAuth.serviceUrl) {
+          const probeQwen = new Qwen3AsrGpuRuntime({
+            modelsDir,
+            serviceUrl: qwenAuth.serviceUrl,
+            apiKey: qwenAuth.apiKey ?? "",
+            model: qwenAuth.model,
+            fetcher: options.modelFetcher,
+          });
+          asrResult = await probeQwen.probeRemoteHealth({ timeoutMs: 8000 });
+          if (asrResult.error) {
+            asrResult = {
+              ...asrResult,
+              error: sanitizeErrorMessage(asrResult.error),
+            };
+          }
+          probeQwen.dispose();
+        }
+
+        const allOk =
+          (clearvoiceResult === null || clearvoiceResult.ok) &&
+          (asrResult === null || asrResult.ok);
+
+        return jsonResponse({
+          ok: allOk,
+          clearvoice: clearvoiceResult
+            ? {
+                ...clearvoiceResult,
+                endpoints: resolveClearVoiceGatewayEndpoints(cvAuth.serviceUrl),
+              }
+            : null,
+          asr: asrResult
+            ? {
+                ...asrResult,
+                endpoints: resolveQwen3AsrGatewayEndpoints(qwenAuth.serviceUrl),
+              }
+            : null,
         });
       }
 

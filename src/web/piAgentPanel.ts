@@ -236,6 +236,12 @@ export interface UiPublicAgentConfig extends ClientVoiceConfig {
   envApiKeyDetected: boolean;
   hasSttApiKey: boolean;
   sttApiKeyPreview: string;
+  hasClearVoiceApiKey?: boolean;
+  clearVoiceApiKeyPreview?: string;
+  effectiveClearVoiceRemoteConfigured?: boolean;
+  hasQwen3AsrApiKey?: boolean;
+  qwen3AsrApiKeyPreview?: string;
+  effectiveQwen3AsrRemoteConfigured?: boolean;
   systemOneMode?: UiSystemOneMode;
   systemOneBaseUrl?: string;
   systemOneModel?: string;
@@ -329,6 +335,8 @@ export interface UiLocalVoiceStatus {
     ssModelReady?: boolean;
     scriptReady: boolean;
     customServiceUrl: string;
+    remote?: boolean;
+    hasApiKey?: boolean;
     ready: boolean;
     multiTrackReady?: boolean;
     serverRunning: boolean;
@@ -346,11 +354,15 @@ export interface UiLocalVoiceStatus {
   readyForVoiceprint: boolean;
   readyForQwen3Asr?: boolean;
   readyForQwen3Gpu?: boolean;
-  activeQwen3Device?: "gpu" | "cpu" | null;
+  readyForQwen3Remote?: boolean;
+  activeQwen3Device?: "remote" | "gpu" | "cpu" | null;
   qwen3ComputeDevice?: "auto" | "gpu" | "cpu";
   gpu?: {
     detected: boolean;
-    backend: "vulkan" | "cuda" | "metal" | "rocm" | "none";
+    backend: "vulkan" | "cuda" | "metal" | "rocm" | "remote" | "none";
+    remote?: boolean;
+    serviceUrl?: string | null;
+    modelName?: string;
     deviceId: string | null;
     deviceName: string | null;
     vramTotalMb: number | null;
@@ -359,6 +371,7 @@ export interface UiLocalVoiceStatus {
     modelReady: boolean;
     ready: boolean;
     serverRunning: boolean;
+    lastLatencyMs?: number | null;
     lastError: string | null;
   };
   readyForSenseVoice?: boolean;
@@ -480,6 +493,9 @@ export interface UiVoiceSnapshot {
   engine: "local" | "browser" | "whisper" | "manual";
   voicePipelineMode?: "legacy" | "clearvoice";
   clearVoiceServiceUrl?: string;
+  clearVoiceModel?: string;
+  qwen3AsrServiceUrl?: string;
+  qwen3AsrModel?: string;
   localAsrEngine?: "auto" | "qwen3-asr" | "sensevoice";
   qwen3ComputeDevice?: "auto" | "gpu" | "cpu";
   qwen3StreamingEnabled?: boolean;
@@ -2399,22 +2415,26 @@ export class PiAgentPanelController {
       subEl.textContent = interim ? `${interim}` : "可直接连续追问，无需重复喊唤醒词";
     } else if (isListening) {
       const localEngine = this.voiceState?.localEngine;
+      const isQwenRemote = localEngine?.activeQwen3Device === "remote";
       const qwen3DevTag =
-        localEngine?.activeQwen3Device === "gpu"
-          ? "GPU"
-          : localEngine?.activeQwen3Device === "cpu"
-            ? "CPU"
-            : "";
+        isQwenRemote
+          ? "在线 GPU"
+          : localEngine?.activeQwen3Device === "gpu"
+            ? "GPU"
+            : localEngine?.activeQwen3Device === "cpu"
+              ? "CPU"
+              : "";
       const streamingOn =
         (this.voiceState?.qwen3StreamingEnabled ?? this.agentState?.config.qwen3StreamingEnabled ?? true) !==
         false;
       const pipelineIsCv =
         (this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy") ===
         "clearvoice";
-      const cvPrefix = pipelineIsCv ? "ClearVoice GPU → " : "";
+      const cvIsRemote = localEngine?.clearVoice?.provider === "remote";
+      const cvPrefix = pipelineIsCv ? (cvIsRemote ? "ClearVoice 在线 → " : "ClearVoice GPU → ") : "";
       const localAsrLabel =
         localEngine?.primaryAsrEngine === "qwen3-asr"
-          ? `${cvPrefix}本地 Qwen3-ASR 0.6B${qwen3DevTag ? ` (${qwen3DevTag})` : ""}${streamingOn ? " · 流式" : ""}`
+          ? `${cvPrefix}${isQwenRemote ? "在线" : "本地"} Qwen3-ASR 0.6B${qwen3DevTag ? ` (${qwen3DevTag})` : ""}${streamingOn ? " · 流式" : ""}`
           : localEngine?.primaryAsrEngine === "sensevoice"
             ? localEngine.activeLocalAsrMode === "sensevoice"
               ? `${cvPrefix}本地 SenseVoice (备用)`
@@ -2434,30 +2454,34 @@ export class PiAgentPanelController {
           : "免唤醒已开启，直接说出设备控制指令即可执行";
     } else {
       const le = this.voiceState?.localEngine;
+      const isQwenRemote = le?.activeQwen3Device === "remote";
       const devLabel =
-        le?.activeQwen3Device === "gpu"
-          ? "GPU"
-          : le?.activeQwen3Device === "cpu"
-            ? "CPU"
-            : "";
+        isQwenRemote
+          ? "在线 GPU"
+          : le?.activeQwen3Device === "gpu"
+            ? "GPU"
+            : le?.activeQwen3Device === "cpu"
+              ? "CPU"
+              : "";
       const streamingOn =
         (this.voiceState?.qwen3StreamingEnabled ?? this.agentState?.config.qwen3StreamingEnabled ?? true) !==
         false;
       const asrReadyPrefix =
         le?.primaryAsrEngine === "qwen3-asr"
           ? le.readyForSenseVoice
-            ? `本地 Qwen3-ASR 0.6B (${devLabel || "主"}${streamingOn ? "·流式" : ""}) · SenseVoice (备用)`
-            : `本地 Qwen3-ASR 0.6B (${devLabel || "主"}${streamingOn ? "·流式" : ""})`
+            ? `${isQwenRemote ? "在线" : "本地"} Qwen3-ASR 0.6B (${devLabel || "主"}${streamingOn ? "·流式" : ""}) · SenseVoice (备用)`
+            : `${isQwenRemote ? "在线" : "本地"} Qwen3-ASR 0.6B (${devLabel || "主"}${streamingOn ? "·流式" : ""})`
           : le?.primaryAsrEngine === "sensevoice"
             ? "本地 SenseVoice (备用)"
             : "";
       const pipelineIsCv =
         (this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy") ===
         "clearvoice";
+      const cvIsRemote = le?.clearVoice?.provider === "remote";
       const readyHint =
         le?.readyForLocalAsr && asrReadyPrefix
           ? pipelineIsCv
-            ? `新方案 ClearVoice GPU (MossFormer2 切片) → ${asrReadyPrefix} 已就绪`
+            ? `新方案 ClearVoice ${cvIsRemote ? "在线 GPU" : "GPU"} (MossFormer2 切片) → ${asrReadyPrefix} 已就绪`
             : `${asrReadyPrefix} · openWakeWord · 降噪已就绪`
           : wakeEnabled
             ? `点击「进入对话」或「开启持续监听」（唤醒词：${wakeWords.slice(0, 3).join(" / ")}）`
@@ -2528,15 +2552,22 @@ export class PiAgentPanelController {
       const streamingOn =
         (vs?.qwen3StreamingEnabled ?? cfg?.qwen3StreamingEnabled ?? true) !== false;
       if (vs.localEngine.primaryAsrEngine === "qwen3-asr") {
+        const isRemote = vs.localEngine.activeQwen3Device === "remote";
         const isGpu = vs.localEngine.activeQwen3Device === "gpu";
         const gpuName = vs.localEngine.gpu?.deviceName;
         tags.push({
-          label: isGpu ? "Qwen3-ASR 0.6B · GPU" : "Qwen3-ASR 0.6B · CPU",
-          title: isGpu
-            ? `主方案 Qwen3-ASR-0.6B GPU 加速 (${gpuName || "GPU"})${vs.localEngine.readyForSenseVoice ? " · SenseVoice 备用热待命" : ""}`
-            : vs.localEngine.readyForSenseVoice
-              ? "主方案 Qwen3-ASR-0.6B (CPU) 已就绪 · SenseVoice 备用热待命"
-              : "主方案 Qwen3-ASR-0.6B (CPU) 已就绪",
+          label: isRemote
+            ? "Qwen3-ASR 0.6B · 在线 GPU"
+            : isGpu
+              ? "Qwen3-ASR 0.6B · GPU"
+              : "Qwen3-ASR 0.6B · CPU",
+          title: isRemote
+            ? `主方案在线 Qwen3-ASR-0.6B (${gpuName || "远程 GPU"})${vs.localEngine.readyForSenseVoice ? " · 本地模型热待命兜底" : ""}`
+            : isGpu
+              ? `主方案 Qwen3-ASR-0.6B GPU 加速 (${gpuName || "GPU"})${vs.localEngine.readyForSenseVoice ? " · SenseVoice 备用热待命" : ""}`
+              : vs.localEngine.readyForSenseVoice
+                ? "主方案 Qwen3-ASR-0.6B (CPU) 已就绪 · SenseVoice 备用热待命"
+                : "主方案 Qwen3-ASR-0.6B (CPU) 已就绪",
         });
       } else {
         tags.push({
@@ -2572,7 +2603,7 @@ export class PiAgentPanelController {
         cvStatus?.provider === "cuda"
           ? "CUDA GPU"
           : cvStatus?.provider === "remote"
-            ? "远程 GPU"
+            ? "在线 GPU"
             : cvReady
               ? "CPU"
               : "未就绪";
