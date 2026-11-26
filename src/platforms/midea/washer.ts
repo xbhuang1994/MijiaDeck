@@ -48,6 +48,8 @@ export interface MideaWasherDrumSpec {
   readonly location: number;
   readonly hasSoftener: boolean;
   readonly hasDry: boolean;
+  /** 该筒是否启用美的远程控制授权协议（如 38135636 仅下筒启用，左/右小筒为 false） */
+  readonly supportsRemoteControlAgree?: boolean;
 }
 
 export interface MideaWasherProfile {
@@ -186,6 +188,7 @@ const TRIPLE_DB_38135636_DRUMS: readonly MideaWasherDrumSpec[] = [
     location: 2,
     hasSoftener: true,
     hasDry: true,
+    supportsRemoteControlAgree: true,
   },
   {
     key: "left",
@@ -195,6 +198,7 @@ const TRIPLE_DB_38135636_DRUMS: readonly MideaWasherDrumSpec[] = [
     location: 3,
     hasSoftener: false,
     hasDry: true,
+    supportsRemoteControlAgree: false,
   },
   {
     key: "right",
@@ -204,6 +208,7 @@ const TRIPLE_DB_38135636_DRUMS: readonly MideaWasherDrumSpec[] = [
     location: 4,
     hasSoftener: false,
     hasDry: true,
+    supportsRemoteControlAgree: false,
   },
 ] as const;
 
@@ -1460,8 +1465,17 @@ export function parseWasherLuaStatus(
   const dryingTunnelOverheating =
     parseBoolFlexible(getField("drying_tunnel_overheating")) ?? prevDrum.dryingTunnelOverheating;
   const remoteRaw = getField("remote_control_flag");
-  const remoteControlEnabled =
-    remoteRaw !== undefined ? parseBoolFlexible(remoteRaw) ?? prevDrum.remoteControlEnabled : prevDrum.remoteControlEnabled;
+  const parsedRemote = remoteRaw !== undefined ? parseBoolFlexible(remoteRaw) : undefined;
+  let remoteControlEnabled: boolean | null;
+  if (targetSpec.supportsRemoteControlAgree === false) {
+    // 副筒未启用远程授权协议（如 38135636 左/右筒 supportRemoteControlAgree=false），0 不代表未开启
+    remoteControlEnabled = parsedRemote === true ? true : null;
+  } else if (!power) {
+    // 关机态固件普遍上报 remote_control_flag=0（含长期授权模式），不能误判为“未开启远程控制”
+    remoteControlEnabled = parsedRemote === true ? true : null;
+  } else {
+    remoteControlEnabled = parsedRemote !== undefined ? parsedRemote : prevDrum.remoteControlEnabled;
+  }
 
   const errRaw = getField("error_code");
   const errorCode =
@@ -1625,11 +1639,13 @@ export function buildWasherLuaControlPayload(
       case "location":
         return wrap({});
       case "control-status":
-      case "start":
+      case "start": {
+        const wasPowerOff = parseBoolFlexible(raw[`${prefix}power`]) === false;
         return wrap({
           [`${prefix}control_status`]: drum.running ? "start" : "pause",
-          ...(drum.running && !drum.power ? { [`${prefix}power`]: "on" } : {}),
+          ...(drum.running && (!drum.power || wasPowerOff) ? { [`${prefix}power`]: "on" } : {}),
         });
+      }
       case "program":
         return wrap({
           [`${prefix}program`]: encodeWasherProgramForLua(drum.program, code, meta),
@@ -1712,8 +1728,13 @@ export function buildWasherLuaControlPayload(
       case "power":
         return { power: drum.power ? "on" : "off" };
       case "control-status":
-      case "start":
-        return { control_status: drum.running ? "start" : "pause" };
+      case "start": {
+        const wasPowerOff = parseBoolFlexible(raw["power"]) === false;
+        return {
+          control_status: drum.running ? "start" : "pause",
+          ...(drum.running && (!drum.power || wasPowerOff) ? { power: "on" } : {}),
+        };
+      }
       case "program":
         return { program: encodeWasherProgramForLua(drum.program, code, meta) };
       case "mode":
@@ -1762,8 +1783,13 @@ export function buildWasherLuaControlPayload(
     case "power":
       return { power: drum.power ? "on" : "off" };
     case "control-status":
-    case "start":
-      return { control_status: drum.running ? "start" : "pause" };
+    case "start": {
+      const wasPowerOff = parseBoolFlexible(raw["power"]) === false;
+      return {
+        control_status: drum.running ? "start" : "pause",
+        ...(drum.running && (!drum.power || wasPowerOff) ? { power: "on" } : {}),
+      };
+    }
     case "program":
       return { program: encodeWasherProgramForLua(drum.program, code, meta) };
     case "mode":
