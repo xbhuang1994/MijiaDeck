@@ -489,6 +489,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
   private _speechGraceSuppressed = false;
   private _consecutiveAmbientNoiseCount = 0;
   private _consecutiveSidetalkCount = 0;
+  private _conversationSpeakerName: string | null = null;
   private _lastTransitionReason: string | null = null;
   private _lastWakeHit: WakeWordSpotRecord | null = null;
   private _engine: VoiceRuntimeEngine = "local";
@@ -806,6 +807,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._consecutiveSidetalkCount = 0;
     this._consecutiveAmbientNoiseCount = 0;
     this._speechGraceSuppressed = false;
+    if (options.speakerName?.trim()) {
+      this._conversationSpeakerName = options.speakerName.trim();
+    }
     this._lastTransitionReason = reason;
     this._timerPaused = false;
     const wakeMs = cfg.wakeWindowSec * 1000 + ttsGraceMs;
@@ -859,6 +863,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._consecutiveSidetalkCount = 0;
     this._consecutiveAmbientNoiseCount = 0;
     this._speechGraceSuppressed = false;
+    this._conversationSpeakerName = null;
     this._lastTransitionReason = reason;
     this._trackMuteManager.reset();
     this._resetDedupState();
@@ -1292,6 +1297,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       this._consecutiveSidetalkCount = 0;
       this._consecutiveAmbientNoiseCount = 0;
       this._speechGraceSuppressed = false;
+      this._conversationSpeakerName = null;
       this._lastTransitionReason = "timeout";
       this._trackMuteManager.reset();
       if (this._mode !== "processing" && this._mode !== "error") {
@@ -1356,6 +1362,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         acousticEvent: options.acousticEvent,
         voiceprint: options.voiceprint,
         voiceprintMode: cfg.voiceprintMode,
+        conversationSpeakerName: this._conversationSpeakerName,
         llmEvaluator,
         capabilityDigest: this._agent.getCapabilityDigest(),
         learnedTriggers: this._agent.getLearnedTriggerSamples(),
@@ -1578,6 +1585,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._consecutiveSidetalkCount = 0;
     this._consecutiveAmbientNoiseCount = 0;
     this._speechGraceSuppressed = false;
+    if (options.voiceprint?.matched && options.voiceprint.speakerName?.trim()) {
+      this._conversationSpeakerName = options.voiceprint.speakerName.trim();
+    }
     this._awakeUntil = null;
     this._lastDispatchedText = text;
     this._lastDispatchedNormText = normText;
@@ -1673,6 +1683,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           this._timerPaused = false;
           this._consecutiveAmbientNoiseCount = 0;
           this._speechGraceSuppressed = false;
+          this._conversationSpeakerName = null;
           this._clearConversationTimer();
           this._clearTtsPauseWatchdog();
           this._lastTransitionReason = "command_done_no_window";
@@ -3867,6 +3878,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           acousticEvent: p.acousticEvent,
           voiceprint: p.voiceprint,
           voiceprintMode: cfg.voiceprintMode,
+          conversationSpeakerName: this._conversationSpeakerName,
           llmEvaluator,
           capabilityDigest,
           learnedTriggers,
@@ -4435,6 +4447,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._consecutiveSidetalkCount = 0;
     this._consecutiveAmbientNoiseCount = 0;
     this._speechGraceSuppressed = false;
+    this._conversationSpeakerName = null;
     this._lastTransitionReason = "cleared";
     this._trackMuteManager.reset();
     this._echoGuard.reset();
@@ -4581,6 +4594,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     this._speechActivityStartedAt = null;
     this._speechGraceSuppressed = false;
     this._consecutiveAmbientNoiseCount = 0;
+    this._conversationSpeakerName = null;
     this._lastTrackBatch = null;
     this._recentTrackBatches = [];
     this._trackMuteManager.reset();

@@ -179,6 +179,8 @@ export interface ConversationTurnInput {
   lastSpokenReply?: string;
   acousticEvent?: string;
   speakerName?: string | null;
+  /** 当前说话人声纹是否与本轮连续对话中的活跃说话人一致 */
+  sameSpeaker?: boolean;
   acousticWake?: { wakeWord: string; score: number } | null;
   /** 当前家庭设备的特殊能力清单 */
   homeCapabilities?: readonly string[];
@@ -424,14 +426,14 @@ const WAKE_DEVICE_COMMAND_QUESTION: SystemOneChoiceQuestion<WakeDeviceCommandDec
 const CONVERSATION_ACTION_QUESTION: SystemOneChoiceQuestion<ConversationActionChoice> = {
   type: "choice",
   instructions:
-    "你是运行在电脑上的多平台智能家居控制助手，可控制家中各类智能设备（见 home_capabilities，含多筒洗衣机袜子筒/内裤筒、干衣机、扫地机、喂食器、智能灌溉等）与回答问题。当前处于连续对话模式（用户可省略唤醒词，若 acoustic_wake 非空表示刚刚检测到唤醒词，若 pending_confirmation 非空表示正在等用户确认）。请结合 home_capabilities、learned_triggers、pending_confirmation、acoustic_wake 与 history 判断最新 utterance 的性质。",
+    "你是运行在电脑上的多平台智能家居控制助手，可控制家中各类智能设备（见 home_capabilities，含多筒洗衣机袜子筒/内裤筒、干衣机、扫地机、喂食器、智能灌溉等）与回答问题。当前处于连续对话模式（用户可省略唤醒词；若 acoustic_wake 非空表示刚刚检测到唤醒词；若 pending_confirmation 非空表示正在等用户确认；若 same_speaker 为 true 表示声纹与本轮对话说话人一致）。请结合 home_capabilities、learned_triggers、pending_confirmation、acoustic_wake、same_speaker 与 history 判断最新 utterance 的性质。重要：当 utterance 明显承接 history 对助手进行叮嘱、提醒、批评、反馈、要求改进、追问或自然回应（如“那以后不要出现这种情况了”“下次注意一点”“为什么刚才没反应”“你刚才说的是什么意思”），即使未提及具体设备名称，也应归类为 followup，不要误判为 side_talk 或 goodbye。",
   criteria: {
     followup:
-      "用户在继续与智能家居助手对话：下达显式或隐式设备控制/调节指令（凡命中 home_capabilities 或 learned_triggers 的请求如“帮我洗一下袜子”“洗内裤”“浇花”“扫地”“喂猫”均属此类）、回复 pending_confirmation 的肯定/否定/改选/消歧答复（如“嗯”“好”“对”“用下筒”“方寸别院那台”“不用了”）、保存或管理长期偏好规则、补充参数、纠正撤销、查询设备状态、环境抱怨反馈，或面向助手的自然追问。",
+      "用户在继续与智能家居助手对话：包括下达显式或隐式设备控制/调节指令（凡命中 home_capabilities 或 learned_triggers 的请求如“帮我洗一下袜子”“洗内裤”“浇花”“扫地”“喂猫”均属此类）、回复 pending_confirmation 的肯定/否定/改选/消歧答复（如“嗯”“好”“对”“用下筒”“方寸别院那台”“不用了”）、保存或管理长期偏好规则、补充参数、纠正撤销、查询设备状态、环境抱怨反馈、面向助手的自然追问，以及承接上文对助手表现的叮嘱、提醒、批评、改进要求、表态或回应（如“那以后不要出现这种情况了”“下次注意一点”“以后别再这样了”“别再听错了”“知道了下次记得”“这次反应挺快”等）。",
     side_talk:
-      "用户在与旁边家人/朋友说话、自言自语、聊日常琐事或要求真人完成家中无任何联网设备支持的跑腿家务（如晚饭吃什么、帮我倒水、拿双筷子、洗碗做饭、去取快递），或纯背景歌词/环境噪声，未面向智能家居助手说话。",
+      "用户在与旁边家人/朋友说话、自言自语、聊与当前对话无关的日常琐事或要求真人完成家中无任何联网设备支持的跑腿家务（如晚饭吃什么、帮我倒水、拿双筷子、洗碗做饭、去取快递），或纯背景歌词/电视广播/环境噪声，未面向智能家居助手说话且未承接 history 对话。",
     goodbye:
-      "用户明确示意结束本次对话、道谢收尾或让助手退下/停止聆听（如“谢谢不用了”、“没事了”、“好了退下吧”、“再见”、“that's all thanks”、“goodbye”）。注意：当 pending_confirmation 存在时，用户回复“算了/取消/不用了”优先视作对确认请求的拒绝 followup 而非直接退出。",
+      "用户明确示意结束本次对话、道谢收尾或让助手退下/停止聆听（如“谢谢不用了”、“没事了”、“好了退下吧”、“再见”、“先这样吧”、“that's all thanks”、“goodbye”）。注意：1) 当 pending_confirmation 存在时，用户回复“算了/取消/不用了”优先视作对确认请求的拒绝 followup 而非直接退出；2) 对助手的叮嘱、批评、提醒改进或承接上文的反馈（如“那以后不要出现这种情况了”“下次别这样了”“下次注意一点”）属于 followup，绝不是 goodbye。",
   },
 };
 
@@ -1296,6 +1298,7 @@ export class SystemOneClient {
       lastSpoken.toLowerCase(),
       input.acousticEvent ?? "",
       input.speakerName ?? "",
+      input.sameSpeaker === true ? "same_spk" : "",
       input.acousticWake
         ? `${input.acousticWake.wakeWord.toLowerCase()}:${input.acousticWake.score.toFixed(2)}`
         : "",
@@ -1328,6 +1331,7 @@ export class SystemOneClient {
     }
     if (input.acousticEvent) state.acoustic_event = input.acousticEvent;
     if (input.speakerName) state.speaker = input.speakerName;
+    if (input.sameSpeaker === true) state.same_speaker = true;
     if (input.acousticWake) {
       state.acoustic_wake = {
         wake_word: input.acousticWake.wakeWord,
@@ -1366,7 +1370,27 @@ export class SystemOneClient {
     const acceptThreshold = this._effectiveAcceptThreshold(strict);
     const action = actionAns.choice;
     const confidence = actionAns.confidence;
-    const accepted = action === "followup" && confidence >= acceptThreshold;
+    const pFollowup = actionAns.probabilities.followup ?? 0;
+    const pSideTalk = actionAns.probabilities.side_talk ?? 0;
+    const pGoodbye = actionAns.probabilities.goodbye ?? 0;
+    const pDirected = pFollowup + pGoodbye;
+    const marginOverSideTalk = pFollowup - pSideTalk;
+
+    // 3 分类概率校准（仅非 strict 模式生效）：
+    // SystemOne 的 confidence 为概率分布集中度指标，在 3 分类（followup/side_talk/goodbye）下，
+    // 当 P(followup) 已达阈值或 P(followup)+P(goodbye) 高度指向助手且 P(side_talk) 极低时，
+    // 集中度 confidence 仍可能略低于阈值，此处基于完整概率分布避免误拦自然跟进表达。
+    const probabilityCalibratedFollowup =
+      !strict &&
+      action === "followup" &&
+      ((pFollowup >= acceptThreshold && pSideTalk <= 0.25 && marginOverSideTalk >= 0.25) ||
+        (pFollowup >= Math.max(0.45, Number((acceptThreshold - 0.2).toFixed(2))) &&
+          pDirected >= Math.max(0.75, Number((acceptThreshold + 0.1).toFixed(2))) &&
+          pSideTalk <= 0.22 &&
+          marginOverSideTalk >= 0.25));
+
+    const accepted =
+      action === "followup" && (confidence >= acceptThreshold || probabilityCalibratedFollowup);
     const shouldExitConversation =
       action === "goodbye" && confidence >= GOODBYE_CONFIDENCE_THRESHOLD;
 

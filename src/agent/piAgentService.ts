@@ -2458,7 +2458,7 @@ export class PiAgentService extends TypedEmitter<PiAgentEvents> {
   recentConversationTurns(limit = 6): Array<{ role: "user" | "assistant"; text: string; timestamp: number }> {
     const turns: Array<{ role: "user" | "assistant"; text: string; timestamp: number }> = [];
     for (const e of this._timeline) {
-      if (e.status !== "done") continue;
+      if (e.status !== "done" && !(e.status === "streaming" && e.text.trim().length > 0)) continue;
       let text = e.text.trim();
       if (!text && e.silentCompleted) {
         text =
