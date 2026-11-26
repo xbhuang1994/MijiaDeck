@@ -1020,7 +1020,11 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           preloadEnglish: hasAsciiWake,
           voicePipelineMode: this.config.voicePipelineMode,
         });
-        if (this.config.sourceSeparationMode !== "off") {
+        if (
+          this.config.sourceSeparationMode !== "off" &&
+          this.config.voicePipelineMode !== "xfyun" &&
+          this.config.voicePipelineMode !== "voice-ws"
+        ) {
           void this._localEngine.sourceSeparator.warmupAsync().catch(() => {});
         }
         if (this.config.owwEnabled) {
@@ -1035,6 +1039,15 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     }
     if (patch.engine !== undefined) {
       this._engine = patch.engine;
+    } else if (!this._active && this._engine === "browser") {
+      const latestStatus = this._localEngine.getStatus();
+      if (
+        latestStatus.readyForLocalAsr ||
+        (this.config.voicePipelineMode === "xfyun" && latestStatus.readyForXfyunIat) ||
+        (this.config.voicePipelineMode === "voice-ws" && latestStatus.readyForVoiceWsAsr)
+      ) {
+        this._engine = "local";
+      }
     }
     if (patch.interimTranscript !== undefined) {
       this._interimTranscript = patch.interimTranscript;

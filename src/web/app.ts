@@ -5466,10 +5466,12 @@ export class MijiaDeckWebApp {
       systemPromptExtra: el<HTMLTextAreaElement>("set-agent-system-prompt").value.trim(),
       voiceEngine: el<HTMLSelectElement>("set-voice-engine").value,
       streamingAsrEnabled: el<HTMLInputElement>("set-voice-streaming-asr").checked,
-      voicePipelineMode:
-        (document.getElementById("set-voice-pipeline-mode") as HTMLSelectElement | null)?.value === "xfyun"
-          ? "xfyun"
-          : "legacy",
+      voicePipelineMode: (() => {
+        const val = (
+          document.getElementById("set-voice-pipeline-mode") as HTMLSelectElement | null
+        )?.value;
+        return val === "xfyun" || val === "voice-ws" ? val : "legacy";
+      })(),
       xfyunEndpointUrl:
         (document.getElementById("set-xfyun-endpoint-url") as HTMLInputElement | null)?.value.trim() ??
         "",
@@ -5573,7 +5575,13 @@ export class MijiaDeckWebApp {
       }
       if (agentRes?.config) this.agentConfigCache = agentRes.config;
       if (agentRes?.agent) this.piAgentPanel.applyAgentSnapshot(agentRes.agent);
-      if (agentRes?.voice) this.piAgentPanel.applyVoiceSnapshot(agentRes.voice);
+      if (agentRes?.voice) {
+        const voiceSnap = agentRes.voice as { localEngine?: UiLocalVoiceStatus };
+        if (voiceSnap.localEngine) {
+          this.localVoiceStatusCache = voiceSnap.localEngine;
+        }
+        this.piAgentPanel.applyVoiceSnapshot(agentRes.voice);
+      }
       this.reloadThemeStylesheet();
       this.closeModal();
       this.showToast("设置已保存", 2200);
