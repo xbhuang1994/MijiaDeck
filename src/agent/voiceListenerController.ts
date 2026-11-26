@@ -2364,7 +2364,10 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         ? decoded.samples
         : resampleLinear(decoded.samples, decoded.sampleRate, 16000);
 
-    // ---- Stage 1.1: 未唤醒门控（HTTP 兜底上传模式）：未唤醒且 openWakeWord 原型就绪时仅做轻量声学唤醒检测，未命中则不调用 ClearVoice/ASR ----
+    // ---- Stage 1.1: 未唤醒门控（HTTP 兜底上传模式）：先做充分降噪/分轨（含 ClearVoice GPU BSS+SE 或 DPDFNet4）再声学唤醒检测，未命中则跳过 ASR ----
+    this._syncLocalEngineConfig();
+    const engineStatusPre = this._localEngine.getStatus();
+
     const uploadNow = Date.now();
     const uploadDurMs = Math.round((pcm16k.length / 16000) * 1000);
     const uploadSpeechStartedAt = Math.max(0, uploadNow - Math.min(30_000, uploadDurMs));
@@ -2378,6 +2381,9 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const uploadInConversation =
       this._dialogState === "conversation" || uploadAwakeActive || uploadConvActive;
     let uploadWakeGateHit: WakeWordAcousticHit | null = null;
+    let preSeparatedCv: Awaited<
+      ReturnType<LocalVoiceEngine["clearVoiceGpu"]["separateAndEnhanceOfflineWithChunking"]>
+    > | null = null;
     if (
       autoDispatch &&
       cfg.wakeWordEnabled &&
@@ -2390,13 +2396,64 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       let gateHit = this._localEngine.scoreWakeWordAudio(pcm16k, cfg.wakeWords, {
         threshold: cfg.owwThreshold,
       });
+      let gateDenoiseEngine = "oww-standby";
       if (!gateHit?.matched && cfg.noiseSuppressionMode !== "off") {
-        const quickDen = this._localEngine.denoise(pcm16k, 16000, "auto");
+        // 1) 按用户配置的降噪模式执行快路径降噪后复检
+        const quickDen = this._localEngine.denoise(pcm16k, 16000, cfg.noiseSuppressionMode);
+        gateDenoiseEngine = `oww-standby-${quickDen.engine}`;
         const denHit = this._localEngine.scoreWakeWordAudio(quickDen.samples, cfg.wakeWords, {
           threshold: cfg.owwThreshold,
         });
         if (denHit && (!gateHit || denHit.score > gateHit.score)) {
           gateHit = denHit;
+        }
+
+        // 2) 若启用 ClearVoice 方案且在线服务就绪，运行多轨盲源分离 + 分轨降噪（彻底剥离电视人声与环境噪）后逐轨检测唤醒词；
+        //    命中后将在 Stage 1.2 直接复用分轨结果，避免重复远端推理！
+        const cvStatus = engineStatusPre.clearVoice;
+        const canStandbyCv =
+          !gateHit?.matched &&
+          cfg.voicePipelineMode === "clearvoice" &&
+          engineStatusPre.readyForClearVoiceGpu &&
+          !this._localEngine.clearVoiceGpu.isInFailureCooldown() &&
+          cvStatus.provider === "remote";
+        if (canStandbyCv) {
+          try {
+            const cvRes = await this._localEngine.clearVoiceGpu.separateAndEnhanceOfflineWithChunking(
+              pcm16k,
+              16000,
+            );
+            preSeparatedCv = cvRes;
+            gateDenoiseEngine = cvRes.engine;
+            for (const tr of cvRes.tracks) {
+              const trHit = this._localEngine.scoreWakeWordAudio(tr.samples, cfg.wakeWords, {
+                threshold: cfg.owwThreshold,
+              });
+              if (trHit && (!gateHit || trHit.score > gateHit.score)) {
+                gateHit = trHit;
+              }
+            }
+          } catch {
+            // ClearVoice 临时不可用时静默回退至本地深度降噪兜底
+          }
+        }
+
+        // 3) 非 ClearVoice（或 ClearVoice 未命中/不可用）且本地具备 DPDFNet4 时，用强效去噪模型做最终声学唤醒复检
+        if (
+          !gateHit?.matched &&
+          !preSeparatedCv &&
+          (cfg.noiseSuppressionMode === "auto" || cfg.noiseSuppressionMode === "neural") &&
+          quickDen.engine !== "dpdfnet4" &&
+          engineStatusPre.readyForDpdfnet
+        ) {
+          const deepDen = this._localEngine.denoise(pcm16k, 16000, "dpdfnet");
+          gateDenoiseEngine = `oww-standby-${deepDen.engine}`;
+          const deepHit = this._localEngine.scoreWakeWordAudio(deepDen.samples, cfg.wakeWords, {
+            threshold: cfg.owwThreshold,
+          });
+          if (deepHit && (!gateHit || deepHit.score > gateHit.score)) {
+            gateHit = deepHit;
+          }
         }
       }
       if (!gateHit?.matched) {
@@ -2404,7 +2461,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           totalMs: Math.round(performance.now() - totalStart),
         };
         this._lastMetrics = {
-          denoiseEngine: "oww-standby",
+          denoiseEngine: gateDenoiseEngine,
           vadEngine: "oww-wake-gate",
           asrEngine: "skipped-unawakened",
           acousticWake: gateHit,
@@ -2415,7 +2472,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
           ok: true,
           text: "",
           speechDetected: true,
-          denoiseEngine: "oww-standby",
+          denoiseEngine: gateDenoiseEngine,
           vadEngine: "oww-wake-gate",
           asrEngine: "skipped-unawakened",
           acousticWake: gateHit,
@@ -2430,12 +2487,10 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     }
 
     // ---- Stage 1.5: 本地自适应多级声源分离与说话人隔离主通道（S_Fused 最终方案） ----
-    this._syncLocalEngineConfig();
     const sttAuthPre = resolveEffectiveSttAuth(cfg);
     const hasCloudSttPre = Boolean(
       sttAuthPre.baseUrl && (sttAuthPre.apiKey || isLocalEndpointUrl(sttAuthPre.baseUrl)),
     );
-    const engineStatusPre = this._localEngine.getStatus();
     const prefPre = options.preferredEngine ?? (cfg.voiceEngine === "whisper" ? "whisper" : "auto");
     const useLocalPre =
       prefPre === "local" ||
@@ -2446,14 +2501,17 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     if (
       useLocalPre &&
       cfg.voicePipelineMode === "clearvoice" &&
-      engineStatusPre.readyForClearVoiceGpu &&
-      !this._localEngine.clearVoiceGpu.isInFailureCooldown()
+      (preSeparatedCv !== null ||
+        (engineStatusPre.readyForClearVoiceGpu &&
+          !this._localEngine.clearVoiceGpu.isInFailureCooldown()))
     ) {
       try {
-        const cvRes = await this._localEngine.clearVoiceGpu.separateAndEnhanceOfflineWithChunking(
-          pcm16k,
-          16000,
-        );
+        const cvRes =
+          preSeparatedCv ??
+          (await this._localEngine.clearVoiceGpu.separateAndEnhanceOfflineWithChunking(
+            pcm16k,
+            16000,
+          ));
         if (cvRes.tracks.length > 0) {
           return await this.processClearVoiceSeparatedTracks(
             cvRes.tracks.map((tr) => ({
