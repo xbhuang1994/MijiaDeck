@@ -249,6 +249,12 @@ export interface UiPublicAgentConfig extends ClientVoiceConfig {
   hasXfyunApiSecret?: boolean;
   xfyunApiSecretPreview?: string;
   effectiveXfyunConfigured?: boolean;
+  voiceWsAsrEndpointUrl?: string;
+  voiceWsAsrDenoise?: boolean;
+  voiceWsAsrLanguage?: string;
+  hasVoiceWsAsrAuthCode?: boolean;
+  voiceWsAsrAuthCodePreview?: string;
+  effectiveVoiceWsAsrConfigured?: boolean;
   systemOneMode?: UiSystemOneMode;
   systemOneBaseUrl?: string;
   systemOneModel?: string;
@@ -370,6 +376,21 @@ export interface UiLocalVoiceStatus {
     lastSid: string | null;
     lastError: string | null;
   };
+  readyForVoiceWsAsr?: boolean;
+  voiceWsAsr?: {
+    configured: boolean;
+    ready: boolean;
+    endpointUrl: string;
+    hasAuthCode: boolean;
+    denoiseEnabled: boolean;
+    language: string | null;
+    denoiseModel: string | null;
+    vadModel: string | null;
+    asrModel: string | null;
+    lastLatencyMs: number | null;
+    lastSessionId: string | null;
+    lastError: string | null;
+  };
   readyForVad: boolean;
   readyForVoiceprint: boolean;
   readyForQwen3Asr?: boolean;
@@ -427,6 +448,7 @@ export interface UiLocalVoiceStatus {
     clearVoiceMossformer2?: boolean;
     clearVoiceMossformer2Ss?: boolean;
     xfyunIat?: boolean;
+    voiceWsAsr?: boolean;
   };
 }
 
@@ -511,7 +533,7 @@ export interface UiVoiceSnapshot {
   active: boolean;
   mode: ClientVoiceMode;
   engine: "local" | "browser" | "whisper" | "manual";
-  voicePipelineMode?: "legacy" | "clearvoice" | "xfyun";
+  voicePipelineMode?: "legacy" | "clearvoice" | "xfyun" | "voice-ws";
   clearVoiceServiceUrl?: string;
   clearVoiceModel?: string;
   qwen3AsrServiceUrl?: string;
@@ -519,6 +541,10 @@ export interface UiVoiceSnapshot {
   xfyunEndpointUrl?: string;
   xfyunAppId?: string;
   effectiveXfyunConfigured?: boolean;
+  voiceWsAsrEndpointUrl?: string;
+  voiceWsAsrDenoise?: boolean;
+  voiceWsAsrLanguage?: string;
+  effectiveVoiceWsAsrConfigured?: boolean;
   localAsrEngine?: "auto" | "qwen3-asr" | "sensevoice";
   qwen3StreamingEnabled?: boolean;
   interimTranscript: string;
@@ -1265,7 +1291,12 @@ export class PiAgentPanelController {
   async toggleVoicePipelineMode(): Promise<void> {
     const current =
       this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy";
-    const order: ReadonlyArray<"legacy" | "clearvoice" | "xfyun"> = ["legacy", "clearvoice", "xfyun"];
+    const order: ReadonlyArray<"legacy" | "clearvoice" | "xfyun" | "voice-ws"> = [
+      "legacy",
+      "clearvoice",
+      "xfyun",
+      "voice-ws",
+    ];
     const idx = order.indexOf(current);
     const next = order[(idx + 1) % order.length] ?? "legacy";
     try {
@@ -1276,11 +1307,13 @@ export class PiAgentPanelController {
       if (res.agent) this.applyAgentSnapshot(res.agent);
       if (res.voice) this.applyVoiceSnapshot(res.voice);
       this.deps.showToast(
-        next === "xfyun"
-          ? "已切换方案：讯飞语音听写大模型 2.0（openWakeWord 唤醒后直推原始音频）"
-          : next === "clearvoice"
-            ? "已切换方案：ClearVoice 多轨盲源分离 + 降噪 → 分轨独立声纹/ASR/判定"
-            : "已切回原方案（GTCRN + 声源分离）",
+        next === "voice-ws"
+          ? "已切换方案：统一流式语音听写网关（openWakeWord 唤醒后直推原始音频）"
+          : next === "xfyun"
+            ? "已切换方案：讯飞语音听写大模型 2.0（openWakeWord 唤醒后直推原始音频）"
+            : next === "clearvoice"
+              ? "已切换方案：ClearVoice 多轨盲源分离 + 降噪 → 分轨独立声纹/ASR/判定"
+              : "已切回原方案（GTCRN + 声源分离）",
         2400,
       );
     } catch (err) {
@@ -1353,6 +1386,11 @@ export class PiAgentPanelController {
             this.voiceState?.effectiveXfyunConfigured ??
             this.agentState.config.effectiveXfyunConfigured,
         ),
+        voiceWsAsrReady: Boolean(
+          this.voiceState?.localEngine?.readyForVoiceWsAsr ??
+            this.voiceState?.effectiveVoiceWsAsrConfigured ??
+            this.agentState.config.effectiveVoiceWsAsrConfigured,
+        ),
         localTtsReady: this.voiceState?.localEngine?.readyForLocalTts,
       });
     }
@@ -1389,6 +1427,10 @@ export class PiAgentPanelController {
         localAsrReady: Boolean(this.voiceState.localEngine.readyForLocalAsr),
         xfyunIatReady: Boolean(
           this.voiceState.localEngine.readyForXfyunIat ?? this.voiceState.effectiveXfyunConfigured,
+        ),
+        voiceWsAsrReady: Boolean(
+          this.voiceState.localEngine.readyForVoiceWsAsr ??
+            this.voiceState.effectiveVoiceWsAsrConfigured,
         ),
         localTtsReady: Boolean(this.voiceState.localEngine.readyForLocalTts),
       });
@@ -2394,6 +2436,7 @@ export class PiAgentPanelController {
         this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy";
       const isClearVoice = pipelineMode === "clearvoice";
       const isXfyun = pipelineMode === "xfyun";
+      const isVoiceWs = pipelineMode === "voice-ws";
       const cvInfo = this.voiceState?.localEngine?.clearVoice;
       const cvReady = Boolean(this.voiceState?.localEngine?.readyForClearVoiceGpu ?? cvInfo?.ready);
       const xfyunReady = Boolean(
@@ -2401,22 +2444,33 @@ export class PiAgentPanelController {
           this.voiceState?.effectiveXfyunConfigured ??
           this.agentState?.config.effectiveXfyunConfigured,
       );
-      pipelineBtn.textContent = isXfyun
-        ? xfyunReady
-          ? "讯飞 2.0(在线)"
-          : "讯飞 2.0(未配置)"
-        : isClearVoice
-          ? cvReady
-            ? "ClearVoice(在线)"
-            : "ClearVoice(未配置)"
-          : "方案：原方案";
-      pipelineBtn.classList.toggle("active", isClearVoice || isXfyun);
-      pipelineBtn.setAttribute("aria-pressed", String(isClearVoice || isXfyun));
-      pipelineBtn.title = isXfyun
-        ? "当前方案：讯飞语音听写大模型 2.0（openWakeWord 唤醒后直接推送原始 16kHz PCM 至讯飞 WebSocket，点击切回原方案）"
-        : isClearVoice
-          ? "当前方案：在线 ClearVoice 多轨切片（Silero VAD 双触发 + 0.3s 上下文 + 20ms 淡入淡出）→ 在线 Qwen3-ASR（点击切换为讯飞语音听写大模型 2.0 方案）"
-          : "当前方案：原方案（GTCRN + Silero VAD + 声源分离），点击切换为在线 ClearVoice 多轨方案 / 讯飞语音听写大模型 2.0";
+      const voiceWsReady = Boolean(
+        this.voiceState?.localEngine?.readyForVoiceWsAsr ??
+          this.voiceState?.effectiveVoiceWsAsrConfigured ??
+          this.agentState?.config.effectiveVoiceWsAsrConfigured,
+      );
+      pipelineBtn.textContent = isVoiceWs
+        ? voiceWsReady
+          ? "统一流式(在线)"
+          : "统一流式(未配置)"
+        : isXfyun
+          ? xfyunReady
+            ? "讯飞 2.0(在线)"
+            : "讯飞 2.0(未配置)"
+          : isClearVoice
+            ? cvReady
+              ? "ClearVoice(在线)"
+              : "ClearVoice(未配置)"
+            : "方案：原方案";
+      pipelineBtn.classList.toggle("active", isClearVoice || isXfyun || isVoiceWs);
+      pipelineBtn.setAttribute("aria-pressed", String(isClearVoice || isXfyun || isVoiceWs));
+      pipelineBtn.title = isVoiceWs
+        ? "当前方案：统一流式语音听写网关（openWakeWord 唤醒后直推 16kHz PCM Binary 帧，服务端 GTCRN+Silero VAD → Qwen3-ASR，点击切回原方案）"
+        : isXfyun
+          ? "当前方案：讯飞语音听写大模型 2.0（openWakeWord 唤醒后直接推送原始 16kHz PCM 至讯飞 WebSocket，点击切换为统一流式语音听写网关）"
+          : isClearVoice
+            ? "当前方案：在线 ClearVoice 多轨切片（Silero VAD 双触发 + 0.3s 上下文 + 20ms 淡入淡出）→ 在线 Qwen3-ASR（点击切换为讯飞语音听写大模型 2.0 方案）"
+            : "当前方案：原方案（GTCRN + Silero VAD + 声源分离），点击切换为 ClearVoice / 讯飞 2.0 / 统一流式网关";
     }
 
     if (cavemanBtn) {
@@ -2469,10 +2523,13 @@ export class PiAgentPanelController {
         this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy";
       const pipelineIsCv = pipelineModeNow === "clearvoice";
       const pipelineIsXfyun = pipelineModeNow === "xfyun";
+      const pipelineIsVoiceWs = pipelineModeNow === "voice-ws";
       const cvPrefix = pipelineIsCv ? "在线 ClearVoice → " : "";
-      const localAsrLabel = pipelineIsXfyun
-        ? "讯飞听写大模型 2.0 · 原始音频直推"
-        : localEngine?.primaryAsrEngine === "qwen3-asr"
+      const localAsrLabel = pipelineIsVoiceWs
+        ? "统一流式听写网关 · WS 原始直推"
+        : pipelineIsXfyun
+          ? "讯飞听写大模型 2.0 · 原始音频直推"
+          : localEngine?.primaryAsrEngine === "qwen3-asr"
           ? `${cvPrefix}在线 Qwen3-ASR 0.6B${streamingOn ? " · 流式" : ""}`
           : localEngine?.primaryAsrEngine === "sensevoice"
             ? localEngine.activeLocalAsrMode === "sensevoice"
@@ -2508,16 +2565,26 @@ export class PiAgentPanelController {
         this.voiceState?.voicePipelineMode ?? this.agentState?.config.voicePipelineMode ?? "legacy";
       const pipelineIsCv = pipelineModeIdle === "clearvoice";
       const pipelineIsXfyun = pipelineModeIdle === "xfyun";
+      const pipelineIsVoiceWs = pipelineModeIdle === "voice-ws";
       const xfyunReadyIdle = Boolean(
         le?.readyForXfyunIat ??
           this.voiceState?.effectiveXfyunConfigured ??
           this.agentState?.config.effectiveXfyunConfigured,
       );
-      const readyHint = pipelineIsXfyun
-        ? xfyunReadyIdle
-          ? "讯飞听写大模型 2.0（openWakeWord 唤醒后直推原始音频）已就绪"
-          : "讯飞听写大模型 2.0 尚未配置密钥，请在设置中填写 APPID / APIKey / APISecret"
-        : le?.readyForLocalAsr && asrReadyPrefix
+      const voiceWsReadyIdle = Boolean(
+        le?.readyForVoiceWsAsr ??
+          this.voiceState?.effectiveVoiceWsAsrConfigured ??
+          this.agentState?.config.effectiveVoiceWsAsrConfigured,
+      );
+      const readyHint = pipelineIsVoiceWs
+        ? voiceWsReadyIdle
+          ? "统一流式语音听写网关（openWakeWord 唤醒后直推原始 PCM，服务端 GTCRN+Silero VAD → Qwen3-ASR）已就绪"
+          : "统一流式语音听写网关尚未配置授权码，请在设置中填写网关地址与授权码"
+        : pipelineIsXfyun
+          ? xfyunReadyIdle
+            ? "讯飞听写大模型 2.0（openWakeWord 唤醒后直推原始音频）已就绪"
+            : "讯飞听写大模型 2.0 尚未配置密钥，请在设置中填写 APPID / APIKey / APISecret"
+          : le?.readyForLocalAsr && asrReadyPrefix
           ? pipelineIsCv
             ? `新方案 在线 ClearVoice (MossFormer2 切片) → ${asrReadyPrefix} 已就绪`
             : `${asrReadyPrefix} · openWakeWord · 降噪已就绪`
@@ -2621,7 +2688,22 @@ export class PiAgentPanelController {
       tags.push({ label: "openWakeWord" });
     }
     const pipelineMode = vs?.voicePipelineMode ?? cfg?.voicePipelineMode ?? "legacy";
-    if (pipelineMode === "xfyun") {
+    if (pipelineMode === "voice-ws") {
+      const wsStatus = vs?.localEngine?.voiceWsAsr;
+      const wsReady = Boolean(
+        vs?.localEngine?.readyForVoiceWsAsr ??
+          wsStatus?.ready ??
+          vs?.effectiveVoiceWsAsrConfigured ??
+          cfg?.effectiveVoiceWsAsrConfigured,
+      );
+      tags.push({
+        label: wsReady ? "统一流式 · WS 直推" : "统一流式 · 未配置",
+        warn: !wsReady,
+        title: wsReady
+          ? `统一流式语音听写网关 (${wsStatus?.endpointUrl || "wss://voice.1inch.cn:18443/v1/ws/asr"}) · openWakeWord 唤醒后直推原始 16kHz PCM`
+          : wsStatus?.lastError || "请在设置中填写统一流式语音听写网关授权码",
+      });
+    } else if (pipelineMode === "xfyun") {
       const xfStatus = vs?.localEngine?.xfyunIat;
       const xfReady = Boolean(
         vs?.localEngine?.readyForXfyunIat ??

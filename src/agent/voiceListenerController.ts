@@ -12,6 +12,7 @@ import {
   resolveEffectiveClearVoiceAuth,
   resolveEffectiveQwen3AsrAuth,
   resolveEffectiveSttAuth,
+  resolveEffectiveVoiceWsAsrAuth,
   resolveEffectiveXfyunAuth,
   type AgentVoiceConfig,
   type CavemanReplyMode,
@@ -262,6 +263,10 @@ export interface VoiceListenerSnapshot {
   xfyunEndpointUrl: string;
   xfyunAppId: string;
   effectiveXfyunConfigured: boolean;
+  voiceWsAsrEndpointUrl: string;
+  voiceWsAsrDenoise: boolean;
+  voiceWsAsrLanguage: string;
+  effectiveVoiceWsAsrConfigured: boolean;
   localAsrEngine: AgentVoiceConfig["localAsrEngine"];
   qwen3StreamingEnabled: boolean;
   asyncVoicePipeline: boolean;
@@ -517,7 +522,8 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const initLocalStatus = this._localEngine.getStatus();
     this._engine =
       initLocalStatus.readyForLocalAsr ||
-      (this.config.voicePipelineMode === "xfyun" && initLocalStatus.readyForXfyunIat)
+      (this.config.voicePipelineMode === "xfyun" && initLocalStatus.readyForXfyunIat) ||
+      (this.config.voicePipelineMode === "voice-ws" && initLocalStatus.readyForVoiceWsAsr)
         ? "local"
         : "browser";
     // 若已配置在线 ClearVoice / Qwen3-ASR 网关，启动后异步探活并同步远端 GPU 名称与状态（非阻塞）
@@ -600,6 +606,7 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
     const cvAuth = resolveEffectiveClearVoiceAuth(cfg);
     const qwenAuth = resolveEffectiveQwen3AsrAuth(cfg);
     const xfyunAuth = resolveEffectiveXfyunAuth(cfg);
+    const voiceWsAuth = resolveEffectiveVoiceWsAsrAuth(cfg);
     this._localEngine.setPreferredAsrEngine?.(cfg.localAsrEngine);
     if (typeof this._localEngine.setClearVoiceRemoteConfig === "function") {
       this._localEngine.setClearVoiceRemoteConfig({
@@ -620,6 +627,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       appId: xfyunAuth.appId,
       apiKey: xfyunAuth.apiKey,
       apiSecret: xfyunAuth.apiSecret,
+    });
+    this._localEngine.setVoiceWsAsrConfig?.({
+      endpointUrl: voiceWsAuth.endpointUrl,
+      authCode: voiceWsAuth.authCode,
+      denoise: voiceWsAuth.denoise,
+      language: voiceWsAuth.language,
     });
   }
 
@@ -1857,7 +1870,12 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         threshold: cfg.owwThreshold,
       });
       let gateDenoiseEngine = "oww-standby";
-      if (!gateHit?.matched && cfg.voicePipelineMode !== "xfyun" && cfg.noiseSuppressionMode !== "off") {
+      if (
+        !gateHit?.matched &&
+        cfg.voicePipelineMode !== "xfyun" &&
+        cfg.voicePipelineMode !== "voice-ws" &&
+        cfg.noiseSuppressionMode !== "off"
+      ) {
         // 1) 按用户配置的降噪模式执行快路径降噪后复检
         const quickDen = this._localEngine.denoise(pcm16k, 16000, cfg.noiseSuppressionMode);
         gateDenoiseEngine = `oww-standby-${quickDen.engine}`;
@@ -2048,6 +2066,116 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         denoiseEngine: "xfyun-raw-direct",
         vadEngine: "xfyun-eos",
         asrEngine: "xfyun-iat-v2",
+        inputSnrDb,
+        outputSnrDb: inputSnrDb,
+        snrGainDb: 0,
+        acousticWake: uploadWakeGateHit,
+      };
+    }
+
+    // ---- Stage 1.16 (统一流式语音听写 WebSocket 网关方案): openWakeWord 唤醒/放行后直接将 16kHz 原始 PCM 推送至网关（服务端 CPU ONNX GTCRN+Silero VAD -> GPU Qwen3-ASR） ----
+    if (
+      cfg.voicePipelineMode === "voice-ws" &&
+      this._localEngine.voiceWsAsr.isConfigured()
+    ) {
+      const wsRes = await this._localEngine.voiceWsAsr.transcribePcm(pcm16k, {
+        minSilenceMs: cfg.vadSilenceMs,
+      });
+      const transcript = sanitizeAsrTranscript(wsRes.text, { wakeWords: cfg.wakeWords });
+      const asrMs = wsRes.asrMs || wsRes.durationMs;
+      const denoiseTag = wsRes.denoiseEnabled ? "voice-ws-gtcrn" : "voice-ws-raw";
+      const inputSnrDb = estimateSnrDb(pcm16k, 16000);
+      let voiceprintResult: VoiceprintIdentifyResult | null = null;
+      let voiceprintMs = 0;
+      const profilesWs = listPublicVoiceprints();
+      if (
+        cfg.voiceprintMode !== "off" &&
+        profilesWs.length > 0 &&
+        pcm16k.length >= 4000 &&
+        engineStatusPre.readyForVoiceprint
+      ) {
+        const emb = this._localEngine.extractSpeakerEmbedding(pcm16k, 16000);
+        voiceprintMs = emb.durationMs;
+        voiceprintResult = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
+      }
+      const timingsBase: Partial<VoicePipelineTimings> = {
+        voiceprintMs,
+        asrMs,
+      };
+      this._lastMetrics = {
+        denoiseEngine: denoiseTag,
+        snrGainDb: 0,
+        vadEngine: "voice-ws-silero",
+        speechRatio: transcript ? 1 : 0,
+        asrEngine: "voice-ws-asr",
+        voiceprint: voiceprintResult,
+        acousticWake: uploadWakeGateHit,
+        updatedAt: Date.now(),
+      };
+      if (!transcript.trim()) {
+        if (autoDispatch) {
+          this._noteNonConversationSegment("ambient_noise");
+        }
+        return {
+          ok: true,
+          text: "",
+          speechDetected: false,
+          denoiseEngine: denoiseTag,
+          vadEngine: "voice-ws-silero",
+          asrEngine: "voice-ws-asr",
+          inputSnrDb,
+          outputSnrDb: inputSnrDb,
+          snrGainDb: 0,
+          voiceprint: voiceprintResult,
+          acousticWake: uploadWakeGateHit,
+          matched: false,
+          wokeOnly: false,
+          command: "",
+          timings: { ...timingsBase, totalMs: Math.round(performance.now() - totalStart) },
+          voiceState: this.snapshot(),
+        };
+      }
+      if (!autoDispatch) {
+        return {
+          ok: true,
+          text: transcript,
+          speechDetected: true,
+          denoiseEngine: denoiseTag,
+          vadEngine: "voice-ws-silero",
+          asrEngine: "voice-ws-asr",
+          inputSnrDb,
+          outputSnrDb: inputSnrDb,
+          snrGainDb: 0,
+          voiceprint: voiceprintResult,
+          acousticWake: uploadWakeGateHit,
+          matched: false,
+          wokeOnly: false,
+          command: "",
+          timings: { ...timingsBase, totalMs: Math.round(performance.now() - totalStart) },
+          voiceState: this.snapshot(),
+        };
+      }
+      const dispatched = await this.handleTranscript(transcript, {
+        isFinal: true,
+        bypassWakeWord: options.bypassWakeWord,
+        engine: "local",
+        segmentDurationMs: uploadDurMs,
+        acousticWake: uploadWakeGateHit,
+        owwEvaluated: Boolean(cfg.owwEnabled && this._localEngine.openWakeWord.isReady),
+        voiceprint: voiceprintResult,
+        snrGainDb: 0,
+        timingsBase,
+        llmAttentionOverride: options.llmAttentionOverride,
+        asyncDispatch: options.asyncDispatch,
+        duringTtsPlayback: options.duringTtsPlayback,
+      });
+      return {
+        ...dispatched,
+        text: transcript,
+        speechDetected: true,
+        denoiseEngine: denoiseTag,
+        vadEngine: "voice-ws-silero",
+        asrEngine: "voice-ws-asr",
         inputSnrDb,
         outputSnrDb: inputSnrDb,
         snrGainDb: 0,
@@ -2664,6 +2792,120 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
         denoiseEngine: "xfyun-raw-direct",
         vadEngine: vadEngineLabel,
         asrEngine: "xfyun-iat-v2",
+        inputSnrDb: segment.inputSnrDb,
+        outputSnrDb: segment.inputSnrDb,
+        snrGainDb: 0,
+        acousticWake,
+      };
+    }
+
+    // 统一流式语音听写 WebSocket 网关方案直通：openWakeWord 唤醒后已将原始 16kHz PCM Binary 帧直推网关完成服务端降噪/VAD/识别，
+    // 此处不做额外本地降噪、声源分离或二次重解码，直接交由注意力门控与 Pi Agent 执行。
+    const isVoiceWsSegment =
+      segment.pipelineMode === "voice-ws" || segment.precomputedAsrEngine === "voice-ws-asr";
+    if (isVoiceWsSegment) {
+      let transcript = sanitizeAsrTranscript(segment.precomputedTranscript ?? "", {
+        wakeWords: cfg.wakeWords,
+      });
+      let asrMs = segment.precomputedAsrMs ?? 0;
+      let denoiseTag =
+        segment.denoiseEngine ||
+        (this._localEngine.voiceWsAsr.getStatus().denoiseEnabled
+          ? "voice-ws-gtcrn"
+          : "voice-ws-raw");
+      if (
+        !transcript &&
+        segment.rawSamples.length >= 1600 &&
+        this._localEngine.voiceWsAsr.isConfigured()
+      ) {
+        const res = await this._localEngine.voiceWsAsr.transcribePcm(segment.rawSamples, {
+          minSilenceMs: cfg.vadSilenceMs,
+        });
+        transcript = sanitizeAsrTranscript(res.text, { wakeWords: cfg.wakeWords });
+        asrMs = res.asrMs || res.durationMs;
+        denoiseTag = res.denoiseEnabled ? "voice-ws-gtcrn" : "voice-ws-raw";
+      }
+
+      let voiceprintResult: VoiceprintIdentifyResult | null = null;
+      let voiceprintMs = 0;
+      if (
+        cfg.voiceprintMode !== "off" &&
+        profiles.length > 0 &&
+        segment.rawSamples.length >= 4000 &&
+        this._localEngine.getStatus().readyForVoiceprint
+      ) {
+        const emb = this._localEngine.extractSpeakerEmbedding(segment.rawSamples, 16000);
+        voiceprintMs = emb.durationMs;
+        voiceprintResult = identifyVoiceprint(emb.embedding, emb.engine, cfg.voiceprintThreshold);
+      }
+
+      const acousticWake = segment.acousticWake ?? null;
+      if (acousticWake?.matched) {
+        this._lastWakeHit = { ...acousticWake, timestamp: Date.now() };
+      }
+
+      const vadEngineLabel = segment.commitReason
+        ? `voice-ws-silero:${segment.commitReason}`
+        : "voice-ws-silero";
+      this._lastMetrics = {
+        denoiseEngine: denoiseTag,
+        snrGainDb: 0,
+        vadEngine: vadEngineLabel,
+        speechRatio: transcript ? 1 : 0,
+        asrEngine: "voice-ws-asr",
+        voiceprint: voiceprintResult,
+        acousticWake,
+        updatedAt: Date.now(),
+      };
+
+      if (!transcript.trim()) {
+        this._noteNonConversationSegment("ambient_noise");
+        return {
+          ok: true,
+          text: "",
+          speechDetected: false,
+          denoiseEngine: denoiseTag,
+          vadEngine: vadEngineLabel,
+          asrEngine: "voice-ws-asr",
+          inputSnrDb: segment.inputSnrDb,
+          outputSnrDb: segment.inputSnrDb,
+          snrGainDb: 0,
+          voiceprint: voiceprintResult,
+          acousticWake,
+          matched: false,
+          wokeOnly: false,
+          command: "",
+          timings: {
+            voiceprintMs,
+            asrMs,
+            totalMs: Math.round(performance.now() - totalStart),
+          },
+          voiceState: this.snapshot(),
+        };
+      }
+
+      const dispatched = await this.handleTranscript(transcript, {
+        isFinal: true,
+        bypassWakeWord: options.bypassWakeWord,
+        engine: "local",
+        segmentDurationMs: Math.round(segment.durationSec * 1000),
+        acousticWake,
+        owwEvaluated: Boolean(cfg.owwEnabled && this._localEngine.openWakeWord.isReady),
+        voiceprint: voiceprintResult,
+        snrGainDb: 0,
+        timingsBase: { voiceprintMs, asrMs },
+        llmAttentionOverride: options.llmAttentionOverride,
+        asyncDispatch: options.asyncDispatch,
+        duringTtsPlayback: options.duringTtsPlayback ?? segment.duringTtsPlayback,
+      });
+
+      return {
+        ...dispatched,
+        text: transcript,
+        speechDetected: true,
+        denoiseEngine: denoiseTag,
+        vadEngine: vadEngineLabel,
+        asrEngine: "voice-ws-asr",
         inputSnrDb: segment.inputSnrDb,
         outputSnrDb: segment.inputSnrDb,
         snrGainDb: 0,
@@ -4268,6 +4510,10 @@ export class VoiceListenerController extends TypedEmitter<VoiceListenerEvents> {
       xfyunEndpointUrl: cfg.xfyunEndpointUrl,
       xfyunAppId: cfg.xfyunAppId,
       effectiveXfyunConfigured: resolveEffectiveXfyunAuth(cfg).configured,
+      voiceWsAsrEndpointUrl: cfg.voiceWsAsrEndpointUrl,
+      voiceWsAsrDenoise: cfg.voiceWsAsrDenoise,
+      voiceWsAsrLanguage: cfg.voiceWsAsrLanguage,
+      effectiveVoiceWsAsrConfigured: resolveEffectiveVoiceWsAsrAuth(cfg).configured,
       localAsrEngine: cfg.localAsrEngine,
       qwen3StreamingEnabled: cfg.qwen3StreamingEnabled,
       asyncVoicePipeline: cfg.asyncVoicePipeline,

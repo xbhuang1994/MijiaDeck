@@ -25,7 +25,7 @@ export type AgentProviderMode =
   | "openai-compatible";
 
 export type VoiceEngineMode = "auto" | "local" | "browser" | "whisper";
-export type VoicePipelineMode = "legacy" | "clearvoice" | "xfyun";
+export type VoicePipelineMode = "legacy" | "clearvoice" | "xfyun" | "voice-ws";
 export type LocalAsrEngineMode = "auto" | "qwen3-asr" | "sensevoice";
 export type TtsEngineMode = "auto" | "local" | "browser";
 export type TtsVoicePreset = "gentle-zh-en" | "warm-zh-baker";
@@ -151,7 +151,7 @@ export const PROVIDER_PRESETS: ReadonlyArray<ProviderPreset> = [
 
 const VALID_PROVIDERS = new Set<string>(PROVIDER_PRESETS.map((p) => p.id));
 const VALID_VOICE_ENGINES = new Set<string>(["auto", "local", "browser", "whisper"]);
-const VALID_VOICE_PIPELINE_MODES = new Set<string>(["legacy", "clearvoice", "xfyun"]);
+const VALID_VOICE_PIPELINE_MODES = new Set<string>(["legacy", "clearvoice", "xfyun", "voice-ws"]);
 const VOICE_PIPELINE_MODE_ALIASES: Readonly<Record<string, VoicePipelineMode>> = {
   legacy: "legacy",
   original: "legacy",
@@ -170,6 +170,18 @@ const VOICE_PIPELINE_MODE_ALIASES: Readonly<Record<string, VoicePipelineMode>> =
   spark_asr_v2: "xfyun",
   xunfei: "xfyun",
   iflytek: "xfyun",
+  "voice-ws": "voice-ws",
+  voice_ws: "voice-ws",
+  "voice-ws-asr": "voice-ws",
+  voice_ws_asr: "voice-ws",
+  "voice-gateway": "voice-ws",
+  voice_gateway: "voice-ws",
+  "ws-asr": "voice-ws",
+  ws_asr: "voice-ws",
+  "unified-ws-asr": "voice-ws",
+  "unified-asr": "voice-ws",
+  "unified-voice": "voice-ws",
+  "voice-asr-gateway": "voice-ws",
 };
 const VALID_LOCAL_ASR_ENGINES = new Set<string>(["auto", "qwen3-asr", "sensevoice"]);
 const LOCAL_ASR_ENGINE_ALIASES: Readonly<Record<string, LocalAsrEngineMode>> = {
@@ -248,6 +260,7 @@ export const DEFAULT_CLEARVOICE_MODEL = "MossFormer2_SE_48K";
 export const DEFAULT_QWEN3_ASR_MODEL = "Qwen/Qwen3-ASR-0.6B";
 export const DEFAULT_QWEN3_STREAMING_ENABLED = true;
 export const DEFAULT_XFYUN_IAT_ENDPOINT = "wss://iat.cn-huabei-1.xf-yun.com/v1";
+export const DEFAULT_VOICE_WS_ASR_ENDPOINT = "wss://voice.1inch.cn:18443/v1/ws/asr";
 export const DEFAULT_TTS_ENGINE: TtsEngineMode = "auto";
 export const DEFAULT_TTS_VOICE: TtsVoicePreset = "gentle-zh-en";
 export const DEFAULT_TTS_SPEED = 0.98;
@@ -264,7 +277,7 @@ export interface AgentVoiceConfig {
   maxHistoryTurns: number;
   voiceEnabled: boolean;
   voiceEngine: VoiceEngineMode;
-  /** 语音前端降噪与切片方案：legacy（原方案 GTCRN/声源分离）/ clearvoice（在线 ClearVoice 多轨切片 -> 在线 Qwen3-ASR）/ xfyun（讯飞语音听写大模型 2.0：openWakeWord 唤醒后直推原始音频） */
+  /** 语音前端降噪与切片方案：legacy（原方案 GTCRN/声源分离）/ clearvoice（在线 ClearVoice 多轨切片 -> 在线 Qwen3-ASR）/ xfyun（讯飞语音听写大模型 2.0：openWakeWord 唤醒后直推原始音频）/ voice-ws（统一流式语音听写 WebSocket 网关：openWakeWord 唤醒后直推原始音频，服务端 CPU ONNX GTCRN+Silero VAD -> GPU Qwen3-ASR） */
   voicePipelineMode: VoicePipelineMode;
   /** 在线 ClearVoice 服务地址（如 https://voice.1inch.cn:18443；仅支持在线模式） */
   clearVoiceServiceUrl: string;
@@ -286,6 +299,14 @@ export interface AgentVoiceConfig {
   xfyunApiKey: string;
   /** 讯飞语音听写大模型 2.0 APISecret（仅保存于服务端本地配置文件，面向前端一律脱敏） */
   xfyunApiSecret: string;
+  /** 统一流式语音听写 WebSocket 网关地址（默认 wss://voice.1inch.cn:18443/v1/ws/asr） */
+  voiceWsAsrEndpointUrl: string;
+  /** 统一流式语音听写网关授权码（仅保存于服务端本地配置文件，面向前端一律脱敏） */
+  voiceWsAsrAuthCode: string;
+  /** 统一流式语音听写网关是否开启服务端 CPU ONNX GTCRN 降噪（默认开启） */
+  voiceWsAsrDenoise: boolean;
+  /** 统一流式语音听写网关指定识别语言（留空自动识别，如 zh / en / ja / yue） */
+  voiceWsAsrLanguage: string;
   /** 语音转写主备策略：auto（主用在线 Qwen3-ASR-0.6B，本地 SenseVoice 自动兜底）/ qwen3-asr / sensevoice */
   localAsrEngine: LocalAsrEngineMode;
   /** 是否开启实时流式转写与智能断句（开启后边说边出字、按标点与停顿智能断句） */
@@ -352,6 +373,7 @@ export interface PublicAgentVoiceConfig
     | "qwen3AsrApiKey"
     | "xfyunApiKey"
     | "xfyunApiSecret"
+    | "voiceWsAsrAuthCode"
   > {
   hasApiKey: boolean;
   apiKeyPreview: string;
@@ -374,6 +396,9 @@ export interface PublicAgentVoiceConfig
   hasXfyunApiSecret: boolean;
   xfyunApiSecretPreview: string;
   effectiveXfyunConfigured: boolean;
+  hasVoiceWsAsrAuthCode: boolean;
+  voiceWsAsrAuthCodePreview: string;
+  effectiveVoiceWsAsrConfigured: boolean;
 }
 
 export interface AgentConfigPatch {
@@ -403,6 +428,11 @@ export interface AgentConfigPatch {
   clearXfyunApiKey?: unknown;
   xfyunApiSecret?: unknown;
   clearXfyunApiSecret?: unknown;
+  voiceWsAsrEndpointUrl?: unknown;
+  voiceWsAsrAuthCode?: unknown;
+  clearVoiceWsAsrAuthCode?: unknown;
+  voiceWsAsrDenoise?: unknown;
+  voiceWsAsrLanguage?: unknown;
   localAsrEngine?: unknown;
   qwen3StreamingEnabled?: unknown;
   voiceLang?: unknown;
@@ -473,6 +503,10 @@ export function defaultAgentVoiceConfig(): AgentVoiceConfig {
     xfyunAppId: "",
     xfyunApiKey: "",
     xfyunApiSecret: "",
+    voiceWsAsrEndpointUrl: DEFAULT_VOICE_WS_ASR_ENDPOINT,
+    voiceWsAsrAuthCode: "",
+    voiceWsAsrDenoise: true,
+    voiceWsAsrLanguage: "",
     localAsrEngine: DEFAULT_LOCAL_ASR_ENGINE,
     qwen3StreamingEnabled: DEFAULT_QWEN3_STREAMING_ENABLED,
     voiceLang: "zh-CN",
@@ -602,6 +636,34 @@ function normalizeWsUrl(value: unknown): string {
   }
 }
 
+function normalizeVoiceWsAsrUrl(value: unknown): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "";
+  }
+  try {
+    const parsed = new URL(trimmed);
+    let protocol = parsed.protocol;
+    if (protocol === "https:") {
+      protocol = "wss:";
+    } else if (protocol === "http:") {
+      protocol = "ws:";
+    } else if (protocol !== "ws:" && protocol !== "wss:") {
+      return "";
+    }
+    const cleanPath =
+      parsed.pathname && parsed.pathname !== "/"
+        ? parsed.pathname.replace(/\/+$/, "")
+        : "/v1/ws/asr";
+    return `${protocol}//${parsed.host}${cleanPath}`;
+  } catch {
+    return "";
+  }
+}
+
 export function normalizeLocalAsrEngine(
   value: unknown,
   fallback: LocalAsrEngineMode = DEFAULT_LOCAL_ASR_ENGINE,
@@ -687,6 +749,18 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
   const xfyunAppId = typeof raw.xfyunAppId === "string" ? raw.xfyunAppId.trim().slice(0, 64) : "";
   const xfyunApiKey = typeof raw.xfyunApiKey === "string" ? raw.xfyunApiKey.trim() : "";
   const xfyunApiSecret = typeof raw.xfyunApiSecret === "string" ? raw.xfyunApiSecret.trim() : "";
+  const voiceWsAsrEndpointUrl =
+    normalizeVoiceWsAsrUrl(raw.voiceWsAsrEndpointUrl) || defaults.voiceWsAsrEndpointUrl;
+  const voiceWsAsrAuthCode =
+    typeof raw.voiceWsAsrAuthCode === "string" ? raw.voiceWsAsrAuthCode.trim() : "";
+  const voiceWsAsrDenoise =
+    typeof raw.voiceWsAsrDenoise === "boolean"
+      ? raw.voiceWsAsrDenoise
+      : defaults.voiceWsAsrDenoise;
+  const voiceWsAsrLanguage =
+    typeof raw.voiceWsAsrLanguage === "string"
+      ? raw.voiceWsAsrLanguage.trim().slice(0, 32)
+      : defaults.voiceWsAsrLanguage;
   const qwen3StreamingEnabled =
     typeof raw.qwen3StreamingEnabled === "boolean"
       ? raw.qwen3StreamingEnabled
@@ -822,6 +896,10 @@ export function normalizeAgentVoiceConfig(raw: Record<string, unknown>): AgentVo
     xfyunAppId,
     xfyunApiKey,
     xfyunApiSecret,
+    voiceWsAsrEndpointUrl,
+    voiceWsAsrAuthCode,
+    voiceWsAsrDenoise,
+    voiceWsAsrLanguage,
     localAsrEngine,
     qwen3StreamingEnabled,
     voiceLang,
@@ -1108,6 +1186,34 @@ export function resolveEffectiveXfyunAuth(config: AgentVoiceConfig): {
   };
 }
 
+export function resolveEffectiveVoiceWsAsrAuth(config: AgentVoiceConfig): {
+  endpointUrl: string;
+  authCode: string;
+  denoise: boolean;
+  language: string | null;
+  configured: boolean;
+} {
+  const endpointUrl =
+    normalizeVoiceWsAsrUrl(config.voiceWsAsrEndpointUrl) ||
+    normalizeVoiceWsAsrUrl(process.env.VOICE_WS_ASR_ENDPOINT ?? "") ||
+    DEFAULT_VOICE_WS_ASR_ENDPOINT;
+  const authCode =
+    config.voiceWsAsrAuthCode.trim() ||
+    process.env.VOICE_WS_ASR_AUTH_CODE?.trim() ||
+    process.env.VOICE_GATEWAY_AUTH_CODE?.trim() ||
+    "";
+  const denoise = config.voiceWsAsrDenoise !== false;
+  const language = config.voiceWsAsrLanguage.trim() || null;
+  const configured = Boolean(endpointUrl && authCode);
+  return {
+    endpointUrl,
+    authCode,
+    denoise,
+    language,
+    configured,
+  };
+}
+
 export function toPublicAgentVoiceConfig(config: AgentVoiceConfig): PublicAgentVoiceConfig {
   const envKey = resolveEnvApiKeyForProvider(config.provider);
   const stt = resolveEffectiveSttAuth(config);
@@ -1118,6 +1224,7 @@ export function toPublicAgentVoiceConfig(config: AgentVoiceConfig): PublicAgentV
   const cvAuth = resolveEffectiveClearVoiceAuth(config);
   const qwenAuth = resolveEffectiveQwen3AsrAuth(config);
   const xfyunAuth = resolveEffectiveXfyunAuth(config);
+  const voiceWsAuth = resolveEffectiveVoiceWsAsrAuth(config);
   const {
     apiKey,
     sttApiKey,
@@ -1126,6 +1233,7 @@ export function toPublicAgentVoiceConfig(config: AgentVoiceConfig): PublicAgentV
     qwen3AsrApiKey,
     xfyunApiKey,
     xfyunApiSecret,
+    voiceWsAsrAuthCode,
     ...rest
   } = config;
   return {
@@ -1151,6 +1259,9 @@ export function toPublicAgentVoiceConfig(config: AgentVoiceConfig): PublicAgentV
     hasXfyunApiSecret: xfyunApiSecret.trim().length > 0,
     xfyunApiSecretPreview: maskSecret(xfyunApiSecret),
     effectiveXfyunConfigured: xfyunAuth.configured,
+    hasVoiceWsAsrAuthCode: voiceWsAsrAuthCode.trim().length > 0,
+    voiceWsAsrAuthCodePreview: maskSecret(voiceWsAsrAuthCode),
+    effectiveVoiceWsAsrConfigured: voiceWsAuth.configured,
   };
 }
 
@@ -1304,6 +1415,30 @@ export function updateAgentVoiceConfig(patch: AgentConfigPatch): AgentVoiceConfi
     if (trimmed.length > 0) {
       nextRaw.xfyunApiSecret = trimmed;
     }
+  }
+  if (patch.voiceWsAsrEndpointUrl !== undefined) {
+    const rawWsUrl = String(patch.voiceWsAsrEndpointUrl).trim();
+    if (rawWsUrl && !normalizeVoiceWsAsrUrl(rawWsUrl)) {
+      throw new Error(
+        "统一流式语音听写网关地址必须是以 ws://、wss://、http:// 或 https:// 开头的有效地址",
+      );
+    }
+    nextRaw.voiceWsAsrEndpointUrl = rawWsUrl || DEFAULT_VOICE_WS_ASR_ENDPOINT;
+  }
+  if (patch.clearVoiceWsAsrAuthCode === true) {
+    nextRaw.voiceWsAsrAuthCode = "";
+  } else if (typeof patch.voiceWsAsrAuthCode === "string") {
+    const trimmed = patch.voiceWsAsrAuthCode.trim();
+    if (trimmed.length > 0) {
+      nextRaw.voiceWsAsrAuthCode = trimmed;
+    }
+  }
+  if (patch.voiceWsAsrDenoise !== undefined) {
+    nextRaw.voiceWsAsrDenoise = Boolean(patch.voiceWsAsrDenoise);
+  }
+  if (patch.voiceWsAsrLanguage !== undefined) {
+    nextRaw.voiceWsAsrLanguage =
+      patch.voiceWsAsrLanguage === null ? "" : String(patch.voiceWsAsrLanguage).trim().slice(0, 32);
   }
   if (patch.localAsrEngine !== undefined) {
     const rawAsr = String(patch.localAsrEngine).trim().toLowerCase();

@@ -1197,6 +1197,7 @@ export class MijiaDeckWebApp {
   private qwen3AsrClearKeyPending = false;
   private xfyunClearKeyPending = false;
   private xfyunClearSecretPending = false;
+  private voiceWsAsrClearCodePending = false;
   private agentModelsFetchGen = 0;
   private agentModelsDebounceTimer: number | null = null;
 
@@ -3673,6 +3674,7 @@ export class MijiaDeckWebApp {
     this.qwen3AsrClearKeyPending = false;
     this.xfyunClearKeyPending = false;
     this.xfyunClearSecretPending = false;
+    this.voiceWsAsrClearCodePending = false;
 
     this.populateSettingsForm(initialTab);
     this.openModal("settings");
@@ -3814,10 +3816,57 @@ export class MijiaDeckWebApp {
     const pipelineSelect = document.getElementById("set-voice-pipeline-mode") as HTMLSelectElement | null;
     if (pipelineSelect) {
       pipelineSelect.value =
-        pipelineModeVal === "clearvoice" || pipelineModeVal === "xfyun" ? pipelineModeVal : "legacy";
+        pipelineModeVal === "clearvoice" ||
+        pipelineModeVal === "xfyun" ||
+        pipelineModeVal === "voice-ws"
+          ? pipelineModeVal
+          : "legacy";
     }
     el<HTMLInputElement>("set-voice-clearvoice-enabled").checked =
       pipelineModeVal === "clearvoice";
+
+    const voiceWsEndpointEl = document.getElementById(
+      "set-voice-ws-asr-endpoint-url",
+    ) as HTMLInputElement | null;
+    if (voiceWsEndpointEl) {
+      voiceWsEndpointEl.value =
+        cfg?.voiceWsAsrEndpointUrl || "wss://voice.1inch.cn:18443/v1/ws/asr";
+    }
+    const voiceWsLangEl = document.getElementById(
+      "set-voice-ws-asr-language",
+    ) as HTMLSelectElement | null;
+    if (voiceWsLangEl) {
+      const langVal = cfg?.voiceWsAsrLanguage || "";
+      if (langVal && !Array.from(voiceWsLangEl.options).some((opt) => opt.value === langVal)) {
+        const opt = document.createElement("option");
+        opt.value = langVal;
+        opt.textContent = langVal;
+        voiceWsLangEl.appendChild(opt);
+      }
+      voiceWsLangEl.value = langVal;
+    }
+    const voiceWsDenoiseEl = document.getElementById(
+      "set-voice-ws-asr-denoise",
+    ) as HTMLSelectElement | null;
+    if (voiceWsDenoiseEl) {
+      voiceWsDenoiseEl.value = cfg?.voiceWsAsrDenoise === false ? "false" : "true";
+    }
+    const voiceWsCodeEl = document.getElementById(
+      "set-voice-ws-asr-auth-code",
+    ) as HTMLInputElement | null;
+    if (voiceWsCodeEl) {
+      voiceWsCodeEl.value = "";
+      voiceWsCodeEl.placeholder = cfg?.hasVoiceWsAsrAuthCode
+        ? `已保存网关授权码 (${cfg.voiceWsAsrAuthCodePreview})，留空保持不变`
+        : "统一流式听写网关授权码（仅保存在本地配置）";
+    }
+    const voiceWsClearBtn = document.getElementById("set-voice-ws-asr-clear-code-btn");
+    if (voiceWsClearBtn) voiceWsClearBtn.hidden = !cfg?.hasVoiceWsAsrAuthCode;
+    const voiceWsTestStatus = document.getElementById("set-voice-ws-asr-test-result");
+    if (voiceWsTestStatus) {
+      voiceWsTestStatus.hidden = true;
+      voiceWsTestStatus.textContent = "";
+    }
 
     const xfyunEndpointEl = document.getElementById("set-xfyun-endpoint-url") as HTMLInputElement | null;
     if (xfyunEndpointEl) {
@@ -3961,6 +4010,12 @@ export class MijiaDeckWebApp {
         xfyunInfo?.ready ??
         this.agentConfigCache?.effectiveXfyunConfigured,
     );
+    const voiceWsInfo = status?.voiceWsAsr ?? null;
+    const voiceWsOk = Boolean(
+      status?.readyForVoiceWsAsr ??
+        voiceWsInfo?.ready ??
+        this.agentConfigCache?.effectiveVoiceWsAsrConfigured,
+    );
     const senseVoiceOk = Boolean(status?.readyForSenseVoice ?? status?.models?.senseVoice);
     const owwOk = Boolean(status?.readyForWakeWord ?? status?.models?.openWakeWord);
     const ttsOk = Boolean(status?.readyForLocalTts ?? status?.models?.localTts);
@@ -4001,13 +4056,25 @@ export class MijiaDeckWebApp {
         ? `讯飞语音听写大模型 2.0 已就绪 (${xfyunInfo?.endpointUrl || "wss://iat.cn-huabei-1.xf-yun.com/v1"}${typeof xfyunInfo?.lastLatencyMs === "number" ? ` · 最近 ${xfyunInfo.lastLatencyMs}ms` : ""})`
         : xfyunInfo?.lastError || "请在下方配置讯飞 APPID / APIKey / APISecret";
     }
+    const voiceWsBadgeLabel = voiceWsOk ? "统一流式听写 (在线)" : "统一流式听写 (未配置)";
+    setBadge("badge-model-voice-ws-asr", voiceWsBadgeLabel, voiceWsOk);
+    const voiceWsBadgeEl = document.getElementById("badge-model-voice-ws-asr");
+    if (voiceWsBadgeEl) {
+      voiceWsBadgeEl.title = voiceWsOk
+        ? `统一流式语音听写网关已就绪 (${voiceWsInfo?.endpointUrl || "wss://voice.1inch.cn:18443/v1/ws/asr"}${typeof voiceWsInfo?.lastLatencyMs === "number" ? ` · 最近 ${voiceWsInfo.lastLatencyMs}ms` : ""})`
+        : voiceWsInfo?.lastError || "请在下方配置统一流式语音听写网关地址与授权码";
+    }
     const cvDescEl = document.getElementById("set-voice-clearvoice-desc");
     if (cvDescEl) {
       const selectedMode =
         (document.getElementById("set-voice-pipeline-mode") as HTMLSelectElement | null)?.value ??
         this.agentConfigCache?.voicePipelineMode ??
         "legacy";
-      if (selectedMode === "xfyun") {
+      if (selectedMode === "voice-ws") {
+        cvDescEl.textContent = voiceWsOk
+          ? `统一流式语音听写网关已就绪（${voiceWsInfo?.endpointUrl || "wss://voice.1inch.cn:18443/v1/ws/asr"}）。openWakeWord 命中唤醒后直接以 Binary Frame 推送 16kHz 原始 PCM，由网关 CPU ONNX（GTCRN 降噪 + Silero VAD v5）过滤静音并送入 GPU Qwen3-ASR 流式识别`
+          : "统一流式语音听写网关方案：openWakeWord 唤醒后直推 16kHz 原始 PCM 至 WebSocket 网关（请先在下方填写网关地址与授权码）；支持随时切换其他方案";
+      } else if (selectedMode === "xfyun") {
         cvDescEl.textContent = xfyunOk
           ? `讯飞语音听写大模型 2.0 已就绪（${xfyunInfo?.endpointUrl || "wss://iat.cn-huabei-1.xf-yun.com/v1"}）。openWakeWord 命中唤醒后直接将 16kHz 原始音频流推送至讯飞 WebSocket，不做额外降噪与特殊处理，支持随时切回 ClearVoice 或原方案`
           : "讯飞语音听写大模型 2.0 方案：openWakeWord 唤醒后直接推送原始音频至讯飞 WebSocket（请先在下方填写 APPID / APIKey / APISecret）；可随时切换回 ClearVoice 或原方案";
@@ -4024,7 +4091,7 @@ export class MijiaDeckWebApp {
         }
       } else {
         cvDescEl.textContent =
-          "当前为原方案（GTCRN / 声源分离 + Qwen3-ASR / SenseVoice），可在下拉菜单中随时切换至 ClearVoice 多轨方案或讯飞语音听写大模型 2.0 方案";
+          "当前为原方案（GTCRN / 声源分离 + Qwen3-ASR / SenseVoice），可在下拉菜单中随时切换至 ClearVoice 多轨方案、讯飞听写 2.0 或统一流式语音听写网关";
       }
     }
     setBadge("badge-model-asr", "SenseVoice (备用)", senseVoiceOk);
@@ -4050,6 +4117,7 @@ export class MijiaDeckWebApp {
       if (cvOk) onlineParts.push(`在线 ClearVoice (${cvInfo?.gpuName || "远程 GPU"})`);
       if (qwen3Ok) onlineParts.push(`在线 Qwen3-ASR-0.6B (${gpuInfo?.deviceName || "远程 GPU"})`);
       if (xfyunOk) onlineParts.push("讯飞语音听写 2.0 (在线)");
+      if (voiceWsOk) onlineParts.push("统一流式语音听写网关 (在线)");
       const onlineSummary =
         onlineParts.length > 0
           ? onlineParts.join(" + ")
@@ -4264,6 +4332,79 @@ export class MijiaDeckWebApp {
         statusEl.textContent = summary;
       }
       this.showToast(res.ok ? "讯飞听写大模型 2.0 连接正常" : "讯飞听写大模型 2.0 连接失败，请检查密钥", 2600);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (statusEl) {
+        statusEl.hidden = false;
+        statusEl.textContent = `✕ 检测失败：${msg}`;
+      }
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "测试连接";
+      }
+    }
+  }
+
+  private async testVoiceWsAsrConnection(): Promise<void> {
+    const btn = document.getElementById("set-voice-ws-asr-test-btn") as HTMLButtonElement | null;
+    const statusEl = document.getElementById("set-voice-ws-asr-test-result");
+    const endpointUrl =
+      (
+        document.getElementById("set-voice-ws-asr-endpoint-url") as HTMLInputElement | null
+      )?.value.trim() ?? "";
+    const authCode =
+      (
+        document.getElementById("set-voice-ws-asr-auth-code") as HTMLInputElement | null
+      )?.value.trim() ?? "";
+    const denoise =
+      (document.getElementById("set-voice-ws-asr-denoise") as HTMLSelectElement | null)?.value !==
+      "false";
+    const language =
+      (
+        document.getElementById("set-voice-ws-asr-language") as HTMLSelectElement | null
+      )?.value.trim() ?? "";
+
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "测试中…";
+    }
+    if (statusEl) {
+      statusEl.hidden = false;
+      statusEl.textContent = "正在校验统一流式语音听写 WebSocket 网关鉴权与连通性…";
+    }
+
+    try {
+      const payload: Record<string, unknown> = {
+        voiceWsAsrEndpointUrl: endpointUrl,
+        voiceWsAsrDenoise: denoise,
+        voiceWsAsrLanguage: language,
+      };
+      if (this.voiceWsAsrClearCodePending) payload.clearVoiceWsAsrAuthCode = true;
+      else if (authCode) payload.voiceWsAsrAuthCode = authCode;
+
+      const res = await apiPost<{
+        ok?: boolean;
+        latencyMs?: number;
+        sessionId?: string | null;
+        denoiseModel?: string | null;
+        vadModel?: string | null;
+        asrModel?: string | null;
+        error?: string;
+      }>("/api/voice/ws-asr/test", payload);
+
+      const modelSummary = [res.asrModel, res.denoiseModel, res.vadModel].filter(Boolean).join(" · ");
+      const summary = res.ok
+        ? `✓ 统一流式语音听写网关鉴权与握手成功 (${res.latencyMs ?? 0}ms${modelSummary ? ` · ${modelSummary}` : ""})`
+        : `✕ 连接失败：${res.error || "服务不可达或鉴权失败"}`;
+      if (statusEl) {
+        statusEl.hidden = false;
+        statusEl.textContent = summary;
+      }
+      this.showToast(
+        res.ok ? "统一流式语音听写网关连接正常" : "统一流式语音听写网关连接失败，请检查授权码",
+        2600,
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (statusEl) {
@@ -5511,6 +5652,17 @@ export class MijiaDeckWebApp {
         "",
       xfyunAppId:
         (document.getElementById("set-xfyun-appid") as HTMLInputElement | null)?.value.trim() ?? "",
+      voiceWsAsrEndpointUrl:
+        (
+          document.getElementById("set-voice-ws-asr-endpoint-url") as HTMLInputElement | null
+        )?.value.trim() ?? "",
+      voiceWsAsrDenoise:
+        (document.getElementById("set-voice-ws-asr-denoise") as HTMLSelectElement | null)?.value !==
+        "false",
+      voiceWsAsrLanguage:
+        (
+          document.getElementById("set-voice-ws-asr-language") as HTMLSelectElement | null
+        )?.value.trim() ?? "",
       voiceLang: el<HTMLSelectElement>("set-voice-lang").value,
       noiseSuppressionMode: el<HTMLSelectElement>("set-voice-noise-mode").value,
       vadMode: el<HTMLSelectElement>("set-voice-vad-mode").value,
@@ -5579,6 +5731,15 @@ export class MijiaDeckWebApp {
     } else if (newXfyunSecret) {
       agentPayload.xfyunApiSecret = newXfyunSecret;
     }
+    const newVoiceWsCode =
+      (
+        document.getElementById("set-voice-ws-asr-auth-code") as HTMLInputElement | null
+      )?.value.trim() ?? "";
+    if (this.voiceWsAsrClearCodePending) {
+      agentPayload.clearVoiceWsAsrAuthCode = true;
+    } else if (newVoiceWsCode) {
+      agentPayload.voiceWsAsrAuthCode = newVoiceWsCode;
+    }
 
     try {
       const agentRes = await apiPost<{
@@ -5594,6 +5755,7 @@ export class MijiaDeckWebApp {
       this.qwen3AsrClearKeyPending = false;
       this.xfyunClearKeyPending = false;
       this.xfyunClearSecretPending = false;
+      this.voiceWsAsrClearCodePending = false;
       if (asRecord(res)) {
         this.applyStatePatch(res);
       } else {
@@ -7186,6 +7348,23 @@ export class MijiaDeckWebApp {
 
     document.getElementById("set-xfyun-test-btn")?.addEventListener("click", () => {
       void this.testXfyunIatConnection();
+    });
+
+    document.getElementById("set-voice-ws-asr-clear-code-btn")?.addEventListener("click", () => {
+      this.voiceWsAsrClearCodePending = true;
+      const input = document.getElementById(
+        "set-voice-ws-asr-auth-code",
+      ) as HTMLInputElement | null;
+      if (input) {
+        input.value = "";
+        input.placeholder = "将在保存设置后清除已保存的网关授权码";
+      }
+      const btn = document.getElementById("set-voice-ws-asr-clear-code-btn");
+      if (btn) btn.hidden = true;
+    });
+
+    document.getElementById("set-voice-ws-asr-test-btn")?.addEventListener("click", () => {
+      void this.testVoiceWsAsrConnection();
     });
 
     el<HTMLSelectElement>("set-theme-mode").addEventListener("change", (e) => {
