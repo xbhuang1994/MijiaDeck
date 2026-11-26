@@ -15,6 +15,7 @@ import {
   type WakeAttentionDecision,
 } from "../src/agent/systemOneClient.ts";
 import {
+  buildSuspectedWakeAliasHint,
   evaluateVoiceAttention,
   extractCommandAfterAcousticWake,
 } from "../src/agent/voiceAttentionGate.ts";
@@ -296,9 +297,31 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
     expect(strictWake.stage).toBe("systemone-attention");
 
     expect(calls).toHaveLength(4);
+    // Exact wake calls send ONLY utterance + wake_words; fuzzy calls also include suspected_wake_alias (and NEVER context/background/intent)
+    expect(Object.keys(calls[0]!.state).sort()).toEqual(["utterance", "wake_words"]);
+    expect(Object.keys(calls[1]!.state).sort()).toEqual([
+      "suspected_wake_alias",
+      "utterance",
+      "wake_words",
+    ]);
+    expect(calls[1]!.state.suspected_wake_alias).toEqual({
+      heard: "尼奥",
+      target_wake_word: "Neo",
+      if_replaced: "Neo，给我讲个冷笑话",
+    });
+    expect(Object.keys(calls[2]!.state).sort()).toEqual([
+      "suspected_wake_alias",
+      "utterance",
+      "wake_words",
+    ]);
+    expect(Object.keys(calls[3]!.state).sort()).toEqual(["utterance", "wake_words"]);
     for (const c of calls) {
-      expect(Object.keys(c.state).sort()).toEqual(["utterance", "wake_words"]);
       expect(Object.keys(c.questions)).toEqual(["decision"]);
+      expect(c.state.history).toBeUndefined();
+      expect(c.state.acoustic_event).toBeUndefined();
+      expect(c.state.home_capabilities).toBeUndefined();
+      expect(c.state.learned_triggers).toBeUndefined();
+      expect(c.state.speaker).toBeUndefined();
     }
   });
 
@@ -563,9 +586,19 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
       const wakeCalls = calls.filter((c) => Boolean(c.questions.decision));
       const convCalls = calls.filter((c) => Boolean(c.questions.conv_action));
       expect(wakeCalls.length).toBe(2);
+      // 1st wake call ("我刚聊到Neo真不错"): exact wake -> strictly utterance + wake_words
+      expect(Object.keys(wakeCalls[0]!.state).sort()).toEqual(["utterance", "wake_words"]);
+      // 2nd wake call ("尼奥，关闭客厅吸顶灯"): fuzzy homophone -> adds suspected_wake_alias only
+      expect(Object.keys(wakeCalls[1]!.state).sort()).toEqual([
+        "suspected_wake_alias",
+        "utterance",
+        "wake_words",
+      ]);
       for (const wc of wakeCalls) {
-        expect(Object.keys(wc.state).sort()).toEqual(["utterance", "wake_words"]);
         expect(Object.keys(wc.questions)).toEqual(["decision"]);
+        expect(wc.state.history).toBeUndefined();
+        expect(wc.state.home_capabilities).toBeUndefined();
+        expect(wc.state.acoustic_event).toBeUndefined();
       }
       expect(convCalls.length).toBe(1);
       expect(Array.isArray(convCalls[0]!.state.history)).toBe(true);
@@ -584,7 +617,7 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
     expect(extractCommandAfterAcousticWake("六点开空调", "Neo")).toBe("六点开空调");
     expect(extractCommandAfterAcousticWake("六。", "Neo")).toBe("");
 
-    // 2. With SystemOne enabled: sends pure { utterance, wake_words } + { decision } and strips '六，' -> enters next flow
+    // 2. With SystemOne enabled: sends utterance + wake_words + suspected_wake_alias + acoustic_wake (no context/background/intent) and strips '六，' -> enters next flow
     const { client, calls } = makeMockSystemOneClient(() => ({
       choice: "valid_wake",
       confidence: 0.91,
@@ -600,7 +633,18 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
       systemOneClient: client,
     });
     expect(calls).toHaveLength(1);
-    expect(Object.keys(calls[0]!.state).sort()).toEqual(["utterance", "wake_words"]);
+    expect(Object.keys(calls[0]!.state).sort()).toEqual([
+      "acoustic_wake",
+      "suspected_wake_alias",
+      "utterance",
+      "wake_words",
+    ]);
+    expect(calls[0]!.state.suspected_wake_alias).toEqual({
+      heard: "六",
+      target_wake_word: "Neo",
+      if_replaced: "Neo，我觉得客厅有点暗呢",
+    });
+    expect(calls[0]!.state.acoustic_wake).toEqual({ wake_word: "Neo", score: 0.7 });
     expect(Object.keys(calls[0]!.questions)).toEqual(["decision"]);
     expect(withS1.accept).toBe(true);
     expect(withS1.wokeOnly).toBe(false);
@@ -784,5 +828,125 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
       mw.dispose();
       await jobs.shutdown();
     }
+  });
+
+  test("reproduces user bug: openWakeWord Neo 0.80 + '你有播放点音乐吧。' passes via acoustic+homophone double confirmation and semantic substitution, while rejecting natural questions like '你有打开窗户吗？'", async () => {
+    // 1. Exact user scenario in smart mode: openWakeWord Neo 0.80 + '你有播放点音乐吧。' -> 0ms fast-wake double confirmation (zero SystemOne false-reject risk!)
+    const { client: s1Mock, calls } = makeMockSystemOneClient((utterance, body) => {
+      // Simulate SystemOne using semantic substitution: natural Chinese questions stay false_wake, ungrammatical homophone commands become valid_wake
+      if (utterance.includes("打开窗户吗") || utterance.includes("今天晚饭吃什么")) {
+        return { choice: "false_wake", confidence: 0.94 };
+      }
+      const alias = body.state.suspected_wake_alias as { if_replaced?: string } | undefined;
+      if (alias?.if_replaced?.startsWith("Neo，")) {
+        return { choice: "valid_wake", confidence: 0.95 };
+      }
+      return { choice: "false_wake", confidence: 0.9 };
+    });
+
+    const strongDoubleConfirm = await evaluateVoiceAttention({
+      rawText: "你有播放点音乐吧。",
+      wakeWordEnabled: true,
+      wakeWords: ["Neo"],
+      attentionMode: "smart",
+      dialogState: "standby",
+      inConversation: false,
+      acousticWake: makeAcousticHit("Neo", 0.8),
+      systemOneClient: s1Mock,
+    });
+    expect(strongDoubleConfirm.accept).toBe(true);
+    expect(strongDoubleConfirm.wokeOnly).toBe(false);
+    expect(strongDoubleConfirm.stage).toBe("fast-wake");
+    expect(strongDoubleConfirm.passSource).toBe("acoustic_wake_recovery");
+    expect(strongDoubleConfirm.wakeWord).toBe("Neo");
+    expect(strongDoubleConfirm.command).toBe("播放点音乐吧");
+    expect(calls).toHaveLength(0);
+
+    // 2. Strict mode or moderate OWW score (0.66): routes to SystemOne with suspected_wake_alias (heard: '你有' -> if_replaced: 'Neo，播放点音乐吧') + acoustic_wake
+    const moderateScoreRes = await evaluateVoiceAttention({
+      rawText: "你有播放点音乐吧。",
+      wakeWordEnabled: true,
+      wakeWords: ["Neo"],
+      attentionMode: "smart",
+      dialogState: "standby",
+      inConversation: false,
+      acousticWake: makeAcousticHit("Neo", 0.66),
+      systemOneClient: s1Mock,
+    });
+    expect(moderateScoreRes.accept).toBe(true);
+    expect(moderateScoreRes.stage).toBe("systemone-attention");
+    expect(moderateScoreRes.wakeWord).toBe("Neo");
+    expect(moderateScoreRes.command).toBe("播放点音乐吧");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.state).toEqual({
+      utterance: "你有播放点音乐吧。",
+      wake_words: ["Neo"],
+      suspected_wake_alias: {
+        heard: "你有",
+        target_wake_word: "Neo",
+        if_replaced: "Neo，播放点音乐吧",
+      },
+      acoustic_wake: {
+        wake_word: "Neo",
+        score: 0.66,
+      },
+    });
+    expect(String(calls[0]!.questions.decision!.instructions)).toContain("你有播放点音乐吧");
+    expect(String(calls[0]!.questions.decision!.instructions)).toContain("if_replaced");
+
+    // 3. Non-direct utterance after homophone ('你有明天北京天气怎么样' + openWakeWord Neo 0.80):
+    //    goes to SystemOne with semantic substitution hint -> valid_wake -> strips '你有' -> passes '明天北京天气怎么样'
+    const nonDirectHomophone = await evaluateVoiceAttention({
+      rawText: "你有明天北京天气怎么样",
+      wakeWordEnabled: true,
+      wakeWords: ["Neo"],
+      attentionMode: "smart",
+      dialogState: "standby",
+      inConversation: false,
+      acousticWake: makeAcousticHit("Neo", 0.8),
+      systemOneClient: s1Mock,
+    });
+    expect(nonDirectHomophone.accept).toBe(true);
+    expect(nonDirectHomophone.stage).toBe("systemone-attention");
+    expect(nonDirectHomophone.wakeWord).toBe("Neo");
+    expect(nonDirectHomophone.command).toBe("明天北京天气怎么样");
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.state.suspected_wake_alias).toEqual({
+      heard: "你有",
+      target_wake_word: "Neo",
+      if_replaced: "Neo，明天北京天气怎么样",
+    });
+
+    // 4. False-positive guard: natural Chinese question '你有打开窗户吗？' even with OWW 0.80 MUST NOT fast-path and MUST be rejected by SystemOne (and offline fallback)
+    const naturalQuestionWithS1 = await evaluateVoiceAttention({
+      rawText: "你有打开窗户吗？",
+      wakeWordEnabled: true,
+      wakeWords: ["Neo"],
+      attentionMode: "smart",
+      dialogState: "standby",
+      inConversation: false,
+      acousticWake: makeAcousticHit("Neo", 0.8),
+      systemOneClient: s1Mock,
+    });
+    expect(naturalQuestionWithS1.accept).toBe(false);
+    expect(naturalQuestionWithS1.stage).toBe("systemone-attention");
+    expect(calls).toHaveLength(3);
+
+    const naturalQuestionOffline = await evaluateVoiceAttention({
+      rawText: "你有打开窗户吗？",
+      wakeWordEnabled: true,
+      wakeWords: ["Neo"],
+      attentionMode: "smart",
+      dialogState: "standby",
+      inConversation: false,
+      acousticWake: makeAcousticHit("Neo", 0.8),
+      systemOneClient: null,
+    });
+    expect(naturalQuestionOffline.accept).toBe(false);
+    expect(naturalQuestionOffline.stage).toBe("pragmatic-reject");
+
+    // 5. buildSuspectedWakeAliasHint returns null for ordinary non-alias sentences (e.g. '今天晚饭吃什么', '六个苹果多少钱')
+    expect(buildSuspectedWakeAliasHint("今天晚饭吃什么", null, makeAcousticHit("Neo", 0.68))).toBeNull();
+    expect(buildSuspectedWakeAliasHint("六个苹果多少钱", null, makeAcousticHit("Neo", 0.68))).toBeNull();
   });
 });
