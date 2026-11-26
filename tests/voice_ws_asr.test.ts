@@ -923,12 +923,63 @@ describe("VoiceListenerController 与 HTTP API 端到端集成（含切换、直
       "legacy",
     );
 
-    // 校验前端 HTML 包含统一流式语音听写网关配置卡片、下拉选项与状态徽章
+    // 校验前端 HTML 包含统一流式语音听写网关配置卡片、下拉选项与状态徽章，且前端脚本保存设置保留 voice-ws 不会误回退 legacy
     const html = await (await fetch(`${runningServer.url}/`)).text();
     expect(html).toContain("set-voice-pipeline-mode");
     expect(html).toContain('value="voice-ws"');
     expect(html).toContain("setting-row-voice-ws-asr");
     expect(html).toContain("badge-model-voice-ws-asr");
     expect(html).toContain("set-voice-ws-asr-test-btn");
+
+    const appJs = await (await fetch(`${runningServer.url}/app.js`)).text();
+    expect(appJs).toContain("set-voice-pipeline-mode");
+    expect(appJs).toContain('"voice-ws"');
+    expect(appJs).not.toMatch(
+      /set-voice-pipeline-mode[\s\S]{0,120}===\s*"xfyun"\s*\?\s*"xfyun"\s*:\s*"legacy"/,
+    );
+  });
+
+  test("无本地 SenseVoice 模型时动态配置并切换至 voice-ws 会将 VoiceListenerController.engine 升级为 local", () => {
+    useTempDataDir();
+    applyTheme("dark", "green");
+    const service = new VirtualDemoService();
+    const jobs = new JobExecutor();
+    const themeCtrl = new ThemeController("dark");
+    const net = new NetworkMonitor({ initialReachability: "online", autoStart: false });
+    const mainWin = new MainWindowController({
+      service,
+      jobs,
+      themeCtrl,
+      networkMonitor: net,
+      autoStartTimers: false,
+      cacheLoader: () => null,
+      cacheSaver: () => {},
+    });
+    const piAgent = new PiAgentService({
+      deps: { service, jobs, mainWindow: mainWin, settingsStore, broadcastState: () => {} },
+    });
+    const engine = new LocalVoiceEngine({
+      modelsDir: path.join(os.tmpdir(), "nonexistent-voice-ws-promote"),
+    });
+    const vl = new VoiceListenerController(piAgent, { localEngine: engine });
+    expect(vl.snapshot().engine).toBe("browser");
+
+    const updated = updateAgentVoiceConfig({
+      voicePipelineMode: "voice-ws",
+      voiceWsAsrEndpointUrl: "wss://voice.1inch.cn:18443/v1/ws/asr",
+      voiceWsAsrAuthCode: "vgw_test_promote_engine_123456",
+    });
+    piAgent.reconfigure(updated);
+    const snap = vl.updateRuntimeState({});
+    expect(snap.voicePipelineMode).toBe("voice-ws");
+    expect(snap.effectiveVoiceWsAsrConfigured).toBe(true);
+    expect(snap.localEngine.readyForVoiceWsAsr).toBe(true);
+    expect(snap.engine).toBe("local");
+
+    vl.dispose();
+    piAgent.dispose();
+    mainWin.dispose();
+    net.stop();
+    void jobs.shutdown();
   });
 });
