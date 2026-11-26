@@ -17,9 +17,14 @@
  *   -> 双轨 SenseVoice 融合识别 + 3D-Speaker 声纹 + 抗歌词唤醒词注意力门控 -> Pi Agent
  */
 
-import type { VadSensitivityMode, VoicePipelineMode } from "../core/agentConfigStore.ts";
+import type {
+  EchoCancellationMode,
+  VadSensitivityMode,
+  VoicePipelineMode,
+} from "../core/agentConfigStore.ts";
 import { sanitizeAsrTranscript } from "./asrHallucinationGuard.ts";
 import { computeRms, estimateSnrDb, hasAudibleAudioEnergy, resampleLinear } from "./audioPcm.ts";
+import { AcousticEchoCanceller } from "./echoCanceller.ts";
 import {
   ClearVoiceMultiTrackAssembler,
   ClearVoiceMultiTrackEndpointTracker,
@@ -183,6 +188,19 @@ export interface VoiceStreamSessionOptions {
   getRecentHistory?: () => ReadonlyArray<SystemOneHistoryEntry>;
   /** 可选对话轮次号获取器（防异步 SystemOne 返回前对话已退出导致陈旧屏蔽） */
   getDialogEpoch?: () => number;
+  /** 回声消除模式：auto / aggressive（启用服务端兜底参考 AEC）/ standard / off */
+  echoCancellationMode?: EchoCancellationMode;
+  /** 客户端浏览器 AudioWorklet 是否已启用实时参考信号 AEC（true 时服务端跳过重复声学消除，保留语义防回声） */
+  clientAecActive?: boolean;
+  /** 服务端兜底 AEC 实时遥测回调 */
+  onAecTelemetry?: (telemetry: {
+    active: boolean;
+    erleDb: number;
+    linearErleDb: number;
+    estimatedDelayMs: number;
+    doubleTalk: boolean;
+    farEndActive: boolean;
+  }) => void;
   onWakeWordSpot?: (hit: WakeWordAcousticHit) => void;
   onSpeechActivity?: (speaking: boolean) => void;
   onSegmentReady: (
@@ -387,6 +405,19 @@ export class VoiceStreamSession {
   private _cvUtteranceDuringTts = false;
   private _legacyUtteranceDuringTts = false;
 
+  // 服务端兜底实时声学回声消除（仅当客户端 AudioWorklet AEC 未激活且有参考音频输入时介入，绝不与客户端重复消除）
+  private _echoCancellationMode: EchoCancellationMode;
+  private _clientAecActive: boolean;
+  private _serverAec: AcousticEchoCanceller | null = null;
+  private _serverAecRefQueue: Float32Array[] = [];
+  private _serverAecRefHeadOffset = 0;
+  private _serverAecRefQueuedSamples = 0;
+  private _serverAecTailActive = false;
+  private _serverAecTelemetryTick = 0;
+  private _serverAecLastErleDb = 0;
+  private _serverAecLastLinearErleDb = 0;
+  private _serverAecLastDelayMs = 0;
+
   // 无 Silero VAD 时的纯 TS 兜底窗口缓冲
   private _fallbackChunks: Float32Array[] = [];
   private _fallbackTotal = 0;
@@ -413,6 +444,8 @@ export class VoiceStreamSession {
         : this._wakeWords.length > 0;
     this._owwEnabled = options.owwEnabled !== false;
     this._wakeGatedAsr = options.wakeGatedAsr !== false;
+    this._echoCancellationMode = options.echoCancellationMode ?? "auto";
+    this._clientAecActive = options.clientAecActive === true;
     const lookbackMs = Math.max(
       600,
       Math.min(6000, Math.round(options.wakeRingLookbackMs ?? DEFAULT_WAKE_RING_LOOKBACK_MS)),
@@ -2737,6 +2770,175 @@ export class VoiceStreamSession {
     return this._droppedPureMusicCount;
   }
 
+  get clientAecActive(): boolean {
+    return this._clientAecActive;
+  }
+
+  get serverAecActive(): boolean {
+    return (
+      !this._clientAecActive &&
+      (this._echoCancellationMode === "auto" || this._echoCancellationMode === "aggressive") &&
+      (this._serverAecRefQueuedSamples > 0 || this._serverAecTailActive)
+    );
+  }
+
+  get serverAecErleDb(): number {
+    return this._serverAecLastErleDb;
+  }
+
+  get serverAecEstimatedDelayMs(): number {
+    return this._serverAecLastDelayMs;
+  }
+
+  setEchoCancellationMode(mode: EchoCancellationMode): void {
+    this._echoCancellationMode = mode;
+    if (this._serverAec) {
+      this._serverAec.setAggressive(mode === "aggressive");
+    }
+    if (mode === "off" || mode === "standard") {
+      this.clearFarEndReference();
+    }
+  }
+
+  setClientAecActive(active: boolean): void {
+    const next = Boolean(active);
+    if (this._clientAecActive === next) return;
+    this._clientAecActive = next;
+    if (next) {
+      // 客户端 AudioWorklet AEC 已接管，清空服务端兜底参考队列避免重复回声处理
+      this.clearFarEndReference();
+    }
+  }
+
+  /**
+   * 推入服务端兜底 AEC 的 TTS 远端参考音频（16kHz 或任意采样率 Mono Float32 PCM）。
+   * 仅在客户端未启用 AudioWorklet AEC 且 echoCancellationMode 为 auto / aggressive 时生效。
+   */
+  pushFarEndReference(samples: Float32Array, sampleRate = TARGET_SR): void {
+    if (this._disposed || samples.length === 0) return;
+    if (this._clientAecActive) return;
+    if (this._echoCancellationMode === "off" || this._echoCancellationMode === "standard") return;
+
+    const pcm16 = sampleRate === TARGET_SR ? samples.slice() : resampleLinear(samples, sampleRate, TARGET_SR);
+    if (pcm16.length === 0) return;
+    this._serverAecRefQueue.push(pcm16);
+    this._serverAecRefQueuedSamples += pcm16.length;
+
+    // 有界队列保护（最多保留最近 20 秒参考音频，防异常断流无限增长）
+    const maxRefSamples = TARGET_SR * 20;
+    while (this._serverAecRefQueuedSamples > maxRefSamples && this._serverAecRefQueue.length > 0) {
+      const head = this._serverAecRefQueue[0]!;
+      const avail = head.length - this._serverAecRefHeadOffset;
+      const excess = this._serverAecRefQueuedSamples - maxRefSamples;
+      if (avail <= excess) {
+        this._serverAecRefQueue.shift();
+        this._serverAecRefHeadOffset = 0;
+        this._serverAecRefQueuedSamples -= avail;
+      } else {
+        this._serverAecRefHeadOffset += excess;
+        this._serverAecRefQueuedSamples -= excess;
+      }
+    }
+  }
+
+  clearFarEndReference(): void {
+    this._serverAecRefQueue = [];
+    this._serverAecRefHeadOffset = 0;
+    this._serverAecRefQueuedSamples = 0;
+    this._serverAecTailActive = false;
+  }
+
+  private _dequeueServerAecReference(count: number): Float32Array {
+    const out = new Float32Array(count);
+    let written = 0;
+    while (written < count && this._serverAecRefQueue.length > 0) {
+      const head = this._serverAecRefQueue[0]!;
+      const avail = head.length - this._serverAecRefHeadOffset;
+      const take = Math.min(count - written, avail);
+      out.set(
+        head.subarray(this._serverAecRefHeadOffset, this._serverAecRefHeadOffset + take),
+        written,
+      );
+      written += take;
+      this._serverAecRefHeadOffset += take;
+      this._serverAecRefQueuedSamples -= take;
+      if (this._serverAecRefHeadOffset >= head.length) {
+        this._serverAecRefQueue.shift();
+        this._serverAecRefHeadOffset = 0;
+      }
+    }
+    return out;
+  }
+
+  private _applyServerAecIfNeeded(mic16k: Float32Array, explicitRef16k?: Float32Array): Float32Array {
+    if (this._echoCancellationMode === "off" || this._echoCancellationMode === "standard") {
+      return mic16k;
+    }
+    if (!explicitRef16k) {
+      if (this._clientAecActive) return mic16k;
+      if (this._serverAecRefQueuedSamples === 0 && !this._serverAecTailActive) {
+        return mic16k;
+      }
+    }
+
+    if (!this._serverAec) {
+      this._serverAec = new AcousticEchoCanceller({
+        sampleRate: TARGET_SR,
+        blockSize: 256,
+        numPartitions: 16,
+        aggressive: this._echoCancellationMode === "aggressive",
+      });
+    } else {
+      this._serverAec.setAggressive(this._echoCancellationMode === "aggressive");
+    }
+
+    const refChunk = explicitRef16k ?? this._dequeueServerAecReference(mic16k.length);
+    const res = this._serverAec.processStream(mic16k, refChunk);
+    this._serverAecTailActive = res.farEndActive;
+    this._serverAecLastErleDb = res.erleDb;
+    this._serverAecLastLinearErleDb = res.linearErleDb ?? 0;
+    this._serverAecLastDelayMs = res.estimatedDelayMs ?? 0;
+
+    this._serverAecTelemetryTick += 1;
+    if (res.farEndActive && this._serverAecTelemetryTick % 4 === 0) {
+      this._opts.onAecTelemetry?.({
+        active: true,
+        erleDb: res.erleDb,
+        linearErleDb: res.linearErleDb ?? 0,
+        estimatedDelayMs: res.estimatedDelayMs ?? 0,
+        doubleTalk: res.doubleTalk,
+        farEndActive: res.farEndActive,
+      });
+    }
+
+    return res.output;
+  }
+
+  /**
+   * 同步双通道音频入口（麦克风 + 远端播报参考信号）：在送入 openWakeWord / VAD / ClearVoice / ASR 之前
+   * 直接执行实时延迟对齐双路径 PBFDAF + Hann-OLA RES 声学回声消除。
+   */
+  pushFrameWithReference(
+    micSamples: Float32Array,
+    refSamples: Float32Array,
+    sampleRate = this._inputRate,
+  ): void {
+    if (this._disposed || micSamples.length === 0) return;
+    const mic16k =
+      sampleRate === TARGET_SR ? micSamples : resampleLinear(micSamples, sampleRate, TARGET_SR);
+    const ref16kRaw =
+      sampleRate === TARGET_SR ? refSamples : resampleLinear(refSamples, sampleRate, TARGET_SR);
+    let ref16k = ref16kRaw;
+    if (ref16kRaw.length !== mic16k.length) {
+      ref16k = new Float32Array(mic16k.length);
+      ref16k.set(ref16kRaw.subarray(0, Math.min(ref16kRaw.length, mic16k.length)), 0);
+    }
+    const cleaned = this._applyServerAecIfNeeded(mic16k, ref16k);
+    if (cleaned.length > 0) {
+      this._ingestPcm16k(cleaned);
+    }
+  }
+
   /**
    * 写入一帧来自浏览器 AudioWorklet 的 Int16 PCM 二进制数据（64ms = 2048 字节）。
    */
@@ -2755,8 +2957,14 @@ export class VoiceStreamSession {
    */
   pushFloat32Samples(samples: Float32Array): void {
     if (this._disposed || samples.length === 0) return;
-    const pcm16k =
+    const resampled =
       this._inputRate === TARGET_SR ? samples : resampleLinear(samples, this._inputRate, TARGET_SR);
+    const pcm16k = this._applyServerAecIfNeeded(resampled);
+    if (pcm16k.length === 0) return;
+    this._ingestPcm16k(pcm16k);
+  }
+
+  private _ingestPcm16k(pcm16k: Float32Array): void {
 
     // 1. 无论新旧方案，始终持续写入时间对齐的 16kHz 原始循环录制缓冲区（零失真、供唤醒后完整回放）
     const chunkStartGlobalSample = this._rawTotalSamples;
@@ -4083,6 +4291,9 @@ export class VoiceStreamSession {
 
   dispose(): void {
     this._disposed = true;
+    this.clearFarEndReference();
+    this._serverAec?.reset();
+    this._serverAec = null;
     this._clearHeldLegacySegment();
     this._resetStandbyClearVoiceState(true, true);
     this._resetStandbyDpdfState(true);
