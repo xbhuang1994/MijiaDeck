@@ -576,7 +576,6 @@ describe("Wake-Word Attention Mechanism (DDSD)", () => {
       "New York weather",
       "你有打开窗户吗？",
       "妞妞过来吃饭",
-      "打开客厅吸顶灯",
       "今天天气真不错",
     ]) {
       const dec = await evaluateVoiceAttention({
@@ -587,6 +586,17 @@ describe("Wake-Word Attention Mechanism (DDSD)", () => {
       });
       expect(dec.accept).toBe(false);
     }
+
+    // Explicit smart-home device control command without wake word passes via OR condition
+    const directDeviceCmdNoWake = await evaluateVoiceAttention({
+      rawText: "打开客厅吸顶灯",
+      wakeWordEnabled: true,
+      wakeWords: neoWakes,
+      attentionMode: "smart",
+    });
+    expect(directDeviceCmdNoWake.accept).toBe(true);
+    expect(directDeviceCmdNoWake.passSource).toBe("device_command");
+    expect(directDeviceCmdNoWake.command).toBe("打开客厅吸顶灯");
   });
 
   test("enforces strict voiceprint policy to block unrecognized speakers", async () => {

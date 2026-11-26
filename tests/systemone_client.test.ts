@@ -15,6 +15,7 @@ import {
   type ImplicitActionChoice,
   type TaskAckScenario,
   type WakeAttentionDecision,
+  type WakeDeviceCommandDecision,
 } from "../src/agent/systemOneClient.ts";
 import { TASK_ACK_SCENARIOS } from "../src/agent/taskAckPolicy.ts";
 import {
@@ -355,9 +356,11 @@ describe("SystemOneClient wire protocol & 6 domain methods", () => {
     expect(client.getStatus().circuitState).toBe("open");
   });
 
-  test("(a) evaluateWakeAttention performs pure false-wake check without context/background/intent/dual-track questions", async () => {
+  test("(a) evaluateWakeAttention checks wake word OR device control command without context/background/intent/dual-track fields", async () => {
     let verdict: WakeAttentionDecision = "valid_wake";
     let conf = 0.72;
+    let cmdVerdict: WakeDeviceCommandDecision = "no_device_command";
+    let cmdConf = 0.91;
     const { fetcher, requests } = createMockFetcher(() =>
       jsonResponse({
         model: DEFAULT_SYSTEMONE_MODEL,
@@ -365,6 +368,10 @@ describe("SystemOneClient wire protocol & 6 domain methods", () => {
           decision: makeChoiceAnswer<WakeAttentionDecision>(verdict, conf, [
             "valid_wake",
             "false_wake",
+          ]),
+          device_command: makeChoiceAnswer<WakeDeviceCommandDecision>(cmdVerdict, cmdConf, [
+            "has_device_command",
+            "no_device_command",
           ]),
         },
         usage: { input_tokens: 90, output_tokens: 8 },
@@ -396,42 +403,69 @@ describe("SystemOneClient wire protocol & 6 domain methods", () => {
     expect(state.utterance).toBe("小派，明天天气怎么样");
     expect(state.wake_words).toEqual(["小派", "Neo"]);
 
-    // Questions must contain ONLY pure binary wake false-trigger decision (no intent, no asr_best)
-    expect(Object.keys(questions)).toEqual(["decision"]);
+    // Questions must contain ONLY binary `decision` + OR `device_command` (no intent, no asr_best)
+    expect(Object.keys(questions).sort()).toEqual(["decision", "device_command"]);
     const criteria = questions.decision!.criteria as Record<string, string>;
     expect(Object.keys(criteria).sort()).toEqual(["false_wake", "valid_wake"]);
     expect(String(questions.decision!.instructions)).toContain("误听");
     expect(String(questions.decision!.instructions)).not.toContain("home_capabilities");
     expect(String(questions.decision!.instructions)).not.toContain("BGM");
+    const cmdCriteria = questions.device_command!.criteria as Record<string, string>;
+    expect(Object.keys(cmdCriteria).sort()).toEqual(["has_device_command", "no_device_command"]);
 
     expect(res).not.toBeNull();
     expect(res!.decision).toBe("valid_wake");
     expect(res!.accepted).toBe(true);
+    expect(res!.acceptedBy).toBe("wake_word");
+    expect(res!.hasDeviceCommand).toBe(false);
     expect(res!.isFalseWake).toBe(false);
     expect(res!.cached).toBe(false);
 
-    // Same confidence 0.72 under strict mode (threshold 0.75) should NOT be accepted
+    // Same confidence 0.72 under strict mode (threshold 0.75) with no device command should NOT be accepted
     const strictRes = await client.evaluateWakeAttention(
       {
-        utterance: "小派打开客厅灯",
+        utterance: "小派今天怎么样",
         wakeWords: ["小派"],
       },
       { strict: true },
     );
     expect(requests).toHaveLength(2);
-    expect(Object.keys(requests[1]!.body.questions as Record<string, unknown>)).toEqual(["decision"]);
+    expect(Object.keys(requests[1]!.body.questions as Record<string, unknown>).sort()).toEqual([
+      "decision",
+      "device_command",
+    ]);
     expect(strictRes!.accepted).toBe(false);
+    expect(strictRes!.acceptedBy).toBe("none");
     expect(strictRes!.isFalseWake).toBe(true);
 
-    // Explicit false_wake verdict rejects cleanly
+    // OR condition: even when decision === "false_wake", has_device_command accepts cleanly!
     verdict = "false_wake";
     conf = 0.93;
+    cmdVerdict = "has_device_command";
+    cmdConf = 0.94;
+    const deviceCmdRes = await client.evaluateWakeAttention({
+      utterance: "房间太热了，把空调打开",
+      wakeWords: ["Neo"],
+    });
+    expect(deviceCmdRes!.decision).toBe("false_wake");
+    expect(deviceCmdRes!.hasDeviceCommand).toBe(true);
+    expect(deviceCmdRes!.accepted).toBe(true);
+    expect(deviceCmdRes!.acceptedBy).toBe("device_command");
+    expect(deviceCmdRes!.isFalseWake).toBe(false);
+
+    // Explicit false_wake + no_device_command rejects cleanly
+    verdict = "false_wake";
+    conf = 0.93;
+    cmdVerdict = "no_device_command";
+    cmdConf = 0.95;
     const falseRes = await client.evaluateWakeAttention({
       utterance: "你哦快过来吃饭",
       wakeWords: ["Neo"],
     });
     expect(falseRes!.decision).toBe("false_wake");
+    expect(falseRes!.hasDeviceCommand).toBe(false);
     expect(falseRes!.accepted).toBe(false);
+    expect(falseRes!.acceptedBy).toBe("none");
     expect(falseRes!.isFalseWake).toBe(true);
   });
 
@@ -1006,6 +1040,11 @@ describe("SystemOneClient circuit breaker & failure classification", () => {
             0.96,
             ["valid_wake", "false_wake"],
           ),
+          device_command: makeChoiceAnswer<WakeDeviceCommandDecision>(
+            "no_device_command",
+            0.96,
+            ["has_device_command", "no_device_command"],
+          ),
         },
         usage: { input_tokens: 40, output_tokens: 6 },
       });
@@ -1123,6 +1162,11 @@ describe("SystemOneClient negative LRU cache", () => {
               0.92,
               ["valid_wake", "false_wake"],
             ),
+            device_command: makeChoiceAnswer<WakeDeviceCommandDecision>(
+              "no_device_command",
+              0.92,
+              ["has_device_command", "no_device_command"],
+            ),
           },
           usage: { input_tokens: 50, output_tokens: 8 },
         });
@@ -1238,6 +1282,11 @@ describe("SystemOneClient negative LRU cache", () => {
             "false_wake",
             0.95,
             ["valid_wake", "false_wake"],
+          ),
+          device_command: makeChoiceAnswer<WakeDeviceCommandDecision>(
+            "no_device_command",
+            0.95,
+            ["has_device_command", "no_device_command"],
           ),
         },
         usage: { input_tokens: 30, output_tokens: 5 },

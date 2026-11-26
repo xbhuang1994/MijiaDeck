@@ -13,6 +13,7 @@ import { PiAgentService } from "../src/agent/piAgentService.ts";
 import {
   SystemOneClient,
   type WakeAttentionDecision,
+  type WakeDeviceCommandDecision,
 } from "../src/agent/systemOneClient.ts";
 import {
   buildSuspectedWakeAliasHint,
@@ -45,6 +46,8 @@ function makeMockSystemOneClient(
   resolver: (utterance: string, body: CapturedSystemOneBody) => {
     choice: WakeAttentionDecision;
     confidence?: number;
+    deviceCommand?: WakeDeviceCommandDecision;
+    deviceCommandConfidence?: number;
   },
   options?: { confidenceThreshold?: number },
 ): { client: SystemOneClient; calls: CapturedSystemOneBody[] } {
@@ -67,6 +70,21 @@ function makeMockSystemOneClient(
         },
         confidence: conf,
       };
+      if (body.questions.device_command) {
+        const cmdChoice: WakeDeviceCommandDecision = verdict.deviceCommand ?? "no_device_command";
+        const cmdConf = verdict.deviceCommandConfidence ?? 0.92;
+        answers.device_command = {
+          type: "choice",
+          choice: cmdChoice,
+          probabilities: {
+            has_device_command:
+              cmdChoice === "has_device_command" ? cmdConf : Number((1 - cmdConf).toFixed(4)),
+            no_device_command:
+              cmdChoice === "no_device_command" ? cmdConf : Number((1 - cmdConf).toFixed(4)),
+          },
+          confidence: cmdConf,
+        };
+      }
     }
 
     if (body.questions.conv_action) {
@@ -222,11 +240,15 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
     expect(req.state.track_a).toBeUndefined();
     expect(req.state.track_b).toBeUndefined();
 
-    // Questions contain ONLY binary `decision` — NO `intent`, NO `asr_best`!
-    expect(Object.keys(req.questions)).toEqual(["decision"]);
+    // Questions contain ONLY binary `decision` + OR `device_command` — NO `intent`, NO `asr_best`!
+    expect(Object.keys(req.questions).sort()).toEqual(["decision", "device_command"]);
     expect(Object.keys(req.questions.decision!.criteria ?? {}).sort()).toEqual([
       "false_wake",
       "valid_wake",
+    ]);
+    expect(Object.keys(req.questions.device_command!.criteria ?? {}).sort()).toEqual([
+      "has_device_command",
+      "no_device_command",
     ]);
 
     // Non-misheard utterance proceeds directly to next flow with FULL text intact (no BGM chopping!)
@@ -316,7 +338,7 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
     ]);
     expect(Object.keys(calls[3]!.state).sort()).toEqual(["utterance", "wake_words"]);
     for (const c of calls) {
-      expect(Object.keys(c.questions)).toEqual(["decision"]);
+      expect(Object.keys(c.questions).sort()).toEqual(["decision", "device_command"]);
       expect(c.state.history).toBeUndefined();
       expect(c.state.acoustic_event).toBeUndefined();
       expect(c.state.home_capabilities).toBeUndefined();
@@ -595,7 +617,7 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
         "wake_words",
       ]);
       for (const wc of wakeCalls) {
-        expect(Object.keys(wc.questions)).toEqual(["decision"]);
+        expect(Object.keys(wc.questions).sort()).toEqual(["decision", "device_command"]);
         expect(wc.state.history).toBeUndefined();
         expect(wc.state.home_capabilities).toBeUndefined();
         expect(wc.state.acoustic_event).toBeUndefined();
@@ -645,7 +667,7 @@ describe("Simplified Wake-Word SystemOne Verification (Pure False-Wake Check)", 
       if_replaced: "Neo，我觉得客厅有点暗呢",
     });
     expect(calls[0]!.state.acoustic_wake).toEqual({ wake_word: "Neo", score: 0.7 });
-    expect(Object.keys(calls[0]!.questions)).toEqual(["decision"]);
+    expect(Object.keys(calls[0]!.questions).sort()).toEqual(["decision", "device_command"]);
     expect(withS1.accept).toBe(true);
     expect(withS1.wokeOnly).toBe(false);
     expect(withS1.stage).toBe("systemone-attention");

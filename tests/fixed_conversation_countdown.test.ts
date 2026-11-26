@@ -133,6 +133,12 @@ describe("Fixed-Seconds Conversation Countdown Exit (Dynamic Keep-Alive Disabled
               probabilities: { valid_wake: 0.96, false_wake: 0.04 },
               confidence: 0.96,
             },
+            device_command: {
+              type: "choice",
+              choice: "no_device_command",
+              probabilities: { has_device_command: 0.04, no_device_command: 0.96 },
+              confidence: 0.96,
+            },
           },
           usage: { input_tokens: 40, output_tokens: 6 },
         }),

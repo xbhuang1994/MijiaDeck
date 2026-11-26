@@ -93,6 +93,7 @@ export interface EvaluateAttentionInput {
 
 export type AttentionPassSource =
   | "explicit_command"
+  | "device_command"
   | "implicit_capability"
   | "pending_confirmation"
   | "acoustic_wake_recovery"
@@ -348,6 +349,127 @@ export function isThirdPersonNeoMention(text: string): boolean {
 export function looksLikeDirectDeviceCommand(text: string): boolean {
   const trimmed = text.trim();
   return DIRECT_COMMAND_START_RE.test(trimmed) || isCustomInstructionVoiceCommand(trimmed);
+}
+
+// 自包含的明确控制设备动宾短语（句中任一分句出现即构成明确控制设备指令）
+const SELF_CONTAINED_DEVICE_CONTROL_RE =
+  /(?:开灯|关灯|熄灯|灭灯|亮灯|开空调|关空调|开风扇|关风扇|开电视|关电视|开音箱|关音箱|开音响|关音响|开插座|关插座|开开关|关开关|开窗帘|关窗帘|拉窗帘|拉上窗帘|拉开窗帘|开加湿器|关加湿器|开净化器|关净化器|开除湿机|关除湿机|开浴霸|关浴霸|开洗衣机|关洗衣机|开热水器|关热水器|开暖风机|关暖风机|开扫地机|关扫地机|全屋开灯|全屋关灯|全部开灯|全部关灯|放歌|放音乐|播音乐|切歌|换歌|换一首|换首歌|下一首|上一首|下一曲|上一曲|暂停播放|停止播放|结束播放|继续播放|取消静音|解除静音|恢复声音|闭麦|开麦|调亮|调暗|调高音量|调低音量|调大音量|调小音量|调大声音|调小声音|声音大一点|声音小一点|声音调大|声音调小|音量大一点|音量小一点|音量调大|音量调小|亮度调高|亮度调低|灯光调亮|灯光调暗|出粮|投喂|喂猫|喂狗|播放(?:一点|点|一首|首|一下)?音乐|播放(?:一首|首|一下)?歌|(?:别|不要)(?:再)?(?:放|播)(?:歌|音乐)|turn\s+(?:on|off)\s+(?:the\s+)?(?:[\w-]+\s+){0,3}(?:lights?|lamps?|ac|air\s*conditioner|fan|curtains?|tv|speaker|washer|heater|humidifier|purifier)|switch\s+(?:on|off)\s+(?:the\s+)?(?:[\w-]+\s+){0,3}(?:lights?|lamps?|ac|fan|curtains?|tv|speaker)|(?:play|pause|stop)\s+(?:the\s+)?music|(?:set|adjust)\s+(?:the\s+)?(?:ac|air\s*conditioner|temp|temperature|brightness|volume|light|lamp)\b)/i;
+
+// 仅在独立短指令形态下认可的音箱/麦克风快捷控制（防“这个房间好静音”等描述句误触）
+const STANDALONE_AUDIO_CONTROL_RE =
+  /^(?:请|帮我|给我|麻烦|快|赶紧|现在)?(?:静音|取消静音|解除静音|恢复声音|闭麦|开麦)(?:吧|一下)?$/i;
+
+// 明确指向智能家居控制对象的设备/媒介/模式名词（排除泛化词如“客厅/窗户”，防“你有打开窗户吗”“客厅挺舒服”误判）
+const DEVICE_CONTROL_TARGET_RE =
+  /(?:灯|吸顶灯|台灯|主灯|射灯|筒灯|吊灯|落地灯|床头灯|氛围灯|夜灯|灯带|照明|空调|冷气|暖气|洗衣机|洗烘|智洗烘|滚筒|波轮|烘干机|干衣机|净化器|加湿器|除湿机|除湿器|扫地机|扫拖|洗地机|风扇|电风扇|循环扇|落地扇|窗帘|纱帘|卷帘|电视|电视机|投影仪|音响|音箱|小爱|音量|声音|音乐|歌曲|插座|排插|插线板|开关|浴霸|热水器|暖风机|电暖器|喂食器|饮水机|猫砂盆|观影模式|睡眠模式|回家模式|离家模式|亮度|色温|暖光|冷光|白光|黄光|红光|蓝光|绿光|\blights?\b|\blamps?\b|\bac\b|air\s*conditioner|\bwasher\b|\bfan\b|\bcurtains?\b|\btv\b|\bspeaker\b|\bvolume\b|\bmusic\b|\bbrightness\b)/i;
+
+// 明确祈使/调节控制动作词（须与 DEVICE_CONTROL_TARGET_RE 同时出现）
+const EXPLICIT_CONTROL_VERB_RE =
+  /(?:打开|开启|关闭|关掉|关上|关一下|开一下|开下|关下|开到|开成|启动|暂停|停止|停一下|停掉|继续|调到|调成|调为|调至|调高|调低|调大|调小|调亮|调暗|关小|关大|开大|开小|设为|设成|设到|设定|设置|改成|换成|切换|升高|降低|加一度|减一度|高一度|低一度|高两度|低两度|亮一点|暗一点|大一点|小一点|高一点|低一点|暖一点|冷一点|播放|放一首|来一首|点一首|拉上|拉开|拉起来|合上|收起|回充|回去充电|回基站|充电|清扫|拖地|扫地|烘干|脱水|静音|执行|开\s*\d+\s*度|调\s*\d+\s*度|turn\s+(?:on|off)|switch\s+(?:on|off)|dim|brighten|play|pause|stop|mute|unmute)/i;
+
+// 把字句设备控制结构（如“把客厅灯关了”“把卧室空调开了”“把电视声音调小”）
+const BA_DEVICE_CONTROL_RE =
+  /把[^，,。！？?!]{1,14}(?:打开|开启|关闭|关掉|关上|关了|关了吧|关一下|关下|关小|关大|开了|开了吧|开一下|开下|开到|开大|开小|调|设|改|换|切|停|暂停|拉上|拉开|合上|收起|静音|送回)/i;
+
+// 明显是非/疑问句护栏（屏蔽“你有打开窗户吗？”“客厅灯开了吗”“空调开着吗”“帮我问问有没有关灯”等非控制问句）
+const DEVICE_CMD_INTERROGATIVE_END_RE = /[吗嘛么呢？?][\s。!！]*$/;
+const DEVICE_CMD_INDIRECT_QUESTION_RE =
+  /(?:有没有|是不是|是否|为什么|怎么(?:没|不|老|又|还)|什么时候|多少|几度|开着吗|关着吗|问问|谁(?:把|给|开|关))/;
+
+// 单分句过去时/状态描述/转述/演示评价/否定不操作护栏（防“我刚才把灯关了”“打开客厅吸顶灯那个演示挺不错”“别关灯”“没关灯”“客厅灯打开了”误触）
+const CLAUSE_PAST_OR_REPORTED_RE =
+  /(?:(?:已经|刚才|刚刚|昨天|昨晚|刚才我|我已经|他已经|她已经|我都|忘记|忘了|记得|没记得|还没|以为|听说|据说|好像|大概|他说|她说|他们说|别人说|有人说|朋友说|同事说|喜欢|讨厌).{0,8}(?:打开|开启|关闭|关掉|关上|关了|开了|关灯|开灯|调|放|停|静音|洗|扫|拖)|(?:那个|这个)?(?:演示|功能|例子|示例|效果|视频|画面|感觉|项目).{0,8}(?:挺|很|真|还|不|好)|(?:开着呢|关着呢|坏了|很亮|太亮了|很好看|挺好用|真好用|挺不错|还不错|真不错|不好用|买了个|买了台)|^(?:如果|要是|假如|万一)|(?:别|不要|不用|不必|不需要|没|没有|未)(?:去|再)?(?:开灯|关灯|熄灯|开空调|关空调|开风扇|关风扇|开电视|关电视|开窗帘|关窗帘|打开|开启|关闭|关掉|关上|启动|调)|^(?!.*(?:把|帮我|给我|请|麻烦|快|赶紧)).*(?:打开|开启|关闭|启动|暂停|停止)了$)/;
+
+const IMPLICIT_CAP_IMPERATIVE_RE =
+  /(?:^|[\s,，])(?:请|帮我|给我|替我|麻烦|开启|启动|打开|关掉|关闭|暂停|停止|洗一下|洗个|烘一下|扫一下|拖一下|浇一下|喂一下|洗|烘|扫|拖|浇|喂)/;
+
+function clauseHasExplicitDeviceControlCommand(
+  clauseRaw: string,
+  capabilityDigest?: HomeCapabilityDigest | null,
+): boolean {
+  const clause = clauseRaw.replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
+  if (clause.length < 2) return false;
+  if (DEVICE_CMD_INTERROGATIVE_END_RE.test(clause)) return false;
+  if (DEVICE_CMD_INDIRECT_QUESTION_RE.test(clause)) return false;
+  if (CLAUSE_PAST_OR_REPORTED_RE.test(clause)) return false;
+  if (NON_COMMAND_CHAT_RE.test(clause)) return false;
+
+  if (STANDALONE_AUDIO_CONTROL_RE.test(clause)) return true;
+  if (SELF_CONTAINED_DEVICE_CONTROL_RE.test(clause)) return true;
+  if (
+    DEVICE_CONTROL_TARGET_RE.test(clause) &&
+    (EXPLICIT_CONTROL_VERB_RE.test(clause) || BA_DEVICE_CONTROL_RE.test(clause))
+  ) {
+    return true;
+  }
+  if (
+    capabilityDigest &&
+    IMPLICIT_CAP_IMPERATIVE_RE.test(clause) &&
+    probeImplicitCapabilities(clause, capabilityDigest)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 判断文本中是否存在明确的智能家居控制设备指令（作为唤醒词判定的或条件：
+ * 满足“是有效唤醒词 OR 存在控制设备指令”即放行不拦截）。
+ * 严格屏蔽日常是非问句（如“你有打开窗户吗？”）、过去时陈述（“我刚才把灯关了”）、
+ * 隐式抱怨（“我觉得客厅有点暗呢”）与闲聊旁白（“晚饭吃什么”“我刚才聊到Neo挺好用的”）。
+ */
+export function hasExplicitDeviceControlCommand(
+  rawText: string,
+  capabilityDigest?: HomeCapabilityDigest | null,
+): boolean {
+  const cleaned = rawText.replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
+  if (cleaned.length < 2 || cleaned.length > 64) return false;
+  if (DEVICE_CMD_INTERROGATIVE_END_RE.test(cleaned)) return false;
+  if (DEVICE_CMD_INDIRECT_QUESTION_RE.test(cleaned)) return false;
+
+  const clauses = cleaned
+    .split(/[，,。！？!?;；]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (clauses.length === 0) return false;
+  return clauses.some((clause) => clauseHasExplicitDeviceControlCommand(clause, capabilityDigest));
+}
+
+function stripLeadingControlFiller(text: string): string {
+  const cleaned = text.replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
+  const m = /^(?:嗯|啊|哦|喔|唉|哎|那个|然后|顺便)[\s,，、!！。:：]+(.+)$/.exec(cleaned);
+  if (m && m[1]) {
+    const rest = m[1].replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
+    if (rest.length >= 2) return rest;
+  }
+  return cleaned;
+}
+
+/**
+ * 在因“存在控制设备指令”或条件放行时，提取干净可执行的控制指令文本（绝不退化为空字符串）。
+ */
+function extractDeviceControlCommand(
+  cleaned: string,
+  wakeSpan: WakeSpanMatch | null,
+  cleanBefore: string,
+  cleanAfter: string,
+  capabilityDigest?: HomeCapabilityDigest | null,
+): string {
+  if (wakeSpan) {
+    if (cleanAfter && hasExplicitDeviceControlCommand(cleanAfter, capabilityDigest)) {
+      return stripLeadingControlFiller(cleanAfter);
+    }
+    if (cleanBefore && hasExplicitDeviceControlCommand(cleanBefore, capabilityDigest)) {
+      return stripLeadingControlFiller(cleanBefore);
+    }
+    if (cleanAfter && cleanAfter.length >= 2) {
+      return stripLeadingControlFiller(cleanAfter);
+    }
+    if (cleanBefore && !VOCATIVE_PREFIX_RE.test(cleanBefore) && cleanBefore.length >= 2) {
+      return stripLeadingControlFiller(cleanBefore);
+    }
+  }
+  return stripLeadingControlFiller(cleaned);
 }
 
 export function isWakeQueryText(text: string): boolean {
@@ -1110,6 +1232,7 @@ function buildAttentionPrompt(params: {
     "",
     "判定准则：",
     "- 若用户直接呼唤你执行设备控制/查询/提问或保存/管理长期附加指令规则（如“小派，关灯”、“帮我把音量调大一点”、“那卧室灯也关掉”、“以后记得洗衣默认用智洗烘模式”、“以后我说打开空调你要自己判断室外温度”），addressed=true。",
+    "- 唤醒词判定或条件：若句子中存在明确的控制智能家居设备指令（如开关或调节灯光、空调、风扇、窗帘、电视、音箱/音乐、洗衣机、扫地机、加湿器/净化器、插座、喂食器、场景模式等），即使唤醒词被误听、吞字或位于句中，也判定 addressed=true 放行不拦截，并在 command 字段中提取干净的控制设备指令。",
     "- 注意背景音乐/电视干扰：如果环境中正在放歌，唤醒词前后可能混入无关歌词碎片（例如“也甘愿赴汤蹈火去走小派打开客厅吸顶灯，间走过这世间”）。只要唤醒词后紧跟明确的设备控制/查询指令，就判定 addressed=true，并在 command 字段中只提取干净的用户指令（去掉前后无关歌词）！",
     "- 若用户只是提到你的名字讨论/夸奖/抱怨/叫别人别管你（如“我刚跟朋友聊到小派挺好用的”、“你觉得小派怎么样”、“别管小派了吃饭吧”、“有人叫小派吗”），addressed=false！",
     "- 若处于连续对话窗口，但新句子明显是在和家人说话（如“晚饭吃什么”、“帮我拿双筷子”），或属于背景音乐歌词、电视广播对话、咖啡馆/环境杂音识别碎片，addressed=false, inConversation=false！",
@@ -1466,6 +1589,22 @@ export async function evaluateVoiceAttention(
         usedLlm: false,
       });
     }
+    if (hasExplicitDeviceControlCommand(cleaned, input.capabilityDigest)) {
+      const cmd = stripLeadingControlFiller(cleaned);
+      return wrap({
+        accept: true,
+        wokeOnly: false,
+        addressed: true,
+        inConversation: true,
+        confidence: 0.86,
+        stage: "fast-wake",
+        passSource: "device_command",
+        reason: "未包含唤醒词，但检测到明确控制设备指令，放行不拦截",
+        wakeWord: null,
+        command: cmd,
+        usedLlm: false,
+      });
+    }
     return wrap({
       accept: false,
       wokeOnly: false,
@@ -1473,7 +1612,7 @@ export async function evaluateVoiceAttention(
       inConversation: false,
       confidence: 0.9,
       stage: "no-wake",
-      reason: "未包含唤醒词",
+      reason: "未包含唤醒词或控制设备指令",
       wakeWord: null,
       command: "",
       usedLlm: false,
@@ -1482,31 +1621,6 @@ export async function evaluateVoiceAttention(
 
   // ==================== 情况 A：句子中提到了唤醒词 ====================
   if (wakeSpan) {
-    // 混合 openWakeWord 声学否决：仅由模糊同音/噪声别名命中，且该唤醒词已启用本地声学原型但声学分低于门槛（用户实录原型 0.42 / TTS 零样本原型 0.32）时拦截
-    const vetoFloor = input.acousticWake?.source === "tts-bootstrap" ? 0.32 : 0.42;
-    if (
-      wakeSpan.fuzzy &&
-      input.owwActiveForWord === true &&
-      (!input.acousticWake || input.acousticWake.score < vetoFloor)
-    ) {
-      return wrap({
-        accept: false,
-        wokeOnly: false,
-        addressed: false,
-        inConversation: inConversationEffective,
-        confidence: 0.9,
-        stage: "acoustic-veto",
-        reason: `模糊唤醒词「${wakeSpan.matchedSurface}」未通过本地声学唤醒校验${
-          input.acousticWake
-            ? `（得分 ${(input.acousticWake.score * 100).toFixed(0)}% < ${Math.round(vetoFloor * 100)}%）`
-            : "（无声学命中）"
-        }，已拦截误触发`,
-        wakeWord: wakeSpan.wakeWord,
-        command: "",
-        usedLlm: false,
-      });
-    }
-
     const cleanBefore = wakeSpan.beforeText;
     const cleanAfter = stripRepeatedLeadingWakeWords(
       wakeSpan.afterText,
@@ -1525,6 +1639,61 @@ export async function evaluateVoiceAttention(
       cleanAfter.length > 0 ? probeImplicitCapabilities(cleanAfter, input.capabilityDigest) : null;
     const isBgmContext = Boolean(input.acousticEvent?.toUpperCase().includes("BGM"));
     const trimmedCmd = isBgmContext ? trimTrailingMusicLyrics(cleanAfter) : cleanAfter;
+    const hasExplicitDeviceCmd =
+      hasExplicitDeviceControlCommand(cleanAfter, input.capabilityDigest) ||
+      hasExplicitDeviceControlCommand(cleaned, input.capabilityDigest);
+    const extractedDeviceCmd = hasExplicitDeviceCmd
+      ? extractDeviceControlCommand(
+          isBgmContext ? trimTrailingMusicLyrics(cleaned) : cleaned,
+          wakeSpan,
+          cleanBefore,
+          trimmedCmd,
+          input.capabilityDigest,
+        )
+      : "";
+
+    // 混合 openWakeWord 声学否决：仅由模糊同音/噪声别名命中，且该唤醒词已启用本地声学原型但声学分低于门槛（用户实录原型 0.42 / TTS 零样本原型 0.32）时拦截；
+    // 或条件：若存在明确控制设备指令，则不因声学否决误拦（smart 模式直接放行，strict 模式交由 SystemOne 复核）。
+    const vetoFloor = input.acousticWake?.source === "tts-bootstrap" ? 0.32 : 0.42;
+    if (
+      wakeSpan.fuzzy &&
+      input.owwActiveForWord === true &&
+      (!input.acousticWake || input.acousticWake.score < vetoFloor)
+    ) {
+      if (!hasExplicitDeviceCmd) {
+        return wrap({
+          accept: false,
+          wokeOnly: false,
+          addressed: false,
+          inConversation: inConversationEffective,
+          confidence: 0.9,
+          stage: "acoustic-veto",
+          reason: `模糊唤醒词「${wakeSpan.matchedSurface}」未通过本地声学唤醒校验${
+            input.acousticWake
+              ? `（得分 ${(input.acousticWake.score * 100).toFixed(0)}% < ${Math.round(vetoFloor * 100)}%）`
+              : "（无声学命中）"
+          }，已拦截误触发`,
+          wakeWord: wakeSpan.wakeWord,
+          command: "",
+          usedLlm: false,
+        });
+      }
+      if (input.attentionMode !== "strict" || !input.systemOneClient?.enabled) {
+        return wrap({
+          accept: true,
+          wokeOnly: false,
+          addressed: true,
+          inConversation: true,
+          confidence: 0.88,
+          stage: "fast-wake",
+          passSource: "device_command",
+          reason: "模糊唤醒词未达声学阈值，但检测到明确控制设备指令，放行不拦截",
+          wakeWord: null,
+          command: extractedDeviceCmd || trimmedCmd || cleaned,
+          usedLlm: false,
+        });
+      }
+    }
 
     // 若在连续对话中带唤醒词发出纯退出指令（如“小派，退下” / “小派，再见”）
     if (
@@ -1635,7 +1804,7 @@ export async function evaluateVoiceAttention(
       });
     }
 
-    // A3-1. 主通道：SystemOne 纯误唤醒校验（仅判断是不是误听有人在叫触发词，不做上下文/背景/意图/双轨等其它判断）
+    // A3-1. 主通道：SystemOne 唤醒词判定（或条件：确认为触发词 OR 存在控制设备指令，满足任一即放行不拦截）
     let sysOneTransientFailure = false;
     if (input.systemOneClient?.enabled) {
       const aliasHint = buildSuspectedWakeAliasHint(cleaned, wakeSpan, input.acousticWake);
@@ -1669,32 +1838,42 @@ export async function evaluateVoiceAttention(
             stage: "systemone-attention",
             reason:
               s1.decision === "false_wake"
-                ? "SystemOne 判定为误听/误唤醒，未在呼叫触发词"
-                : "SystemOne 唤醒校验置信度低于阈值，已保守忽略",
+                ? "SystemOne 判定为误听/误唤醒且无控制设备指令，未触发执行"
+                : "SystemOne 唤醒与指令校验置信度低于阈值，已保守忽略",
             wakeWord: wakeSpan.wakeWord,
             command: "",
             usedLlm: true,
           });
         }
 
-        const extractedCmd = cleanAfter
-          ? cleanAfter
-          : cleanBefore &&
-              !VOCATIVE_PREFIX_RE.test(cleanBefore) &&
-              !REFERENTIAL_BEFORE_RE.test(cleanBefore)
-            ? cleanBefore
-            : "";
+        const acceptedByDeviceCmd = s1.acceptedBy === "device_command";
+        const extractedCmd = acceptedByDeviceCmd
+          ? extractDeviceControlCommand(
+              cleaned,
+              wakeSpan,
+              cleanBefore,
+              cleanAfter,
+              input.capabilityDigest,
+            )
+          : cleanAfter
+            ? cleanAfter
+            : cleanBefore &&
+                !VOCATIVE_PREFIX_RE.test(cleanBefore) &&
+                !REFERENTIAL_BEFORE_RE.test(cleanBefore)
+              ? cleanBefore
+              : "";
 
         return wrap({
           accept: true,
-          wokeOnly: extractedCmd.length === 0,
+          wokeOnly: acceptedByDeviceCmd ? false : extractedCmd.length === 0,
           addressed: true,
           inConversation: true,
-          confidence: s1.confidence,
+          confidence: acceptedByDeviceCmd ? s1.deviceCommand.confidence : s1.confidence,
           stage: "systemone-attention",
-          passSource: "systemone",
-          reason:
-            extractedCmd.length === 0
+          passSource: acceptedByDeviceCmd ? "device_command" : "systemone",
+          reason: acceptedByDeviceCmd
+            ? "SystemOne 检测到控制设备指令，放行进入下一流程"
+            : extractedCmd.length === 0
               ? `SystemOne 确认触发词「${wakeSpan.wakeWord}」非误听，进入下一流程`
               : `SystemOne 确认触发词「${wakeSpan.wakeWord}」非误听，直接进入下一流程`,
           wakeWord: wakeSpan.wakeWord,
@@ -1774,6 +1953,23 @@ export async function evaluateVoiceAttention(
         reason: `识别到「${wakeSpan.wakeWord}」后紧跟明确设备控制指令`,
         wakeWord: wakeSpan.wakeWord,
         command: trimTrailingMusicLyrics(cleanAfter),
+        usedLlm: false,
+      });
+    }
+
+    // 或条件：即使唤醒词位于句中或带第三人称前文，只要包含明确控制设备指令仍放行不拦截
+    if (hasExplicitDeviceCmd) {
+      return wrap({
+        accept: true,
+        wokeOnly: false,
+        addressed: true,
+        inConversation: true,
+        confidence: 0.86,
+        stage: "fast-wake",
+        passSource: "device_command",
+        reason: "检测到明确控制设备指令，放行进入下一流程",
+        wakeWord: wakeSpan.wakeWord,
+        command: extractedDeviceCmd || trimmedCmd || cleaned,
         usedLlm: false,
       });
     }
@@ -2182,13 +2378,21 @@ export async function evaluateVoiceAttention(
       !isAmbiguousInterrogative && effectiveCmd
         ? probeImplicitCapabilities(effectiveCmd, input.capabilityDigest)
         : null;
+    const standbyExplicitDeviceCmd =
+      !isAmbiguousInterrogative &&
+      effectiveCmd.length > 0 &&
+      hasExplicitDeviceControlCommand(effectiveCmd, input.capabilityDigest);
     const standbyDirect =
       !isAmbiguousInterrogative &&
       effectiveCmd.length > 0 &&
       (looksLikeDirectDeviceCommand(effectiveCmd) ||
+        standbyExplicitDeviceCmd ||
         isCustomInstructionVoiceCommand(effectiveCmd) ||
         Boolean(standbyCapMatch));
     if (standbyDirect && (input.attentionMode !== "strict" || !input.systemOneClient?.enabled)) {
+      const cleanStandbyCmd = standbyExplicitDeviceCmd
+        ? stripLeadingControlFiller(effectiveCmd)
+        : effectiveCmd;
       return wrap({
         accept: true,
         wokeOnly: false,
@@ -2196,18 +2400,24 @@ export async function evaluateVoiceAttention(
         inConversation: true,
         confidence: Math.max(0.84, input.acousticWake.score),
         stage: "fast-wake",
-        passSource: standbyCapMatch ? "implicit_capability" : "acoustic_wake_recovery",
+        passSource: standbyCapMatch
+          ? "implicit_capability"
+          : standbyExplicitDeviceCmd && !looksLikeDirectDeviceCommand(effectiveCmd)
+            ? "device_command"
+            : "acoustic_wake_recovery",
         matchedCapability: standbyCapMatch?.matchedCapabilityLabel,
         reason: standbyCapMatch
           ? `声学唤醒「${input.acousticWake.wakeWord}」并命中设备能力「${standbyCapMatch.matchedCapabilityLabel}」`
-          : `声学唤醒「${input.acousticWake.wakeWord}」且后接明确控制指令`,
+          : standbyExplicitDeviceCmd && !looksLikeDirectDeviceCommand(effectiveCmd)
+            ? `声学唤醒「${input.acousticWake.wakeWord}」且存在明确控制设备指令，放行进入下一流程`
+            : `声学唤醒「${input.acousticWake.wakeWord}」且后接明确控制指令`,
         wakeWord: input.acousticWake.wakeWord,
-        command: effectiveCmd,
+        command: cleanStandbyCmd,
         usedLlm: false,
       });
     }
 
-    // 声学唤醒已触发但未命中文本唤醒词：交由 SystemOne 仅做纯误唤醒校验（不传上下文/背景/设备能力），非误听直接进入下一流程
+    // 声学唤醒已触发但未命中文本唤醒词：交由 SystemOne 校验（或条件：触发词非误听 OR 存在控制设备指令）
     if (input.systemOneClient?.enabled) {
       const wakeWordsForCheck =
         input.wakeWords.length > 0 ? input.wakeWords : [input.acousticWake.wakeWord];
@@ -2242,27 +2452,32 @@ export async function evaluateVoiceAttention(
             stage: "systemone-attention",
             reason:
               s1.decision === "false_wake"
-                ? "SystemOne 判定为误听/误唤醒，未在呼叫触发词"
-                : "SystemOne 唤醒校验置信度低于阈值，已保守忽略",
+                ? "SystemOne 判定为误听/误唤醒且无控制设备指令，未触发执行"
+                : "SystemOne 唤醒与指令校验置信度低于阈值，已保守忽略",
             wakeWord: input.acousticWake.wakeWord,
             command: "",
             usedLlm: true,
           });
         }
+        const acceptedByDeviceCmd = s1.acceptedBy === "device_command";
+        const finalCmd = acceptedByDeviceCmd
+          ? stripLeadingControlFiller(extractedCmd || cmd)
+          : extractedCmd;
         return wrap({
           accept: true,
-          wokeOnly: extractedCmd.length === 0,
+          wokeOnly: acceptedByDeviceCmd ? false : finalCmd.length === 0,
           addressed: true,
           inConversation: true,
-          confidence: s1.confidence,
+          confidence: acceptedByDeviceCmd ? s1.deviceCommand.confidence : s1.confidence,
           stage: "systemone-attention",
-          passSource: "systemone",
-          reason:
-            extractedCmd.length === 0
+          passSource: acceptedByDeviceCmd ? "device_command" : "systemone",
+          reason: acceptedByDeviceCmd
+            ? "SystemOne 检测到控制设备指令，放行进入下一流程"
+            : finalCmd.length === 0
               ? `SystemOne 确认触发词「${input.acousticWake.wakeWord}」非误听，进入下一流程`
               : `SystemOne 确认触发词「${input.acousticWake.wakeWord}」非误听，直接进入下一流程`,
           wakeWord: input.acousticWake.wakeWord,
-          command: extractedCmd,
+          command: finalCmd,
           usedLlm: true,
         });
       }
@@ -2282,8 +2497,9 @@ export async function evaluateVoiceAttention(
       }
     }
 
-    // 声学唤醒已命中但 SystemOne 未启用或暂不可用时的兜底：绝不再按“有效对话上下文”误拒，除明显第三人称提及或日常疑问句外直接放行进入下一流程
-    if (isThirdPersonNeoMention(cleaned) || isAmbiguousInterrogative) {
+    // 声学唤醒已命中但 SystemOne 未启用或暂不可用时的兜底：绝不再按“有效对话上下文”误拒，除明显第三人称提及或日常疑问句外直接放行进入下一流程；
+    // 若存在明确控制设备指令，即便句含第三人称提及前文也放行不拦截。
+    if (!standbyExplicitDeviceCmd && (isThirdPersonNeoMention(cleaned) || isAmbiguousInterrogative)) {
       return wrap({
         accept: false,
         wokeOnly: false,
@@ -2301,20 +2517,126 @@ export async function evaluateVoiceAttention(
     }
     return wrap({
       accept: true,
-      wokeOnly: extractedCmd.length === 0,
+      wokeOnly: standbyExplicitDeviceCmd ? false : extractedCmd.length === 0,
       addressed: true,
       inConversation: true,
       confidence: Math.max(0.8, input.acousticWake.score),
       stage: "fast-wake",
-      passSource: "acoustic_wake_recovery",
-      reason:
-        extractedCmd.length === 0
+      passSource: standbyExplicitDeviceCmd ? "device_command" : "acoustic_wake_recovery",
+      reason: standbyExplicitDeviceCmd
+        ? `声学唤醒「${input.acousticWake.wakeWord}」且存在明确控制设备指令，放行进入下一流程`
+        : extractedCmd.length === 0
           ? `声学唤醒「${input.acousticWake.wakeWord}」命中，进入唤醒聆听`
           : `声学唤醒「${input.acousticWake.wakeWord}」命中，直接进入下一流程`,
       wakeWord: input.acousticWake.wakeWord,
-      command: extractedCmd,
+      command: standbyExplicitDeviceCmd ? stripLeadingControlFiller(effectiveCmd) : extractedCmd,
       usedLlm: false,
     });
+  }
+
+  // ==================== 情况 D：待机态无文本/声学唤醒词 -> 或条件：判断是否存在控制设备指令，存在也放行不拦截 ====================
+  const standbyText = cleaned.replace(LEADING_PUNCT_RE, "").replace(TRAILING_PUNCT_RE, "").trim();
+  const isBgmStandby = Boolean(input.acousticEvent?.toUpperCase().includes("BGM"));
+  const standbyExplicitDeviceCmd = hasExplicitDeviceControlCommand(
+    standbyText,
+    input.capabilityDigest,
+  );
+  if (standbyExplicitDeviceCmd) {
+    const cleanDeviceCmd = stripLeadingControlFiller(
+      isBgmStandby ? trimTrailingMusicLyrics(standbyText) : standbyText,
+    );
+    if (input.attentionMode === "strict" && input.systemOneClient?.enabled) {
+      const s1 = await input.systemOneClient.evaluateWakeAttention(
+        {
+          utterance: cleaned,
+          wakeWords: input.wakeWords,
+        },
+        { strict: true },
+      );
+      if (s1?.accepted) {
+        const acceptedByDeviceCmd = s1.acceptedBy === "device_command";
+        return wrap({
+          accept: true,
+          wokeOnly: false,
+          addressed: true,
+          inConversation: true,
+          confidence: acceptedByDeviceCmd ? s1.deviceCommand.confidence : s1.confidence,
+          stage: "systemone-attention",
+          passSource: acceptedByDeviceCmd ? "device_command" : "systemone",
+          reason: "SystemOne 检测到控制设备指令，放行进入下一流程",
+          wakeWord: null,
+          command: cleanDeviceCmd || standbyText,
+          usedLlm: true,
+        });
+      }
+      return wrap({
+        accept: false,
+        wokeOnly: false,
+        addressed: false,
+        inConversation: false,
+        confidence: s1?.confidence ?? 0.75,
+        stage: "systemone-attention",
+        reason: s1
+          ? "SystemOne 判定未包含唤醒词或有效控制设备指令"
+          : "SystemOne 唤醒校验暂不可用，严格模式下已保守忽略",
+        wakeWord: null,
+        command: "",
+        usedLlm: Boolean(s1),
+      });
+    }
+    return wrap({
+      accept: true,
+      wokeOnly: false,
+      addressed: true,
+      inConversation: true,
+      confidence: 0.88,
+      stage: "fast-wake",
+      passSource: "device_command",
+      reason: "未检测到唤醒词，但存在明确控制设备指令，放行进入下一流程",
+      wakeWord: null,
+      command: cleanDeviceCmd || standbyText,
+      usedLlm: false,
+    });
+  }
+
+  // 待机态口语化/隐式设备控制候选（仅当包含明确智能家居领域/能力线索且非问句/闲聊/旁白时才请 SystemOne 复核，普通聊天/电视声零额外调用）
+  if (
+    input.systemOneClient?.enabled &&
+    !isBgmStandby &&
+    standbyText.length >= 2 &&
+    standbyText.length <= 64 &&
+    !DEVICE_CMD_INTERROGATIVE_END_RE.test(standbyText) &&
+    !DEVICE_CMD_INDIRECT_QUESTION_RE.test(standbyText) &&
+    !NON_COMMAND_CHAT_RE.test(standbyText) &&
+    !OBVIOUS_SIDETALK_RE.test(standbyText) &&
+    !isThirdPersonNeoMention(standbyText) &&
+    !isNoiseOrGarbledFragment(standbyText, input.acousticEvent) &&
+    ((hasSmartHomeDomainIntent(standbyText) && CONVERSATION_ACTION_OR_QUERY_RE.test(standbyText)) ||
+      Boolean(probeImplicitCapabilities(standbyText, input.capabilityDigest)))
+  ) {
+    const s1 = await input.systemOneClient.evaluateWakeAttention(
+      {
+        utterance: cleaned,
+        wakeWords: input.wakeWords,
+      },
+      { strict: input.attentionMode === "strict" },
+    );
+    if (s1?.accepted) {
+      const acceptedByDeviceCmd = s1.acceptedBy === "device_command";
+      return wrap({
+        accept: true,
+        wokeOnly: false,
+        addressed: true,
+        inConversation: true,
+        confidence: acceptedByDeviceCmd ? s1.deviceCommand.confidence : s1.confidence,
+        stage: "systemone-attention",
+        passSource: acceptedByDeviceCmd ? "device_command" : "systemone",
+        reason: "SystemOne 检测到控制设备指令，放行进入下一流程",
+        wakeWord: null,
+        command: stripLeadingControlFiller(standbyText),
+        usedLlm: true,
+      });
+    }
   }
 
   return wrap({
@@ -2324,7 +2646,7 @@ export async function evaluateVoiceAttention(
     inConversation: false,
     confidence: 0.92,
     stage: "no-wake",
-    reason: "未检测到唤醒词",
+    reason: "未检测到唤醒词或控制设备指令",
     wakeWord: null,
     command: "",
     usedLlm: false,

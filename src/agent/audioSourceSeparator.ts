@@ -49,6 +49,7 @@ import {
   evaluateVoiceAttention,
   extractCommandAfterAcousticWake,
   findWakeWordSpan,
+  hasExplicitDeviceControlCommand,
   hasSmartHomeDomainIntent,
   isExplicitExitPhrase,
   isThirdPersonNeoMention,
@@ -1590,7 +1591,14 @@ export class AudioSourceSeparator {
       }
     }
 
-    if (!opts.bypassWakeWord && wakeWordEnabled && !inConv && !wakeSpan && !hasPendingConfirm) {
+    if (
+      !opts.bypassWakeWord &&
+      wakeWordEnabled &&
+      !inConv &&
+      !wakeSpan &&
+      !hasPendingConfirm &&
+      !hasExplicitDeviceControlCommand(workingText, opts.capabilityDigest)
+    ) {
       return makeRejected("no-wake", "未检测到有效唤醒词或受控声学唤醒信号", acousticWake);
     }
 
@@ -1626,7 +1634,8 @@ export class AudioSourceSeparator {
 
     let finalDecision = decision;
     const isSystemOneWakeVerified =
-      decision.stage === "systemone-attention" && Boolean(decision.wakeWord);
+      decision.stage === "systemone-attention" &&
+      (Boolean(decision.wakeWord) || decision.passSource === "device_command");
     const isBgmOrMusicContext = Boolean(
       isNoisyOrMusic || isTseOrMusicSeparated || bestEvent.toUpperCase().includes("BGM"),
     );
